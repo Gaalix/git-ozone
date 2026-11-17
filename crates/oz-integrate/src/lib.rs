@@ -1,7 +1,35 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Path guardrails (`--scope`/`--deny`), `oz radar` collision detection, and in-memory merge.
+//! Path guardrails (`--scope`/`--deny`), `oz radar` collision detection, atomic in-memory
+//! merge (`oz integrate`), conflict sandbox resolution (`oz resolve`), and stacked rebasing.
+
+pub mod guardrails;
+pub mod merge;
+pub mod radar;
+pub mod resolve;
+pub(crate) mod sandbox;
+pub mod stack;
+
+pub use guardrails::{
+    IntegrationGuardrailOptions, check_branch_guardrails_for_integration,
+    check_workspace_scope_for_integration,
+};
+pub use merge::{IntegrateOptions, IntegrateOutcome, continue_integration, integrate};
+pub use radar::{RadarOptions, RadarReport, scan_radar};
+pub use resolve::{
+    AbortOutcome, ContinueOutcome, ResolveOptions, ResolveOutcome, abort_integration,
+    active_session, continue_session, resolve_conflict,
+};
+pub use sandbox::{
+    ConflictSideRef, IntegrateSessionState, IntegrationMode, IntegrationSession,
+    RebasedCommitInfo, ResolvedIntegrateSource, StackRebaseSessionState, StackedBranchPlan,
+    StoredConflict, TakeSide,
+};
+pub use stack::{
+    RebasedBranchOutcome, StackBranchStatus, StackCommitSummary, StackRebaseOptions,
+    StackRebaseOutcome, StackStatusReport, continue_stack_rebase, stack_rebase, stack_status,
+};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use oz_core::{OzError, Result};

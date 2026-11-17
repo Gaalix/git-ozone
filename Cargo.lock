@@ -1985,6 +1985,7 @@ dependencies = [
 name = "oz-integrate"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gix",
  "globset",
  "imara-diff",
@@ -1994,6 +1995,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
