@@ -23,6 +23,7 @@ pub struct MutationTransaction {
     command: String,
     actor: ActorInfo,
     ws_key: String,
+    watch_all_branches: bool,
     watched_refs: Vec<String>,
     pre_refs: BTreeMap<String, String>,
     pre_branch: Option<String>,
@@ -33,22 +34,45 @@ pub struct MutationTransaction {
 }
 
 impl MutationTransaction {
-    /// Captures pre-mutation workspace state and all local branch refs (`refs/heads/*`).
+    /// Captures pre-mutation workspace state and only this workspace's active branch ref
+    /// (`refs/heads/<branch>`, or `HEAD` if detached), keeping concurrent workspaces isolated.
     pub fn begin(
         repo: &OzoneRepo,
         command: impl Into<String>,
         actor: ActorInfo,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
-        Self::begin_with_refs(repo, command, actor, &[], pre_dirty_override)
+        Self::begin_with_options(repo, command, actor, &[], false, pre_dirty_override)
     }
 
-    /// Captures pre-mutation workspace state, local branch refs, and any extra `watched_refs`.
+    /// Captures pre-mutation workspace state, this workspace's active ref, and any explicit `watched_refs`.
     pub fn begin_with_refs(
         repo: &OzoneRepo,
         command: impl Into<String>,
         actor: ActorInfo,
         watched_refs: &[&str],
+        pre_dirty_override: Option<&[FileChange]>,
+    ) -> Result<Self> {
+        Self::begin_with_options(repo, command, actor, watched_refs, false, pre_dirty_override)
+    }
+
+    /// Captures pre-mutation workspace state plus ALL local branch refs (`refs/heads/*`) for
+    /// repo-wide operations such as multi-branch integration.
+    pub fn begin_watching_all_branches(
+        repo: &OzoneRepo,
+        command: impl Into<String>,
+        actor: ActorInfo,
+        pre_dirty_override: Option<&[FileChange]>,
+    ) -> Result<Self> {
+        Self::begin_with_options(repo, command, actor, &[], true, pre_dirty_override)
+    }
+
+    fn begin_with_options(
+        repo: &OzoneRepo,
+        command: impl Into<String>,
+        actor: ActorInfo,
+        watched_refs: &[&str],
+        watch_all_branches: bool,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
         ensure_mount_healthy(repo)?;
@@ -62,12 +86,18 @@ impl MutationTransaction {
         let pre_dirty_tree = build_dirty_tree(&gix_repo, pre_base_tree, &pre_dirty_files)?;
 
         let watched: Vec<String> = watched_refs.iter().map(|r| (*r).to_string()).collect();
-        let pre_refs = snapshot_refs(&gix_repo, &watched)?;
+        let pre_refs = snapshot_refs(
+            &gix_repo,
+            pre_branch.as_deref(),
+            &watched,
+            watch_all_branches,
+        )?;
 
         Ok(Self {
             command: command.into(),
             actor,
             ws_key: workspace_key(repo).to_string(),
+            watch_all_branches,
             watched_refs: watched,
             pre_refs,
             pre_branch,
@@ -103,7 +133,13 @@ impl MutationTransaction {
         let post_dirty_files =
             scan_dirty_files(repo, &gix_repo, post_base_tree, post_dirty_override)?;
         let post_dirty_tree = build_dirty_tree(&gix_repo, post_base_tree, &post_dirty_files)?;
-        let post_refs = snapshot_refs(&gix_repo, &self.watched_refs)?;
+        let branch_for_refs = post_branch.as_deref().or(self.pre_branch.as_deref());
+        let post_refs = snapshot_refs(
+            &gix_repo,
+            branch_for_refs,
+            &self.watched_refs,
+            self.watch_all_branches,
+        )?;
 
         let mut all_ref_names = BTreeSet::new();
         all_ref_names.extend(self.pre_refs.keys().cloned());
@@ -187,8 +223,8 @@ where
     Ok((result, entry))
 }
 
-/// Wraps a mutating operation while watching explicit refs in addition to `refs/heads/*` and
-/// optionally accepting a post-mutation dirty file list returned by `mutate`.
+/// Wraps a mutating operation while watching explicit refs in addition to this workspace's
+/// active branch ref and optionally accepting a post-mutation dirty file list returned by `mutate`.
 pub fn record_mutation_with_refs<T, F>(
     repo: &OzoneRepo,
     command: impl Into<String>,
@@ -207,24 +243,50 @@ where
     Ok((result, entry))
 }
 
+/// Wraps a repo-wide mutating operation while watching ALL local branch refs (`refs/heads/*`).
+pub fn record_mutation_all_branches<T, F>(
+    repo: &OzoneRepo,
+    command: impl Into<String>,
+    actor: ActorInfo,
+    dirty_override: Option<&[FileChange]>,
+    mutate: F,
+) -> Result<(T, OpLogEntry)>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let tx = MutationTransaction::begin_watching_all_branches(repo, command, actor, dirty_override)?;
+    let result = mutate()?;
+    let entry = tx.finish(repo, None)?;
+    Ok((result, entry))
+}
+
 fn snapshot_refs(
     gix_repo: &gix::Repository,
+    active_branch: Option<&str>,
     watched_refs: &[String],
+    watch_all_branches: bool,
 ) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
 
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let branches = platform
-        .local_branches()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    if watch_all_branches {
+        let platform = gix_repo
+            .references()
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        let branches = platform
+            .local_branches()
+            .map_err(|err| OzError::Git(err.to_string()))?;
 
-    for item in branches {
-        let mut reference = item.map_err(|err| OzError::Git(err.to_string()))?;
-        let name = reference.name().as_bstr().to_str_lossy().into_owned();
-        if let Ok(oid) = reference.peel_to_id() {
-            map.insert(name, oid.detach().to_hex().to_string());
+        for item in branches {
+            let mut reference = item.map_err(|err| OzError::Git(err.to_string()))?;
+            let name = reference.name().as_bstr().to_str_lossy().into_owned();
+            if let Ok(oid) = reference.peel_to_id() {
+                map.insert(name, oid.detach().to_hex().to_string());
+            }
+        }
+    } else if let Some(branch) = active_branch {
+        let ref_name = format!("refs/heads/{branch}");
+        if let Some(oid_hex) = read_ref_oid_hex(gix_repo, &ref_name)? {
+            map.insert(ref_name, oid_hex);
         }
     }
 

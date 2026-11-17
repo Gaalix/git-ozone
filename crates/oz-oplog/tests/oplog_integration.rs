@@ -1050,3 +1050,174 @@ fn error_paths_empty_oplog_enotconn_and_nothing_to_redo() {
         .expect_err("enotconn checkpoint");
     assert!(matches!(err_mount, OzError::MountUnavailable { .. }));
 }
+
+#[test]
+fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("iso-refs");
+    let (main_repo, c0_hex) = init_repo_with_commit(&repo_dir, &[("shared.txt", "base\n")]);
+    main_repo.layout.ensure_initialized().expect("init ozone");
+
+    run_git(&repo_dir, &["branch", "feat/a"]);
+    run_git(&repo_dir, &["branch", "feat/b"]);
+
+    let ws_a_dir = tmp.path().join("iso-refs.oz/ws-a");
+    let ws_b_dir = tmp.path().join("iso-refs.oz/ws-b");
+    fs::create_dir_all(&ws_a_dir).unwrap();
+    fs::create_dir_all(&ws_b_dir).unwrap();
+    fs::write(ws_a_dir.join("shared.txt"), "base\n").unwrap();
+    fs::write(ws_b_dir.join("shared.txt"), "base\n").unwrap();
+
+    for (name, branch, dir) in [("ws-a", "feat/a", &ws_a_dir), ("ws-b", "feat/b", &ws_b_dir)] {
+        let st = WorkspaceState {
+            schema_version: WorkspaceState::CURRENT_SCHEMA_VERSION,
+            name: name.to_string(),
+            branch: branch.to_string(),
+            base_branch: Some("main".to_string()),
+            base_commit: Some(c0_hex.clone()),
+            base_tree: c0_hex.clone(),
+            backend: BackendKind::CasHardlink,
+            worktree_path: dir.clone(),
+            git_worktree_dir: None,
+            baseline_id: None,
+            dirty_paths: BTreeMap::new(),
+            pinned_paths: Default::default(),
+            scope: Vec::new(),
+            deny: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_checkpoint_oid: None,
+        };
+        fs::write(
+            main_repo.layout.workspace_state_path(name),
+            serde_json::to_string_pretty(&st).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let repo_a = OzoneRepo::discover(Some(&ws_a_dir)).unwrap();
+    let repo_b = OzoneRepo::discover(Some(&ws_b_dir)).unwrap();
+
+    // Workspace A opens a mutation transaction.
+    let tx_a = oz_oplog::MutationTransaction::begin(
+        &repo_a,
+        "oz commit -m feat-a",
+        agent_actor(Some("ws-a")),
+        None,
+    )
+    .expect("begin tx_a");
+
+    // While ws-a is in-flight, ws-b concurrently commits on feat/b!
+    let (cb1_id, entry_b) = record_mutation(&repo_b, "oz commit -m feat-b", agent_actor(Some("ws-b")), None, || {
+        let oid = commit_via_gix(&repo_dir, "feat/b", "feat-b", &[("b.txt", "b1\n")], &[]);
+        fs::write(ws_b_dir.join("b.txt"), "b1\n").unwrap();
+        Ok(oid)
+    })
+    .expect("record ws-b mutation");
+    let cb1_hex = cb1_id.to_hex().to_string();
+    assert!(entry_b.ref_deltas.contains_key("refs/heads/feat/b"));
+    assert!(!entry_b.ref_deltas.contains_key("refs/heads/feat/a"));
+
+    // Now ws-a commits on feat/a and finishes its transaction.
+    let ca1_id = commit_via_gix(&repo_dir, "feat/a", "feat-a", &[("a.txt", "a1\n")], &[]);
+    fs::write(ws_a_dir.join("a.txt"), "a1\n").unwrap();
+    let entry_a = tx_a.finish(&repo_a, None).expect("finish tx_a");
+
+    assert_eq!(
+        entry_a.ref_deltas.keys().collect::<Vec<_>>(),
+        vec!["refs/heads/feat/a"],
+        "ws-a ref_deltas must NOT include refs/heads/feat/b"
+    );
+    assert_eq!(
+        entry_a.ref_deltas["refs/heads/feat/a"].old.as_deref(),
+        Some(c0_hex.as_str())
+    );
+    assert_eq!(
+        entry_a.ref_deltas["refs/heads/feat/a"].new.as_deref(),
+        Some(ca1_id.to_hex().to_string().as_str())
+    );
+
+    // Undoing ws-a rolls back feat/a without touching or conflicting with feat/b!
+    undo(&repo_a, 1usize, agent_actor(Some("ws-a"))).expect("undo ws-a");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "refs/heads/feat/a"]), c0_hex);
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "refs/heads/feat/b"]), cb1_hex);
+    assert!(!ws_a_dir.join("a.txt").exists());
+    assert_eq!(fs::read_to_string(ws_b_dir.join("b.txt")).unwrap(), "b1\n");
+}
+
+#[test]
+fn fuse_fast_path_prunes_ignored_dir_with_many_files_under_10ms() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("fuse-ignore");
+    let (_, head_oid) = init_repo_with_commit(
+        &repo_dir,
+        &[
+            (".gitignore", "target/\n*.log\n"),
+            ("src/lib.rs", "pub fn ok() -> bool { true }\n"),
+        ],
+    );
+    run_git(&repo_dir, &["branch", "feat/fuse-prune"]);
+
+    let layout = OzoneLayout::from_git_common_dir(repo_dir.join(".git"));
+    layout.ensure_initialized().expect("init ozone");
+
+    let ws_name = "agent-prune";
+    let ws_workdir = tmp.path().join("fuse-ignore.oz").join(ws_name);
+    let upper_dir = layout.ws_upper_dir(ws_name);
+    let meta_dir = layout.ws_tombstone_dir(ws_name);
+
+    fs::create_dir_all(&ws_workdir).unwrap();
+    fs::create_dir_all(upper_dir.join("src")).unwrap();
+    fs::create_dir_all(&meta_dir).unwrap();
+
+    // Populate 2,000 ignored build artifacts inside `upper/target/debug/deps/`.
+    let target_deps = upper_dir.join("target/debug/deps");
+    fs::create_dir_all(&target_deps).unwrap();
+    for i in 0..2000 {
+        fs::write(target_deps.join(format!("crate_{i:04}.rlib")), "artifact").unwrap();
+    }
+    fs::write(upper_dir.join("src/lib.rs"), "pub fn ok() -> bool { false }\n").unwrap();
+
+    let mr = MountRecord {
+        schema_version: MountRecord::CURRENT_SCHEMA_VERSION,
+        workspace: ws_name.to_string(),
+        branch: "feat/fuse-prune".to_string(),
+        backend: BackendKind::LinuxFuse3,
+        repo_root: repo_dir.clone(),
+        git_dir: repo_dir.join(".git"),
+        mount_point: ws_workdir.clone(),
+        upper_dir: Some(upper_dir),
+        meta_dir: Some(meta_dir),
+        base_tree: None,
+        base_commit: Some(head_oid),
+        socket_path: None,
+        daemon_pid: None,
+        mounted: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    fs::create_dir_all(layout.ws_meta_dir(ws_name)).unwrap();
+    fs::write(
+        layout.ws_mount_record_path(ws_name),
+        serde_json::to_string_pretty(&mr).unwrap(),
+    )
+    .unwrap();
+
+    let fuse_repo = OzoneRepo::discover(Some(&ws_workdir)).unwrap();
+
+    let t0 = Instant::now();
+    let cp = checkpoint(&fuse_repo, "oz checkpoint", None, agent_actor(Some(ws_name)), None)
+        .expect("checkpoint");
+    let elapsed = t0.elapsed();
+
+    eprintln!("FUSE checkpoint with 2000 ignored target/ files: {:?}", elapsed);
+    assert_eq!(cp.dirty_file_count, 1);
+    assert_eq!(
+        cp.entry.ws_snapshots[ws_name].dirty_files[0].path,
+        "src/lib.rs"
+    );
+    assert!(
+        elapsed < Duration::from_millis(10),
+        "FUSE checkpoint with 2000 ignored files took {elapsed:?} (>= 10ms)"
+    );
+}

@@ -222,24 +222,40 @@ fn resolve_fuse_dirs(repo: &OzoneRepo) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-fn build_gitignore_matcher(repo: &OzoneRepo, upper_dir: Option<&Path>) -> Option<Gitignore> {
+fn build_gitignore_matcher(
+    repo: &OzoneRepo,
+    upper_dir: Option<&Path>,
+    base_tree: Option<&gix::Tree<'_>>,
+) -> Option<Gitignore> {
     let root = &repo.workdir_path;
     let mut builder = GitignoreBuilder::new(root);
     let mut any = false;
 
+    let upper_gi = upper_dir.map(|u| u.join(".gitignore"));
     let workdir_gi = root.join(".gitignore");
-    if workdir_gi.is_file() {
+    let repo_gi = repo.repo_root.join(".gitignore");
+
+    if let Some(ref u_gi) = upper_gi
+        && u_gi.is_file()
+    {
+        let _ = builder.add(u_gi);
+        any = true;
+    } else if workdir_gi.is_file() {
         let _ = builder.add(&workdir_gi);
         any = true;
-    } else if let Some(upper) = upper_dir {
-        let upper_gi = upper.join(".gitignore");
-        if upper_gi.is_file() {
-            let _ = builder.add(&upper_gi);
-            any = true;
-        } else if repo.repo_root.join(".gitignore").is_file() {
-            let _ = builder.add(repo.repo_root.join(".gitignore"));
-            any = true;
+    } else if repo_gi.is_file() {
+        let _ = builder.add(&repo_gi);
+        any = true;
+    } else if let Some(tree) = base_tree
+        && let Ok(Some(entry)) = tree.lookup_entry_by_path(".gitignore")
+        && !entry.mode().is_tree()
+        && let Ok(obj) = entry.object()
+    {
+        let content = String::from_utf8_lossy(&obj.data);
+        for line in content.lines() {
+            let _ = builder.add_line(None, line);
         }
+        any = true;
     }
 
     let exclude = repo.git_common_dir.join("info").join("exclude");
@@ -405,16 +421,33 @@ fn snapshot_from_fuse_layers(
     meta_dir: &Path,
 ) -> Result<Vec<DirtyFileSnapshot>> {
     let hash_kind = gix_repo.object_hash();
-    let gi = build_gitignore_matcher(repo, Some(upper_dir));
+    let gi = build_gitignore_matcher(repo, Some(upper_dir), Some(base_tree));
     let mut map: BTreeMap<String, DirtyFileState> = BTreeMap::new();
     let mut present_in_upper = HashSet::new();
 
     if upper_dir.is_dir() {
-        let mut upper_entries = Vec::new();
         let walker = walkdir::WalkDir::new(upper_dir)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| e.file_name() != ".git");
+            .filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                if e.file_name() == ".git" {
+                    return false;
+                }
+                if e.file_type().is_dir()
+                    && let Ok(rel_path) = e.path().strip_prefix(upper_dir)
+                    && let Some(rel) = path_to_rel_string(rel_path)
+                    && is_ignored_rel(gi.as_ref(), &rel, true)
+                    && matches!(base_tree.lookup_entry_by_path(&rel), Ok(None))
+                {
+                    // Prune untracked gitignored directories (e.g. `upper/target/`) immediately
+                    // without descending into any files inside them.
+                    return false;
+                }
+                true
+            });
 
         for entry in walker {
             let entry = entry.map_err(|err| OzError::Other(err.to_string()))?;
@@ -422,10 +455,7 @@ fn snapshot_from_fuse_layers(
                 continue;
             }
             let ft = entry.file_type();
-            if ft.is_dir() {
-                continue;
-            }
-            if !ft.is_file() && !ft.is_symlink() {
+            if ft.is_dir() || (!ft.is_file() && !ft.is_symlink()) {
                 continue;
             }
             let Ok(rel_path) = entry.path().strip_prefix(upper_dir) else {
@@ -434,32 +464,29 @@ fn snapshot_from_fuse_layers(
             let Some(rel) = path_to_rel_string(rel_path) else {
                 continue;
             };
-            present_in_upper.insert(rel.clone());
-            upper_entries.push((rel, entry.path().to_path_buf()));
-        }
-
-        for (rel, full_path) in upper_entries {
-            let meta = fs::symlink_metadata(&full_path)?;
-            let (bytes, mode) = read_disk_blob_and_mode(&full_path, &meta)?;
-            let computed_oid = compute_blob_oid(hash_kind, &bytes)?;
 
             let tree_entry = base_tree
                 .lookup_entry_by_path(&rel)
                 .map_err(|err| OzError::Git(err.to_string()))?;
 
-            match tree_entry {
-                Some(entry) => {
-                    // Committed files remain in `upper_dir`; skip when bytes & mode match HEAD.
-                    if entry.object_id() == computed_oid && entry_mode_to_u32(entry.mode()) == mode
-                    {
-                        continue;
-                    }
-                }
-                None => {
-                    if is_ignored_rel(gi.as_ref(), &rel, false) {
-                        continue;
-                    }
-                }
+            // Skip untracked gitignored files BEFORE reading or SHA-1 hashing their bytes.
+            if tree_entry.is_none() && is_ignored_rel(gi.as_ref(), &rel, false) {
+                continue;
+            }
+
+            present_in_upper.insert(rel.clone());
+
+            let full_path = entry.path();
+            let meta = fs::symlink_metadata(full_path)?;
+            let (bytes, mode) = read_disk_blob_and_mode(full_path, &meta)?;
+            let computed_oid = compute_blob_oid(hash_kind, &bytes)?;
+
+            if let Some(base_entry) = tree_entry
+                && base_entry.object_id() == computed_oid
+                && entry_mode_to_u32(base_entry.mode()) == mode
+            {
+                // Committed files remain in `upper_dir`; skip when bytes & mode match HEAD.
+                continue;
             }
 
             let blob_oid = write_blob_if_needed(gix_repo, &bytes)?;

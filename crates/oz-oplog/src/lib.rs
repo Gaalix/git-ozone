@@ -13,7 +13,9 @@ pub mod undo;
 
 pub use checkpoint::checkpoint;
 pub use dirty::workspace_key;
-pub use mutation::{MutationTransaction, record_mutation, record_mutation_with_refs};
+pub use mutation::{
+    MutationTransaction, record_mutation, record_mutation_all_branches, record_mutation_with_refs,
+};
 pub use store::{
     append_entry, ensure_oplog_dirs, entry_path, head_lock_path, head_path, list_entries,
     load_entry, ops_dir, read_head_op_id,
