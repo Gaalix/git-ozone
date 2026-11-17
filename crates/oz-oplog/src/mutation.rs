@@ -5,8 +5,8 @@
 
 use crate::dirty::{
     SnapshotSlice, build_dirty_tree, ensure_mount_healthy, make_ws_snapshot, open_gix_for_workspace,
-    read_ref_oid_hex, resolve_workspace_head, scan_dirty_files, sync_workspace_state_file,
-    workspace_key,
+    read_ref_oid_hex, resolve_workspace_head, scan_dirty_files, snapshots_match,
+    sync_workspace_state_file, workspace_key,
 };
 use crate::new_op_id;
 use crate::store::{append_entry, ensure_oplog_dirs};
@@ -24,6 +24,7 @@ pub struct MutationTransaction {
     actor: ActorInfo,
     ws_key: String,
     watch_all_branches: bool,
+    watch_remote_refs: bool,
     watched_refs: Vec<String>,
     pre_refs: BTreeMap<String, String>,
     pre_branch: Option<String>,
@@ -42,7 +43,15 @@ impl MutationTransaction {
         actor: ActorInfo,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
-        Self::begin_with_options(repo, command, actor, &[], false, pre_dirty_override)
+        Self::begin_with_options(
+            repo,
+            command,
+            actor,
+            &[],
+            false,
+            false,
+            pre_dirty_override,
+        )
     }
 
     /// Captures pre-mutation workspace state, this workspace's active ref, and any explicit `watched_refs`.
@@ -53,7 +62,15 @@ impl MutationTransaction {
         watched_refs: &[&str],
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
-        Self::begin_with_options(repo, command, actor, watched_refs, false, pre_dirty_override)
+        Self::begin_with_options(
+            repo,
+            command,
+            actor,
+            watched_refs,
+            false,
+            false,
+            pre_dirty_override,
+        )
     }
 
     /// Captures pre-mutation workspace state plus ALL local branch refs (`refs/heads/*`) for
@@ -64,7 +81,34 @@ impl MutationTransaction {
         actor: ActorInfo,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
-        Self::begin_with_options(repo, command, actor, &[], true, pre_dirty_override)
+        Self::begin_with_options(
+            repo,
+            command,
+            actor,
+            &[],
+            true,
+            false,
+            pre_dirty_override,
+        )
+    }
+
+    /// Captures pre-mutation workspace state plus ALL local (`refs/heads/*`) and remote-tracking
+    /// (`refs/remotes/*`) branch refs for network commands such as `fetch`, `push`, and `pull`.
+    pub fn begin_watching_all_refs(
+        repo: &OzoneRepo,
+        command: impl Into<String>,
+        actor: ActorInfo,
+        pre_dirty_override: Option<&[FileChange]>,
+    ) -> Result<Self> {
+        Self::begin_with_options(
+            repo,
+            command,
+            actor,
+            &[],
+            true,
+            true,
+            pre_dirty_override,
+        )
     }
 
     fn begin_with_options(
@@ -73,6 +117,7 @@ impl MutationTransaction {
         actor: ActorInfo,
         watched_refs: &[&str],
         watch_all_branches: bool,
+        watch_remote_refs: bool,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
         ensure_mount_healthy(repo)?;
@@ -91,6 +136,7 @@ impl MutationTransaction {
             pre_branch.as_deref(),
             &watched,
             watch_all_branches,
+            watch_remote_refs,
         )?;
 
         Ok(Self {
@@ -98,6 +144,7 @@ impl MutationTransaction {
             actor,
             ws_key: workspace_key(repo).to_string(),
             watch_all_branches,
+            watch_remote_refs,
             watched_refs: watched,
             pre_refs,
             pre_branch,
@@ -125,6 +172,29 @@ impl MutationTransaction {
         message: Option<&str>,
         post_dirty_override: Option<&[FileChange]>,
     ) -> Result<OpLogEntry> {
+        let stored = self
+            .finish_inner(repo, message, post_dirty_override, false)?
+            .expect("finish_inner with only_if_changed=false always returns Some");
+        Ok(stored)
+    }
+
+    /// Appends an [`OpKind::Mutate`] entry only if at least one watched ref, `HEAD`, or dirty
+    /// working-tree file changed between `begin` and `finish`.
+    pub fn finish_if_changed(
+        self,
+        repo: &OzoneRepo,
+        post_dirty_override: Option<&[FileChange]>,
+    ) -> Result<Option<OpLogEntry>> {
+        self.finish_inner(repo, None, post_dirty_override, true)
+    }
+
+    fn finish_inner(
+        self,
+        repo: &OzoneRepo,
+        message: Option<&str>,
+        post_dirty_override: Option<&[FileChange]>,
+        only_if_changed: bool,
+    ) -> Result<Option<OpLogEntry>> {
         ensure_mount_healthy(repo)?;
         let gix_repo = open_gix_for_workspace(repo)?;
 
@@ -139,19 +209,40 @@ impl MutationTransaction {
             branch_for_refs,
             &self.watched_refs,
             self.watch_all_branches,
+            self.watch_remote_refs,
         )?;
 
         let mut all_ref_names = BTreeSet::new();
         all_ref_names.extend(self.pre_refs.keys().cloned());
         all_ref_names.extend(post_refs.keys().cloned());
 
+        let both_detached = self.pre_branch.is_none() && post_branch.is_none();
         let mut ref_deltas = BTreeMap::new();
         for name in all_ref_names {
+            if name == "HEAD" && !both_detached {
+                // Symbolic <-> detached HEAD transitions are captured via WsSnapshot branch fields
+                // so `oz undo` never attempts `RefEdit::delete("HEAD")`.
+                continue;
+            }
             let old = self.pre_refs.get(&name).cloned();
             let new = post_refs.get(&name).cloned();
             if old != new {
                 ref_deltas.insert(name, RefDelta { old, new });
             }
+        }
+
+        if only_if_changed
+            && ref_deltas.is_empty()
+            && self.pre_branch == post_branch
+            && self.pre_head_commit == post_head_commit
+            && snapshots_match(
+                &self.pre_base_tree.to_hex().to_string(),
+                &self.pre_dirty_files,
+                &post_base_tree.to_hex().to_string(),
+                &post_dirty_files,
+            )
+        {
+            return Ok(None);
         }
 
         let ws_snap = make_ws_snapshot(
@@ -200,7 +291,7 @@ impl MutationTransaction {
             post_branch.as_deref(),
         )?;
 
-        Ok(stored)
+        Ok(Some(stored))
     }
 }
 
@@ -265,6 +356,7 @@ fn snapshot_refs(
     active_branch: Option<&str>,
     watched_refs: &[String],
     watch_all_branches: bool,
+    watch_remote_refs: bool,
 ) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
 
@@ -278,6 +370,9 @@ fn snapshot_refs(
 
         for item in branches {
             let mut reference = item.map_err(|err| OzError::Git(err.to_string()))?;
+            if matches!(reference.target(), gix::refs::TargetRef::Symbolic(_)) {
+                continue;
+            }
             let name = reference.name().as_bstr().to_str_lossy().into_owned();
             if let Ok(oid) = reference.peel_to_id() {
                 map.insert(name, oid.detach().to_hex().to_string());
@@ -287,6 +382,26 @@ fn snapshot_refs(
         let ref_name = format!("refs/heads/{branch}");
         if let Some(oid_hex) = read_ref_oid_hex(gix_repo, &ref_name)? {
             map.insert(ref_name, oid_hex);
+        }
+    }
+
+    if watch_remote_refs {
+        let platform = gix_repo
+            .references()
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        let remotes = platform
+            .remote_branches()
+            .map_err(|err| OzError::Git(err.to_string()))?;
+
+        for item in remotes {
+            let mut reference = item.map_err(|err| OzError::Git(err.to_string()))?;
+            if matches!(reference.target(), gix::refs::TargetRef::Symbolic(_)) {
+                continue;
+            }
+            let name = reference.name().as_bstr().to_str_lossy().into_owned();
+            if let Ok(oid) = reference.peel_to_id() {
+                map.insert(name, oid.detach().to_hex().to_string());
+            }
         }
     }
 

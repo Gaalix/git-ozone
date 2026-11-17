@@ -8,13 +8,13 @@ pub mod detect;
 pub mod lifecycle;
 pub mod materialize;
 
-pub use backends::{CasHardlinkBackend, backend_for_kind};
+pub use backends::{CasHardlinkBackend, backend_for_kind, prepare_vfs_seed_layer};
 #[cfg(target_os = "macos")]
 pub use backends::ClonefileBackend;
 #[cfg(target_os = "linux")]
 pub use backends::{FicloneBackend, Fuse3VfsBackend};
 #[cfg(target_os = "windows")]
-pub use backends::RefsCloneBackend;
+pub use backends::{ProjFsVfsBackend, RefsCloneBackend};
 pub use detect::{
     FilesystemProbe, LinuxFuseReadiness, detect_filesystem, detect_filesystem_with_ozone,
     probe_ozone_reflink, probe_reflink_in_dir, select_backend,

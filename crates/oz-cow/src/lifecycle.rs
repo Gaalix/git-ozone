@@ -7,6 +7,8 @@
 use crate::backends::{backend_for_kind, remove_dir_if_exists};
 #[cfg(target_os = "linux")]
 use crate::backends::Fuse3VfsBackend;
+#[cfg(target_os = "windows")]
+use crate::backends::ProjFsVfsBackend;
 use crate::detect::{detect_filesystem_with_ozone, select_backend};
 use crate::{SpawnRequest, SpawnedWorkspace};
 use chrono::Utc;
@@ -466,7 +468,12 @@ pub fn remove_workspace(
             );
             fuse.destroy_with_context(&repo.git_common_dir, name, &worktree_path)?;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        if backend_kind == BackendKind::WindowsProjFs {
+            let projfs = ProjFsVfsBackend::new(repo.config.daemon.auto_start);
+            projfs.destroy_with_context(&repo.git_common_dir, name, &worktree_path)?;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             let _ = remove_dir_if_exists(&worktree_path);
         }
@@ -591,6 +598,11 @@ fn spawn_with_backend(
             repo.config.daemon.auto_start,
         );
         return crate::WorkspaceBackend::spawn(&fuse, req);
+    }
+    #[cfg(target_os = "windows")]
+    if kind == BackendKind::WindowsProjFs {
+        let projfs = ProjFsVfsBackend::new(repo.config.daemon.auto_start);
+        return crate::WorkspaceBackend::spawn(&projfs, req);
     }
     let _ = repo;
     backend_for_kind(kind)?.spawn(req)

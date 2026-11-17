@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Synchronous IPC client, auto-spawn, and `SIGKILL` recovery for `oz-vfsd`.
+//! Synchronous IPC client, auto-spawn, and crash recovery for `oz-vfsd`.
 
 use crate::lookup::find_oz_vfsd_bin;
 use crate::overlay::lazy_unmount_fuse;
 use crate::protocol::{DirtyPathEntry, MountInfo, MountSpec, VfsRequest, VfsResponse, encode_line};
-use oz_core::{BackendKind, MountRecord, OzError, OzoneLayout, Result};
+use oz_core::{MountRecord, OzError, OzoneLayout, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,22 +17,18 @@ pub struct DaemonPong {
     pub pid: u32,
 }
 
-/// Returns the canonical Unix socket path `.git/ozone/vfsd.sock` for `git_dir`.
+/// Returns the canonical IPC endpoint path `.git/ozone/vfsd.sock` for `git_dir`.
 #[must_use]
 pub fn socket_path_for_git_dir(git_dir: &Path) -> PathBuf {
     git_dir.join("ozone").join("vfsd.sock")
 }
 
-/// Sends a single [`VfsRequest`] over `socket_path` and parses the JSON line [`VfsResponse`].
-#[cfg(unix)]
-pub fn send_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsResponse> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-
-    let mut stream = UnixStream::connect(socket_path)?;
-    let timeout = Some(Duration::from_secs(10));
-    let _ = stream.set_read_timeout(timeout);
-    let _ = stream.set_write_timeout(timeout);
+fn exchange_ipc_line<S: std::io::Read + std::io::Write>(
+    mut stream: S,
+    socket_path: &Path,
+    req: &VfsRequest,
+) -> Result<VfsResponse> {
+    use std::io::{BufRead, BufReader};
 
     let encoded = encode_line(req)?;
     stream.write_all(encoded.as_bytes())?;
@@ -51,11 +47,59 @@ pub fn send_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsResponse>
     Ok(resp)
 }
 
-/// Non-Unix compile-time stub for [`send_request`].
-#[cfg(not(unix))]
+/// Sends a single [`VfsRequest`] over loopback TCP using the `"tcp://127.0.0.1:<port>"`
+/// endpoint stored inside `socket_path`.
+pub fn send_tcp_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsResponse> {
+    let raw = std::fs::read_to_string(socket_path)?;
+    let addr_raw = raw.trim().strip_prefix("tcp://").ok_or_else(|| {
+        OzError::Other(format!(
+            "invalid oz-vfsd TCP endpoint in {} (expected 'tcp://127.0.0.1:<port>')",
+            socket_path.display()
+        ))
+    })?;
+    let addr: std::net::SocketAddr = addr_raw.parse().map_err(|err| {
+        OzError::Other(format!(
+            "invalid oz-vfsd TCP socket address '{addr_raw}' in {}: {err}",
+            socket_path.display()
+        ))
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(OzError::Other(format!(
+            "refusing non-loopback oz-vfsd IPC address {addr} in {}",
+            socket_path.display()
+        )));
+    }
+
+    let stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    let timeout = Some(Duration::from_secs(10));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    exchange_ipc_line(stream, socket_path, req)
+}
+
+/// Sends a single [`VfsRequest`] over `socket_path` and parses the JSON line [`VfsResponse`].
+#[cfg(unix)]
+pub fn send_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsResponse> {
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(socket_path)?;
+    let timeout = Some(Duration::from_secs(10));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    exchange_ipc_line(stream, socket_path, req)
+}
+
+/// Sends a single [`VfsRequest`] over loopback TCP using the endpoint stored in `socket_path`.
+#[cfg(windows)]
+pub fn send_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsResponse> {
+    send_tcp_request(socket_path, req)
+}
+
+/// Unsupported platform compile-time stub for [`send_request`].
+#[cfg(not(any(unix, windows)))]
 pub fn send_request(_socket_path: &Path, _req: &VfsRequest) -> Result<VfsResponse> {
     Err(OzError::Other(
-        "oz-vfsd Unix socket IPC client is only supported on Unix".to_string(),
+        "oz-vfsd IPC client is only supported on Unix and Windows".to_string(),
     ))
 }
 
@@ -72,25 +116,24 @@ pub fn ping_daemon(socket_path: &Path) -> Result<DaemonPong> {
     }
 }
 
-/// Ensures `oz-vfsd` is running for `git_dir` and all `mounted: true` FUSE3 workspaces
+/// Ensures `oz-vfsd` is running for `git_dir` and all `mounted: true` daemon-backed workspaces
 /// from `<git_dir>/ozone/ws/*/mount.json` are healthy and mounted.
 ///
-/// Automatically cleans up dead `vfsd.sock` sockets and `ENOTCONN` (`errno == 107`)
-/// stale FUSE mountpoints via `fusermount3 -u -z`, spawns `oz-vfsd --git-dir <git_dir>`
-/// detached with stdio redirected away from caller pipes, and polls until both the
-/// socket responds and every active mountpoint passes `stat()`.
-#[cfg(unix)]
+/// On Unix, cleans up dead `vfsd.sock` sockets and `ENOTCONN` (`errno == 107`) stale FUSE
+/// mountpoints via `fusermount3 -u -z`, spawns `oz-vfsd --git-dir <git_dir>` detached with
+/// `setsid()`. On Windows, spawns `oz-vfsd.exe` detached (`CREATE_NO_WINDOW | DETACHED_PROCESS`)
+/// listening on loopback TCP and virtualizing ProjFS mountpoints.
+#[cfg(any(unix, windows))]
 pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
     use fs4::FileExt as Fs4FileExt;
     use std::fs::OpenOptions;
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     let layout = OzoneLayout::from_git_common_dir(git_dir);
     std::fs::create_dir_all(&layout.ozone_dir)?;
     std::fs::create_dir_all(layout.ws_dir())?;
     let sock = socket_path_for_git_dir(git_dir);
-    let records = load_expected_fuse_mounts(&layout);
+    let records = load_expected_daemon_mounts(&layout);
 
     if ping_daemon(&sock).is_ok() {
         return verify_or_repair_live_mounts(git_dir, &sock, &records);
@@ -135,13 +178,24 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
         .stdout(stdout_stdio)
         .stderr(stderr_stdio);
 
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS (0x0000_0008) | CREATE_NO_WINDOW (0x0800_0000)
+        cmd.creation_flags(0x0800_0008);
     }
 
     let mut child = cmd.spawn().map_err(|err| {
@@ -184,11 +238,11 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
     verify_or_repair_live_mounts(git_dir, &sock, &records)
 }
 
-/// Non-Unix compile-time stub for [`ensure_daemon_and_mounts`].
-#[cfg(not(unix))]
+/// Unsupported platform compile-time stub for [`ensure_daemon_and_mounts`].
+#[cfg(not(any(unix, windows)))]
 pub fn ensure_daemon_and_mounts(_git_dir: &Path) -> Result<Vec<MountInfo>> {
     Err(OzError::Other(
-        "oz-vfsd FUSE3 auto-spawn is only supported on Unix".to_string(),
+        "oz-vfsd auto-spawn is only supported on Unix and Windows".to_string(),
     ))
 }
 
@@ -322,7 +376,7 @@ pub fn shutdown_daemon(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn verify_or_repair_live_mounts(
     git_dir: &Path,
     sock: &Path,
@@ -349,7 +403,7 @@ fn verify_or_repair_live_mounts(
     list_mounts_via_socket(sock)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn list_mounts_via_socket(sock: &Path) -> Result<Vec<MountInfo>> {
     match send_request(sock, &VfsRequest::ListMounts)? {
         VfsResponse::MountList { mounts } => Ok(mounts),
@@ -362,8 +416,8 @@ fn list_mounts_via_socket(sock: &Path) -> Result<Vec<MountInfo>> {
     }
 }
 
-#[cfg(unix)]
-fn load_expected_fuse_mounts(layout: &OzoneLayout) -> Vec<MountRecord> {
+#[cfg(any(unix, windows))]
+fn load_expected_daemon_mounts(layout: &OzoneLayout) -> Vec<MountRecord> {
     let mut records = Vec::new();
     let Ok(entries) = std::fs::read_dir(layout.ws_dir()) else {
         return records;
@@ -380,7 +434,7 @@ fn load_expected_fuse_mounts(layout: &OzoneLayout) -> Vec<MountRecord> {
         let Ok(record) = serde_json::from_str::<MountRecord>(&raw) else {
             continue;
         };
-        if record.mounted && record.backend == BackendKind::LinuxFuse3 {
+        if record.mounted && record.backend.requires_daemon() {
             records.push(record);
         }
     }
@@ -393,6 +447,11 @@ fn needs_stale_unmount(mount_point: &Path) -> bool {
         Err(err) if oz_core::is_enotconn(&err) => true,
         _ => is_fuse_mount_in_proc_mountinfo(mount_point),
     }
+}
+
+#[cfg(not(unix))]
+fn needs_stale_unmount(_mount_point: &Path) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -416,14 +475,14 @@ fn is_fuse_mount_in_proc_mountinfo(mount_point: &Path) -> bool {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn all_mount_points_stat_healthy(records: &[MountRecord]) -> bool {
     records
         .iter()
         .all(|r| std::fs::symlink_metadata(&r.mount_point).is_ok())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn daemon_lists_all_mounts(sock: &Path, records: &[MountRecord]) -> bool {
     if records.is_empty() {
         return true;
@@ -436,7 +495,7 @@ fn daemon_lists_all_mounts(sock: &Path, records: &[MountRecord]) -> bool {
         .all(|r| mounts.iter().any(|m| m.workspace == r.workspace && m.mounted))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn open_daemon_log_stdio(log_path: &Path) -> std::process::Stdio {
     use std::fs::OpenOptions;
     use std::process::Stdio;
@@ -447,7 +506,7 @@ fn open_daemon_log_stdio(log_path: &Path) -> std::process::Stdio {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_log_tail(log_path: &Path) -> String {
     let Ok(raw) = std::fs::read_to_string(log_path) else {
         return String::new();

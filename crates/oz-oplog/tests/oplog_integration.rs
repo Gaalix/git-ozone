@@ -1221,3 +1221,150 @@ fn fuse_fast_path_prunes_ignored_dir_with_many_files_under_10ms() {
         "FUSE checkpoint with 2000 ignored files took {elapsed:?} (>= 10ms)"
     );
 }
+
+#[test]
+fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("win-projfs-oplog");
+    fs::create_dir_all(&repo_dir).expect("mkdir");
+    run_git(&repo_dir, &["init", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.name", "Ozone Test"]);
+    run_git(&repo_dir, &["config", "user.email", "test@ozone.dev"]);
+
+    // 1. Create 1,200 files for <10ms reset --hard + undo benchmark.
+    fs::write(repo_dir.join(".gitignore"), "*.log\n").unwrap();
+    for d in 0..24 {
+        let sub = repo_dir.join(format!("mod_{d:02}"));
+        fs::create_dir_all(&sub).unwrap();
+        for f in 0..50 {
+            fs::write(sub.join(format!("f_{f:02}.rs")), format!("// {d} {f}\n")).unwrap();
+        }
+    }
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "c1"]);
+
+    // Commit C2 modifying 1 file and adding 1 file.
+    fs::write(repo_dir.join("mod_00/f_00.rs"), "// c2\n").unwrap();
+    fs::write(repo_dir.join("added_in_c2.rs"), "pub fn c2() {}\n").unwrap();
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "c2"]);
+    let c2_oid = run_git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    // Dirty modified tracked file + untracked non-ignored files + ignored file.
+    fs::write(repo_dir.join("mod_01/f_05.rs"), "// uncommitted edit\n").unwrap();
+    fs::write(repo_dir.join("untracked_wip.txt"), "wip data\n").unwrap();
+    fs::create_dir_all(repo_dir.join("untracked_dir")).unwrap();
+    fs::write(repo_dir.join("untracked_dir/nested.txt"), "nested wip\n").unwrap();
+    fs::write(repo_dir.join("keep.log"), "ignored log\n").unwrap();
+
+    let repo = OzoneRepo::discover(Some(&repo_dir)).expect("discover");
+    let tx = oz_oplog::MutationTransaction::begin_watching_all_branches(
+        &repo,
+        "oz git reset --hard HEAD~1",
+        agent_actor(None),
+        None,
+    )
+    .expect("begin tx");
+
+    run_git(&repo_dir, &["reset", "--hard", "HEAD~1"]);
+    run_git(&repo_dir, &["clean", "-fd"]);
+    tx.finish(&repo, None).expect("finish tx");
+
+    assert_ne!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2_oid);
+    assert!(!repo_dir.join("added_in_c2.rs").exists());
+    assert!(!repo_dir.join("untracked_wip.txt").exists());
+    assert!(!repo_dir.join("untracked_dir/nested.txt").exists());
+    assert_eq!(fs::read_to_string(repo_dir.join("mod_01/f_05.rs")).unwrap(), "// 1 5\n");
+
+    let t0 = Instant::now();
+    undo(&repo, 1usize, agent_actor(None)).expect("undo reset+clean");
+    let elapsed = t0.elapsed();
+    eprintln!("1200-file reset --hard + clean -fd undo took {:?}", elapsed);
+
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2_oid);
+    assert_eq!(fs::read_to_string(repo_dir.join("added_in_c2.rs")).unwrap(), "pub fn c2() {}\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("mod_01/f_05.rs")).unwrap(),
+        "// uncommitted edit\n"
+    );
+    assert_eq!(fs::read_to_string(repo_dir.join("untracked_wip.txt")).unwrap(), "wip data\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("untracked_dir/nested.txt")).unwrap(),
+        "nested wip\n"
+    );
+    assert!(repo_dir.join("keep.log").is_file());
+    assert!(
+        elapsed < Duration::from_millis(10),
+        "undo took {elapsed:?} (>= 10ms)"
+    );
+
+    // 2. Verify WindowsProjFs WorkspaceState without mount.json still triggers O(dirty) fast path!
+    let ws_name = "projfs-fast";
+    let upper_dir = repo.layout.ws_upper_dir(ws_name);
+    let meta_dir = repo.layout.ws_tombstone_dir(ws_name);
+    let ws_workdir = tmp.path().join("win-projfs-oplog.oz").join(ws_name);
+    fs::create_dir_all(upper_dir.join("mod_00")).unwrap();
+    fs::create_dir_all(meta_dir.join("whiteouts")).unwrap();
+    fs::create_dir_all(&ws_workdir).unwrap();
+    fs::write(upper_dir.join("mod_00/f_01.rs"), "// projfs edit\n").unwrap();
+
+    run_git(&repo_dir, &["branch", "feat/projfs"]);
+    let st = WorkspaceState {
+        schema_version: WorkspaceState::CURRENT_SCHEMA_VERSION,
+        name: ws_name.to_string(),
+        branch: "feat/projfs".to_string(),
+        base_branch: Some("main".to_string()),
+        base_commit: Some(c2_oid.clone()),
+        base_tree: c2_oid,
+        backend: BackendKind::WindowsProjFs,
+        worktree_path: ws_workdir.clone(),
+        git_worktree_dir: None,
+        baseline_id: None,
+        dirty_paths: BTreeMap::new(),
+        pinned_paths: Default::default(),
+        scope: Vec::new(),
+        deny: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_checkpoint_oid: None,
+    };
+    fs::write(
+        repo.layout.workspace_state_path(ws_name),
+        serde_json::to_string_pretty(&st).unwrap(),
+    )
+    .unwrap();
+
+    let projfs_repo = OzoneRepo::discover(Some(&ws_workdir)).unwrap();
+    let cp = checkpoint(&projfs_repo, "oz checkpoint", None, agent_actor(Some(ws_name)), None)
+        .expect("projfs checkpoint");
+    assert_eq!(cp.dirty_file_count, 1);
+    assert_eq!(
+        cp.entry.ws_snapshots[ws_name].dirty_files[0].path,
+        "mod_00/f_01.rs"
+    );
+
+    // 3. Verify branch switch + remote ref snapshot undo/redo roundtrip.
+    let sw_tx = oz_oplog::MutationTransaction::begin_watching_all_refs(
+        &repo,
+        "oz git switch -c feat/undo-sw",
+        agent_actor(None),
+        None,
+    )
+    .expect("begin switch tx");
+    run_git(&repo_dir, &["checkout", "-b", "feat/undo-sw"]);
+    sw_tx.finish(&repo, None).expect("finish switch tx");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/undo-sw");
+
+    undo(&repo, 1usize, agent_actor(None)).expect("undo switch -c");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    let show_feat = Command::new("git")
+        .args(["rev-parse", "--verify", "refs/heads/feat/undo-sw"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    assert!(!show_feat.status.success(), "created branch should be deleted on undo");
+
+    redo(&repo, agent_actor(None)).expect("redo switch -c");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/undo-sw");
+}
+

@@ -18,7 +18,7 @@ use gix::objs::tree::EntryKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Options controlling [`commit_changes`].
 #[derive(Debug, Clone, Default)]
@@ -131,10 +131,27 @@ enum IndexDelta {
 /// Executes a stage-free (or `--pick` / `--exclude` partial) commit directly into the
 /// repository ODB, runs pre-commit guardrails, advances the active branch ref atomically
 /// via `gix` CAS ref edit, updates `.git/index` / `.git/worktrees/<ws>/index`, and clears
-/// `pinned_paths` in `.git/ozone/state/<ws>.json` if present.
+/// virtual `pinned_paths` if present (`.git/ozone/state/<ws>.json` or `.git/ozone/pinned_main.json`).
 ///
 /// Unselected hunks and unselected files remain 100% untouched on disk.
 pub fn commit_changes(repo: &OzoneRepo, opts: &CommitOptions) -> Result<CommitOutcome> {
+    commit_changes_inner(repo, opts, false)
+}
+
+/// Executes [`commit_changes`] while ignoring any virtual `pinned` paths (equivalent to `git commit -a`),
+/// committing all working-tree changes (subject to `opts.pick` / `opts.exclude`) and clearing any pinned set.
+pub fn commit_changes_ignoring_pinned(
+    repo: &OzoneRepo,
+    opts: &CommitOptions,
+) -> Result<CommitOutcome> {
+    commit_changes_inner(repo, opts, true)
+}
+
+fn commit_changes_inner(
+    repo: &OzoneRepo,
+    opts: &CommitOptions,
+    ignore_pinned: bool,
+) -> Result<CommitOutcome> {
     if opts.message.trim().is_empty() {
         return Err(OzError::InvalidUsage {
             message: "commit message cannot be empty".to_string(),
@@ -155,7 +172,7 @@ pub fn commit_changes(repo: &OzoneRepo, opts: &CommitOptions) -> Result<CommitOu
     let selection = if ctx.changes.is_empty() && opts.allow_empty {
         BTreeMap::new()
     } else {
-        resolve_selection(repo, &ctx, &opts.pick, &opts.exclude)?
+        resolve_selection(repo, &ctx, &opts.pick, &opts.exclude, ignore_pinned)?
     };
 
     if selection.is_empty() && !opts.allow_empty {
@@ -417,8 +434,8 @@ pub fn commit_changes(repo: &OzoneRepo, opts: &CommitOptions) -> Result<CommitOu
     // Update `.git/index` / `.git/worktrees/<ws>/index` if applicable.
     update_git_index(repo, &gix_repo, &ctx, &index_deltas)?;
 
-    // Clear `pinned_paths` in `.git/ozone/state/<ws>.json` if present.
-    let clear_all_pinned = opts.pick.is_empty() && opts.exclude.is_empty();
+    // Clear virtual `pinned_paths` (`.git/ozone/state/<ws>.json` or `.git/ozone/pinned_main.json`).
+    let clear_all_pinned = (opts.pick.is_empty() && opts.exclude.is_empty()) || ignore_pinned;
     clear_pinned_paths_if_present(repo, &committed_paths, &partial_hunk_paths, clear_all_pinned)?;
 
     let remaining_dirty_count =
@@ -451,8 +468,14 @@ fn resolve_selection(
     ctx: &StatusContext,
     pick: &[String],
     exclude: &[String],
+    ignore_pinned: bool,
 ) -> Result<BTreeMap<usize, FileSelection>> {
     let mut selected: BTreeMap<usize, FileSelection> = BTreeMap::new();
+    let pinned_paths = if pick.is_empty() && exclude.is_empty() && !ignore_pinned {
+        read_pinned_paths(repo)?
+    } else {
+        BTreeSet::new()
+    };
 
     if !pick.is_empty() {
         for raw_target in pick {
@@ -485,19 +508,18 @@ fn resolve_selection(
                 });
             }
         }
-    } else if exclude.is_empty()
-        && let Some(ref ws) = repo.workspace_state
-        && !ws.pinned_paths.is_empty()
-    {
+    } else if !ignore_pinned && exclude.is_empty() && !pinned_paths.is_empty() {
         for (file_idx, change) in ctx.changes.iter().enumerate() {
-            if ws.pinned_paths.contains(&change.path) {
+            if pinned_paths.contains(&change.path) {
                 selected.insert(file_idx, FileSelection::Full);
             }
         }
         if selected.is_empty() {
             return Err(OzError::InvalidUsage {
-                message: "none of the workspace pinned paths have uncommitted changes".to_string(),
-                recovery: vec!["Run `oz status` or pass `--pick` explicitly.".to_string()],
+                message: "none of the pinned paths have uncommitted changes".to_string(),
+                recovery: vec![
+                    "Run `oz status` or pass `--pick` / `oz git commit -a` explicitly.".to_string(),
+                ],
             });
         }
     } else {
@@ -775,43 +797,218 @@ fn update_git_index(
     Ok(())
 }
 
+const PINNED_SCHEMA_VERSION: u32 = 1;
+
+const fn default_pinned_schema_version() -> u32 {
+    PINNED_SCHEMA_VERSION
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PinnedPathsDoc {
+    #[serde(default = "default_pinned_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    pinned_paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PinnedPathsFile {
+    Doc(PinnedPathsDoc),
+    Set(BTreeSet<String>),
+}
+
+fn normalize_pinned_path(raw: &str) -> String {
+    crate::diff::normalize_target_path(raw)
+}
+
+fn external_pinned_file_path(repo: &OzoneRepo) -> PathBuf {
+    match repo.workspace {
+        Some(ref ws_name) => repo
+            .layout
+            .ozone_dir
+            .join(format!("pinned_wt_{ws_name}.json")),
+        None => repo.layout.main_pinned_path(),
+    }
+}
+
+fn read_pinned_doc(path: &Path) -> Result<BTreeSet<String>> {
+    if !path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let parsed: PinnedPathsFile = serde_json::from_str(&raw)?;
+    let set = match parsed {
+        PinnedPathsFile::Doc(doc) => doc.pinned_paths,
+        PinnedPathsFile::Set(set) => set,
+    };
+    Ok(set
+        .into_iter()
+        .map(|p| normalize_pinned_path(&p))
+        .filter(|p| !p.is_empty())
+        .collect())
+}
+
+/// Reads the virtual `pinned` path set for `repo`.
+///
+/// Named workspaces store `pinned_paths` inside `.git/ozone/state/<ws>.json`;
+/// the main repository stores them at `.git/ozone/pinned_main.json` (`OzoneLayout::main_pinned_path()`)
+/// so `.git/ozone/state/` contains strictly `WorkspaceState` files.
+pub fn read_pinned_paths(repo: &OzoneRepo) -> Result<BTreeSet<String>> {
+    if let Some(ref ws_name) = repo.workspace {
+        let state_path = repo.layout.workspace_state_path(ws_name);
+        if state_path.is_file() {
+            let raw = fs::read_to_string(&state_path)?;
+            let state: WorkspaceState = serde_json::from_str(&raw)?;
+            return Ok(state
+                .pinned_paths
+                .into_iter()
+                .map(|p| normalize_pinned_path(&p))
+                .filter(|p| !p.is_empty())
+                .collect());
+        }
+        let wt_path = external_pinned_file_path(repo);
+        if wt_path.is_file() {
+            return read_pinned_doc(&wt_path);
+        }
+        if let Some(ref st) = repo.workspace_state {
+            return Ok(st
+                .pinned_paths
+                .iter()
+                .map(|p| normalize_pinned_path(p))
+                .filter(|p| !p.is_empty())
+                .collect());
+        }
+        return Ok(BTreeSet::new());
+    }
+
+    read_pinned_doc(&repo.layout.main_pinned_path())
+}
+
+/// Atomically writes the complete virtual `pinned` path set for `repo`.
+pub fn write_pinned_paths(repo: &OzoneRepo, paths: &BTreeSet<String>) -> Result<()> {
+    let normalized: BTreeSet<String> = paths
+        .iter()
+        .map(|p| normalize_pinned_path(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if let Some(ref ws_name) = repo.workspace {
+        let state_path = repo.layout.workspace_state_path(ws_name);
+        if state_path.is_file() {
+            let raw = fs::read_to_string(&state_path)?;
+            let mut state: WorkspaceState = serde_json::from_str(&raw)?;
+            if state.pinned_paths == normalized {
+                return Ok(());
+            }
+            state.pinned_paths = normalized;
+            state.updated_at = chrono::Utc::now();
+            return write_json_atomic(&state_path, &state);
+        }
+    }
+
+    let target_path = external_pinned_file_path(repo);
+    if normalized.is_empty() && !target_path.is_file() {
+        return Ok(());
+    }
+    repo.layout.ensure_initialized()?;
+    let doc = PinnedPathsDoc {
+        schema_version: PINNED_SCHEMA_VERSION,
+        pinned_paths: normalized,
+    };
+    write_json_atomic(&target_path, &doc)
+}
+
+/// Inserts `paths` into the virtual `pinned` path set for `repo`, returning the updated set.
+pub fn add_pinned_paths<I, S>(repo: &OzoneRepo, paths: I) -> Result<BTreeSet<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut set = read_pinned_paths(repo)?;
+    for p in paths {
+        let norm = normalize_pinned_path(p.as_ref());
+        if !norm.is_empty() {
+            set.insert(norm);
+        }
+    }
+    write_pinned_paths(repo, &set)?;
+    Ok(set)
+}
+
+/// Clears all paths from the virtual `pinned` path set for `repo`.
+pub fn clear_pinned_paths(repo: &OzoneRepo) -> Result<()> {
+    write_pinned_paths(repo, &BTreeSet::new())
+}
+
+/// Removes specific `paths` from the virtual `pinned` path set for `repo`, returning the remaining set.
+pub fn remove_pinned_paths<I, S>(repo: &OzoneRepo, paths: I) -> Result<BTreeSet<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut set = read_pinned_paths(repo)?;
+    if set.is_empty() {
+        return Ok(set);
+    }
+    let mut changed = false;
+    for p in paths {
+        let norm = normalize_pinned_path(p.as_ref());
+        if set.remove(&norm) {
+            changed = true;
+        }
+    }
+    if changed {
+        write_pinned_paths(repo, &set)?;
+    }
+    Ok(set)
+}
+
 fn clear_pinned_paths_if_present(
     repo: &OzoneRepo,
     committed_paths: &[String],
     partial_hunk_paths: &[String],
     clear_all_pinned: bool,
 ) -> Result<()> {
-    let Some(ref ws_name) = repo.workspace else {
-        return Ok(());
-    };
-    let state_path = repo.layout.workspace_state_path(ws_name);
-    if !state_path.is_file() {
-        return Ok(());
-    }
+    if let Some(ref ws_name) = repo.workspace {
+        let state_path = repo.layout.workspace_state_path(ws_name);
+        if state_path.is_file() {
+            let raw = fs::read_to_string(&state_path)?;
+            let mut state: WorkspaceState = serde_json::from_str(&raw)?;
+            if state.pinned_paths.is_empty() && state.dirty_paths.is_empty() {
+                return Ok(());
+            }
 
-    let raw = fs::read_to_string(&state_path)?;
-    let mut state: WorkspaceState = serde_json::from_str(&raw)?;
-    if state.pinned_paths.is_empty() && state.dirty_paths.is_empty() {
-        return Ok(());
+            if clear_all_pinned {
+                state.pinned_paths.clear();
+            } else {
+                for path in committed_paths {
+                    state.pinned_paths.remove(path);
+                }
+            }
+
+            let partial_set: BTreeSet<&str> =
+                partial_hunk_paths.iter().map(String::as_str).collect();
+            for path in committed_paths {
+                if !partial_set.contains(path.as_str()) {
+                    state.dirty_paths.remove(path);
+                }
+            }
+            state.updated_at = chrono::Utc::now();
+
+            return write_json_atomic(&state_path, &state);
+        }
     }
 
     if clear_all_pinned {
-        state.pinned_paths.clear();
-    } else {
-        for path in committed_paths {
-            state.pinned_paths.remove(path);
-        }
+        clear_pinned_paths(repo)?;
+    } else if !committed_paths.is_empty() {
+        let _ = remove_pinned_paths(repo, committed_paths)?;
     }
-
-    let partial_set: BTreeSet<&str> = partial_hunk_paths.iter().map(String::as_str).collect();
-    for path in committed_paths {
-        if !partial_set.contains(path.as_str()) {
-            state.dirty_paths.remove(path);
-        }
-    }
-    state.updated_at = chrono::Utc::now();
-
-    write_json_atomic(&state_path, &state)
+    Ok(())
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {

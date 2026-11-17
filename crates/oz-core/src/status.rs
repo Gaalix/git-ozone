@@ -7,7 +7,7 @@
 use crate::diff::{compute_file_diff, file_id};
 use crate::error::{OzError, Result};
 use crate::repo::OzoneRepo;
-use crate::types::{BackendKind, ChangeKind, FileChange};
+use crate::types::{ChangeKind, FileChange};
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -320,7 +320,7 @@ pub(crate) fn compute_status_context(repo: &OzoneRepo) -> Result<StatusContext> 
         }
     }
 
-    let pinned_set = repo.workspace_state.as_ref().map(|s| &s.pinned_paths);
+    let pinned_set = crate::commit::read_pinned_paths(repo)?;
 
     let changes: Vec<FileChange> = dirty_items
         .par_iter()
@@ -328,7 +328,7 @@ pub(crate) fn compute_status_context(repo: &OzoneRepo) -> Result<StatusContext> 
         .map(|(idx, item)| {
             let file_num = idx + 1;
             let fid = file_id(file_num);
-            let pinned = pinned_set.is_some_and(|p| p.contains(&item.raw.path));
+            let pinned = pinned_set.contains(&item.raw.path);
             let out_of_scope = scope_policy.is_out_of_scope(&item.raw.path);
 
             if item.known_binary {
@@ -381,7 +381,7 @@ pub(crate) fn compute_status_context(repo: &OzoneRepo) -> Result<StatusContext> 
 
 fn detect_fuse_dirs(repo: &OzoneRepo) -> Option<(PathBuf, PathBuf)> {
     if let Some(ref mr) = repo.mount_record
-        && (mr.backend == BackendKind::LinuxFuse3
+        && (mr.backend.requires_daemon()
             || (mr.upper_dir.is_some() && mr.meta_dir.is_some()))
     {
         let upper = mr
@@ -395,7 +395,7 @@ fn detect_fuse_dirs(repo: &OzoneRepo) -> Option<(PathBuf, PathBuf)> {
         return Some((upper, meta));
     }
     if let Some(ref ws) = repo.workspace_state
-        && ws.backend == BackendKind::LinuxFuse3
+        && ws.backend.requires_daemon()
     {
         return Some((
             repo.layout.ws_upper_dir(&ws.name),

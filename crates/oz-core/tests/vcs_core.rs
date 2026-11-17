@@ -8,8 +8,10 @@
 use chrono::Utc;
 use oz_core::{
     BackendKind, ChangeKind, CommitOptions, ExitCode, GuardrailOptions, GuardrailTarget,
-    MountRecord, OzError, OzoneLayout, OzoneRepo, WorkspaceState, check_guardrails, commit_changes,
-    compute_diff, compute_status, render_unified_diff,
+    MountRecord, OzError, OzoneLayout, OzoneRepo, SwitchOptions, WorkspaceState, add_pinned_paths,
+    check_guardrails, clear_pinned_paths, commit_changes, commit_changes_ignoring_pinned,
+    compute_diff, compute_status, read_pinned_paths, remove_pinned_paths, render_unified_diff,
+    switch_branch,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -751,4 +753,144 @@ fn linked_worktree_fuse_partial_commit_and_dir_whiteout_and_all_guardrails() {
     )
     .expect("deleting .env is allowed");
 }
+
+#[test]
+fn main_repo_pinned_main_json_and_windows_projfs_fast_path_and_switch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_root = tmp.path().join("pinned-main");
+    init_repo_with_user(&repo_root);
+    fs::write(repo_root.join("a.rs"), "pub fn a() -> i32 { 1 }\n").expect("write a");
+    fs::write(repo_root.join("b.rs"), "pub fn b() -> i32 { 1 }\n").expect("write b");
+    git(&repo_root, &["add", "."]);
+    git(&repo_root, &["commit", "-m", "init"]);
+
+    let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover");
+    assert_eq!(repo.workspace, None);
+
+    fs::write(repo_root.join("a.rs"), "pub fn a() -> i32 { 2 }\n").expect("edit a");
+    fs::write(repo_root.join("b.rs"), "pub fn b() -> i32 { 2 }\n").expect("edit b");
+    fs::write(repo_root.join("c.rs"), "pub fn c() -> i32 { 1 }\n").expect("add c");
+
+    // Pin a.rs and c.rs in main repo -> stored at `.git/ozone/pinned_main.json`, NOT `.git/ozone/state/`!
+    let pinned = add_pinned_paths(&repo, ["a.rs", "./c.rs"]).expect("add pinned");
+    assert_eq!(pinned.len(), 2);
+    assert!(repo.layout.main_pinned_path().is_file());
+    let state_entries: Vec<_> = fs::read_dir(repo.layout.state_dir())
+        .expect("read state dir")
+        .collect();
+    assert!(
+        state_entries.is_empty(),
+        "main-repo pinned paths MUST NOT be stored inside .git/ozone/state/"
+    );
+
+    let status = compute_status(&repo).expect("status");
+    assert_eq!(status.changes.len(), 3);
+    assert!(status.changes[0].pinned); // a.rs
+    assert!(!status.changes[1].pinned); // b.rs
+    assert!(status.changes[2].pinned); // c.rs
+
+    // Unpin c.rs, then commit -> commits ONLY a.rs!
+    let rem = remove_pinned_paths(&repo, ["c.rs"]).expect("remove c.rs");
+    assert_eq!(rem.len(), 1);
+    let out1 = commit_changes(&repo, &CommitOptions::new("feat: commit pinned a.rs")).expect("commit a");
+    assert_eq!(out1.committed_paths, vec!["a.rs"]);
+    assert_eq!(out1.remaining_dirty_count, 2);
+    assert!(read_pinned_paths(&repo).expect("read pinned").is_empty());
+
+    // Pin b.rs, then commit ignoring pinned (`-a`) -> commits BOTH b.rs and c.rs and clears pinned!
+    add_pinned_paths(&repo, ["b.rs"]).expect("pin b");
+    let out2 = commit_changes_ignoring_pinned(&repo, &CommitOptions::new("feat: commit all"))
+        .expect("commit all ignoring pinned");
+    assert_eq!(out2.committed_paths, vec!["b.rs", "c.rs"]);
+    assert_eq!(out2.remaining_dirty_count, 0);
+    assert!(read_pinned_paths(&repo).expect("read pinned").is_empty());
+    clear_pinned_paths(&repo).expect("clear no-op");
+
+    // Verify WindowsProjFs triggers O(dirty_files) upper/ + meta/ fast path via backend.requires_daemon().
+    let ws_name = "win-projfs";
+    let upper_dir = repo.layout.ws_upper_dir(ws_name);
+    let meta_dir = repo.layout.ws_tombstone_dir(ws_name);
+    let ws_mount = tmp.path().join("pinned-main.oz").join(ws_name);
+    fs::create_dir_all(&upper_dir).expect("mkdir upper");
+    fs::create_dir_all(meta_dir.join("whiteouts")).expect("mkdir wh");
+    fs::create_dir_all(meta_dir.join("opaque")).expect("mkdir op");
+    fs::create_dir_all(&ws_mount).expect("mkdir mount");
+    fs::write(upper_dir.join("a.rs"), "pub fn a() -> i32 { 99 }\n").expect("write upper a");
+    fs::write(meta_dir.join("whiteouts/b.rs.oz_wh"), b"").expect("write whiteout b");
+    git(&repo_root, &["branch", "feat/projfs"]);
+
+    let state = WorkspaceState {
+        schema_version: WorkspaceState::CURRENT_SCHEMA_VERSION,
+        name: ws_name.to_string(),
+        branch: "feat/projfs".to_string(),
+        base_branch: Some("main".to_string()),
+        base_commit: Some(out2.commit_oid.clone()),
+        base_tree: out2.tree_oid.clone(),
+        backend: BackendKind::WindowsProjFs,
+        worktree_path: ws_mount.clone(),
+        git_worktree_dir: None,
+        baseline_id: None,
+        dirty_paths: BTreeMap::new(),
+        pinned_paths: BTreeSet::new(),
+        scope: Vec::new(),
+        deny: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_checkpoint_oid: None,
+    };
+    fs::write(
+        repo.layout.workspace_state_path(ws_name),
+        serde_json::to_string_pretty(&state).expect("json"),
+    )
+    .expect("write state");
+
+    let projfs_repo = OzoneRepo::discover(Some(&ws_mount)).expect("discover projfs");
+    let projfs_status = compute_status(&projfs_repo).expect("projfs status");
+    assert!(projfs_status.used_fuse_fast_path);
+    assert_eq!(projfs_status.changes.len(), 2);
+    assert_eq!(projfs_status.changes[0].path, "a.rs");
+    assert_eq!(projfs_status.changes[0].kind, ChangeKind::Modified);
+    assert_eq!(projfs_status.changes[1].path, "b.rs");
+    assert_eq!(projfs_status.changes[1].kind, ChangeKind::Deleted);
+
+    // Switch branches in main repo with dirty conflict check.
+    let sw1 = switch_branch(
+        &repo,
+        &SwitchOptions {
+            create_branch: Some("feat/sw".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("switch -c");
+    assert_eq!(sw1.branch.as_deref(), Some("feat/sw"));
+    fs::write(repo_root.join("a.rs"), "pub fn a() -> i32 { 77 }\n").expect("edit a on feat/sw");
+    commit_changes(&repo, &CommitOptions::new("feat: change a on feat/sw")).expect("commit feat/sw");
+
+    fs::write(repo_root.join("a.rs"), "dirty conflict\n").expect("dirty a");
+    let err = switch_branch(
+        &repo,
+        &SwitchOptions {
+            target: Some("main".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect_err("dirty overwrite refused");
+    assert!(matches!(err, OzError::Conflict { .. }));
+
+    let sw2 = switch_branch(
+        &repo,
+        &SwitchOptions {
+            target: Some("main".to_string()),
+            force: true,
+            ..Default::default()
+        },
+    )
+    .expect("force switch");
+    assert_eq!(sw2.branch.as_deref(), Some("main"));
+    assert_eq!(
+        fs::read_to_string(repo_root.join("a.rs")).expect("read a on main"),
+        "pub fn a() -> i32 { 2 }\n"
+    );
+}
+
 
