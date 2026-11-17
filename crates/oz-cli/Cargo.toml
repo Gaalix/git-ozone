@@ -1,0 +1,38 @@
+[package]
+name = "oz-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ozone CLI (oz and git-ozone binaries)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "oz"
+path = "src/main.rs"
+
+[[bin]]
+name = "git-ozone"
+path = "src/bin/git_ozone.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+oz-agent.workspace = true
+oz-cloud-api.workspace = true
+oz-core.workspace = true
+oz-cow.workspace = true
+oz-github.workspace = true
+oz-integrate.workspace = true
+oz-oplog.workspace = true
+oz-vfsd.workspace = true
+oz-warm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

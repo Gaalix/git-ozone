@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oz-cli",
+    "crates/oz-core",
+    "crates/oz-cow",
+    "crates/oz-vfsd",
+    "crates/oz-warm",
+    "crates/oz-oplog",
+    "crates/oz-integrate",
+    "crates/oz-github",
+    "crates/oz-agent",
+    "crates/oz-cloud-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal workspace crates
+oz-core = { path = "crates/oz-core" }
+oz-cow = { path = "crates/oz-cow" }
+oz-vfsd = { path = "crates/oz-vfsd" }
+oz-warm = { path = "crates/oz-warm" }
+oz-oplog = { path = "crates/oz-oplog" }
+oz-integrate = { path = "crates/oz-integrate" }
+oz-github = { path = "crates/oz-github" }
+oz-agent = { path = "crates/oz-agent" }
+oz-cloud-api = { path = "crates/oz-cloud-api" }
+
+# Pure-Rust Git & Diff
+gix = { version = "0.90", default-features = false, features = ["basic", "blob-diff", "dirwalk", "excludes", "index", "merge", "revision", "serde", "sha1", "status", "worktree-mutation"] }
+imara-diff = "0.2"
+
+# Pure-Rust FUSE3 & CoW
+fuser = { version = "0.18", default-features = false }
+reflink-copy = "0.1"
+
+# CLI, Serialization & Config
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.2"
+
+# Hashing, Parallelism & Async Runtime
+blake3 = "1.8"
+rayon = "1.12"
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "process"] }
+
+# Error Handling & System Utilities
+thiserror = "2.0"
+anyhow = "1.0"
+libc = "0.2"
+fs4 = "1.1"
+tempfile = "3.27"
+filetime = "0.2"
+walkdir = "2.5"
+ignore = "0.4"
+globset = "0.4"
+ulid = "3.0"
+chrono = { version = "0.4", features = ["serde"] }

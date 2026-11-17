@@ -1,0 +1,16 @@
+[package]
+name = "oz-oplog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Append-only MVCC operation log, checkpoints, and sub-10ms undo/redo"
+
+[dependencies]
+chrono.workspace = true
+fs4.workspace = true
+gix.workspace = true
+oz-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true

@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pure-rust-guard:
+    name: Verify pure-Rust Cargo.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Cargo.lock for forbidden C bindings
+        run: |
+          set -euo pipefail
+          forbidden=(
+            'name = "openssl-sys"'
+            'name = "libgit2-sys"'
+            'name = "curl-sys"'
+            'name = "fuse-sys"'
+            'name = "libfuse"'
+          )
+          for pat in "${forbidden[@]}"; do
+            if grep -Fq "$pat" Cargo.lock; then
+              echo "ERROR: Forbidden C dependency found in Cargo.lock: $pat"
+              exit 1
+            fi
+          done
+          echo "OK: Cargo.lock is free of openssl-sys, libgit2-sys, curl-sys, and libfuse/fuse-sys bindings."
+
+  test:
+    name: Build & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare Ubuntu FUSE3 runtime (without libfuse3-dev)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          if ! command -v fusermount3 >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends fuse3
+          fi
+          ls -la /dev/fuse
+          which fusermount3
+          fusermount3 --version
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Verify oz --version --json and git-ozone doctor --json
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver_json="$(mktemp)"
+          doc_json="$(mktemp)"
+          trap 'rm -f "$ver_json" "$doc_json"' EXIT
+
+          cargo run --locked -p oz-cli --bin oz -- --version --json | tee "$ver_json"
+          grep -q '"schema": "oz.v1"' "$ver_json"
+          grep -q '"ok": true' "$ver_json"
+
+          cargo run --locked -p oz-cli --bin git-ozone -- doctor --json | tee "$doc_json"
+          grep -q '"schema": "oz.v1"' "$doc_json"
+          grep -q '"ok": true' "$doc_json"
+
+      - name: Verify git ozone alias invocation
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          alias_json="$(mktemp)"
+          trap 'rm -f "$alias_json"' EXIT
+          export PATH="$PWD/target/debug:$PATH"
+          git ozone doctor --json | tee "$alias_json"
+          grep -q '"schema": "oz.v1"' "$alias_json"
+          grep -q '"ok": true' "$alias_json"

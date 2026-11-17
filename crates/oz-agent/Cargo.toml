@@ -1,0 +1,16 @@
+[package]
+name = "oz-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent harness setup, MCP stdio server, and refs/notes/ai provenance"
+
+[dependencies]
+chrono.workspace = true
+oz-core.workspace = true
+oz-integrate.workspace = true
+oz-oplog.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

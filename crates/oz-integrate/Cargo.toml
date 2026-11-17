@@ -1,0 +1,18 @@
+[package]
+name = "oz-integrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Path guardrails, collision radar, and atomic in-memory merge sandbox"
+
+[dependencies]
+gix.workspace = true
+globset.workspace = true
+imara-diff.workspace = true
+oz-core.workspace = true
+oz-cow.workspace = true
+oz-oplog.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "oz-vfsd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Background VFS daemon and IPC protocol for FUSE3 (Linux ext4) and ProjFS (Windows NTFS)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "oz-vfsd"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+oz-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
