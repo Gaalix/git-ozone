@@ -1201,7 +1201,37 @@ impl ProjFsEnumCache {
     }
 }
 
-/// Maps a [`std::io::Error`] into a standard Win32 `HRESULT`.
+/// Steps through `entries[*idx..]` invoking `fill`, returning `ERROR_INSUFFICIENT_BUFFER_HR`
+/// when `fill` runs out of buffer space on the very first entry (`added == 0`) or `PRJ_S_OK`
+/// once at least one entry has been emitted (or enumeration reaches EOF).
+pub fn step_dir_enum_buffer(
+    entries: &[ProjFsDirEntry],
+    idx: &mut usize,
+    single: bool,
+    mut fill: impl FnMut(&ProjFsDirEntry) -> i32,
+) -> i32 {
+    let mut added = 0usize;
+    while *idx < entries.len() {
+        let hr = fill(&entries[*idx]);
+        if hr == ERROR_INSUFFICIENT_BUFFER_HR {
+            return if added == 0 {
+                ERROR_INSUFFICIENT_BUFFER_HR
+            } else {
+                PRJ_S_OK
+            };
+        }
+        if hr < 0 {
+            return hr;
+        }
+        *idx += 1;
+        added += 1;
+        if single {
+            break;
+        }
+    }
+    PRJ_S_OK
+}
+
 #[allow(dead_code)]
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 #[allow(dead_code)]
@@ -1402,15 +1432,10 @@ mod win32 {
                 Ok(rows)
             }) { return hresult_from_io_error(&e); }
             let (entries, idx) = enums.cursor_slice(&id_bytes);
-            while *idx < entries.len() {
-                let mut basic = entries[*idx].to_basic_info();
-                let hr = unsafe { (st.api.fill_dir_entry)(encode_wide_z(OsStr::new(&entries[*idx].name)).as_ptr(), &mut basic, buf) };
-                if hr == ERROR_INSUFFICIENT_BUFFER_HR { break; }
-                if hr < 0 { return hr; }
-                *idx += 1;
-                if single { break; }
-            }
-            PRJ_S_OK
+            step_dir_enum_buffer(entries, idx, single, |entry| {
+                let mut basic = entry.to_basic_info();
+                unsafe { (st.api.fill_dir_entry)(encode_wide_z(OsStr::new(&entry.name)).as_ptr(), &mut basic, buf) }
+            })
         })
     }
     unsafe extern "system" fn get_placeholder_cb(cb: *const PrjCallbackData) -> i32 {
@@ -1626,5 +1651,50 @@ mod tests {
         assert_ne!(g1, g3);
         assert_eq!(g1[6] >> 4, 5);
         assert_eq!(g1[8] >> 6, 2);
+    }
+
+    #[test]
+    fn step_dir_enum_buffer_handles_insufficient_buffer_on_first_vs_later_entry() {
+        let make_entry = |name: &str| ProjFsDirEntry {
+            name: name.to_string(),
+            is_dir: false,
+            file_size: 4,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            file_attributes: FILE_ATTRIBUTE_ARCHIVE,
+            layer: LayerKind::Baseline,
+            host_path: PathBuf::from(name),
+        };
+        let entries = vec![make_entry("a.txt"), make_entry("b.txt"), make_entry("c.txt")];
+        let mut idx = 0usize;
+
+        // First entry overflows buffer (`added == 0`) -> must return ERROR_INSUFFICIENT_BUFFER_HR
+        // and leave `idx` unchanged so ProjFS retries with a larger buffer.
+        let hr0 = step_dir_enum_buffer(&entries, &mut idx, false, |_| ERROR_INSUFFICIENT_BUFFER_HR);
+        assert_eq!(hr0, ERROR_INSUFFICIENT_BUFFER_HR);
+        assert_eq!(idx, 0);
+
+        // Buffer fits 2 entries before returning ERROR_INSUFFICIENT_BUFFER_HR -> returns PRJ_S_OK
+        // with `idx == 2` so the next call resumes at "c.txt".
+        let mut calls = 0usize;
+        let hr1 = step_dir_enum_buffer(&entries, &mut idx, false, |_| {
+            calls += 1;
+            if calls <= 2 {
+                PRJ_S_OK
+            } else {
+                ERROR_INSUFFICIENT_BUFFER_HR
+            }
+        });
+        assert_eq!(hr1, PRJ_S_OK);
+        assert_eq!(idx, 2);
+
+        // Remaining entry fits, then subsequent EOF call returns PRJ_S_OK cleanly.
+        let hr2 = step_dir_enum_buffer(&entries, &mut idx, false, |_| PRJ_S_OK);
+        assert_eq!(hr2, PRJ_S_OK);
+        assert_eq!(idx, 3);
+        let hr_eof = step_dir_enum_buffer(&entries, &mut idx, false, |_| panic!("unexpected fill"));
+        assert_eq!(hr_eof, PRJ_S_OK);
     }
 }
