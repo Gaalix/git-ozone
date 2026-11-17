@@ -35,6 +35,17 @@ const fn default_true() -> bool {
     true
 }
 
+impl MountSpec {
+    /// Resolves the optional middle `seed/` layer directory (`<meta_dir>/../seed`).
+    #[must_use]
+    pub fn resolved_seed_dir(&self) -> Option<PathBuf> {
+        self.meta_dir
+            .parent()
+            .map(|p| p.join("seed"))
+            .filter(|d| d.is_dir())
+    }
+}
+
 /// Request message sent over `.git/ozone/vfsd.sock` (or Windows named pipe).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]

@@ -3,6 +3,23 @@
 
 //! Ecosystem warm build/dependency cache detection, baseline capture, and `mtime` preservation.
 
+pub mod baseline;
+pub mod mtime;
+pub mod quiescent;
+pub mod trampoline;
+
+pub use baseline::{GcReport, capture_baseline, gc_baselines, touch_baseline_lru};
+pub use mtime::{
+    MtimeApplyStats, apply_baseline_mtimes, compute_changed_paths_between_commits,
+};
+pub use quiescent::{
+    BaselineResolution, BaselineSource, LoadedBaseline, find_baseline,
+    find_nearest_prior_baseline, is_repo_quiescent, resolve_or_capture_baseline,
+};
+pub use trampoline::{
+    is_venv_bin_script, parse_python_shebang, rewrite_python_trampoline_bytes,
+};
+
 use chrono::{DateTime, Utc};
 use oz_core::OzoneConfig;
 use serde::{Deserialize, Serialize};

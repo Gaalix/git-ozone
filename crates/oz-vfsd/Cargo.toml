@@ -13,12 +13,16 @@ name = "oz-vfsd"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
+fs4.workspace = true
+libc.workspace = true
 oz-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+walkdir.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser.workspace = true
