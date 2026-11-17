@@ -13,8 +13,8 @@ use gix::merge::tree::{Conflict, Resolution, ResolutionFailure, TreatAsUnresolve
 use gix::object::tree::EntryMode;
 use gix::objs::tree::EntryKind;
 use oz_core::{
-    ConflictEntry, OzError, OzoneRepo, Result, StatusReport, ensure_change_id_trailer,
-    is_binary_bytes, is_conflict_marker_line,
+    ConflictEntry, OzError, OzoneRepo, Result, StatusReport, WorkspaceState,
+    ensure_change_id_trailer, is_binary_bytes, is_conflict_marker_line,
 };
 use oz_cow::materialize::{
     TreeDelta, apply_tree_delta_to_dir, clone_dir_with_reflink, compute_tree_delta,
@@ -1569,4 +1569,21 @@ pub(crate) fn collect_tree_leaf_map(
         out.insert(f.filepath.to_str_lossy().into_owned(), (f.oid, f.mode));
     }
     Ok(out)
+}
+
+/// Atomically writes a [`WorkspaceState`] JSON file via temp file + rename.
+pub(crate) fn write_workspace_state_atomic(path: &Path, state: &WorkspaceState) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| OzError::Other(format!("path {} has no parent", path.display())))?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".tmp_{}_{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("ws.json"),
+        std::process::id()
+    ));
+    let bytes = serde_json::to_vec_pretty(state)?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }

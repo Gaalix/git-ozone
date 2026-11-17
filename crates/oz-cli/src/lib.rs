@@ -9,9 +9,10 @@ pub mod recovery;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    CheckpointArgs, CommitArgs, DiffArgs, SetupArgs, UndoArgs, WsCommand, handle_checkpoint,
-    handle_commit, handle_diff, handle_redo, handle_setup, handle_status, handle_undo, handle_ws,
-    print_json_envelope,
+    CheckpointArgs, CommitArgs, DiffArgs, IntegrateArgs, RadarArgs, ResolveArgs, SetupArgs,
+    StackCommand, UndoArgs, WsCommand, handle_checkpoint, handle_commit, handle_diff,
+    handle_integrate, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
+    handle_status, handle_undo, handle_ws, print_json_envelope,
 };
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, InteractionMode, MountHealth, OzError,
@@ -69,7 +70,16 @@ pub enum Commands {
     Undo(UndoArgs),
     /// Re-apply the most recently undone operation.
     Redo,
-    /// Initialize colocated `.git/ozone/` metadata and optionally install `systemd --user` unit.
+    /// Detect overlapping hunks, shared-file edits, and out-of-scope changes across workspaces.
+    Radar(RadarArgs),
+    /// Atomically integrate workspaces or branches in memory with `--verify` and conflict sandbox.
+    Integrate(IntegrateArgs),
+    /// Resolve conflicts inside `../<repo>.oz/_integrate` (`--take ours|theirs|base`).
+    Resolve(ResolveArgs),
+    /// Manage stacked branches (`rebase`, `status`) preserving `Change-Id:` trailers.
+    #[command(subcommand)]
+    Stack(StackCommand),
+    /// Initialize colocated `.git/ozone/` metadata, `systemd --user`, or Windows ProjFS.
     Setup(SetupArgs),
     /// Inspect OS, filesystem (`statfs`), FUSE3/reflink readiness, and colocated repo status.
     Doctor,
@@ -212,6 +222,12 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         }
         Some(Commands::Undo(args)) => handle_undo(&args, cli.directory.as_deref(), mode),
         Some(Commands::Redo) => handle_redo(cli.directory.as_deref(), mode),
+        Some(Commands::Radar(args)) => handle_radar(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Integrate(args)) => handle_integrate(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Resolve(args)) => handle_resolve(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Stack(stack_cmd)) => {
+            handle_stack(stack_cmd, cli.directory.as_deref(), mode)
+        }
         Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),
         Some(Commands::Version) => handle_version(invocation, mode),

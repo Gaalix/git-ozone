@@ -10,7 +10,10 @@
 //! (`reset --hard`, `clean`, `rm`, `mv`, `restore`, `revert`, `cherry-pick`, `stash`, etc.)
 //! are wrapped in [`oz_oplog::MutationTransaction`] so `oz undo` reverses them safely.
 
-use crate::commands::print_json_envelope;
+use crate::commands::{
+    attach_out_of_scope_warnings, print_abort_human, print_integrate_human, print_json_envelope,
+    print_stack_rebase_human, wrap_integrate_envelope, wrap_stack_rebase_envelope,
+};
 use crate::recovery::discover_and_recover_repo;
 use clap::Args;
 use oz_core::{
@@ -25,6 +28,11 @@ use oz_core::{
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, gc_workspaces,
     list_workspaces, remove_workspace, spawn_workspace,
+};
+use oz_integrate::{
+    IntegrateOptions, IntegrationMode, StackRebaseOptions, StackRebaseOutcome, abort_integration,
+    active_session, continue_integration_with_verify, continue_stack_rebase, integrate,
+    stack_rebase,
 };
 use oz_oplog::{ActorInfo, ActorKind, MutationTransaction};
 use serde::Serialize;
@@ -1438,10 +1446,11 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
         let workspace = report.workspace.clone();
         let branch = report.branch.clone();
         let head_oid = report.head_oid.clone();
-        Ok(Envelope::success(report)
+        let env = Envelope::success(report)
             .with_workspace(workspace)
             .with_branch(branch)
-            .with_head_oid(head_oid))
+            .with_head_oid(head_oid);
+        Ok(attach_out_of_scope_warnings(&repo, env))
     })();
 
     emit_json_or_human(mode, res, |env| {
@@ -2184,27 +2193,10 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
     }
 
     if let Some(ref fpath) = msg_file {
-        let content = if fpath == "-" {
-            let mut buf = String::new();
-            use std::io::Read as _;
-            if let Err(err) = std::io::stdin().read_to_string(&mut buf) {
-                return emit_error(mode, &OzError::Io(err));
-            }
-            buf
-        } else {
-            let resolved = if Path::new(fpath).is_absolute() {
-                PathBuf::from(fpath)
-            } else {
-                invocation_dir(parsed).join(fpath)
-            };
-            match std::fs::read_to_string(&resolved) {
-                Ok(s) => s,
-                Err(err) => return emit_error(mode, &OzError::Io(err)),
-            }
-        };
-        let trimmed = content.trim_end_matches(['\r', '\n']);
-        if !trimmed.is_empty() {
-            messages.push(trimmed.to_string());
+        match read_git_message_file(parsed, fpath) {
+            Ok(Some(trimmed)) => messages.push(trimmed),
+            Ok(None) => {}
+            Err(err) => return emit_error(mode, &err),
         }
     }
 
@@ -2561,31 +2553,547 @@ fn run_native_checkout_paths(
 }
 
 // ============================================================================
-// Wave 1 Delegation / Wave 2 Integration Seams: `merge` & `rebase`
+// Native In-Memory Integration & Stacked Rebase: `merge` & `rebase`
 // ============================================================================
 
-/// Handles `oz git merge ...`.
-///
-/// WAVE 2 INTEGRATION SEAM (`m2-integrator`):
-/// In Wave 1, this delegates to system `git merge` wrapped inside
-/// `MutationTransaction::begin_watching_all_branches` so `oz undo` reverses merges cleanly.
-/// In Wave 2, replace the inner `delegate_mutating(parsed, "merge", ...)` call with
-/// `oz_integrate::integrate` (preserving `MutationTransaction` and `oz.v1` JSON envelope).
-pub fn handle_git_merge(parsed: &ParsedGitGlobals) -> ExitCode {
-    // WAVE 2 INTEGRATION SEAM (m2-integrator): swap inner call to `oz_integrate::integrate`.
-    delegate_mutating(parsed, "merge", &parsed.subcommand_args, false, true)
+fn read_git_message_file(parsed: &ParsedGitGlobals, fpath: &str) -> Result<Option<String>> {
+    let content = if fpath == "-" {
+        let mut buf = String::new();
+        use std::io::Read as _;
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        let resolved = if Path::new(fpath).is_absolute() {
+            PathBuf::from(fpath)
+        } else {
+            invocation_dir(parsed).join(fpath)
+        };
+        std::fs::read_to_string(&resolved)?
+    };
+    let trimmed = content.trim_end_matches(['\r', '\n']);
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
 }
 
-/// Handles `oz git rebase ...`.
-///
-/// WAVE 2 INTEGRATION SEAM (`m2-integrator`):
-/// In Wave 1, this delegates to system `git rebase` wrapped inside
-/// `MutationTransaction::begin_watching_all_branches` so `oz undo` reverses rebases cleanly.
-/// In Wave 2, replace the inner `delegate_mutating(parsed, "rebase", ...)` call with
-/// `oz_integrate::stack_rebase` (preserving `MutationTransaction` and `oz.v1` JSON envelope).
+enum GitMergeAction {
+    Continue { verify_cmd: Option<String> },
+    Abort,
+    Integrate {
+        sources: Vec<String>,
+        message: Option<String>,
+        verify_cmd: Option<String>,
+        allow_out_of_scope: bool,
+        force: bool,
+    },
+    Fallback,
+}
+
+fn parse_git_merge_action(
+    parsed: &ParsedGitGlobals,
+    args: &[String],
+) -> Result<GitMergeAction> {
+    let mut is_continue = false;
+    let mut is_abort = false;
+    let mut messages = Vec::new();
+    let mut msg_file: Option<String> = None;
+    let mut verify_cmd: Option<String> = None;
+    let mut allow_out_of_scope = false;
+    let mut force = false;
+    let mut sources = Vec::new();
+    let mut after_sep = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            after_sep = true;
+            i += 1;
+            continue;
+        }
+        if !after_sep && arg.starts_with('-') {
+            match arg.as_str() {
+                "--continue" => {
+                    is_continue = true;
+                    i += 1;
+                }
+                "--abort" => {
+                    is_abort = true;
+                    i += 1;
+                }
+                "-m" | "--message" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: format!("option `{arg}` requires a merge commit message"),
+                            recovery: vec!["oz git merge <branch> -m \"...\"".to_string()],
+                        });
+                    };
+                    messages.push(val.clone());
+                    i += 2;
+                }
+                "-F" | "--file" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: format!("option `{arg}` requires a file path"),
+                            recovery: vec!["oz git merge <branch> -F <file>".to_string()],
+                        });
+                    };
+                    msg_file = Some(val.clone());
+                    i += 2;
+                }
+                "--verify" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: "option `--verify` requires a command string".to_string(),
+                            recovery: vec!["oz git merge <branch> --verify \"cargo test\"".to_string()],
+                        });
+                    };
+                    verify_cmd = Some(val.clone());
+                    i += 2;
+                }
+                "--allow-out-of-scope" => {
+                    allow_out_of_scope = true;
+                    i += 1;
+                }
+                "--force" => {
+                    force = true;
+                    i += 1;
+                }
+                "--no-ff" | "--ff" | "--no-edit" | "--edit" | "-e" | "-q" | "--quiet"
+                | "-v" | "--verbose" | "--stat" | "--no-stat" | "--progress" | "--no-progress"
+                | "--no-verify" => {
+                    i += 1;
+                }
+                _ => {
+                    if let Some(val) = arg.strip_prefix("--message=") {
+                        messages.push(val.to_string());
+                        i += 1;
+                    } else if let Some(val) = arg.strip_prefix("-m")
+                        && !arg.starts_with("--")
+                    {
+                        messages.push(val.to_string());
+                        i += 1;
+                    } else if let Some(val) = arg.strip_prefix("--file=") {
+                        msg_file = Some(val.to_string());
+                        i += 1;
+                    } else if let Some(val) = arg.strip_prefix("-F")
+                        && !arg.starts_with("--")
+                    {
+                        msg_file = Some(val.to_string());
+                        i += 1;
+                    } else if let Some(val) = arg.strip_prefix("--verify=") {
+                        verify_cmd = Some(val.to_string());
+                        i += 1;
+                    } else {
+                        return Ok(GitMergeAction::Fallback);
+                    }
+                }
+            }
+            continue;
+        }
+        sources.push(arg.clone());
+        i += 1;
+    }
+
+    if is_continue && is_abort {
+        return Err(OzError::InvalidUsage {
+            message: "cannot pass both `--continue` and `--abort` to `oz git merge`".to_string(),
+            recovery: vec![
+                "oz git merge --continue".to_string(),
+                "oz git merge --abort".to_string(),
+            ],
+        });
+    }
+    if is_continue {
+        if !sources.is_empty() {
+            return Ok(GitMergeAction::Fallback);
+        }
+        return Ok(GitMergeAction::Continue { verify_cmd });
+    }
+    if is_abort {
+        if !sources.is_empty() {
+            return Ok(GitMergeAction::Fallback);
+        }
+        return Ok(GitMergeAction::Abort);
+    }
+    if sources.is_empty() {
+        return Ok(GitMergeAction::Fallback);
+    }
+
+    if let Some(ref fpath) = msg_file
+        && let Some(trimmed) = read_git_message_file(parsed, fpath)?
+    {
+        messages.push(trimmed);
+    }
+    let message = (!messages.is_empty()).then(|| messages.join("\n\n"));
+
+    Ok(GitMergeAction::Integrate {
+        sources,
+        message,
+        verify_cmd,
+        allow_out_of_scope,
+        force,
+    })
+}
+
+fn can_resolve_all_merge_sources_natively(repo: &OzoneRepo, sources: &[String]) -> Result<bool> {
+    let summaries = list_workspaces(repo)?;
+    for src in sources {
+        let short = src.strip_prefix("refs/heads/").unwrap_or(src);
+        let matches_ws = summaries
+            .iter()
+            .any(|s| s.state.name == *src || s.state.branch == short);
+        if !matches_ws && !is_local_branch(repo, short)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Handles `oz git merge ...` natively via `oz_integrate::integrate`, falling back to
+/// OpLog-wrapped system `git merge` only when unsupported flags or non-local refs are passed.
+pub fn handle_git_merge(parsed: &ParsedGitGlobals) -> ExitCode {
+    let (args, mode) = extract_json_agent_flags(&parsed.subcommand_args, parsed.mode);
+    let action = match parse_git_merge_action(parsed, &args) {
+        Ok(a) => a,
+        Err(err) => return emit_error(mode, &err),
+    };
+
+    match action {
+        GitMergeAction::Fallback => {
+            delegate_mutating(parsed, "merge", &parsed.subcommand_args, false, true)
+        }
+        GitMergeAction::Continue { verify_cmd } => {
+            let repo = match discover_and_recover_repo(parsed.effective_dir.as_deref(), true) {
+                Ok(r) => r,
+                Err(err) => return emit_error(mode, &err),
+            };
+            let session = match active_session(&repo) {
+                Ok(s) => s,
+                Err(err) => return emit_error(mode, &err),
+            };
+            if session
+                .as_ref()
+                .is_some_and(|s| s.mode == IntegrationMode::Integrate)
+            {
+                let actor = actor_from_mode(mode, &repo);
+                let res = continue_integration_with_verify(&repo, verify_cmd.as_deref(), actor)
+                    .map(|out| wrap_integrate_envelope(out, repo.workspace.clone()));
+                return emit_json_or_human(mode, res, |env| print_integrate_human(&env.data));
+            }
+            if repo.git_dir.join("MERGE_HEAD").exists() {
+                return delegate_mutating(parsed, "merge", &parsed.subcommand_args, false, true);
+            }
+            emit_error(
+                mode,
+                &OzError::InvalidUsage {
+                    message: "no merge in progress to continue".to_string(),
+                    recovery: vec!["oz git merge <branch>".to_string()],
+                },
+            )
+        }
+        GitMergeAction::Abort => {
+            let repo = match discover_and_recover_repo(parsed.effective_dir.as_deref(), false) {
+                Ok(r) => r,
+                Err(err) => return emit_error(mode, &err),
+            };
+            let session = match active_session(&repo) {
+                Ok(s) => s,
+                Err(err) => return emit_error(mode, &err),
+            };
+            if session
+                .as_ref()
+                .is_some_and(|s| s.mode == IntegrationMode::Integrate)
+            {
+                let res = abort_integration(&repo).map(|out| {
+                    Envelope::success(out)
+                        .with_workspace(repo.workspace.clone())
+                        .with_branch(repo.branch.clone())
+                        .with_head_oid(repo.head_oid.clone())
+                });
+                return emit_json_or_human(mode, res, |env| print_abort_human(&env.data));
+            }
+            if repo.git_dir.join("MERGE_HEAD").exists() {
+                return delegate_mutating(parsed, "merge", &parsed.subcommand_args, false, true);
+            }
+            emit_error(
+                mode,
+                &OzError::InvalidUsage {
+                    message: "no merge in progress to abort".to_string(),
+                    recovery: vec!["oz git status".to_string()],
+                },
+            )
+        }
+        GitMergeAction::Integrate {
+            sources,
+            message,
+            verify_cmd,
+            allow_out_of_scope,
+            force,
+        } => {
+            let repo = match discover_and_recover_repo(parsed.effective_dir.as_deref(), true) {
+                Ok(r) => r,
+                Err(err) => return emit_error(mode, &err),
+            };
+            if repo.branch.is_none()
+                || repo.git_dir.join("MERGE_HEAD").exists()
+                || !can_resolve_all_merge_sources_natively(&repo, &sources).unwrap_or(false)
+            {
+                return delegate_mutating(parsed, "merge", &parsed.subcommand_args, false, true);
+            }
+
+            let actor = actor_from_mode(mode, &repo);
+            let opts = IntegrateOptions {
+                sources,
+                into: repo.branch.clone(),
+                verify_cmd,
+                allow_out_of_scope,
+                force,
+                message,
+            };
+            let res = integrate(&repo, &opts, actor)
+                .map(|out| wrap_integrate_envelope(out, repo.workspace.clone()));
+            emit_json_or_human(mode, res, |env| print_integrate_human(&env.data))
+        }
+    }
+}
+
+enum GitRebaseAction {
+    Continue,
+    Abort,
+    StackRebase {
+        onto: String,
+        update_refs: bool,
+    },
+    Fallback,
+}
+
+fn parse_git_rebase_action(args: &[String], mode: InteractionMode) -> Result<GitRebaseAction> {
+    let mut is_continue = false;
+    let mut is_abort = false;
+    let mut explicit_onto: Option<String> = None;
+    let mut update_refs = false;
+    let mut positionals = Vec::new();
+    let mut after_sep = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            after_sep = true;
+            i += 1;
+            continue;
+        }
+        if !after_sep && arg.starts_with('-') {
+            match arg.as_str() {
+                "--continue" => {
+                    is_continue = true;
+                    i += 1;
+                }
+                "--abort" => {
+                    is_abort = true;
+                    i += 1;
+                }
+                "-i" | "--interactive" => {
+                    if mode.non_interactive {
+                        return Err(OzError::InvalidUsage {
+                            message: "`git rebase -i` is interactive and disabled in non-interactive mode"
+                                .to_string(),
+                            recovery: vec!["Run `oz git rebase <branch>` or `oz stack rebase`.".to_string()],
+                        });
+                    }
+                    return Ok(GitRebaseAction::Fallback);
+                }
+                "--onto" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: "option `--onto` requires a base branch".to_string(),
+                            recovery: vec!["oz git rebase --onto <branch>".to_string()],
+                        });
+                    };
+                    explicit_onto = Some(val.clone());
+                    i += 2;
+                }
+                "--update-refs" => {
+                    update_refs = true;
+                    i += 1;
+                }
+                "--no-update-refs" | "-q" | "--quiet" | "-v" | "--verbose" | "--stat" | "-n"
+                | "--no-stat" | "--no-verify" => {
+                    i += 1;
+                }
+                _ => {
+                    if let Some(val) = arg.strip_prefix("--onto=") {
+                        explicit_onto = Some(val.to_string());
+                        i += 1;
+                    } else {
+                        return Ok(GitRebaseAction::Fallback);
+                    }
+                }
+            }
+            continue;
+        }
+        positionals.push(arg.clone());
+        i += 1;
+    }
+
+    if is_continue && is_abort {
+        return Err(OzError::InvalidUsage {
+            message: "cannot pass both `--continue` and `--abort` to `oz git rebase`".to_string(),
+            recovery: vec![
+                "oz git rebase --continue".to_string(),
+                "oz git rebase --abort".to_string(),
+            ],
+        });
+    }
+    if is_continue {
+        if !positionals.is_empty() {
+            return Ok(GitRebaseAction::Fallback);
+        }
+        return Ok(GitRebaseAction::Continue);
+    }
+    if is_abort {
+        if !positionals.is_empty() {
+            return Ok(GitRebaseAction::Fallback);
+        }
+        return Ok(GitRebaseAction::Abort);
+    }
+
+    let onto = match (explicit_onto, positionals.as_slice()) {
+        (Some(base), []) => base,
+        (None, [upstream]) => upstream.clone(),
+        _ => return Ok(GitRebaseAction::Fallback),
+    };
+
+    Ok(GitRebaseAction::StackRebase { onto, update_refs })
+}
+
+/// Handles `oz git rebase ...` natively via `oz_integrate::stack_rebase`, falling back to
+/// OpLog-wrapped system `git rebase` only when unsupported flags or remote/range forms apply.
 pub fn handle_git_rebase(parsed: &ParsedGitGlobals) -> ExitCode {
-    // WAVE 2 INTEGRATION SEAM (m2-integrator): swap inner call to `oz_integrate::stack_rebase`.
-    delegate_mutating(parsed, "rebase", &parsed.subcommand_args, false, true)
+    let (args, mode) = extract_json_agent_flags(&parsed.subcommand_args, parsed.mode);
+    let action = match parse_git_rebase_action(&args, mode) {
+        Ok(a) => a,
+        Err(err) => return emit_error(mode, &err),
+    };
+
+    match action {
+        GitRebaseAction::Fallback => {
+            delegate_mutating(parsed, "rebase", &parsed.subcommand_args, false, true)
+        }
+        GitRebaseAction::Continue => {
+            let repo = match discover_and_recover_repo(parsed.effective_dir.as_deref(), true) {
+                Ok(r) => r,
+                Err(err) => return emit_error(mode, &err),
+            };
+            let session = match active_session(&repo) {
+                Ok(s) => s,
+                Err(err) => return emit_error(mode, &err),
+            };
+            if session
+                .as_ref()
+                .is_some_and(|s| s.mode == IntegrationMode::StackRebase)
+            {
+                let actor = actor_from_mode(mode, &repo);
+                let res = continue_stack_rebase(&repo, actor).map(|out| {
+                    let post_repo = OzoneRepo::discover(parsed.effective_dir.as_deref())
+                        .unwrap_or_else(|_| repo.clone());
+                    wrap_stack_rebase_envelope(out, &post_repo)
+                });
+                return emit_json_or_human(mode, res, |env| print_stack_rebase_human(&env.data));
+            }
+            if repo.git_dir.join("rebase-merge").exists()
+                || repo.git_dir.join("rebase-apply").exists()
+            {
+                return delegate_mutating(parsed, "rebase", &parsed.subcommand_args, false, true);
+            }
+            emit_error(
+                mode,
+                &OzError::InvalidUsage {
+                    message: "no rebase in progress to continue".to_string(),
+                    recovery: vec!["oz git rebase <branch>".to_string()],
+                },
+            )
+        }
+        GitRebaseAction::Abort => {
+            let repo = match discover_and_recover_repo(parsed.effective_dir.as_deref(), false) {
+                Ok(r) => r,
+                Err(err) => return emit_error(mode, &err),
+            };
+            let session = match active_session(&repo) {
+                Ok(s) => s,
+                Err(err) => return emit_error(mode, &err),
+            };
+            if session
+                .as_ref()
+                .is_some_and(|s| s.mode == IntegrationMode::StackRebase)
+            {
+                let res = abort_integration(&repo).map(|out| {
+                    Envelope::success(out)
+                        .with_workspace(repo.workspace.clone())
+                        .with_branch(repo.branch.clone())
+                        .with_head_oid(repo.head_oid.clone())
+                });
+                return emit_json_or_human(mode, res, |env| print_abort_human(&env.data));
+            }
+            if repo.git_dir.join("rebase-merge").exists()
+                || repo.git_dir.join("rebase-apply").exists()
+            {
+                return delegate_mutating(parsed, "rebase", &parsed.subcommand_args, false, true);
+            }
+            emit_error(
+                mode,
+                &OzError::InvalidUsage {
+                    message: "no rebase in progress to abort".to_string(),
+                    recovery: vec!["oz git status".to_string()],
+                },
+            )
+        }
+        GitRebaseAction::StackRebase { onto, update_refs } => {
+            let repo = match discover_and_recover_repo(parsed.effective_dir.as_deref(), true) {
+                Ok(r) => r,
+                Err(err) => return emit_error(mode, &err),
+            };
+            let onto_short = onto.strip_prefix("refs/heads/").unwrap_or(&onto);
+            let Some(ref cur_branch) = repo.branch else {
+                return delegate_mutating(parsed, "rebase", &parsed.subcommand_args, false, true);
+            };
+            if repo.git_dir.join("rebase-merge").exists()
+                || repo.git_dir.join("rebase-apply").exists()
+                || !is_local_branch(&repo, onto_short).unwrap_or(false)
+            {
+                return delegate_mutating(parsed, "rebase", &parsed.subcommand_args, false, true);
+            }
+            if cur_branch == onto_short {
+                let noop = StackRebaseOutcome {
+                    onto_branch: onto_short.to_string(),
+                    onto_oid: repo.head_oid.clone().unwrap_or_default(),
+                    branches: Vec::new(),
+                    rebased_commits: Vec::new(),
+                    op_id: None,
+                    updated_workspaces: Vec::new(),
+                };
+                let env = wrap_stack_rebase_envelope(noop, &repo);
+                return emit_json_or_human(mode, Ok(env), |_| {
+                    println!("Current branch {cur_branch} is up to date.");
+                });
+            }
+
+            let actor = actor_from_mode(mode, &repo);
+            let opts = StackRebaseOptions {
+                branches: if update_refs {
+                    Vec::new()
+                } else {
+                    vec![cur_branch.clone()]
+                },
+                onto: Some(onto_short.to_string()),
+            };
+            let res = stack_rebase(&repo, &opts, actor).map(|out| {
+                let post_repo = OzoneRepo::discover(parsed.effective_dir.as_deref())
+                    .unwrap_or_else(|_| repo.clone());
+                wrap_stack_rebase_envelope(out, &post_repo)
+            });
+            emit_json_or_human(mode, res, |env| print_stack_rebase_human(&env.data))
+        }
+    }
 }
 
 // ============================================================================

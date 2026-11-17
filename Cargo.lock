@@ -1879,7 +1879,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "oz-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "oz-core",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "oz-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "oz-cloud-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "oz-core",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "oz-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "oz-cow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1971,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "oz-github"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gix",
  "oz-core",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "oz-integrate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "gix",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "oz-oplog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs4",
@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "oz-vfsd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "oz-warm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",

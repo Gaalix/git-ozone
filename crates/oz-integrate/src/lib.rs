@@ -15,7 +15,10 @@ pub use guardrails::{
     IntegrationGuardrailOptions, check_branch_guardrails_for_integration,
     check_workspace_scope_for_integration,
 };
-pub use merge::{IntegrateOptions, IntegrateOutcome, continue_integration, integrate};
+pub use merge::{
+    IntegrateOptions, IntegrateOutcome, continue_integration, continue_integration_with_verify,
+    integrate,
+};
 pub use radar::{RadarOptions, RadarReport, scan_radar};
 pub use resolve::{
     AbortOutcome, ContinueOutcome, ResolveOptions, ResolveOutcome, abort_integration,

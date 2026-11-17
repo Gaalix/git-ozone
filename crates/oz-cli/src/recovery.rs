@@ -1,11 +1,9 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Transparent FUSE3 `SIGKILL` recovery at CLI command entry.
+//! Transparent daemon VFS (`SIGKILL`) recovery at CLI command entry.
 
-use oz_core::{
-    BackendKind, MountHealth, MountRecord, OzError, OzoneRepo, Result, probe_mount_health_os,
-};
+use oz_core::{MountHealth, MountRecord, OzError, OzoneRepo, Result, probe_mount_health_os};
 use std::path::{Path, PathBuf};
 
 /// Discovers the repository and transparently recovers any dead `oz-vfsd` FUSE3 daemon
@@ -23,7 +21,7 @@ pub fn discover_and_recover_repo(
     let mut repo = OzoneRepo::discover(directory)?;
 
     let self_needs_recovery = repo_mount_needs_recovery(&repo);
-    let ws_needs_recovery = recover_all_ws && any_fuse_workspace_needs_recovery(&repo);
+    let ws_needs_recovery = recover_all_ws && any_daemon_workspace_needs_recovery(&repo);
 
     if self_needs_recovery || ws_needs_recovery {
         oz_vfsd::ensure_daemon_and_mounts(&repo.layout.git_common_dir)?;
@@ -65,24 +63,24 @@ fn repo_mount_needs_recovery(repo: &OzoneRepo) -> bool {
         MountHealth::NotMounted => repo
             .mount_record
             .as_ref()
-            .is_some_and(|mr| mr.mounted && mr.backend == BackendKind::LinuxFuse3),
+            .is_some_and(|mr| mr.mounted && mr.backend.requires_daemon()),
         MountHealth::Healthy => {
             repo.mount_record
                 .as_ref()
-                .is_some_and(|mr| mr.mounted && mr.backend == BackendKind::LinuxFuse3)
+                .is_some_and(|mr| mr.mounted && mr.backend.requires_daemon())
                 && oz_vfsd::ping_daemon(&repo.layout.vfsd_socket_path()).is_err()
         }
         MountHealth::NotApplicable => false,
     }
 }
 
-fn any_fuse_workspace_needs_recovery(repo: &OzoneRepo) -> bool {
+fn any_daemon_workspace_needs_recovery(repo: &OzoneRepo) -> bool {
     let ws_dir = repo.layout.ws_dir();
     let Ok(entries) = std::fs::read_dir(&ws_dir) else {
         return false;
     };
 
-    let mut has_expected_fuse_mount = false;
+    let mut has_expected_daemon_mount = false;
     for entry in entries.flatten() {
         let mount_json = entry.path().join("mount.json");
         let Ok(raw) = std::fs::read_to_string(&mount_json) else {
@@ -91,13 +89,13 @@ fn any_fuse_workspace_needs_recovery(repo: &OzoneRepo) -> bool {
         let Ok(record) = serde_json::from_str::<MountRecord>(&raw) else {
             continue;
         };
-        if record.mounted && record.backend == BackendKind::LinuxFuse3 {
-            has_expected_fuse_mount = true;
+        if record.mounted && record.backend.requires_daemon() {
+            has_expected_daemon_mount = true;
             if probe_mount_health_os(&record.mount_point) != MountHealth::Healthy {
                 return true;
             }
         }
     }
 
-    has_expected_fuse_mount && oz_vfsd::ping_daemon(&repo.layout.vfsd_socket_path()).is_err()
+    has_expected_daemon_mount && oz_vfsd::ping_daemon(&repo.layout.vfsd_socket_path()).is_err()
 }

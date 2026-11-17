@@ -13,6 +13,7 @@ use crate::sandbox::{
     normalize_branch_short, open_gix_with_fallback, parse_oid, preserve_or_add_change_id,
     resolve_local_branch, resolve_main_repo, resolve_signatures, save_session,
     sync_git_index_for_delta, verify_and_build_resolved_tree, write_commit_in_odb,
+    write_workspace_state_atomic,
 };
 use chrono::Utc;
 use gix::bstr::ByteSlice;
@@ -26,7 +27,6 @@ use oz_cow::materialize::compute_tree_delta;
 use oz_oplog::{ActorInfo, MutationTransaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
 
 /// Options controlling [`stack_rebase`].
 #[derive(Debug, Clone, Default)]
@@ -274,7 +274,7 @@ pub fn stack_rebase(
         rebased_commits: Vec::new(),
     };
 
-    execute_stack_rebase_loop(&main_repo, &gix_repo, &mut state, actor)
+    execute_stack_rebase_loop(repo, &main_repo, &gix_repo, &mut state, actor)
 }
 
 /// Resumes a paused `StackRebase` conflict session after conflicts in `../<repo>.oz/_integrate`
@@ -337,7 +337,7 @@ pub fn continue_stack_rebase(repo: &OzoneRepo, actor: ActorInfo) -> Result<Stack
         }
     }
 
-    execute_stack_rebase_loop(&main_repo, &gix_repo, &mut state, actor)
+    execute_stack_rebase_loop(repo, &main_repo, &gix_repo, &mut state, actor)
 }
 
 fn initial_onto_for_branch(state: &StackRebaseSessionState, branch_idx: usize) -> String {
@@ -351,6 +351,7 @@ fn initial_onto_for_branch(state: &StackRebaseSessionState, branch_idx: usize) -
 }
 
 fn execute_stack_rebase_loop(
+    caller_repo: &OzoneRepo,
     main_repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     state: &mut StackRebaseSessionState,
@@ -511,10 +512,11 @@ fn execute_stack_rebase_loop(
         state.current_commit_index = 0;
     }
 
-    finalize_stack_rebase(main_repo, gix_repo, state, actor)
+    finalize_stack_rebase(caller_repo, main_repo, gix_repo, state, actor)
 }
 
 fn finalize_stack_rebase(
+    caller_repo: &OzoneRepo,
     main_repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     state: &StackRebaseSessionState,
@@ -608,6 +610,7 @@ fn finalize_stack_rebase(
 
     let summaries = list_workspaces(main_repo)?;
     let mut ws_updates = Vec::new();
+    let mut caller_ws_dirty = None;
     for summary in summaries {
         let ws = summary.state;
         if let Some((old_t, new_t, new_oid)) = changed_trees.get(&ws.branch).copied() {
@@ -632,14 +635,32 @@ fn finalize_stack_rebase(
                         )],
                     });
                 }
+                if caller_repo.workspace.as_deref() == Some(ws.name.as_str()) {
+                    caller_ws_dirty = Some(st.changes);
+                }
             }
             ws_updates.push((ws, summary.mount_health, old_t, new_t, new_oid, delta));
         }
     }
 
-    let main_dirty_override = main_checked_out_delta
-        .as_ref()
-        .map(|(st, _, _, _)| st.changes.clone());
+    let use_caller_ws_tx = main_checked_out_delta.is_none()
+        && caller_repo.workspace.is_some()
+        && caller_repo
+            .branch
+            .as_deref()
+            .is_some_and(|b| changed_trees.contains_key(b));
+    let tx_repo = if use_caller_ws_tx {
+        caller_repo
+    } else {
+        main_repo
+    };
+    let tx_dirty_override = if use_caller_ws_tx {
+        caller_ws_dirty
+    } else {
+        main_checked_out_delta
+            .as_ref()
+            .map(|(st, _, _, _)| st.changes.clone())
+    };
     let branch_names: Vec<&str> = state.branches.iter().map(|b| b.branch.as_str()).collect();
     let cmd_str = format!(
         "oz stack rebase {} --onto {}",
@@ -647,10 +668,10 @@ fn finalize_stack_rebase(
         state.onto_branch
     );
     let tx = MutationTransaction::begin_watching_all_branches(
-        main_repo,
+        tx_repo,
         cmd_str,
         actor,
-        main_dirty_override.as_deref(),
+        tx_dirty_override.as_deref(),
     )?;
 
     // Single atomic CAS transaction across all stacked `refs/heads/*`.
@@ -692,7 +713,7 @@ fn finalize_stack_rebase(
     updated_workspaces.sort();
 
     let _ = cleanup_session_and_sandbox(main_repo, None);
-    let op_entry = tx.finish(main_repo, main_dirty_override.as_deref())?;
+    let op_entry = tx.finish(tx_repo, tx_dirty_override.as_deref())?;
 
     Ok(StackRebaseOutcome {
         onto_branch: state.onto_branch.clone(),
@@ -702,22 +723,6 @@ fn finalize_stack_rebase(
         op_id: Some(op_entry.op_id),
         updated_workspaces,
     })
-}
-
-fn write_workspace_state_atomic(path: &Path, state: &WorkspaceState) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| OzError::Other(format!("path {} has no parent", path.display())))?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".tmp_{}_{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("ws.json"),
-        std::process::id()
-    ));
-    let bytes = serde_json::to_vec_pretty(state)?;
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 fn build_rebased_commit_from_original(

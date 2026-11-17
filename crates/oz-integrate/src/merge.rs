@@ -17,13 +17,14 @@ use crate::sandbox::{
     open_gix_with_fallback, parse_oid, preserve_or_add_change_id, resolve_local_branch,
     resolve_main_repo, resolve_signatures, run_verify_command, save_session,
     sync_git_index_for_delta, verify_and_build_resolved_tree, write_commit_in_odb,
+    write_workspace_state_atomic,
 };
 use chrono::Utc;
 use gix::hash::ObjectId;
 use gix::merge::tree::TreatAsUnresolved;
 use gix::refs::transaction::{PreviousValue, RefEdit};
 use gix::refs::{FullName, Target};
-use oz_core::{OzError, OzoneRepo, Result, WorkspaceState, compute_status};
+use oz_core::{MountHealth, OzError, OzoneRepo, Result, WorkspaceState, compute_status};
 use oz_cow::list_workspaces;
 use oz_cow::materialize::compute_tree_delta;
 use oz_oplog::{ActorInfo, MutationTransaction};
@@ -121,6 +122,7 @@ pub fn integrate(
     };
 
     run_merge_pipeline(
+        repo,
         &main_repo,
         &gix_repo,
         &merge_ctx,
@@ -137,6 +139,15 @@ pub fn integrate(
 /// have been resolved, builds the resolved tree, merges any remaining sources, runs `--verify`,
 /// and commits atomically.
 pub fn continue_integration(repo: &OzoneRepo, actor: ActorInfo) -> Result<IntegrateOutcome> {
+    continue_integration_with_verify(repo, None, actor)
+}
+
+/// Same as [`continue_integration`], allowing `--verify` to be supplied or overridden at continuation time.
+pub fn continue_integration_with_verify(
+    repo: &OzoneRepo,
+    verify_override: Option<&str>,
+    actor: ActorInfo,
+) -> Result<IntegrateOutcome> {
     let main_repo = resolve_main_repo(repo)?;
     let Some(session) = load_session(&main_repo)? else {
         return Err(OzError::InvalidUsage {
@@ -178,13 +189,16 @@ pub fn continue_integration(repo: &OzoneRepo, actor: ActorInfo) -> Result<Integr
         into_branch: state.into_branch.clone(),
         original_into_oid: parse_oid(&state.original_into_oid)?,
         original_into_tree: parse_oid(&state.original_into_tree)?,
-        verify_cmd: state.verify_cmd.clone(),
+        verify_cmd: verify_override
+            .map(str::to_string)
+            .or_else(|| state.verify_cmd.clone()),
         allow_out_of_scope: state.allow_out_of_scope,
         force: state.force,
         message: state.message.clone(),
     };
 
     run_merge_pipeline(
+        repo,
         &main_repo,
         &gix_repo,
         &merge_ctx,
@@ -209,6 +223,7 @@ struct IntegrateExecutionCtx {
 
 #[allow(clippy::too_many_arguments)]
 fn run_merge_pipeline(
+    caller_repo: &OzoneRepo,
     main_repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     ctx: &IntegrateExecutionCtx,
@@ -345,6 +360,7 @@ fn run_merge_pipeline(
     }
 
     finalize_integration(
+        caller_repo,
         main_repo,
         gix_repo,
         ctx,
@@ -358,6 +374,7 @@ fn run_merge_pipeline(
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_integration(
+    caller_repo: &OzoneRepo,
     main_repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     ctx: &IntegrateExecutionCtx,
@@ -438,12 +455,65 @@ fn finalize_integration(
         None
     };
 
+    // Check any active Ozone workspace currently checked out on `ctx.into_branch`.
+    let summaries = list_workspaces(main_repo)?;
+    let mut ws_updates = Vec::new();
+    let mut caller_ws_dirty = None;
+    for summary in summaries {
+        let ws = summary.state;
+        if ws.branch != ctx.into_branch {
+            continue;
+        }
+        if (ws.worktree_path.is_dir() || ws.backend.requires_daemon())
+            && let Ok(ws_repo) = OzoneRepo::discover(Some(&ws.worktree_path))
+            && let Ok(st) = compute_status(&ws_repo)
+        {
+            let conflicts = conflicting_dirty_paths(&st, &delta);
+            if !conflicts.is_empty() {
+                if created_temp_sandbox {
+                    let _ = cleanup_session_and_sandbox(main_repo, Some(&sandbox_dir));
+                }
+                return Err(OzError::Conflict {
+                    message: format!(
+                        "workspace '{}' on '{}' has conflicting uncommitted changes in: {}",
+                        ws.name,
+                        ws.branch,
+                        conflicts.join(", ")
+                    ),
+                    conflicts: Vec::new(),
+                    recovery: vec![format!(
+                        "oz -C {} commit -m \"save local edits\"",
+                        ws.worktree_path.display()
+                    )],
+                });
+            }
+            if caller_repo.workspace.as_deref() == Some(ws.name.as_str()) {
+                caller_ws_dirty = Some(st.changes);
+            }
+        }
+        ws_updates.push((ws, summary.mount_health));
+    }
+
+    let use_caller_ws_tx = !main_on_into
+        && caller_repo.workspace.is_some()
+        && caller_repo.branch.as_deref() == Some(ctx.into_branch.as_str());
+    let tx_repo = if use_caller_ws_tx {
+        caller_repo
+    } else {
+        main_repo
+    };
+    let tx_dirty_override = if use_caller_ws_tx {
+        caller_ws_dirty.as_deref()
+    } else {
+        main_status.as_ref().map(|s| s.changes.as_slice())
+    };
+
     let cmd_str = format!("oz integrate {} --into {}", merged_sources.join(" "), ctx.into_branch);
     let tx = MutationTransaction::begin_watching_all_branches(
-        main_repo,
+        tx_repo,
         cmd_str,
         actor,
-        main_status.as_ref().map(|s| s.changes.as_slice()),
+        tx_dirty_override,
     )?;
 
     let full_ref_name = format!("refs/heads/{}", ctx.into_branch);
@@ -489,15 +559,40 @@ fn finalize_integration(
         )?;
     }
 
+    for (mut ws, mount_health) in ws_updates {
+        if ws.worktree_path.is_dir()
+            && (!ws.backend.requires_daemon() || mount_health == MountHealth::Healthy)
+        {
+            apply_tree_delta_with_cleanup(
+                gix_repo,
+                ctx.original_into_tree,
+                final_tree_id,
+                &ws.worktree_path,
+            )?;
+        }
+        if let Some(ref wt_git_dir) = ws.git_worktree_dir
+            && wt_git_dir.is_dir()
+        {
+            sync_git_index_for_delta(
+                wt_git_dir,
+                &ws.worktree_path,
+                ctx.original_into_tree,
+                final_tree_id,
+                &delta,
+            )?;
+        }
+        ws.base_commit = Some(final_commit_oid.to_hex().to_string());
+        ws.base_tree = final_tree_id.to_hex().to_string();
+        ws.updated_at = Utc::now();
+        write_workspace_state_atomic(&main_repo.layout.workspace_state_path(&ws.name), &ws)?;
+    }
+
     let _ = cleanup_session_and_sandbox(
         main_repo,
         existing_sandbox.map(|(p, _)| p).or(Some(&sandbox_dir)),
     );
 
-    let post_dirty_override = main_status
-        .as_ref()
-        .map(|s| s.changes.as_slice());
-    let op_entry = tx.finish(main_repo, post_dirty_override)?;
+    let op_entry = tx.finish(tx_repo, tx_dirty_override)?;
 
     Ok(IntegrateOutcome {
         into_branch: ctx.into_branch.clone(),

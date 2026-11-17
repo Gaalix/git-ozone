@@ -178,7 +178,7 @@ pub fn resolve_conflict(
     }
 
     let continued = if opts.auto_continue {
-        Some(continue_session(&main_repo, actor)?)
+        Some(continue_session(repo, actor)?)
     } else {
         None
     };
@@ -205,10 +205,10 @@ pub fn continue_session(repo: &OzoneRepo, actor: ActorInfo) -> Result<ContinueOu
 
     match session.mode {
         IntegrationMode::Integrate => {
-            Ok(ContinueOutcome::Integrate(continue_integration(&main_repo, actor)?))
+            Ok(ContinueOutcome::Integrate(continue_integration(repo, actor)?))
         }
         IntegrationMode::StackRebase => Ok(ContinueOutcome::StackRebase(
-            continue_stack_rebase(&main_repo, actor)?,
+            continue_stack_rebase(repo, actor)?,
         )),
     }
 }

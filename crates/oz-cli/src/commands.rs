@@ -5,14 +5,22 @@
 
 use crate::recovery::discover_and_recover_repo;
 use chrono::{DateTime, Utc};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use oz_core::{
     BackendKind, CommitOptions, CommitOutcome, DiffReport, Envelope, ExitCode, FileChange,
-    InteractionMode, OzError, OzoneRepo, Result, compute_diff, compute_status, render_unified_diff,
+    InteractionMode, OzError, OzoneRepo, Result, ScopePolicy, StatusReport, WarningEntry,
+    compute_diff, compute_status, render_unified_diff,
 };
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, detect_filesystem,
     gc_workspaces, list_workspaces, remove_workspace, select_backend, spawn_workspace,
+};
+use oz_integrate::{
+    AbortOutcome, CollisionSeverity, ContinueOutcome, IntegrateOptions, IntegrateOutcome,
+    IntegrationMode, RadarOptions, RadarReport, ResolveOptions, ResolveOutcome, StackRebaseOptions,
+    StackRebaseOutcome, StackStatusReport, TakeSide, abort_integration,
+    continue_integration_with_verify, continue_stack_rebase, integrate, resolve_conflict,
+    scan_radar, stack_rebase, stack_status,
 };
 use oz_oplog::{
     ActorInfo, ActorKind, CheckpointOutcome, MutationTransaction, RedoOutcome, UndoOutcome,
@@ -134,6 +142,110 @@ pub struct SetupArgs {
     /// Install a `systemd --user` service unit for `oz-vfsd` on Linux.
     #[arg(long)]
     pub systemd_user: bool,
+    /// Enable the Windows Projected File System (`Client-ProjFS`) feature on Windows.
+    #[arg(long)]
+    pub enable_projfs: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RadarArgs {
+    /// Base branch or revision to project workspace edits onto (defaults to active repo branch or `main`).
+    #[arg(long, value_name = "REV")]
+    pub base: Option<String>,
+    /// Exclude branch-diverged commits and scan only uncommitted working-tree edits.
+    #[arg(long)]
+    pub no_committed: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct IntegrateArgs {
+    /// Workspace or branch names to integrate in order.
+    pub sources: Vec<String>,
+    /// Target branch to integrate into (defaults to `main`).
+    #[arg(long, value_name = "BRANCH")]
+    pub into: Option<String>,
+    /// Verification shell command executed inside `../<repo>.oz/_integrate` before advancing the target branch.
+    #[arg(long, value_name = "CMD")]
+    pub verify: Option<String>,
+    /// Override `--scope` and `--deny` path guardrails.
+    #[arg(long)]
+    pub allow_out_of_scope: bool,
+    /// Override content guardrails (secrets, conflict markers, oversized blobs).
+    #[arg(long)]
+    pub force: bool,
+    /// Resume an active integration conflict session after resolving `_integrate/`.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+    /// Abort an active integration or stack rebase conflict session and remove `_integrate/`.
+    #[arg(long)]
+    pub abort: bool,
+    /// Optional custom merge commit message.
+    #[arg(short = 'm', long = "message", value_name = "MSG")]
+    pub message: Option<String>,
+}
+
+/// Resolution side accepted by `oz resolve --take`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TakeSideArg {
+    Ours,
+    Theirs,
+    Base,
+}
+
+impl From<TakeSideArg> for TakeSide {
+    fn from(value: TakeSideArg) -> Self {
+        match value {
+            TakeSideArg::Ours => Self::Ours,
+            TakeSideArg::Theirs => Self::Theirs,
+            TakeSideArg::Base => Self::Base,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ResolveArgs {
+    /// Conflict ID (e.g., `c1`) to resolve. Omit when `--all` is passed.
+    pub conflict_id: Option<String>,
+    /// Resolve all unresolved conflicts in the active `_integrate/` session.
+    #[arg(long)]
+    pub all: bool,
+    /// Version to apply (`ours`, `theirs`, or `base`).
+    #[arg(long, value_enum, value_name = "SIDE")]
+    pub take: TakeSideArg,
+    /// Automatically continue the paused integration or stack rebase after resolving.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+}
+
+/// Stacked-branch subcommands (`oz stack ...`).
+#[derive(Debug, Subcommand)]
+pub enum StackCommand {
+    /// Rebase stacked branches in memory onto a base branch, preserving `Change-Id:` trailers.
+    Rebase(StackRebaseArgs),
+    /// Inspect stacked branches, `Change-Id:` trailers, and rebase readiness.
+    Status(StackStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct StackRebaseArgs {
+    /// Stacked branch names to rebase (auto-discovers stacked branches if omitted).
+    pub branches: Vec<String>,
+    /// Target base branch to rebase onto (defaults to `main`).
+    #[arg(long, value_name = "BRANCH")]
+    pub onto: Option<String>,
+    /// Resume an active stack rebase conflict session after resolving `_integrate/`.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+    /// Abort an active stack rebase conflict session and remove `_integrate/`.
+    #[arg(long)]
+    pub abort: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct StackStatusArgs {
+    /// Base branch to compare stacked branches against (defaults to `main`).
+    #[arg(long, value_name = "BRANCH")]
+    pub onto: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,6 +337,8 @@ struct SetupData {
     recommended_backend: BackendKind,
     oz_vfsd_bin: PathBuf,
     systemd_unit_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projfs_enabled: Option<bool>,
 }
 
 fn actor_from_mode(mode: InteractionMode, repo: &OzoneRepo) -> ActorInfo {
@@ -556,6 +670,39 @@ fn execute_ws_gc(
     Ok(env)
 }
 
+pub(crate) fn attach_out_of_scope_warnings(
+    repo: &OzoneRepo,
+    mut env: Envelope<StatusReport>,
+) -> Envelope<StatusReport> {
+    let policy = ScopePolicy::from_repo(repo).ok();
+    let warnings: Vec<WarningEntry> = env
+        .data
+        .changes
+        .iter()
+        .filter(|change| change.out_of_scope)
+        .map(|change| {
+            let message = policy
+                .as_ref()
+                .and_then(|p| p.violation_reason(&change.path))
+                .unwrap_or_else(|| {
+                    format!(
+                        "'{}' is outside workspace allowed scope or matches deny pattern",
+                        change.path
+                    )
+                });
+            WarningEntry::Structured {
+                code: "out_of_scope".to_string(),
+                message,
+                path: Some(change.path.clone()),
+            }
+        })
+        .collect();
+    for w in warnings {
+        env = env.with_warning(w);
+    }
+    env
+}
+
 pub(crate) fn handle_status(directory: Option<&Path>, mode: InteractionMode) -> ExitCode {
     let res = (|| -> Result<Envelope<_>> {
         let repo = discover_and_recover_repo(directory, false)?;
@@ -563,10 +710,11 @@ pub(crate) fn handle_status(directory: Option<&Path>, mode: InteractionMode) -> 
         let workspace = report.workspace.clone();
         let branch = report.branch.clone();
         let head_oid = report.head_oid.clone();
-        Ok(Envelope::success(report)
+        let env = Envelope::success(report)
             .with_workspace(workspace)
             .with_branch(branch)
-            .with_head_oid(head_oid))
+            .with_head_oid(head_oid);
+        Ok(attach_out_of_scope_warnings(&repo, env))
     })();
 
     render_command_result(mode, res, |env| {
@@ -835,6 +983,13 @@ pub(crate) fn handle_setup(
         let repo = discover_and_recover_repo(directory, false)?;
         repo.layout.ensure_initialized()?;
 
+        let projfs_enabled = if args.enable_projfs {
+            let newly_enabled = oz_vfsd::enable_windows_projfs()?;
+            Some(newly_enabled || oz_vfsd::is_windows_projfs_enabled())
+        } else {
+            None
+        };
+
         let probe = detect_filesystem(&repo.repo_root)?;
         let recommended_backend = select_backend(&probe, repo.config.backend);
         let vfsd_bin = oz_vfsd::find_oz_vfsd_bin()?;
@@ -865,6 +1020,7 @@ pub(crate) fn handle_setup(
             recommended_backend,
             oz_vfsd_bin: vfsd_bin,
             systemd_unit_path,
+            projfs_enabled,
         })
         .with_workspace(repo.workspace)
         .with_branch(repo.branch)
@@ -872,6 +1028,9 @@ pub(crate) fn handle_setup(
 
         if cfg!(target_os = "linux") && !args.systemd_user {
             env = env.with_recovery_command("oz setup --systemd-user");
+        }
+        if cfg!(target_os = "windows") && !args.enable_projfs && !oz_vfsd::is_windows_projfs_enabled() {
+            env = env.with_recovery_command("oz setup --enable-projfs");
         }
         Ok(env)
     })();
@@ -887,5 +1046,445 @@ pub(crate) fn handle_setup(
         if let Some(ref unit) = d.systemd_unit_path {
             println!("Installed systemd --user unit: {}", unit.display());
         }
+        if let Some(enabled) = d.projfs_enabled {
+            println!("Windows ProjFS (Client-ProjFS) enabled: {enabled}");
+        }
     })
+}
+
+pub(crate) fn wrap_integrate_envelope(
+    outcome: IntegrateOutcome,
+    workspace: Option<String>,
+) -> Envelope<IntegrateOutcome> {
+    let branch = outcome.into_branch.clone();
+    let head_oid = outcome.commit_oid.clone();
+    let op_id = outcome.op_id.clone();
+    let mut env = Envelope::success(outcome)
+        .with_workspace(workspace)
+        .with_branch(Some(branch))
+        .with_head_oid(Some(head_oid));
+    if let Some(id) = op_id {
+        env = env
+            .with_op_id(id.clone())
+            .with_recovery_command(format!("oz undo {id}"));
+    }
+    env
+}
+
+pub(crate) fn wrap_stack_rebase_envelope(
+    outcome: StackRebaseOutcome,
+    post_repo: &OzoneRepo,
+) -> Envelope<StackRebaseOutcome> {
+    let op_id = outcome.op_id.clone();
+    let mut env = Envelope::success(outcome)
+        .with_workspace(post_repo.workspace.clone())
+        .with_branch(post_repo.branch.clone())
+        .with_head_oid(post_repo.head_oid.clone());
+    if let Some(id) = op_id {
+        env = env
+            .with_op_id(id.clone())
+            .with_recovery_command(format!("oz undo {id}"));
+    }
+    env
+}
+
+pub(crate) fn print_integrate_human(outcome: &IntegrateOutcome) {
+    if outcome.merged_sources.is_empty() {
+        println!(
+            "Already up to date on {} ({})",
+            outcome.into_branch,
+            &outcome.commit_oid[..outcome.commit_oid.len().min(12)]
+        );
+    } else {
+        println!(
+            "Integrated [{}] into {} ({})",
+            outcome.merged_sources.join(", "),
+            outcome.into_branch,
+            &outcome.commit_oid[..outcome.commit_oid.len().min(12)]
+        );
+    }
+}
+
+pub(crate) fn print_stack_rebase_human(outcome: &StackRebaseOutcome) {
+    println!(
+        "Rebased {} branch(es) onto {} ({} commit(s) replayed)",
+        outcome.branches.len(),
+        outcome.onto_branch,
+        outcome.rebased_commits.len()
+    );
+    for b in &outcome.branches {
+        println!(
+            "  {}  {} -> {} ({} commit(s))",
+            b.branch,
+            &b.previous_oid[..b.previous_oid.len().min(12)],
+            &b.new_oid[..b.new_oid.len().min(12)],
+            b.commit_count
+        );
+    }
+}
+
+pub(crate) fn print_abort_human(outcome: &AbortOutcome) {
+    if outcome.aborted {
+        println!("Aborted active conflict session and cleaned _integrate sandbox");
+    } else {
+        println!("No active conflict session to abort");
+    }
+}
+
+pub(crate) fn handle_radar(
+    args: &RadarArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<RadarReport>> {
+        let repo = discover_and_recover_repo(directory, true)?;
+        let opts = RadarOptions {
+            base_branch: args.base.clone(),
+            include_committed: !args.no_committed,
+            workspaces: Vec::new(),
+        };
+        let report = scan_radar(&repo, &opts)?;
+        Ok(Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        println!(
+            "Radar base={} ({} workspace(s) scanned)",
+            d.base_branch,
+            d.scanned_workspaces.len()
+        );
+        if d.collisions.is_empty() {
+            println!("no collisions detected");
+            return;
+        }
+        for item in &d.collisions {
+            let sev = match item.severity {
+                CollisionSeverity::OverlappingHunks => "overlapping_hunks",
+                CollisionSeverity::SameFileDifferentLines => "same_file_different_lines",
+                CollisionSeverity::OutOfScope => "out_of_scope",
+            };
+            let spans: Vec<String> = item
+                .workspaces
+                .iter()
+                .map(|w| format!("{}:{}", w.ws, w.lines))
+                .collect();
+            println!(
+                "  [{sev}] {}  ({}) -> {}",
+                item.path,
+                spans.join(", "),
+                item.suggested_action
+            );
+        }
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum IntegrateCliData {
+    Integrated(IntegrateOutcome),
+    Aborted(AbortOutcome),
+}
+
+pub(crate) fn handle_integrate(
+    args: &IntegrateArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<IntegrateCliData>> {
+        if args.continue_session && args.abort {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass both `--continue` and `--abort` to `oz integrate`"
+                    .to_string(),
+                recovery: vec![
+                    "oz integrate --continue".to_string(),
+                    "oz integrate --abort".to_string(),
+                ],
+            });
+        }
+        if (args.continue_session || args.abort) && !args.sources.is_empty() {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass source branches alongside `--continue` or `--abort`"
+                    .to_string(),
+                recovery: vec![
+                    "oz integrate --continue".to_string(),
+                    "oz integrate --abort".to_string(),
+                ],
+            });
+        }
+
+        let repo = discover_and_recover_repo(directory, true)?;
+        let actor = actor_from_mode(mode, &repo);
+
+        if args.abort {
+            let outcome = abort_integration(&repo)?;
+            return Ok(Envelope::success(IntegrateCliData::Aborted(outcome))
+                .with_workspace(repo.workspace)
+                .with_branch(repo.branch)
+                .with_head_oid(repo.head_oid));
+        }
+
+        if args.continue_session {
+            let outcome =
+                continue_integration_with_verify(&repo, args.verify.as_deref(), actor)?;
+            let wrapped = wrap_integrate_envelope(outcome, repo.workspace);
+            return Ok(map_envelope_data(wrapped, IntegrateCliData::Integrated));
+        }
+
+        if args.sources.is_empty() {
+            return Err(OzError::InvalidUsage {
+                message: "missing source workspaces or branches for `oz integrate`".to_string(),
+                recovery: vec![
+                    "oz integrate <ws-or-branch>... --into main".to_string(),
+                    "oz integrate --continue".to_string(),
+                    "oz integrate --abort".to_string(),
+                ],
+            });
+        }
+
+        let opts = IntegrateOptions {
+            sources: args.sources.clone(),
+            into: args.into.clone(),
+            verify_cmd: args.verify.clone(),
+            allow_out_of_scope: args.allow_out_of_scope,
+            force: args.force,
+            message: args.message.clone(),
+        };
+        let outcome = integrate(&repo, &opts, actor)?;
+        let wrapped = wrap_integrate_envelope(outcome, repo.workspace);
+        Ok(map_envelope_data(wrapped, IntegrateCliData::Integrated))
+    })();
+
+    render_command_result(mode, res, |env| match &env.data {
+        IntegrateCliData::Integrated(out) => print_integrate_human(out),
+        IntegrateCliData::Aborted(out) => print_abort_human(out),
+    })
+}
+
+pub(crate) fn handle_resolve(
+    args: &ResolveArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<ResolveOutcome>> {
+        if args.all && args.conflict_id.is_some() {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass both `<conflict_id>` and `--all` to `oz resolve`".to_string(),
+                recovery: vec![
+                    "oz resolve c1 --take ours".to_string(),
+                    "oz resolve --all --take ours".to_string(),
+                ],
+            });
+        }
+
+        let repo = discover_and_recover_repo(directory, false)?;
+        let actor = actor_from_mode(mode, &repo);
+        let opts = ResolveOptions {
+            conflict_id: args.conflict_id.clone(),
+            all: args.all,
+            take: args.take.into(),
+            auto_continue: args.continue_session,
+        };
+        let outcome = resolve_conflict(&repo, &opts, actor)?;
+        let post_repo = OzoneRepo::discover(directory).unwrap_or(repo);
+
+        let mut env = Envelope::success(outcome.clone())
+            .with_workspace(post_repo.workspace)
+            .with_branch(post_repo.branch)
+            .with_head_oid(post_repo.head_oid);
+
+        match &outcome.continued {
+            Some(ContinueOutcome::Integrate(int_out)) => {
+                env = env
+                    .with_branch(Some(int_out.into_branch.clone()))
+                    .with_head_oid(Some(int_out.commit_oid.clone()));
+                if let Some(ref op_id) = int_out.op_id {
+                    env = env
+                        .with_op_id(op_id.clone())
+                        .with_recovery_command(format!("oz undo {op_id}"));
+                }
+            }
+            Some(ContinueOutcome::StackRebase(sr_out)) => {
+                if let Some(ref op_id) = sr_out.op_id {
+                    env = env
+                        .with_op_id(op_id.clone())
+                        .with_recovery_command(format!("oz undo {op_id}"));
+                }
+            }
+            None => {
+                if outcome.remaining_unresolved.is_empty() {
+                    let cont_cmd = match outcome.mode {
+                        IntegrationMode::Integrate => "oz integrate --continue",
+                        IntegrationMode::StackRebase => "oz stack rebase --continue",
+                    };
+                    env = env.with_recovery_command(cont_cmd);
+                } else {
+                    env = env.with_recovery_command(format!(
+                        "oz resolve {} --take ours",
+                        outcome.remaining_unresolved[0]
+                    ));
+                }
+            }
+        }
+
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        println!(
+            "Resolved [{}] ({} remaining unresolved)",
+            d.resolved_ids.join(", "),
+            d.remaining_unresolved.len()
+        );
+        match &d.continued {
+            Some(ContinueOutcome::Integrate(out)) => print_integrate_human(out),
+            Some(ContinueOutcome::StackRebase(out)) => print_stack_rebase_human(out),
+            None => {}
+        }
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum StackRebaseCliData {
+    Rebased(StackRebaseOutcome),
+    Aborted(AbortOutcome),
+}
+
+pub(crate) fn handle_stack(
+    cmd: StackCommand,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    match cmd {
+        StackCommand::Rebase(args) => handle_stack_rebase(&args, directory, mode),
+        StackCommand::Status(args) => handle_stack_status(&args, directory, mode),
+    }
+}
+
+fn handle_stack_rebase(
+    args: &StackRebaseArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<StackRebaseCliData>> {
+        if args.continue_session && args.abort {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass both `--continue` and `--abort` to `oz stack rebase`"
+                    .to_string(),
+                recovery: vec![
+                    "oz stack rebase --continue".to_string(),
+                    "oz stack rebase --abort".to_string(),
+                ],
+            });
+        }
+        if (args.continue_session || args.abort)
+            && (!args.branches.is_empty() || args.onto.is_some())
+        {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass branches or `--onto` alongside `--continue` or `--abort`"
+                    .to_string(),
+                recovery: vec![
+                    "oz stack rebase --continue".to_string(),
+                    "oz stack rebase --abort".to_string(),
+                ],
+            });
+        }
+
+        let repo = discover_and_recover_repo(directory, true)?;
+        let actor = actor_from_mode(mode, &repo);
+
+        if args.abort {
+            let outcome = abort_integration(&repo)?;
+            return Ok(Envelope::success(StackRebaseCliData::Aborted(outcome))
+                .with_workspace(repo.workspace)
+                .with_branch(repo.branch)
+                .with_head_oid(repo.head_oid));
+        }
+
+        let outcome = if args.continue_session {
+            continue_stack_rebase(&repo, actor)?
+        } else {
+            stack_rebase(
+                &repo,
+                &StackRebaseOptions {
+                    branches: args.branches.clone(),
+                    onto: args.onto.clone(),
+                },
+                actor,
+            )?
+        };
+        let post_repo = OzoneRepo::discover(directory).unwrap_or(repo);
+        let wrapped = wrap_stack_rebase_envelope(outcome, &post_repo);
+        Ok(map_envelope_data(wrapped, StackRebaseCliData::Rebased))
+    })();
+
+    render_command_result(mode, res, |env| match &env.data {
+        StackRebaseCliData::Rebased(out) => print_stack_rebase_human(out),
+        StackRebaseCliData::Aborted(out) => print_abort_human(out),
+    })
+}
+
+fn handle_stack_status(
+    args: &StackStatusArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<StackStatusReport>> {
+        let repo = discover_and_recover_repo(directory, true)?;
+        let report = stack_status(&repo, args.onto.as_deref())?;
+        Ok(Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        println!("Stack onto {} ({} branch(es))", d.onto_branch, d.branches.len());
+        if d.branches.is_empty() {
+            println!("no stacked branches ahead of {}", d.onto_branch);
+            return;
+        }
+        for b in &d.branches {
+            let parent = b.parent_branch.as_deref().unwrap_or(&d.onto_branch);
+            let status_flag = if b.needs_rebase { "needs-rebase" } else { "up-to-date" };
+            println!(
+                "  {} (parent: {}, ahead: {}, behind: {}, {})",
+                b.branch, parent, b.ahead_count, b.behind_onto_count, status_flag
+            );
+            for c in &b.commits {
+                let cid = c.change_id.as_deref().unwrap_or("-");
+                println!(
+                    "    {} {} [Change-Id: {}]",
+                    &c.oid[..c.oid.len().min(8)],
+                    c.subject,
+                    cid
+                );
+            }
+        }
+    })
+}
+
+fn map_envelope_data<A: Serialize, B: Serialize, F: FnOnce(A) -> B>(
+    env: Envelope<A>,
+    map_fn: F,
+) -> Envelope<B> {
+    Envelope {
+        schema: env.schema,
+        ok: env.ok,
+        op_id: env.op_id,
+        workspace: env.workspace,
+        branch: env.branch,
+        head_oid: env.head_oid,
+        data: map_fn(env.data),
+        warnings: env.warnings,
+        conflicts: env.conflicts,
+        recovery_commands: env.recovery_commands,
+        error: env.error,
+    }
 }

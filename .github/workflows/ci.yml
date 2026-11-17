@@ -60,6 +60,21 @@ jobs:
           which fusermount3
           fusermount3 --version
 
+      - name: Enable Windows ProjFS (Client-ProjFS)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $feature = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          if ($feature.State -ne 'Enabled') {
+            Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart | Out-Null
+          }
+          $dll = Join-Path $env:SystemRoot 'System32\ProjectedFSLib.dll'
+          if (-not (Test-Path $dll)) {
+            throw "ProjectedFSLib.dll not found at $dll after enabling Client-ProjFS"
+          }
+          Get-Item $dll | Select-Object FullName, Length
+
       - name: Build workspace
         run: cargo build --workspace --locked
 
