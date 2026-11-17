@@ -1,23 +1,26 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Background VFS daemon (`oz-vfsd`), Linux FUSE3 CoW overlay engine, IPC client/server,
-//! executable lookup, and `systemd --user` helpers.
+//! Background VFS daemon (`oz-vfsd`), Linux FUSE3 CoW overlay engine, Windows ProjFS engine,
+//! IPC client/server, executable lookup, and OS setup helpers.
 //!
 //! On Linux (`ext4`), `oz-vfsd` drives an unprivileged pure-Rust `fuser` FUSE3 overlay
 //! backed by `.git/ozone/ws/<ws>/upper/` with tombstones and opacity markers in
-//! `.git/ozone/ws/<ws>/meta/`. On Windows (`NTFS`), Milestone 2 adds `windows-projfs`.
+//! `.git/ozone/ws/<ws>/meta/`. On Windows (`NTFS`), `oz-vfsd` drives Windows ProjFS via
+//! dynamic `ProjectedFSLib.dll` FFI backed by the exact same `upper/` + `meta/` layout.
 
 pub mod client;
 pub mod lookup;
 pub mod overlay;
+pub mod projfs;
 pub mod protocol;
 pub mod server;
 pub mod systemd;
+pub mod windows_setup;
 
 pub use client::{
     DaemonPong, dirty_paths_via_daemon, ensure_daemon_and_mounts, mount_via_daemon, ping_daemon,
-    send_request, shutdown_daemon, socket_path_for_git_dir, unmount_via_daemon,
+    send_request, send_tcp_request, shutdown_daemon, socket_path_for_git_dir, unmount_via_daemon,
 };
 pub use lookup::{OZ_VFSD_BIN_ENV, find_oz_vfsd_bin, resolve_oz_vfsd_bin_with, vfsd_binary_name};
 pub use overlay::{
@@ -25,11 +28,21 @@ pub use overlay::{
     WHITEOUT_SUFFIX, lazy_unmount_fuse, list_merged_dir_entries, mount_overlay, resolve_rel_path,
     resolve_seed_dir, scan_dirty_paths,
 };
+pub use projfs::{
+    MountedProjFs, ProjFsDirEntry, ProjFsLayerEngine, ProjFsPlaceholderInfo, compute_instance_guid,
+    mount_projfs, normalize_rel_path, prj_file_name_compare, prj_file_name_match,
+    system_time_to_filetime, unix_to_filetime,
+};
 pub use protocol::{DirtyPathEntry, MountInfo, MountSpec, VfsRequest, VfsResponse, encode_line};
-pub use server::{VfsDaemon, run_daemon};
+pub use server::{VfsDaemon, run_daemon, run_tcp_daemon};
 pub use systemd::{
     generate_systemd_user_unit, install_systemd_user_unit, install_systemd_user_unit_in,
     systemd_user_unit_dir, systemd_user_unit_name,
+};
+pub use windows_setup::{
+    PROJFS_ENABLE_POWERSHELL_CMD, enable_windows_projfs, enable_windows_projfs_with,
+    generate_windows_startup_cmd, is_windows_projfs_enabled, is_windows_projfs_enabled_in,
+    projected_fs_dll_path, projected_fs_dll_path_in,
 };
 
 /// Builds a pure-Rust `fuser::Config` for Linux FUSE3 mounts without requiring `user_allow_other`

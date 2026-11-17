@@ -1,11 +1,15 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Unix socket IPC server (`oz-vfsd`) managing one or more CoW FUSE3 workspace mounts.
+//! Local IPC server (`oz-vfsd`) managing CoW FUSE3 (Linux) and ProjFS (Windows) mounts.
 
 use crate::overlay::{
-    MountedOverlay, OverlayMountConfig, lazy_unmount_fuse, mount_overlay, scan_dirty_paths,
+    OverlayMountConfig, lazy_unmount_fuse, scan_dirty_paths,
 };
+#[cfg(not(target_os = "windows"))]
+use crate::overlay::{MountedOverlay, mount_overlay};
+#[cfg(target_os = "windows")]
+use crate::projfs::{MountedProjFs, mount_projfs};
 use crate::protocol::{MountInfo, MountSpec, VfsRequest, VfsResponse, encode_line};
 use chrono::Utc;
 use fs4::{FileExt as Fs4FileExt, TryLockError};
@@ -37,14 +41,55 @@ impl VfsDaemon {
     }
 }
 
+enum MountedVfs {
+    #[cfg(not(target_os = "windows"))]
+    Overlay(MountedOverlay),
+    #[cfg(target_os = "windows")]
+    ProjFs(MountedProjFs),
+}
+
+impl MountedVfs {
+    fn config(&self) -> &OverlayMountConfig {
+        match self {
+            #[cfg(not(target_os = "windows"))]
+            Self::Overlay(m) => &m.config,
+            #[cfg(target_os = "windows")]
+            Self::ProjFs(m) => &m.config,
+        }
+    }
+
+    fn unmount(self, force: bool) -> Result<()> {
+        match self {
+            #[cfg(not(target_os = "windows"))]
+            Self::Overlay(m) => m.unmount(force),
+            #[cfg(target_os = "windows")]
+            Self::ProjFs(m) => m.unmount(force),
+        }
+    }
+}
+
+fn mount_platform_vfs(spec: &MountSpec) -> Result<(BackendKind, MountedVfs)> {
+    #[cfg(target_os = "windows")]
+    {
+        let mounted = mount_projfs(spec)?;
+        Ok((BackendKind::WindowsProjFs, MountedVfs::ProjFs(mounted)))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mounted = mount_overlay(spec)?;
+        Ok((BackendKind::LinuxFuse3, MountedVfs::Overlay(mounted)))
+    }
+}
+
 struct ActiveMount {
     spec: MountSpec,
-    mounted: MountedOverlay,
+    backend: BackendKind,
+    mounted: MountedVfs,
 }
 
 impl ActiveMount {
     fn info(&self) -> MountInfo {
-        let dirty_count = scan_dirty_paths(&self.mounted.config).map_or(0, |v| v.len());
+        let dirty_count = scan_dirty_paths(self.mounted.config()).map_or(0, |v| v.len());
         MountInfo {
             workspace: self.spec.workspace.clone(),
             branch: self.spec.branch.clone(),
@@ -98,7 +143,12 @@ impl DaemonManager {
         Ok(())
     }
 
-    fn persist_mount_state(&mut self, spec: &MountSpec, mounted_flag: bool) {
+    fn persist_mount_state(
+        &mut self,
+        spec: &MountSpec,
+        backend: BackendKind,
+        mounted_flag: bool,
+    ) {
         let ws_dir = if !spec.git_dir.as_os_str().is_empty() {
             spec.git_dir.join("ozone").join("ws").join(&spec.workspace)
         } else if let Some(parent) = spec.meta_dir.parent() {
@@ -122,7 +172,7 @@ impl DaemonManager {
             schema_version: MountRecord::CURRENT_SCHEMA_VERSION,
             workspace: spec.workspace.clone(),
             branch: spec.branch.clone(),
-            backend: BackendKind::LinuxFuse3,
+            backend,
             repo_root: spec.repo_root.clone(),
             git_dir: spec.git_dir.clone(),
             mount_point: spec.mount_point.clone(),
@@ -168,14 +218,16 @@ impl DaemonManager {
             let _ = old.mounted.unmount(true);
         }
 
-        let mounted = mount_overlay(&spec)?;
+        let (backend, mounted) = mount_platform_vfs(&spec)?;
         let active = ActiveMount {
             spec: spec.clone(),
+            backend,
             mounted,
         };
         let info = active.info();
+        let active_backend = active.backend;
         self.mounts.insert(spec.workspace.clone(), active);
-        self.persist_mount_state(&spec, true);
+        self.persist_mount_state(&spec, active_backend, true);
         Ok(info)
     }
 
@@ -202,7 +254,7 @@ impl DaemonManager {
 
     fn dirty_paths(&self, workspace: &str) -> Result<Vec<crate::protocol::DirtyPathEntry>> {
         if let Some(active) = self.mounts.get(workspace) {
-            return scan_dirty_paths(&active.mounted.config).map_err(OzError::Io);
+            return scan_dirty_paths(active.mounted.config()).map_err(OzError::Io);
         }
         let spec_path = self.ws_dir(workspace).join("spec.json");
         if let Ok(raw) = std::fs::read_to_string(&spec_path)
@@ -245,7 +297,7 @@ impl DaemonManager {
             let Ok(record) = serde_json::from_str::<MountRecord>(&raw) else {
                 continue;
             };
-            if !record.mounted || record.backend != BackendKind::LinuxFuse3 {
+            if !record.mounted || !record.backend.requires_daemon() {
                 continue;
             }
 
@@ -512,13 +564,10 @@ mod unix_signal {
     }
 }
 
-/// Runs the `oz-vfsd` Unix socket daemon until `Shutdown` IPC or `SIGTERM`/`SIGINT`.
-#[cfg(unix)]
-pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
-    use tokio::sync::Notify;
-
+async fn prepare_daemon_runtime(
+    git_dir: &Path,
+    socket_path: &Path,
+) -> Result<(File, Arc<Mutex<DaemonManager>>)> {
     let ozone_dir = git_dir.join("ozone");
     std::fs::create_dir_all(&ozone_dir)?;
     std::fs::create_dir_all(ozone_dir.join("ws"))?;
@@ -526,7 +575,7 @@ pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let _lock_file = acquire_daemon_lock(git_dir)?;
+    let lock_file = acquire_daemon_lock(git_dir)?;
 
     if socket_path.exists() {
         let _ = std::fs::remove_file(socket_path);
@@ -537,7 +586,7 @@ pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
         socket_path.to_path_buf(),
     )));
 
-    // Restore previously active FUSE mounts before opening the IPC socket so clients
+    // Restore previously active VFS mounts before opening the IPC endpoint so clients
     // connecting after startup immediately observe live mounts.
     {
         let mgr = Arc::clone(&manager);
@@ -548,6 +597,200 @@ pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
         .map_err(|e| OzError::Other(format!("startup restore panicked: {e}")))?;
     }
 
+    Ok((lock_file, manager))
+}
+
+async fn cleanup_daemon_runtime(socket_path: &Path, manager: Arc<Mutex<DaemonManager>>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        manager
+            .lock()
+            .expect("daemon lock poisoned")
+            .unmount_all_clean();
+    })
+    .await;
+    let _ = std::fs::remove_file(socket_path);
+}
+
+async fn serve_ipc_stream<S>(
+    stream: S,
+    manager: Arc<Mutex<DaemonManager>>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let req: VfsRequest = match serde_json::from_str(trimmed) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        let resp = VfsResponse::Error {
+                            code: "invalid_request".to_string(),
+                            message: err.to_string(),
+                        };
+                        if let Ok(encoded) = encode_line(&resp) {
+                            let _ = write_half.write_all(encoded.as_bytes()).await;
+                        }
+                        continue;
+                    }
+                };
+                let mgr_call = Arc::clone(&manager);
+                let call_res = tokio::task::spawn_blocking(move || {
+                    mgr_call
+                        .lock()
+                        .expect("daemon lock poisoned")
+                        .handle_request(req)
+                })
+                .await;
+
+                let (resp, should_shutdown) = match call_res {
+                    Ok(pair) => pair,
+                    Err(err) => (
+                        VfsResponse::Error {
+                            code: "internal_error".to_string(),
+                            message: err.to_string(),
+                        },
+                        false,
+                    ),
+                };
+                if let Ok(encoded) = encode_line(&resp)
+                    && write_half.write_all(encoded.as_bytes()).await.is_err()
+                {
+                    break;
+                }
+                let _ = write_half.flush().await;
+                if should_shutdown {
+                    shutdown_notify.notify_waiters();
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn write_tcp_endpoint_file(socket_path: &Path, endpoint: &str) -> std::io::Result<()> {
+    let parent = socket_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = socket_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("vfsd.sock");
+    let tmp = socket_path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, endpoint.as_bytes())?;
+    std::fs::rename(&tmp, socket_path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+mod win_signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CTRL_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler_routine: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+
+    unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+        CTRL_RECEIVED.store(true, Ordering::SeqCst);
+        1
+    }
+
+    pub(super) struct WinCtrlWatcher;
+
+    impl WinCtrlWatcher {
+        pub(super) fn install() -> Self {
+            CTRL_RECEIVED.store(false, Ordering::SeqCst);
+            unsafe {
+                let _ = SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+            }
+            Self
+        }
+
+        pub(super) async fn wait(&self) {
+            while !CTRL_RECEIVED.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    impl Drop for WinCtrlWatcher {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = SetConsoleCtrlHandler(Some(ctrl_handler), 0);
+            }
+        }
+    }
+}
+
+/// Runs the un-gated loopback TCP IPC daemon (`tcp://127.0.0.1:<port>\n` recorded at
+/// `socket_path`) until `Shutdown` IPC (or console Ctrl-C on Windows).
+pub async fn run_tcp_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+
+    let (_lock_file, manager) = prepare_daemon_runtime(git_dir, socket_path).await?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    write_tcp_endpoint_file(socket_path, &format!("tcp://127.0.0.1:{port}\n"))?;
+
+    let shutdown_notify = Arc::new(Notify::new());
+    #[cfg(windows)]
+    let ctrl_watcher = win_signal::WinCtrlWatcher::install();
+    let ctrl_c_fut = async {
+        #[cfg(windows)]
+        ctrl_watcher.wait().await;
+        #[cfg(not(windows))]
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(ctrl_c_fut);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_notify.notified() => {
+                break;
+            }
+            () = &mut ctrl_c_fut => {
+                break;
+            }
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else {
+                    break;
+                };
+                let mgr = Arc::clone(&manager);
+                let notify = Arc::clone(&shutdown_notify);
+                tokio::spawn(serve_ipc_stream(stream, mgr, notify));
+            }
+        }
+    }
+
+    drop(listener);
+    cleanup_daemon_runtime(socket_path, manager).await;
+    Ok(())
+}
+
+/// Runs the `oz-vfsd` Unix socket daemon until `Shutdown` IPC or `SIGTERM`/`SIGINT`.
+#[cfg(unix)]
+pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
+    use tokio::net::UnixListener;
+    use tokio::sync::Notify;
+
+    let (_lock_file, manager) = prepare_daemon_runtime(git_dir, socket_path).await?;
     let listener = UnixListener::bind(socket_path)?;
     let shutdown_notify = Arc::new(Notify::new());
     let signal_watcher = unix_signal::SignalWatcher::install()?;
@@ -566,85 +809,26 @@ pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
                 };
                 let mgr = Arc::clone(&manager);
                 let notify = Arc::clone(&shutdown_notify);
-                tokio::spawn(async move {
-                    let (read_half, mut write_half) = stream.into_split();
-                    let mut reader = BufReader::new(read_half);
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let trimmed = line.trim();
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
-                                let req: VfsRequest = match serde_json::from_str(trimmed) {
-                                    Ok(r) => r,
-                                    Err(err) => {
-                                        let resp = VfsResponse::Error {
-                                            code: "invalid_request".to_string(),
-                                            message: err.to_string(),
-                                        };
-                                        if let Ok(encoded) = encode_line(&resp) {
-                                            let _ = write_half.write_all(encoded.as_bytes()).await;
-                                        }
-                                        continue;
-                                    }
-                                };
-                                let mgr_call = Arc::clone(&mgr);
-                                let call_res = tokio::task::spawn_blocking(move || {
-                                    mgr_call.lock().expect("daemon lock poisoned").handle_request(req)
-                                }).await;
-
-                                let (resp, should_shutdown) = match call_res {
-                                    Ok(pair) => pair,
-                                    Err(err) => (
-                                        VfsResponse::Error {
-                                            code: "internal_error".to_string(),
-                                            message: err.to_string(),
-                                        },
-                                        false,
-                                    ),
-                                };
-                                if let Ok(encoded) = encode_line(&resp)
-                                    && write_half.write_all(encoded.as_bytes()).await.is_err()
-                                {
-                                    break;
-                                }
-                                let _ = write_half.flush().await;
-                                if should_shutdown {
-                                    notify.notify_waiters();
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
+                tokio::spawn(serve_ipc_stream(stream, mgr, notify));
             }
         }
     }
 
     drop(listener);
-    let _ = std::fs::remove_file(socket_path);
-    let mgr_cleanup = Arc::clone(&manager);
-    let _ = tokio::task::spawn_blocking(move || {
-        mgr_cleanup
-            .lock()
-            .expect("daemon lock poisoned")
-            .unmount_all_clean();
-    })
-    .await;
-
+    cleanup_daemon_runtime(socket_path, manager).await;
     Ok(())
 }
 
-/// Non-Unix compile-time stub for [`run_daemon`].
-#[cfg(not(unix))]
+/// Runs the `oz-vfsd` Windows loopback TCP + ProjFS daemon until `Shutdown` IPC or Ctrl-C.
+#[cfg(windows)]
+pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
+    run_tcp_daemon(git_dir, socket_path).await
+}
+
+/// Unsupported platform stub for [`run_daemon`].
+#[cfg(not(any(unix, windows)))]
 pub async fn run_daemon(_git_dir: &Path, _socket_path: &Path) -> Result<()> {
     Err(OzError::Other(
-        "oz-vfsd Unix socket daemon is only supported on Unix (Windows ProjFS lands in Milestone 2)"
-            .to_string(),
+        "oz-vfsd daemon is only supported on Unix and Windows".to_string(),
     ))
 }

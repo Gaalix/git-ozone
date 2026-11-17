@@ -116,13 +116,13 @@ pub struct MergedDirEntry {
     pub layer: LayerKind,
 }
 
-fn marker_path(root: &Path, rel: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn marker_path(root: &Path, rel: &Path, suffix: &str) -> PathBuf {
     let mut os = root.join(rel).into_os_string();
     os.push(suffix);
     PathBuf::from(os)
 }
 
-fn ancestors_inclusive(rel: &Path) -> Vec<PathBuf> {
+pub(crate) fn ancestors_inclusive(rel: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut cur = PathBuf::new();
     for comp in rel.components() {
@@ -237,7 +237,7 @@ pub fn resolve_rel_path(cfg: &OverlayMountConfig, rel: &Path) -> Option<Resolved
 
 /// Checks whether `rel` exists in `seed_dir` or `baseline_dir` (ignoring `upper_dir` and
 /// user whiteouts/opaque markers, while respecting `seed_whiteouts`).
-fn resolve_in_lower_layers(
+pub(crate) fn resolve_in_lower_layers(
     cfg: &OverlayMountConfig,
     rel: &Path,
 ) -> Option<(LayerKind, PathBuf, std::fs::Metadata)> {
@@ -282,7 +282,7 @@ fn resolve_in_lower_layers(
     None
 }
 
-fn lower_layers_blocked_at_dir(cfg: &OverlayMountConfig, rel_dir: &Path) -> bool {
+pub(crate) fn lower_layers_blocked_at_dir(cfg: &OverlayMountConfig, rel_dir: &Path) -> bool {
     let prefixes = ancestors_inclusive(rel_dir);
     let whiteouts = cfg.whiteouts_dir();
     let opaque = cfg.opaque_dir();

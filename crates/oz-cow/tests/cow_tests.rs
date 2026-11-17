@@ -4,15 +4,21 @@
 //! Integration tests for `oz-cow` backends, empirical reflink probing, CAS hardlink isolation,
 //! workspace lifecycle management, and `Fuse3VfsBackend` Unix socket IPC.
 
-use oz_core::{BackendKind, MountHealth, MountRecord, OzoneConfig, OzoneRepo};
+use oz_core::{BackendKind, MountHealth, OzoneConfig, OzoneRepo};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use oz_core::MountRecord;
 use oz_cow::{
     CasHardlinkBackend, GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnRequest,
-    SpawnWorkspaceOptions, WorkspaceBackend, detect_filesystem_with_ozone, gc_workspaces,
-    list_workspaces, probe_ozone_reflink, remove_workspace, spawn_workspace,
+    SpawnWorkspaceOptions, WorkspaceBackend, backend_for_kind, detect_filesystem_with_ozone,
+    gc_workspaces, list_workspaces, prepare_vfs_seed_layer, probe_ozone_reflink, remove_workspace,
+    spawn_workspace,
 };
 #[cfg(target_os = "linux")]
 use oz_cow::Fuse3VfsBackend;
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "windows")]
+use oz_cow::ProjFsVfsBackend;
+use oz_vfsd::{MountSpec, OverlayMountConfig, ProjFsLayerEngine};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use oz_vfsd::{MountInfo, VfsRequest, VfsResponse, encode_line};
 use oz_warm::capture_baseline;
 use std::path::Path;
@@ -520,4 +526,263 @@ fn fuse3_backend_fails_fast_when_auto_start_disabled_and_socket_missing() {
         .expect_err("should fail when socket missing and auto_start=false");
 
     assert!(matches!(err, oz_core::OzError::MountUnavailable { .. }));
+}
+
+#[test]
+fn windows_projfs_backend_availability_and_shared_seed_layer() {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let err = match backend_for_kind(BackendKind::WindowsProjFs) {
+            Ok(_) => panic!("WindowsProjFs must not be constructed on non-Windows"),
+            Err(e) => e,
+        };
+        match err {
+            oz_core::OzError::InvalidUsage { message, .. } => {
+                assert_eq!(message, "windows_proj_fs backend is only available on Windows");
+            }
+            other => panic!("expected InvalidUsage, got {other:?}"),
+        }
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("seed-repo");
+    std::fs::create_dir_all(repo_root.join("src")).expect("mkdir src");
+    std::fs::write(repo_root.join("README.md"), "# Base\n").expect("write readme");
+    std::fs::write(repo_root.join("src/keep.rs"), "pub fn v() -> u32 { 1 }\n").expect("write keep");
+    std::fs::write(repo_root.join("src/old.rs"), "pub fn old() {}\n").expect("write old");
+
+    let c1 = init_repo(&repo_root);
+    let ozone_dir = repo_root.join(".git/ozone");
+    std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
+    capture_baseline(&repo_root, &ozone_dir, &c1, &OzoneConfig::default()).expect("capture c1");
+
+    assert!(
+        Command::new("git")
+            .args(["checkout", "-b", "feat/projfs-seed"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git checkout -b")
+            .status
+            .success()
+    );
+    std::fs::write(repo_root.join("src/keep.rs"), "pub fn v() -> u32 { 2 }\n").expect("mod keep");
+    std::fs::write(repo_root.join("src/added.rs"), "pub fn added() {}\n").expect("add");
+    std::fs::remove_file(repo_root.join("src/old.rs")).expect("del old");
+    let c2 = commit_all(&repo_root, "branch changes");
+    let tree_out = Command::new("git")
+        .args(["rev-parse", &format!("{c2}^{{tree}}")])
+        .current_dir(&repo_root)
+        .output()
+        .expect("rev-parse tree");
+    let target_tree = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
+
+    let git_dir = repo_root.join(".git");
+    let ws_meta = git_dir.join("ozone/ws/ws-shared");
+    let upper_dir = ws_meta.join("upper");
+    let seed_dir = ws_meta.join("seed");
+    let meta_dir = ws_meta.join("meta");
+    let seed_whiteouts_dir = meta_dir.join("seed_whiteouts");
+    let baseline_dir = ozone_dir.join("baselines").join(&c1).join("root");
+    let mount_point = dir.path().join("seed-repo.oz/ws-shared");
+
+    std::fs::create_dir_all(&upper_dir).expect("mkdir upper");
+    std::fs::create_dir_all(&seed_dir).expect("mkdir seed");
+    std::fs::create_dir_all(&seed_whiteouts_dir).expect("mkdir swh");
+    std::fs::create_dir_all(meta_dir.join("whiteouts")).expect("mkdir wh");
+    std::fs::create_dir_all(meta_dir.join("opaque")).expect("mkdir opq");
+    std::fs::create_dir_all(&mount_point).expect("mkdir mnt");
+    std::fs::create_dir_all(git_dir.join("worktrees/ws-shared")).expect("mkdir wt");
+
+    let req = SpawnRequest {
+        workspace_name: "ws-shared".to_string(),
+        branch: "feat/projfs-seed".to_string(),
+        base_commit: Some(c2.clone()),
+        base_tree: Some(target_tree.clone()),
+        repo_root: repo_root.clone(),
+        git_dir: git_dir.clone(),
+        target_path: mount_point.clone(),
+        upper_dir: Some(upper_dir.clone()),
+        meta_dir: Some(meta_dir.clone()),
+        baseline_dir: Some(baseline_dir.clone()),
+        scope: Vec::new(),
+        deny: Vec::new(),
+        materialize_files: true,
+    };
+
+    prepare_vfs_seed_layer(&req, &git_dir, &seed_dir, &seed_whiteouts_dir)
+        .expect("prepare_vfs_seed_layer");
+
+    assert!(seed_dir.join(".git").is_file());
+    assert!(seed_dir.join("src/keep.rs").is_file());
+    assert!(seed_dir.join("src/added.rs").is_file());
+    assert!(!seed_dir.join("README.md").exists());
+    assert!(seed_whiteouts_dir.join("src/old.rs.oz_wh").is_file());
+
+    let spec = MountSpec {
+        workspace: "ws-shared".to_string(),
+        branch: "feat/projfs-seed".to_string(),
+        repo_root,
+        git_dir,
+        mount_point,
+        upper_dir,
+        meta_dir,
+        base_tree: Some(target_tree),
+        base_commit: Some(c2),
+        baseline_dir: Some(baseline_dir),
+        allow_other: false,
+        writeback_cache: false,
+    };
+    let engine = ProjFsLayerEngine::new(OverlayMountConfig::from_spec(&spec));
+    let src_names: Vec<String> = engine
+        .enumerate_dir("src", None)
+        .expect("enum src")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(src_names, vec!["added.rs", "keep.rs"]);
+    assert_eq!(
+        engine
+            .read_hydration_data("src/keep.rs", 0, 64)
+            .expect("read keep"),
+        b"pub fn v() -> u32 { 2 }\n"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn projfs_backend_fails_fast_when_auto_start_disabled_and_socket_missing() {
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("no-daemon-win");
+    std::fs::create_dir_all(repo_root.join(".git/ozone")).expect("mkdir");
+
+    let backend = ProjFsVfsBackend::new(false);
+    let err = backend
+        .spawn(&SpawnRequest {
+            workspace_name: "ws1".to_string(),
+            branch: "feat/ws1".to_string(),
+            base_commit: None,
+            base_tree: None,
+            repo_root: repo_root.clone(),
+            git_dir: repo_root.join(".git"),
+            target_path: dir.path().join("no-daemon-win.oz/ws1"),
+            upper_dir: None,
+            meta_dir: None,
+            baseline_dir: None,
+            scope: Vec::new(),
+            deny: Vec::new(),
+            materialize_files: true,
+        })
+        .expect_err("should fail when socket missing and auto_start=false");
+
+    assert!(matches!(err, oz_core::OzError::MountUnavailable { .. }));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn projfs_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_tcp_listener() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("win-vfs-repo");
+    std::fs::create_dir_all(repo_root.join("src")).expect("mkdir src");
+    std::fs::write(repo_root.join("README.md"), "# Win VFS\n").expect("write readme");
+    let c1 = init_repo(&repo_root);
+    let ozone_dir = repo_root.join(".git/ozone");
+    std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
+    capture_baseline(&repo_root, &ozone_dir, &c1, &OzoneConfig::default()).expect("capture c1");
+
+    assert!(
+        Command::new("git")
+            .args(["branch", "feat/win-vfs"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git branch")
+            .status
+            .success()
+    );
+
+    let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover");
+    let sock_path = repo.layout.vfsd_socket_path();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock tcp");
+    let port = listener.local_addr().expect("addr").port();
+    std::fs::write(&sock_path, format!("tcp://127.0.0.1:{port}\n")).expect("write endpoint");
+
+    let seen_requests = Arc::new(Mutex::new(Vec::<VfsRequest>::new()));
+    let seen_clone = Arc::clone(&seen_requests);
+    let server_handle = std::thread::spawn(move || {
+        let mut active_mounts: Vec<MountInfo> = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read line");
+            let req: VfsRequest = serde_json::from_str(line.trim()).expect("parse req");
+
+            let mut done = false;
+            let resp = match &req {
+                VfsRequest::Ping => VfsResponse::Pong {
+                    version: "0.1.0".to_string(),
+                    pid: std::process::id(),
+                },
+                VfsRequest::ListMounts => VfsResponse::MountList {
+                    mounts: active_mounts.clone(),
+                },
+                VfsRequest::Mount { spec } => {
+                    let info = MountInfo {
+                        workspace: spec.workspace.clone(),
+                        branch: spec.branch.clone(),
+                        mount_point: spec.mount_point.clone(),
+                        upper_dir: spec.upper_dir.clone(),
+                        mounted: true,
+                        dirty_count: 0,
+                    };
+                    active_mounts.push(info.clone());
+                    seen_clone.lock().expect("lock").push(req.clone());
+                    VfsResponse::Mounted { mount: info }
+                }
+                VfsRequest::Unmount { workspace, .. } => {
+                    active_mounts.retain(|m| m.workspace != *workspace);
+                    seen_clone.lock().expect("lock").push(req.clone());
+                    done = true;
+                    VfsResponse::Unmounted {
+                        workspace: workspace.clone(),
+                    }
+                }
+                other => VfsResponse::Error {
+                    code: "unexpected".to_string(),
+                    message: format!("unexpected request: {other:?}"),
+                },
+            };
+
+            let encoded = encode_line(&resp).expect("encode resp");
+            stream.write_all(encoded.as_bytes()).expect("write resp");
+            stream.flush().expect("flush");
+            if done {
+                break;
+            }
+        }
+    });
+
+    let mut opts = SpawnWorkspaceOptions::new("agent-win");
+    opts.branch = Some("feat/win-vfs".to_string());
+    opts.backend = Some(BackendKind::WindowsProjFs);
+    let spawned = spawn_workspace(&repo, &opts).expect("spawn projfs workspace");
+    assert_eq!(spawned.state.backend, BackendKind::WindowsProjFs);
+
+    let mount_json: MountRecord = serde_json::from_str(
+        &std::fs::read_to_string(repo.layout.ws_mount_record_path("agent-win")).expect("read"),
+    )
+    .expect("parse mount.json");
+    assert!(mount_json.mounted);
+
+    remove_workspace(&repo, "agent-win", &RemoveWorkspaceOptions::default())
+        .expect("remove projfs workspace");
+
+    server_handle.join().expect("server thread join");
+    let requests = seen_requests.lock().expect("lock");
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(&requests[0], VfsRequest::Mount { .. }));
+    assert!(matches!(&requests[1], VfsRequest::Unmount { workspace, force: true } if workspace == "agent-win"));
 }
