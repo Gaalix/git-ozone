@@ -13,8 +13,7 @@ use gix::objs::tree::EntryKind;
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use oz_core::{
-    BackendKind, ChangeKind, DirtyEntry, FileChange, MountHealth, OzError, OzoneRepo, Result,
-    WorkspaceState,
+    ChangeKind, DirtyEntry, FileChange, MountHealth, OzError, OzoneRepo, Result, WorkspaceState,
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -69,22 +68,34 @@ pub(crate) fn resolve_workspace_head(
 ) -> Result<(Option<String>, Option<ObjectId>, ObjectId)> {
     let empty_tree = ObjectId::empty_tree(gix_repo.object_hash());
 
-    if let Some(ref branch) = repo.branch {
-        let ref_name = format!("refs/heads/{branch}");
-        if let Some(mut reference) = gix_repo
-            .try_find_reference(&ref_name)
-            .map_err(|err| OzError::Git(err.to_string()))?
-        {
-            let commit = reference
-                .peel_to_commit()
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            let tree_id = commit
-                .tree_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach();
-            return Ok((Some(branch.clone()), Some(commit.id), tree_id));
+    if repo.workspace.is_some() && !repo.is_linked_worktree {
+        let mut virtual_branch = repo.branch.clone();
+        if let Some(ref ws_name) = repo.workspace {
+            let state_path = repo.layout.workspace_state_path(ws_name);
+            if state_path.is_file()
+                && let Ok(raw) = fs::read_to_string(&state_path)
+                && let Ok(state) = serde_json::from_str::<WorkspaceState>(&raw)
+            {
+                virtual_branch = Some(state.branch);
+            }
         }
-        return Ok((Some(branch.clone()), None, empty_tree));
+        if let Some(ref branch) = virtual_branch {
+            let ref_name = format!("refs/heads/{branch}");
+            if let Some(mut reference) = gix_repo
+                .try_find_reference(&ref_name)
+                .map_err(|err| OzError::Git(err.to_string()))?
+            {
+                let commit = reference
+                    .peel_to_commit()
+                    .map_err(|err| OzError::Git(err.to_string()))?;
+                let tree_id = commit
+                    .tree_id()
+                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .detach();
+                return Ok((Some(branch.clone()), Some(commit.id), tree_id));
+            }
+            return Ok((Some(branch.clone()), None, empty_tree));
+        }
     }
 
     let mut head = gix_repo
@@ -205,13 +216,20 @@ enum ScanItem {
 }
 
 fn resolve_fuse_dirs(repo: &OzoneRepo) -> Option<(PathBuf, PathBuf)> {
-    if let Some(ref record) = repo.mount_record
-        && let (Some(upper), Some(meta)) = (&record.upper_dir, &record.meta_dir)
-    {
-        return Some((upper.clone(), meta.clone()));
+    if let Some(ref record) = repo.mount_record {
+        if let (Some(upper), Some(meta)) = (&record.upper_dir, &record.meta_dir) {
+            return Some((upper.clone(), meta.clone()));
+        }
+        if record.backend.requires_daemon() {
+            let upper = repo.layout.ws_upper_dir(&record.workspace);
+            let meta = repo.layout.ws_tombstone_dir(&record.workspace);
+            if upper.is_dir() || meta.is_dir() {
+                return Some((upper, meta));
+            }
+        }
     }
     if let Some(ref state) = repo.workspace_state
-        && state.backend == BackendKind::LinuxFuse3
+        && state.backend.requires_daemon()
     {
         let upper = repo.layout.ws_upper_dir(&state.name);
         let meta = repo.layout.ws_tombstone_dir(&state.name);
@@ -936,7 +954,12 @@ fn write_resolved_leaf(
                     prune_empty_parents(&repo.workdir_path, &disk_path);
                     Ok(true)
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        || err.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    Ok(false)
+                }
                 Err(err) => Err(OzError::Io(err)),
             }
         }
@@ -1005,7 +1028,8 @@ fn write_resolved_leaf(
 }
 
 /// Restores ONLY changed paths between `(src_base_tree, src_dirty_files)` and
-/// `(dst_base_tree, dst_dirty_files)` in `repo.workdir_path` (`O(dirty_files)`).
+/// `(dst_base_tree, dst_dirty_files)` in `repo.workdir_path` (`O(dirty_files)`),
+/// returning `(touched_files_count, touched_candidate_paths)`.
 pub(crate) fn restore_working_tree(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
@@ -1013,8 +1037,9 @@ pub(crate) fn restore_working_tree(
     src_dirty_files: &[DirtyFileSnapshot],
     dst_base_tree: ObjectId,
     dst_dirty_files: &[DirtyFileSnapshot],
-) -> Result<usize> {
-    let mut candidate_paths = tree_diff_paths(gix_repo, src_base_tree, dst_base_tree)?;
+) -> Result<(usize, BTreeSet<String>)> {
+    let tree_changes = tree_diff_paths(gix_repo, src_base_tree, dst_base_tree)?;
+    let mut candidate_paths = tree_changes;
     for snap in src_dirty_files {
         candidate_paths.insert(snap.path.clone());
     }
@@ -1025,7 +1050,7 @@ pub(crate) fn restore_working_tree(
     }
 
     if candidate_paths.is_empty() {
-        return Ok(0);
+        return Ok((0, candidate_paths));
     }
 
     let dst_tree = gix_repo
@@ -1033,14 +1058,14 @@ pub(crate) fn restore_working_tree(
         .map_err(|err| OzError::Git(err.to_string()))?;
 
     let mut touched = 0usize;
-    for rel_path in candidate_paths {
-        let target_leaf = resolve_target_leaf(&dst_tree, &dst_dirty_map, &rel_path)?;
-        if write_resolved_leaf(repo, gix_repo, &rel_path, &target_leaf)? {
+    for rel_path in &candidate_paths {
+        let target_leaf = resolve_target_leaf(&dst_tree, &dst_dirty_map, rel_path)?;
+        if write_resolved_leaf(repo, gix_repo, rel_path, &target_leaf)? {
             touched += 1;
         }
     }
 
-    Ok(touched)
+    Ok((touched, candidate_paths))
 }
 
 /// Compares two snapshot states (`base_tree` + sorted `dirty_files`) for exact equality.
@@ -1073,16 +1098,27 @@ pub(crate) struct SnapshotSlice {
 
 /// Builds a complete [`WsSnapshot`] from pre/post [`SnapshotSlice`] states.
 pub(crate) fn make_ws_snapshot(post: SnapshotSlice, pre: Option<SnapshotSlice>) -> WsSnapshot {
-    let (pre_base_tree, pre_dirty_tree, pre_dirty_files, pre_head_commit, pre_branch) = match pre
-    {
-        Some(p) => (
-            Some(p.base_tree.to_hex().to_string()),
-            p.dirty_tree.map(|id| id.to_hex().to_string()),
-            p.dirty_files,
-            p.head_commit.map(|id| id.to_hex().to_string()),
-            p.branch,
-        ),
-        None => (None, None, Vec::new(), None, None),
+    let post_detached = post.branch.is_none();
+    let (
+        pre_base_tree,
+        pre_dirty_tree,
+        pre_dirty_files,
+        pre_head_commit,
+        pre_branch,
+        pre_detached,
+    ) = match pre {
+        Some(p) => {
+            let detached = p.branch.is_none();
+            (
+                Some(p.base_tree.to_hex().to_string()),
+                p.dirty_tree.map(|id| id.to_hex().to_string()),
+                p.dirty_files,
+                p.head_commit.map(|id| id.to_hex().to_string()),
+                p.branch,
+                detached,
+            )
+        }
+        None => (None, None, Vec::new(), None, None, false),
     };
     WsSnapshot {
         base_tree: post.base_tree.to_hex().to_string(),
@@ -1093,8 +1129,119 @@ pub(crate) fn make_ws_snapshot(post: SnapshotSlice, pre: Option<SnapshotSlice>) 
         pre_dirty_files,
         head_commit: post.head_commit.map(|id| id.to_hex().to_string()),
         pre_head_commit,
-        branch: post.branch.or(pre_branch),
+        branch: post.branch,
+        pre_branch,
+        pre_detached,
+        post_detached,
     }
+}
+
+/// Patches ONLY mismatched paths from `changed_paths` inside `.git/index` (or
+/// `.git/worktrees/<ws>/index`) to match `target_tree_id`, keeping system `git status`
+/// accurate after `oz undo` / `oz redo` without rewriting `.git/index` on dirty-only checkpoints.
+pub(crate) fn sync_git_index_diff(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    target_tree_id: ObjectId,
+    changed_paths: &BTreeSet<String>,
+) -> Result<()> {
+    if changed_paths.is_empty() || (repo.workspace.is_some() && !repo.is_linked_worktree) {
+        return Ok(());
+    }
+    let index_path = repo.git_dir.join("index");
+    if !index_path.is_file() {
+        return Ok(());
+    }
+
+    let (mut index, loaded_from_disk) = match gix::index::File::at(
+        &index_path,
+        gix_repo.object_hash(),
+        true,
+        gix::index::decode::Options::default(),
+    ) {
+        Ok(idx) => (idx, true),
+        Err(_) => (
+            gix_repo
+                .index_from_tree(&target_tree_id)
+                .map_err(|err| OzError::Git(err.to_string()))?,
+            false,
+        ),
+    };
+
+    let dst_tree = gix_repo
+        .find_tree(target_tree_id)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+
+    let mut patch_paths: Vec<(&str, Option<(ObjectId, gix::index::entry::Mode)>)> = Vec::new();
+    for rel in changed_paths {
+        let target = match dst_tree
+            .lookup_entry_by_path(rel.as_str())
+            .map_err(|err| OzError::Git(err.to_string()))?
+        {
+            Some(entry) if !entry.mode().is_tree() => {
+                Some((entry.object_id(), entry.mode().kind().into()))
+            }
+            _ => None,
+        };
+        let bstr = rel.as_bytes().as_bstr();
+        let unconflicted =
+            index.entry_by_path_and_stage(bstr, gix::index::entry::Stage::Unconflicted);
+        let matches = match (target, unconflicted) {
+            (Some((oid, mode)), Some(entry)) => {
+                entry.id == oid
+                    && entry.mode == mode
+                    && index
+                        .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Base)
+                        .is_none()
+                    && index
+                        .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Ours)
+                        .is_none()
+                    && index
+                        .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Theirs)
+                        .is_none()
+            }
+            (None, None) => index.entry_by_path(bstr).is_none(),
+            _ => false,
+        };
+        if !matches {
+            patch_paths.push((rel.as_str(), target));
+        }
+    }
+
+    if patch_paths.is_empty() && loaded_from_disk {
+        return Ok(());
+    }
+
+    if !patch_paths.is_empty() {
+        let patch_set: BTreeSet<&str> = patch_paths.iter().map(|(p, _)| *p).collect();
+        index.remove_tree();
+        index.remove_entries(|_, path, _| patch_set.contains(path.to_str_lossy().as_ref()));
+
+        for (rel, target) in patch_paths {
+            if let Some((object_id, mode)) = target {
+                let disk_path = repo.workdir_path.join(rel);
+                let stat = gix::index::fs::Metadata::from_path_no_follow(&disk_path)
+                    .ok()
+                    .and_then(|meta| gix::index::entry::Stat::from_fs(&meta).ok())
+                    .unwrap_or_default();
+                index.dangerously_push_entry(
+                    stat,
+                    object_id,
+                    gix::index::entry::Flags::empty(),
+                    mode,
+                    rel.as_bytes().as_bstr(),
+                );
+            }
+        }
+        index.sort_entries();
+    }
+    index
+        .write(gix::index::write::Options {
+            extensions: gix::index::write::Extensions::None,
+            skip_hash: true,
+        })
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    Ok(())
 }
 
 /// Updates `.git/ozone/state/<ws>.json` atomically if the state file already exists.

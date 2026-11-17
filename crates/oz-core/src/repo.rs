@@ -114,6 +114,15 @@ impl OzoneLayout {
         self.state_dir().join(format!("{ws}.json"))
     }
 
+    /// `.git/ozone/pinned_main.json` (virtual pinned set for the main repository).
+    ///
+    /// Stored outside `.git/ozone/state/` because `oz_cow::list_workspaces` parses
+    /// every `*.json` file inside `.git/ozone/state/` as a `WorkspaceState`.
+    #[must_use]
+    pub fn main_pinned_path(&self) -> PathBuf {
+        self.ozone_dir.join("pinned_main.json")
+    }
+
     /// `.git/ozone/baselines/` (quiescent baseline trees & warm caches).
     #[must_use]
     pub fn baselines_dir(&self) -> PathBuf {
@@ -430,9 +439,14 @@ where
         let workspace_state = read_workspace_state(&layout, &oz_match.workspace_name)?;
         let config = OzoneConfig::load_for_repo(&repo_root, &layout.ozone_dir)?;
 
-        let branch = Some(mount_record.branch.clone());
-        let head_oid = resolve_branch_head_oid(&repo_root, branch.as_deref())
-            .or_else(|| mount_record.base_commit.clone());
+        let (branch, head_oid) = if is_linked_worktree {
+            read_head_info_from_git_dir(&git_dir, &repo_root)
+        } else {
+            let br = Some(mount_record.branch.clone());
+            let oid = resolve_branch_head_oid(&repo_root, br.as_deref())
+                .or_else(|| mount_record.base_commit.clone());
+            (br, oid)
+        };
 
         let mount_health = probe_mount(&oz_match.workspace_root);
 

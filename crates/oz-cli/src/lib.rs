@@ -4,6 +4,7 @@
 //! Ozone CLI (`oz` and `git-ozone`) argument parsing, `oz.v1` JSON rendering, and subcommands.
 
 pub mod commands;
+pub mod git_shim;
 pub mod recovery;
 
 use clap::{Parser, Subcommand};
@@ -74,6 +75,8 @@ pub enum Commands {
     Doctor,
     /// Print version information (equivalent to `--version`).
     Version,
+    /// Git-compatible command shim (`alias git="oz git"`) backed by Ozone + MVCC OpLog.
+    Git(git_shim::GitShimArgs),
 }
 
 #[derive(Debug, Serialize)]
@@ -155,7 +158,12 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
     let raw_json_hint = args.iter().any(|a| a == "--json");
     let raw_agent_hint = args.iter().any(|a| a == "--agent");
 
-    let cli = match Cli::try_parse_from(&args) {
+    let (parse_slice, trailing_git_args) = match find_git_subcommand_index(&args) {
+        Some(idx) => (&args[..=idx], Some(args[idx + 1..].to_vec())),
+        None => (args.as_slice(), None),
+    };
+
+    let cli = match Cli::try_parse_from(parse_slice) {
         Ok(cli) => cli,
         Err(err) => {
             use clap::error::ErrorKind;
@@ -207,6 +215,12 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),
         Some(Commands::Version) => handle_version(invocation, mode),
+        Some(Commands::Git(mut git_args)) => {
+            if let Some(raw_tail) = trailing_git_args {
+                git_args.args = raw_tail;
+            }
+            git_shim::handle_git(&git_args, cli.directory.as_deref(), mode)
+        }
         None => {
             let msg = "no subcommand provided; run `oz --help` or `oz doctor --json`";
             if mode.json {
@@ -220,6 +234,33 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
             ExitCode::UsageOrGuardrail
         }
     }
+}
+
+fn find_git_subcommand_index(args: &[OsString]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < args.len() {
+        let s = args[i].to_string_lossy();
+        if matches!(
+            s.as_ref(),
+            "--json" | "--agent" | "-V" | "--version" | "-h" | "--help"
+        ) {
+            i += 1;
+            continue;
+        }
+        if s == "-C" {
+            i += 2;
+            continue;
+        }
+        if s.starts_with("-C") || s.starts_with("--directory=") {
+            i += 1;
+            continue;
+        }
+        if s == "--" || s.starts_with('-') {
+            return None;
+        }
+        return (s == "git").then_some(i);
+    }
+    None
 }
 
 fn handle_version(invocation: CliInvocation, mode: InteractionMode) -> ExitCode {

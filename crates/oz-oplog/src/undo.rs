@@ -7,16 +7,16 @@
 use crate::dirty::{
     SnapshotSlice, ensure_mount_healthy, make_ws_snapshot, open_gix_for_workspace, parse_oid,
     resolve_workspace_head, restore_working_tree, scan_dirty_files, snapshots_match,
-    sync_workspace_state_file, workspace_key,
+    sync_git_index_diff, sync_workspace_state_file, workspace_key,
 };
 use crate::new_op_id;
 use crate::store::{append_entry, ensure_oplog_dirs, list_entries, load_entry};
 use crate::types::{
-    ActorInfo, OpKind, OpLogEntry, RedoOutcome, RefDelta, UndoOutcome, UndoTarget, WsSnapshot,
-    DEFAULT_WORKSPACE_KEY,
+    ActorInfo, DEFAULT_WORKSPACE_KEY, OpKind, OpLogEntry, RedoOutcome, RefDelta, UndoOutcome,
+    UndoTarget, WsSnapshot,
 };
 use chrono::Utc;
-use gix::refs::transaction::{PreviousValue, RefEdit};
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 use oz_core::{FileChange, OzError, OzoneRepo, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -119,17 +119,50 @@ fn undone_targets(entry: &OpLogEntry) -> Vec<String> {
 }
 
 /// Applies atomic `gix` CAS ref updates transitioning each ref from `old` (expected current)
-/// to `new` (desired target).
-fn apply_cas_ref_deltas(
+/// to `new` (desired target), and updates `HEAD` symbolically or detached when `src` and `dst`
+/// branch/HEAD mode differ (for main repo or linked git worktrees with their own `HEAD`).
+fn apply_cas_ref_deltas_and_head(
+    update_git_head: bool,
     gix_repo: &gix::Repository,
     transitions: &BTreeMap<String, RefDelta>,
+    src: &SnapshotSlice,
+    dst: &SnapshotSlice,
     reflog_msg: &str,
 ) -> Result<()> {
-    if transitions.is_empty() {
-        return Ok(());
+    let mut edits = Vec::with_capacity(transitions.len() + 1);
+    let head_changed = src.branch != dst.branch
+        || (src.branch.is_none() && dst.branch.is_none() && src.head_commit != dst.head_commit);
+
+    let head_edit = if update_git_head && head_changed && !transitions.contains_key("HEAD") {
+        let new_target = if let Some(ref br) = dst.branch {
+            let full = FullName::try_from(format!("refs/heads/{br}").as_str())
+                .map_err(|err| OzError::Git(format!("invalid branch ref 'refs/heads/{br}': {err}")))?;
+            Some(Target::Symbolic(full))
+        } else {
+            dst.head_commit.map(Target::Object)
+        };
+        new_target.map(|target| RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: reflog_msg.into(),
+                },
+                expected: PreviousValue::Any,
+                new: target,
+            },
+            name: FullName::try_from("HEAD").expect("HEAD is valid ref name"),
+            deref: false,
+        })
+    } else {
+        None
+    };
+
+    // Place HEAD update before any ref deletions so deleting a previously checked-out branch succeeds.
+    if let Some(edit) = head_edit {
+        edits.push(edit);
     }
 
-    let mut edits = Vec::with_capacity(transitions.len());
     for (ref_name, delta) in transitions {
         if delta.old == delta.new {
             continue;
@@ -244,7 +277,11 @@ fn post_slice(snap: &WsSnapshot) -> Result<SnapshotSlice> {
         dirty_tree: snap.dirty_tree.as_deref().map(parse_oid).transpose()?,
         dirty_files: snap.dirty_files.clone(),
         head_commit: snap.head_commit.as_deref().map(parse_oid).transpose()?,
-        branch: snap.branch.clone(),
+        branch: if snap.post_detached {
+            None
+        } else {
+            snap.branch.clone()
+        },
     })
 }
 
@@ -253,12 +290,17 @@ fn pre_slice(snap: &WsSnapshot, op_id: &str) -> Result<SnapshotSlice> {
         message: format!("operation '{op_id}' has no recorded pre-operation workspace snapshot"),
         recovery: vec!["No prior state exists before the earliest checkpoint.".to_string()],
     })?;
+    let branch = if snap.pre_detached {
+        None
+    } else {
+        snap.pre_branch.clone().or_else(|| snap.branch.clone())
+    };
     Ok(SnapshotSlice {
         base_tree: parse_oid(pre_base)?,
         dirty_tree: snap.pre_dirty_tree.as_deref().map(parse_oid).transpose()?,
         dirty_files: snap.pre_dirty_files.clone(),
         head_commit: snap.pre_head_commit.as_deref().map(parse_oid).transpose()?,
-        branch: snap.branch.clone(),
+        branch,
     })
 }
 
@@ -532,9 +574,17 @@ fn apply_and_record_transition(
     plan: TransitionPlan,
     actor: ActorInfo,
 ) -> Result<UndoOutcome> {
-    apply_cas_ref_deltas(gix_repo, &plan.ref_deltas, plan.reflog_label)?;
+    let update_git_head = repo.workspace.is_none() || repo.is_linked_worktree;
+    apply_cas_ref_deltas_and_head(
+        update_git_head,
+        gix_repo,
+        &plan.ref_deltas,
+        &src,
+        &dst,
+        plan.reflog_label,
+    )?;
 
-    let restored_files = restore_working_tree(
+    let (restored_files, touched_paths) = restore_working_tree(
         repo,
         gix_repo,
         src.base_tree,
@@ -543,13 +593,17 @@ fn apply_and_record_transition(
         &dst.dirty_files,
     )?;
 
+    if !touched_paths.is_empty() {
+        sync_git_index_diff(repo, gix_repo, dst.base_tree, &touched_paths)?;
+    }
+
     let op_id = new_op_id();
     let restored_base_tree = dst.base_tree.to_hex().to_string();
     let restored_dirty_tree = dst.dirty_tree.map(|id| id.to_hex().to_string());
     let dst_head = dst.head_commit;
     let dst_base = dst.base_tree;
     let dst_dirty_for_state = dst.dirty_files.clone();
-    let dst_branch = dst.branch.clone().or_else(|| src.branch.clone());
+    let dst_branch = dst.branch.clone();
 
     let ws_snap = make_ws_snapshot(dst, Some(src));
     let mut ws_snapshots = BTreeMap::new();

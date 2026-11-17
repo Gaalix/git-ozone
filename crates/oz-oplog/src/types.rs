@@ -102,6 +102,15 @@ pub struct WsSnapshot {
     /// Checked-out branch name for this workspace, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Pre-operation checked-out branch name (`None` if detached or legacy entry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_branch: Option<String>,
+    /// True when pre-operation `HEAD` was detached (distinguishes detached from legacy omitted `pre_branch`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pre_detached: bool,
+    /// True when post-operation `HEAD` was detached.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub post_detached: bool,
 }
 
 const fn is_false(value: &bool) -> bool {

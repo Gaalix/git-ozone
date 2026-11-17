@@ -7,6 +7,7 @@
 //! configuration parsing, canonical `oz.v1` JSON envelope formatting, non-interactive
 //! detection, exit codes, and shared domain types.
 
+pub mod checkout;
 pub mod commit;
 pub mod config;
 pub mod diff;
@@ -17,7 +18,17 @@ pub mod repo;
 pub mod status;
 pub mod types;
 
-pub use commit::{CommitOptions, CommitOutcome, commit_changes, compute_change_id, ensure_change_id_trailer};
+pub use checkout::{
+    CheckoutPathsOptions, CheckoutPathsOutcome, PathspecMatcher, SwitchOptions, SwitchOutcome,
+    checkout_paths, create_or_reset_local_branch, is_local_branch, list_git_worktree_entries,
+    list_tracked_paths_in_head, resolves_as_revision, switch_branch,
+};
+
+pub use commit::{
+    CommitOptions, CommitOutcome, add_pinned_paths, clear_pinned_paths, commit_changes,
+    commit_changes_ignoring_pinned, compute_change_id, ensure_change_id_trailer,
+    read_pinned_paths, remove_pinned_paths, write_pinned_paths,
+};
 pub use config::{
     DEFAULT_MAX_BASELINE_GB, DEFAULT_MAX_BLOB_MB, DEFAULT_WORKSPACE_TEMPLATE, DaemonConfig,
     GuardrailsConfig, OzoneConfig, WarmConfig, normalize_lexical, validate_workspace_name,
