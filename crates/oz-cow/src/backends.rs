@@ -16,7 +16,10 @@ use oz_core::{BackendKind, MountRecord, OzError, OzoneLayout, Result};
 #[cfg(target_os = "linux")]
 use oz_core::{MountHealth, OzoneRepo, probe_mount_health_os};
 #[cfg(target_os = "linux")]
-use oz_vfsd::{MountSpec, VfsRequest, VfsResponse, encode_line, find_oz_vfsd_bin};
+use oz_vfsd::{
+    MountSpec, ensure_daemon_and_mounts, lazy_unmount_fuse, mount_via_daemon, ping_daemon,
+    unmount_via_daemon,
+};
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -217,23 +220,14 @@ impl Fuse3VfsBackend {
         workspace_path: &Path,
     ) -> Result<()> {
         let layout = OzoneLayout::from_git_common_dir(git_common_dir);
-        let sock_path = layout.vfsd_socket_path();
 
-        if sock_path.exists() {
-            let _ = send_vfs_request(
-                &sock_path,
-                &VfsRequest::Unmount {
-                    workspace: workspace.to_string(),
-                    force: true,
-                },
-            );
-        }
+        let _ = unmount_via_daemon(git_common_dir, workspace, true);
 
         // Fallback unmount if mountpoint is still active or ENOTCONN.
         if probe_mount_health_os(workspace_path) == MountHealth::DisconnectedEnotconn
             || is_linux_mountpoint(workspace_path)
         {
-            let _ = run_fusermount3_unmount(workspace_path);
+            let _ = lazy_unmount_fuse(workspace_path);
         }
 
         if workspace_path.exists() {
@@ -246,6 +240,7 @@ impl Fuse3VfsBackend {
             && let Ok(mut rec) = serde_json::from_str::<MountRecord>(&raw)
         {
             rec.mounted = false;
+            rec.daemon_pid = None;
             rec.updated_at = Utc::now();
             if let Ok(json) = serde_json::to_string_pretty(&rec) {
                 let _ = std::fs::write(&mount_json, json);
@@ -326,19 +321,35 @@ impl WorkspaceBackend for Fuse3VfsBackend {
         };
         write_json_atomic(&mount_json_path, &mount_record)?;
 
-        let stream = connect_or_start_vfsd(
-            &sock_path,
-            &git_common_dir,
-            &req.workspace_name,
-            &req.target_path,
-            self.auto_start,
-        )?;
+        let wrap_mount_err = |err: OzError| match err {
+            OzError::MountUnavailable { .. } => err,
+            other => OzError::MountUnavailable {
+                workspace: req.workspace_name.clone(),
+                path: req.target_path.clone(),
+                errno: None,
+                message: other.to_string(),
+            },
+        };
+
+        if self.auto_start {
+            let _ = ensure_daemon_and_mounts(&git_common_dir).map_err(wrap_mount_err)?;
+        } else if ping_daemon(&sock_path).is_err() {
+            return Err(OzError::MountUnavailable {
+                workspace: req.workspace_name.clone(),
+                path: req.target_path.clone(),
+                errno: None,
+                message: format!(
+                    "oz-vfsd socket {} is not listening and daemon.auto_start is disabled",
+                    sock_path.display()
+                ),
+            });
+        }
 
         let spec = MountSpec {
             workspace: req.workspace_name.clone(),
             branch: req.branch.clone(),
             repo_root: req.repo_root.clone(),
-            git_dir: git_common_dir,
+            git_dir: git_common_dir.clone(),
             mount_point: req.target_path.clone(),
             upper_dir: upper_dir.clone(),
             meta_dir: meta_dir.clone(),
@@ -349,42 +360,20 @@ impl WorkspaceBackend for Fuse3VfsBackend {
             writeback_cache: self.writeback_cache,
         };
 
-        let resp = send_vfs_request_on_stream(
-            stream,
-            &sock_path,
-            &VfsRequest::Mount {
-                spec: Box::new(spec),
-            },
-        )
-        .map_err(|err| OzError::MountUnavailable {
-            workspace: req.workspace_name.clone(),
-            path: req.target_path.clone(),
-            errno: None,
-            message: err.to_string(),
-        })?;
+        let _mount_info = mount_via_daemon(&git_common_dir, &spec).map_err(wrap_mount_err)?;
 
-        match resp {
-            VfsResponse::Mounted { .. } => {
-                mount_record.mounted = true;
-                mount_record.updated_at = Utc::now();
-                write_json_atomic(&mount_json_path, &mount_record)?;
-            }
-            VfsResponse::Error { code, message } => {
-                return Err(OzError::MountUnavailable {
-                    workspace: req.workspace_name.clone(),
-                    path: req.target_path.clone(),
-                    errno: None,
-                    message: format!("oz-vfsd rejected mount ({code}): {message}"),
-                });
-            }
-            other => {
-                return Err(OzError::MountUnavailable {
-                    workspace: req.workspace_name.clone(),
-                    path: req.target_path.clone(),
-                    errno: None,
-                    message: format!("unexpected oz-vfsd response to Mount: {other:?}"),
-                });
-            }
+        // Prefer the MountRecord persisted by live oz-vfsd (includes daemon_pid), or update
+        // mounted=true if a test mock listener handled the IPC without writing mount.json.
+        if let Ok(raw) = std::fs::read_to_string(&mount_json_path)
+            && let Ok(persisted) = serde_json::from_str::<MountRecord>(&raw)
+            && persisted.mounted
+        {
+            mount_record = persisted;
+        } else {
+            mount_record.daemon_pid = ping_daemon(&sock_path).ok().map(|p| p.pid);
+            mount_record.mounted = true;
+            mount_record.updated_at = Utc::now();
+            write_json_atomic(&mount_json_path, &mount_record)?;
         }
 
         Ok(SpawnedWorkspace {
@@ -409,7 +398,7 @@ impl WorkspaceBackend for Fuse3VfsBackend {
         if probe_mount_health_os(workspace_path) == MountHealth::DisconnectedEnotconn
             || is_linux_mountpoint(workspace_path)
         {
-            let _ = run_fusermount3_unmount(workspace_path);
+            let _ = lazy_unmount_fuse(workspace_path);
         }
         remove_dir_if_exists(workspace_path)
     }
@@ -618,143 +607,6 @@ fn whiteout_marker_path(root: &Path, rel_path: &str) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn connect_or_start_vfsd(
-    sock_path: &Path,
-    git_common_dir: &Path,
-    workspace: &str,
-    mount_point: &Path,
-    auto_start: bool,
-) -> Result<std::os::unix::net::UnixStream> {
-    use std::os::unix::net::UnixStream;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    if let Ok(stream) = UnixStream::connect(sock_path) {
-        return Ok(stream);
-    }
-
-    if !auto_start {
-        return Err(OzError::MountUnavailable {
-            workspace: workspace.to_string(),
-            path: mount_point.to_path_buf(),
-            errno: None,
-            message: format!(
-                "oz-vfsd socket {} is not listening and daemon.auto_start is disabled",
-                sock_path.display()
-            ),
-        });
-    }
-
-    let bin = find_oz_vfsd_bin()?;
-    if sock_path.exists() {
-        let _ = std::fs::remove_file(sock_path);
-    }
-
-    let log_path = git_common_dir.join("ozone/vfsd.log");
-    let stdout_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .ok();
-    let stderr_file = stdout_file.as_ref().and_then(|f| f.try_clone().ok());
-
-    let mut cmd = Command::new(&bin);
-    cmd.arg("--git-dir")
-        .arg(git_common_dir)
-        .arg("--socket")
-        .arg(sock_path)
-        .stdin(Stdio::null());
-    match stdout_file {
-        Some(f) => {
-            cmd.stdout(Stdio::from(f));
-        }
-        None => {
-            cmd.stdout(Stdio::null());
-        }
-    }
-    match stderr_file {
-        Some(f) => {
-            cmd.stderr(Stdio::from(f));
-        }
-        None => {
-            cmd.stderr(Stdio::null());
-        }
-    }
-
-    let mut child = cmd.spawn().map_err(|err| OzError::MountUnavailable {
-        workspace: workspace.to_string(),
-        path: mount_point.to_path_buf(),
-        errno: err.raw_os_error(),
-        message: format!("failed to spawn {}: {err}", bin.display()),
-    })?;
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if let Ok(stream) = UnixStream::connect(sock_path) {
-            return Ok(stream);
-        }
-        if let Some(status) = child.try_wait()? {
-            return Err(OzError::MountUnavailable {
-                workspace: workspace.to_string(),
-                path: mount_point.to_path_buf(),
-                errno: None,
-                message: format!(
-                    "oz-vfsd ({}) exited early with status {status} before opening {}",
-                    bin.display(),
-                    sock_path.display()
-                ),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
-
-    Err(OzError::MountUnavailable {
-        workspace: workspace.to_string(),
-        path: mount_point.to_path_buf(),
-        errno: None,
-        message: format!(
-            "timed out waiting for oz-vfsd socket at {}",
-            sock_path.display()
-        ),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn send_vfs_request(sock_path: &Path, req: &VfsRequest) -> Result<VfsResponse> {
-    let stream = std::os::unix::net::UnixStream::connect(sock_path)?;
-    send_vfs_request_on_stream(stream, sock_path, req)
-}
-
-#[cfg(target_os = "linux")]
-fn send_vfs_request_on_stream(
-    mut stream: std::os::unix::net::UnixStream,
-    sock_path: &Path,
-    req: &VfsRequest,
-) -> Result<VfsResponse> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::time::Duration;
-
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    let line = encode_line(req)?;
-    stream.write_all(line.as_bytes())?;
-    stream.flush()?;
-
-    let mut reader = BufReader::new(stream);
-    let mut resp_line = String::new();
-    reader.read_line(&mut resp_line)?;
-    if resp_line.trim().is_empty() {
-        return Err(OzError::Other(format!(
-            "empty response from oz-vfsd socket {}",
-            sock_path.display()
-        )));
-    }
-    let resp: VfsResponse = serde_json::from_str(resp_line.trim())?;
-    Ok(resp)
-}
-
-#[cfg(target_os = "linux")]
 fn is_linux_mountpoint(path: &Path) -> bool {
     let Ok(canon) = std::fs::canonicalize(path) else {
         return false;
@@ -767,21 +619,6 @@ fn is_linux_mountpoint(path: &Path) -> bool {
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .any(|mp| mp == target)
-}
-
-#[cfg(target_os = "linux")]
-fn run_fusermount3_unmount(path: &Path) -> std::io::Result<()> {
-    let status = std::process::Command::new("fusermount3")
-        .args(["-u", "-z"])
-        .arg(path)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "fusermount3 -u -z exited with {status}"
-        )))
-    }
 }
 
 #[cfg(target_os = "linux")]

@@ -1,9 +1,17 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Ozone CLI (`oz` and `git-ozone`) argument parsing, `oz.v1` JSON rendering, and `doctor`.
+//! Ozone CLI (`oz` and `git-ozone`) argument parsing, `oz.v1` JSON rendering, and subcommands.
+
+pub mod commands;
+pub mod recovery;
 
 use clap::{Parser, Subcommand};
+use commands::{
+    CheckpointArgs, CommitArgs, DiffArgs, SetupArgs, UndoArgs, WsCommand, handle_checkpoint,
+    handle_commit, handle_diff, handle_redo, handle_setup, handle_status, handle_undo, handle_ws,
+    print_json_envelope,
+};
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, InteractionMode, MountHealth, OzError,
     OzoneRepo, find_git_ozone_on_path,
@@ -45,6 +53,23 @@ pub struct Cli {
 /// Supported Ozone subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Manage CoW/FUSE3 agent workspaces (`spawn`, `list`, `rm`, `gc`).
+    #[command(subcommand)]
+    Ws(WsCommand),
+    /// Show indexless `O(dirty_files)` working-tree status with deterministic `[f1]` / `h1a` IDs.
+    Status,
+    /// Show Histogram unified diffs with deterministic file/hunk IDs.
+    Diff(DiffArgs),
+    /// Stage-free commit (whole tree or `--pick` / `--exclude` partial) with guardrails & `Change-Id`.
+    Commit(CommitArgs),
+    /// Capture an `< 10 ms` MVCC working-tree checkpoint in the OpLog.
+    Checkpoint(CheckpointArgs),
+    /// Sub-10 ms undo of recent OpLog mutations/checkpoints or un-checkpointed edits.
+    Undo(UndoArgs),
+    /// Re-apply the most recently undone operation.
+    Redo,
+    /// Initialize colocated `.git/ozone/` metadata and optionally install `systemd --user` unit.
+    Setup(SetupArgs),
     /// Inspect OS, filesystem (`statfs`), FUSE3/reflink readiness, and colocated repo status.
     Doctor,
     /// Print version information (equivalent to `--version`).
@@ -170,6 +195,16 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
     }
 
     match cli.command {
+        Some(Commands::Ws(ws_cmd)) => handle_ws(ws_cmd, cli.directory.as_deref(), mode),
+        Some(Commands::Status) => handle_status(cli.directory.as_deref(), mode),
+        Some(Commands::Diff(args)) => handle_diff(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Commit(args)) => handle_commit(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Checkpoint(args)) => {
+            handle_checkpoint(&args, cli.directory.as_deref(), mode)
+        }
+        Some(Commands::Undo(args)) => handle_undo(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Redo) => handle_redo(cli.directory.as_deref(), mode),
+        Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),
         Some(Commands::Version) => handle_version(invocation, mode),
         None => {
@@ -376,15 +411,6 @@ pub fn build_doctor_envelope(
         env = env.with_warning(w);
     }
     Ok(env)
-}
-
-fn print_json_envelope<T: Serialize>(env: &Envelope<T>) {
-    match env.to_json_pretty() {
-        Ok(s) => println!("{s}"),
-        Err(err) => {
-            eprintln!("error: failed to serialize oz.v1 envelope: {err}");
-        }
-    }
 }
 
 fn print_doctor_human(env: &Envelope<DoctorReport>) {

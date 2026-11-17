@@ -1624,6 +1624,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "484be5657551d7868d67587df967fb4fcbe9d266a761cc855aaa148fda0b3cc7"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "imara-diff"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1882,6 +1898,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "oz-agent",
  "oz-cloud-api",
  "oz-core",
@@ -1914,10 +1931,14 @@ dependencies = [
 name = "oz-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "chrono",
  "gix",
  "globset",
+ "ignore",
+ "imara-diff",
  "libc",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
@@ -1930,14 +1951,22 @@ dependencies = [
 name = "oz-cow"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "chrono",
+ "filetime",
+ "gix",
+ "globset",
  "libc",
  "oz-core",
+ "oz-vfsd",
+ "oz-warm",
+ "rayon",
  "reflink-copy",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "walkdir",
 ]
 
 [[package]]
@@ -1975,25 +2004,33 @@ dependencies = [
  "chrono",
  "fs4",
  "gix",
+ "ignore",
  "oz-core",
+ "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "ulid",
+ "walkdir",
 ]
 
 [[package]]
 name = "oz-vfsd"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
+ "fs4",
  "fuser",
+ "libc",
  "oz-core",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]
@@ -2004,9 +2041,10 @@ dependencies = [
  "chrono",
  "filetime",
  "fs4",
+ "gix",
  "oz-core",
- "oz-cow",
  "rayon",
+ "reflink-copy",
  "serde",
  "serde_json",
  "tempfile",

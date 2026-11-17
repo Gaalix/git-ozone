@@ -393,38 +393,56 @@ fn fuse3_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_unix_listener
     let seen_requests = Arc::new(Mutex::new(Vec::<VfsRequest>::new()));
     let seen_clone = Arc::clone(&seen_requests);
     let server_handle = std::thread::spawn(move || {
-        // Expect exactly 2 IPC calls: Mount, then Unmount.
-        for stream in listener.incoming().take(2) {
+        let mut active_mounts: Vec<MountInfo> = Vec::new();
+        for stream in listener.incoming() {
             let mut stream = stream.expect("accept");
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut line = String::new();
             reader.read_line(&mut line).expect("read request line");
             let req: VfsRequest = serde_json::from_str(line.trim()).expect("parse VfsRequest");
 
+            let mut done = false;
             let resp = match &req {
-                VfsRequest::Mount { spec } => VfsResponse::Mounted {
-                    mount: MountInfo {
+                VfsRequest::Ping => VfsResponse::Pong {
+                    version: "0.1.0".to_string(),
+                    pid: std::process::id(),
+                },
+                VfsRequest::ListMounts => VfsResponse::MountList {
+                    mounts: active_mounts.clone(),
+                },
+                VfsRequest::Mount { spec } => {
+                    let info = MountInfo {
                         workspace: spec.workspace.clone(),
                         branch: spec.branch.clone(),
                         mount_point: spec.mount_point.clone(),
                         upper_dir: spec.upper_dir.clone(),
                         mounted: true,
                         dirty_count: 0,
-                    },
-                },
-                VfsRequest::Unmount { workspace, .. } => VfsResponse::Unmounted {
-                    workspace: workspace.clone(),
-                },
+                    };
+                    active_mounts.push(info.clone());
+                    seen_clone.lock().expect("lock").push(req.clone());
+                    VfsResponse::Mounted { mount: info }
+                }
+                VfsRequest::Unmount { workspace, .. } => {
+                    active_mounts.retain(|m| m.workspace != *workspace);
+                    seen_clone.lock().expect("lock").push(req.clone());
+                    done = true;
+                    VfsResponse::Unmounted {
+                        workspace: workspace.clone(),
+                    }
+                }
                 other => VfsResponse::Error {
                     code: "unexpected".to_string(),
                     message: format!("unexpected request: {other:?}"),
                 },
             };
 
-            seen_clone.lock().expect("lock").push(req);
             let encoded = encode_line(&resp).expect("encode resp");
             stream.write_all(encoded.as_bytes()).expect("write resp");
             stream.flush().expect("flush");
+            if done {
+                break;
+            }
         }
     });
 
