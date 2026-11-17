@@ -47,12 +47,29 @@ pub fn select_backend(probe: &FilesystemProbe, configured: Option<BackendKind>) 
 /// Probes OS, host filesystem type, reflink support, and VFS daemon readiness for `path`.
 pub fn detect_filesystem(path: &Path) -> Result<FilesystemProbe> {
     let existing = nearest_existing_ancestor(path);
+    let existing_ozone = find_existing_ozone_dir(&existing);
+    detect_filesystem_with_ozone(path, existing_ozone.as_deref())
+}
+
+/// Probes OS, host filesystem type, empirical `.git/ozone/.probe` reflink support, and VFS daemon
+/// readiness for `path`.
+pub fn detect_filesystem_with_ozone(
+    path: &Path,
+    ozone_dir: Option<&Path>,
+) -> Result<FilesystemProbe> {
+    let existing = nearest_existing_ancestor(path);
     let (fs_kind, fs_magic) = probe_fs_kind(&existing)?;
-    let reflink_supported = fs_kind.supports_reflinks();
+    let reflink_supported = if let Some(oz) = ozone_dir {
+        probe_ozone_reflink(oz)
+    } else if fs_kind.supports_reflinks() {
+        probe_reflink_ephemeral(&existing).unwrap_or_else(|| fs_kind.supports_reflinks())
+    } else {
+        false
+    };
 
     let fuse = detect_linux_fuse();
     let projfs_ready = detect_windows_projfs();
-    let recommended_backend = recommend_backend(&fs_kind, fuse.as_ref(), projfs_ready);
+    let recommended_backend = recommend_backend(&fs_kind, reflink_supported, fuse.as_ref(), projfs_ready);
 
     Ok(FilesystemProbe {
         os: std::env::consts::OS.to_string(),
@@ -67,6 +84,58 @@ pub fn detect_filesystem(path: &Path) -> Result<FilesystemProbe> {
     })
 }
 
+/// Empirically probes native kernel reflink support inside `<ozone_dir>/.probe`.
+#[must_use]
+pub fn probe_ozone_reflink(ozone_dir: &Path) -> bool {
+    probe_reflink_in_dir(&ozone_dir.join(".probe"))
+}
+
+/// Empirically tests `reflink_copy::reflink` using temporary probe files inside `probe_dir`.
+#[must_use]
+pub fn probe_reflink_in_dir(probe_dir: &Path) -> bool {
+    if std::fs::create_dir_all(probe_dir).is_err() {
+        return false;
+    }
+    probe_reflink_ephemeral(probe_dir).unwrap_or(false)
+}
+
+fn probe_reflink_ephemeral(dir: &Path) -> Option<bool> {
+    if !dir.is_dir() {
+        return None;
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let src = dir.join(format!(".oz_probe_src_{pid}_{seq}"));
+    let dst = dir.join(format!(".oz_probe_dst_{pid}_{seq}"));
+
+    if std::fs::write(&src, b"ozone-reflink-probe").is_err() {
+        let _ = std::fs::remove_file(&src);
+        return None;
+    }
+    let _ = std::fs::remove_file(&dst);
+    let res = reflink_copy::reflink(&src, &dst).is_ok();
+    let _ = std::fs::remove_file(&dst);
+    let _ = std::fs::remove_file(&src);
+    Some(res)
+}
+
+fn find_existing_ozone_dir(path: &Path) -> Option<PathBuf> {
+    for anc in path.ancestors() {
+        let cand = anc.join(".git/ozone");
+        if cand.is_dir() {
+            return Some(cand);
+        }
+        if anc.file_name().is_some_and(|n| n == "ozone")
+            && anc.parent().and_then(|p| p.file_name()).is_some_and(|n| n == ".git")
+            && anc.is_dir()
+        {
+            return Some(anc.to_path_buf());
+        }
+    }
+    None
+}
+
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     for anc in path.ancestors() {
         if anc.exists() {
@@ -78,22 +147,25 @@ fn nearest_existing_ancestor(path: &Path) -> PathBuf {
 
 fn recommend_backend(
     fs_kind: &FilesystemKind,
+    reflink_supported: bool,
     fuse: Option<&LinuxFuseReadiness>,
     projfs_ready: Option<bool>,
 ) -> BackendKind {
     match std::env::consts::OS {
         "macos" => {
-            if matches!(fs_kind, FilesystemKind::Apfs) {
+            if reflink_supported && matches!(fs_kind, FilesystemKind::Apfs) {
                 BackendKind::ApfsClonefile
             } else {
                 BackendKind::CasHardlink
             }
         }
         "linux" => {
-            if matches!(
-                fs_kind,
-                FilesystemKind::Btrfs | FilesystemKind::Xfs | FilesystemKind::Bcachefs
-            ) {
+            if reflink_supported
+                && matches!(
+                    fs_kind,
+                    FilesystemKind::Btrfs | FilesystemKind::Xfs | FilesystemKind::Bcachefs
+                )
+            {
                 BackendKind::LinuxFiclone
             } else if fuse.is_some_and(|f| f.ready) {
                 BackendKind::LinuxFuse3
@@ -102,7 +174,7 @@ fn recommend_backend(
             }
         }
         "windows" => {
-            if matches!(fs_kind, FilesystemKind::Refs) {
+            if reflink_supported && matches!(fs_kind, FilesystemKind::Refs) {
                 BackendKind::WindowsRefsClone
             } else if matches!(fs_kind, FilesystemKind::Ntfs) && projfs_ready == Some(true) {
                 BackendKind::WindowsProjFs

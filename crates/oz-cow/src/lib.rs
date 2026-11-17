@@ -3,9 +3,27 @@
 
 //! Tiered Copy-on-Write workspace backend trait and host filesystem capability detection.
 
+pub mod backends;
 pub mod detect;
+pub mod lifecycle;
+pub mod materialize;
 
-pub use detect::{FilesystemProbe, LinuxFuseReadiness, detect_filesystem, select_backend};
+pub use backends::{CasHardlinkBackend, backend_for_kind};
+#[cfg(target_os = "macos")]
+pub use backends::ClonefileBackend;
+#[cfg(target_os = "linux")]
+pub use backends::{FicloneBackend, Fuse3VfsBackend};
+#[cfg(target_os = "windows")]
+pub use backends::RefsCloneBackend;
+pub use detect::{
+    FilesystemProbe, LinuxFuseReadiness, detect_filesystem, detect_filesystem_with_ozone,
+    probe_ozone_reflink, probe_reflink_in_dir, select_backend,
+};
+pub use lifecycle::{
+    GcWorkspacesOptions, GcWorkspacesReport, RemoveWorkspaceOptions, RemovedWorkspace,
+    SpawnWorkspaceOptions, SpawnedWorkspaceInfo, WorkspaceSummary, gc_workspaces, list_workspaces,
+    remove_workspace, spawn_workspace,
+};
 
 use oz_core::{BackendKind, MountRecord, OzError, Result};
 use serde::{Deserialize, Serialize};
