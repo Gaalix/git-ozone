@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: OzoneVCS.Ozone
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: Ozone Contributors
+PublisherUrl: https://github.com/ozone-vcs
+PublisherSupportUrl: https://github.com/ozone-vcs/ozone/issues
+PackageName: Ozone
+PackageUrl: https://github.com/ozone-vcs/ozone
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/ozone-vcs/ozone/blob/main/LICENSE-MIT
+Copyright: Copyright (c) 2026 Ozone Contributors
+ShortDescription: Pure-Rust CoW Git client and multi-agent workspace engine
+Description: |-
+  Ozone (oz / git-ozone / oz-vfsd) is a cross-platform, GitHub-compatible
+  pure-Rust Git client designed for zero-bloat parallel coding agent workspaces.
+  On Windows, Ozone supports instant copy-on-write workspaces on ReFS Dev Drives
+  and standard NTFS via Windows Projected File System (ProjFS, enabled via
+  `oz setup`), warm build caches, stage-free hunk commits, sub-10ms MVCC undo,
+  collision radar, native GitHub stacked PRs, and a built-in MCP server.
+Moniker: oz
+Tags:
+  - git
+  - vcs
+  - worktree
+  - cow
+  - projfs
+  - rust
+  - ai-agents
+  - mcp
+ReleaseNotesUrl: https://github.com/ozone-vcs/ozone/releases/tag/v1.0.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
