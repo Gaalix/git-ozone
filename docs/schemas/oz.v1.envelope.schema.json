@@ -554,6 +554,61 @@
         "engine_elapsed_ms": { "type": "number", "minimum": 0 }
       }
     },
+    "DoctorCheck": {
+      "type": "object",
+      "required": ["id", "category", "status", "summary"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "enum": [
+            "linux_fuse",
+            "windows_projfs_dev_drive",
+            "macos_apfs_clonefile",
+            "oz_vfsd",
+            "git_ozone_alias",
+            "ssh_signing",
+            "github_auth",
+            "repository_mounts"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "enum": ["platform", "daemon", "cli", "security", "auth", "repository"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ok", "warn", "fail", "not_applicable"]
+        },
+        "summary": { "type": "string" },
+        "remediation": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DoctorActiveMount": {
+      "type": "object",
+      "required": [
+        "workspace",
+        "branch",
+        "backend",
+        "mount_point",
+        "mounted",
+        "health"
+      ],
+      "properties": {
+        "workspace": { "type": "string" },
+        "branch": { "type": "string" },
+        "backend": { "$ref": "#/$defs/BackendKind" },
+        "mount_point": { "type": "string" },
+        "mounted": { "type": "boolean" },
+        "health": { "type": "string" },
+        "daemon_pid": { "type": "integer", "minimum": 0 },
+        "upper_dir": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
     "DoctorData": {
       "type": "object",
       "required": [
@@ -566,12 +621,16 @@
         "filesystem",
         "fuse",
         "projfs_ready",
+        "windows",
+        "macos",
         "recommended_backend",
         "oz_vfsd",
         "git_ozone_alias",
         "repo",
         "ssh_signing",
-        "github_auth"
+        "github_auth",
+        "checks",
+        "remediation_hints"
       ],
       "properties": {
         "invoked_as": { "type": "string" },
@@ -582,11 +641,18 @@
         "target_path": { "type": "string" },
         "filesystem": {
           "type": "object",
-          "required": ["type", "reflink_ready"],
+          "required": [
+            "type",
+            "reflink_ready",
+            "apfs_clonefile_ready",
+            "dev_drive_refs"
+          ],
           "properties": {
             "type": { "type": "string" },
             "magic": { "type": "string" },
-            "reflink_ready": { "type": "boolean" }
+            "reflink_ready": { "type": "boolean" },
+            "apfs_clonefile_ready": { "type": "boolean" },
+            "dev_drive_refs": { "type": "boolean" }
           }
         },
         "fuse": {
@@ -601,26 +667,127 @@
           }
         },
         "projfs_ready": { "type": ["boolean", "null"] },
+        "windows": {
+          "type": ["object", "null"],
+          "required": [
+            "projfs_feature",
+            "projfs_dll_path",
+            "projfs_dll_exists",
+            "projfs_ready",
+            "dev_drive_detected",
+            "refs_clone_ready"
+          ],
+          "properties": {
+            "projfs_feature": { "type": "string" },
+            "projfs_dll_path": { "type": "string" },
+            "projfs_dll_exists": { "type": "boolean" },
+            "projfs_ready": { "type": "boolean" },
+            "dev_drive_detected": { "type": "boolean" },
+            "refs_clone_ready": { "type": "boolean" }
+          }
+        },
+        "macos": {
+          "type": ["object", "null"],
+          "required": ["apfs_detected", "clonefile_ready"],
+          "properties": {
+            "apfs_detected": { "type": "boolean" },
+            "clonefile_ready": { "type": "boolean" }
+          }
+        },
         "recommended_backend": { "$ref": "#/$defs/BackendKind" },
         "oz_vfsd": {
           "type": "object",
-          "required": ["found", "path"],
+          "required": [
+            "found",
+            "path",
+            "daemon_required",
+            "daemon_running",
+            "daemon_health"
+          ],
           "properties": {
             "found": { "type": "boolean" },
-            "path": { "type": ["string", "null"] }
+            "path": { "type": ["string", "null"] },
+            "daemon_required": { "type": "boolean" },
+            "daemon_running": { "type": "boolean" },
+            "daemon_health": {
+              "type": "string",
+              "enum": [
+                "binary_missing",
+                "running",
+                "stopped_with_active_mounts",
+                "stopped_idle",
+                "not_required"
+              ]
+            },
+            "daemon_pid": { "type": "integer", "minimum": 0 },
+            "daemon_version": { "type": "string" },
+            "socket_path": { "type": "string" }
           }
         },
         "git_ozone_alias": {
           "type": "object",
-          "required": ["invoked_as", "found_on_path"],
+          "required": ["invoked_as", "found_on_path", "resolved"],
           "properties": {
             "invoked_as": { "type": "string" },
-            "found_on_path": { "type": ["string", "null"] }
+            "found_on_path": { "type": ["string", "null"] },
+            "resolved": { "type": "boolean" },
+            "sibling_path": { "type": "string" }
           }
         },
-        "repo": { "type": "object" },
+        "repo": {
+          "type": "object",
+          "required": [
+            "in_repo",
+            "colocated",
+            "repo_root",
+            "git_dir",
+            "git_common_dir",
+            "ozone_dir",
+            "ozone_initialized",
+            "is_linked_worktree",
+            "workspace",
+            "branch",
+            "head_oid",
+            "mount_health",
+            "repo_config_present",
+            "local_config_present",
+            "active_mount_count",
+            "unhealthy_mount_count",
+            "active_mounts"
+          ],
+          "properties": {
+            "in_repo": { "type": "boolean" },
+            "colocated": { "type": "boolean" },
+            "repo_root": { "type": ["string", "null"] },
+            "git_dir": { "type": ["string", "null"] },
+            "git_common_dir": { "type": ["string", "null"] },
+            "ozone_dir": { "type": ["string", "null"] },
+            "ozone_initialized": { "type": "boolean" },
+            "is_linked_worktree": { "type": "boolean" },
+            "workspace": { "type": ["string", "null"] },
+            "branch": { "type": ["string", "null"] },
+            "head_oid": { "type": ["string", "null"] },
+            "mount_health": { "type": ["string", "null"] },
+            "repo_config_present": { "type": "boolean" },
+            "local_config_present": { "type": "boolean" },
+            "active_mount_count": { "type": "integer", "minimum": 0 },
+            "unhealthy_mount_count": { "type": "integer", "minimum": 0 },
+            "active_mounts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/DoctorActiveMount" }
+            }
+          }
+        },
         "ssh_signing": { "type": "object" },
-        "github_auth": { "type": "object" }
+        "github_auth": { "type": "object" },
+        "checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/DoctorCheck" }
+        },
+        "remediation_hints": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
       }
     },
     "PrCreateData": {

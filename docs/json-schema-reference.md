@@ -278,7 +278,7 @@ Returns `RadarReport`:
 
 ### `oz doctor --json`
 
-Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw credentials — tokens are masked):
+Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw credentials — tokens are masked and inline private key PEM payloads are redacted):
 
 ```json
 {
@@ -288,7 +288,13 @@ Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw cr
   "os": "linux",
   "arch": "x86_64",
   "target_path": "/dev/my-repo",
-  "filesystem": { "type": "ext4", "magic": "0xef53", "reflink_ready": false },
+  "filesystem": {
+    "type": "ext4",
+    "magic": "0xef53",
+    "reflink_ready": false,
+    "apfs_clonefile_ready": false,
+    "dev_drive_refs": false
+  },
   "fuse": {
     "dev_fuse_exists": true,
     "dev_fuse_rw": true,
@@ -298,9 +304,23 @@ Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw cr
     "ready": true
   },
   "projfs_ready": null,
+  "windows": null,
+  "macos": null,
   "recommended_backend": "linux_fuse3",
-  "oz_vfsd": { "found": true, "path": "/usr/bin/oz-vfsd" },
-  "git_ozone_alias": { "invoked_as": "oz", "found_on_path": "/usr/bin/git-ozone" },
+  "oz_vfsd": {
+    "found": true,
+    "path": "/usr/bin/oz-vfsd",
+    "daemon_required": true,
+    "daemon_running": false,
+    "daemon_health": "stopped_idle",
+    "socket_path": "/dev/my-repo/.git/ozone/vfsd.sock"
+  },
+  "git_ozone_alias": {
+    "invoked_as": "oz",
+    "found_on_path": "/usr/bin/git-ozone",
+    "resolved": true,
+    "sibling_path": "/usr/bin/git-ozone"
+  },
   "repo": {
     "in_repo": true,
     "colocated": true,
@@ -315,7 +335,21 @@ Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw cr
     "head_oid": "a1b2c3d4...",
     "mount_health": "healthy",
     "repo_config_present": true,
-    "local_config_present": false
+    "local_config_present": false,
+    "active_mount_count": 1,
+    "unhealthy_mount_count": 0,
+    "active_mounts": [
+      {
+        "workspace": "agent-auth",
+        "branch": "feat/pkce",
+        "backend": "linux_fuse3",
+        "mount_point": "/dev/my-repo.oz/agent-auth",
+        "mounted": true,
+        "health": "healthy",
+        "daemon_pid": 42100,
+        "upper_dir": "/dev/my-repo/.git/ozone/ws/agent-auth/upper"
+      }
+    ]
   },
   "ssh_signing": {
     "enabled_by_default": true,
@@ -338,9 +372,25 @@ Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw cr
     "authenticated": true,
     "token_source": { "kind": "github_token_env" },
     "masked_token": "ghp_****1234"
-  }
+  },
+  "checks": [
+    {
+      "id": "linux_fuse",
+      "category": "platform",
+      "status": "ok",
+      "summary": "/dev/fuse is read/write and fusermount3 is ready (fusermount3 version: 3.14.0)"
+    }
+  ],
+  "remediation_hints": []
 }
 ```
+
+Key M4 diagnostic fields:
+* `windows`: Populated on Windows (`projfs_feature`, `projfs_dll_path`, `projfs_dll_exists`, `projfs_ready`, `dev_drive_detected`, `refs_clone_ready`); `null` on non-Windows.
+* `macos`: Populated on macOS (`apfs_detected`, `clonefile_ready`); `null` on non-macOS.
+* `oz_vfsd.daemon_health`: One of `"running"`, `"stopped_idle"`, `"stopped_with_active_mounts"`, `"binary_missing"`, or `"not_required"` (with optional `daemon_pid`, `daemon_version`, `socket_path`).
+* `checks[]`: Structured diagnostics across all 8 canonical check IDs (`linux_fuse`, `windows_projfs_dev_drive`, `macos_apfs_clonefile`, `oz_vfsd`, `git_ozone_alias`, `ssh_signing`, `github_auth`, `repository_mounts`) with `status` (`"ok" | "warn" | "fail" | "not_applicable"`), `category` (`"platform" | "daemon" | "cli" | "security" | "auth" | "repository"`), `summary`, and optional `remediation[]`.
+* `remediation_hints[]`: Deduplicated actionable commands aggregated across failing/warning checks.
 
 ---
 
