@@ -358,15 +358,15 @@ fn snapshot_worktree_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 // ============================================================================
-// GATE 1: Pure-Rust Cargo.lock & v0.3.0 Release-Candidate Gate
+// GATE 1: Pure-Rust Cargo.lock & Workspace Version Consistency Gate
 // ============================================================================
 
 #[test]
 fn gate1_pure_rust_cargo_lock_and_v0_3_0_release_candidate() {
-    assert_eq!(
-        env!("CARGO_PKG_VERSION"),
-        "0.3.0",
-        "workspace package version must be 0.3.0 for Milestone 3 RC"
+    let expected_version = env!("CARGO_PKG_VERSION");
+    assert!(
+        !expected_version.is_empty(),
+        "workspace package version must not be empty"
     );
 
     // 1. Verify both `oz --version --json` and `git-ozone --version --json`.
@@ -387,17 +387,18 @@ fn gate1_pure_rust_cargo_lock_and_v0_3_0_release_candidate() {
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["data"]["name"], "oz");
         assert_eq!(parsed["data"]["invoked_as"], expected_invoked);
-        assert_eq!(parsed["data"]["version"], "0.3.0");
+        assert_eq!(parsed["data"]["version"], expected_version);
         assert_eq!(parsed["data"]["pure_rust"], true);
         assert_eq!(parsed["data"]["non_interactive"], true);
     }
 
-    // 2. Verify root Cargo.toml and Cargo.lock are synced to 0.3.0 and free of forbidden C bindings.
+    // 2. Verify root Cargo.toml and Cargo.lock are synced to the workspace version and free of forbidden C bindings.
     let root = workspace_root_dir();
     let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let expected_toml_version = format!("version = \"{expected_version}\"");
     assert!(
-        cargo_toml.contains("version = \"0.3.0\""),
-        "root Cargo.toml must declare workspace version 0.3.0"
+        cargo_toml.contains(&expected_toml_version),
+        "root Cargo.toml must declare workspace version {expected_version}"
     );
 
     let cargo_lock = fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
@@ -428,10 +429,10 @@ fn gate1_pure_rust_cargo_lock_and_v0_3_0_release_candidate() {
         "oz-cloud-api",
     ];
     for crate_name in workspace_crates {
-        let expected_stanza = format!("name = \"{crate_name}\"\nversion = \"0.3.0\"");
+        let expected_stanza = format!("name = \"{crate_name}\"\nversion = \"{expected_version}\"");
         assert!(
             cargo_lock.contains(&expected_stanza),
-            "Cargo.lock missing synced v0.3.0 package entry for {crate_name}"
+            "Cargo.lock missing synced v{expected_version} package entry for {crate_name}"
         );
     }
 }

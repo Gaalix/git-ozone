@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const GITHUB_API_VERSION: &str = "2022-11-28";
-const CLIENT_USER_AGENT: &str = "ozone-vcs/0.3.0";
+const CLIENT_USER_AGENT: &str = concat!("ozone-vcs/", env!("CARGO_PKG_VERSION"));
 
 /// Branch pointer on a GitHub Pull Request (`head` or `base`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

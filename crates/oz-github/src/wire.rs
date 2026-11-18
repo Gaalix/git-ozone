@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-const USER_AGENT_VALUE: &str = "ozone/0.3.0";
+const USER_AGENT_VALUE: &str = concat!("ozone/", env!("CARGO_PKG_VERSION"));
 
 /// HTTP authentication header mode when connecting over `http://` or `https://`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

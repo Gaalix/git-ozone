@@ -18,16 +18,17 @@ use commands::{
     handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope,
 };
 use oz_core::{
-    BackendKind, CliInvocation, Envelope, ExitCode, InteractionMode, MountHealth, OzError,
-    OzoneRepo, SshSigningReport, expand_tilde_path, find_git_ozone_on_path,
-    inspect_ssh_signing_config, resolve_signing_private_key,
+    BackendKind, CliInvocation, Envelope, ExitCode, FilesystemKind, InteractionMode, MountHealth,
+    MountRecord, OzError, OzoneRepo, SshSigningReport, expand_tilde_path, find_git_ozone_on_path,
+    inspect_ssh_signing_config, probe_mount_health_os, resolve_signing_private_key,
 };
 use oz_cow::{FilesystemProbe, LinuxFuseReadiness, detect_filesystem, select_backend};
 use oz_github::{GitHubAuthProbe, probe_github_auth};
-use oz_vfsd::find_oz_vfsd_bin;
+use oz_vfsd::{PROJFS_ENABLE_POWERSHELL_CMD, find_oz_vfsd_bin, ping_daemon, projected_fs_dll_path};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Top-level CLI options shared across `oz` and `git-ozone`.
 #[derive(Debug, Parser)]
@@ -125,6 +126,25 @@ struct VersionData {
     non_interactive: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorCheckStatus {
+    Ok,
+    Warn,
+    Fail,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorCheck {
+    pub id: &'static str,
+    pub category: &'static str,
+    pub status: DoctorCheckStatus,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DoctorFilesystem {
     #[serde(rename = "type")]
@@ -132,18 +152,62 @@ pub struct DoctorFilesystem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub magic: Option<String>,
     pub reflink_ready: bool,
+    pub apfs_clonefile_ready: bool,
+    pub dev_drive_refs: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorWindowsDiagnostics {
+    pub projfs_feature: &'static str,
+    pub projfs_dll_path: PathBuf,
+    pub projfs_dll_exists: bool,
+    pub projfs_ready: bool,
+    pub dev_drive_detected: bool,
+    pub refs_clone_ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorMacOsDiagnostics {
+    pub apfs_detected: bool,
+    pub clonefile_ready: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DoctorVfsd {
     pub found: bool,
     pub path: Option<PathBuf>,
+    pub daemon_required: bool,
+    pub daemon_running: bool,
+    pub daemon_health: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DoctorGitOzoneAlias {
     pub invoked_as: &'static str,
     pub found_on_path: Option<PathBuf>,
+    pub resolved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sibling_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorActiveMount {
+    pub workspace: String,
+    pub branch: String,
+    pub backend: BackendKind,
+    pub mount_point: PathBuf,
+    pub mounted: bool,
+    pub health: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upper_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +226,9 @@ pub struct DoctorRepoStatus {
     pub mount_health: Option<&'static str>,
     pub repo_config_present: bool,
     pub local_config_present: bool,
+    pub active_mount_count: usize,
+    pub unhealthy_mount_count: usize,
+    pub active_mounts: Vec<DoctorActiveMount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,12 +242,16 @@ pub struct DoctorReport {
     pub filesystem: DoctorFilesystem,
     pub fuse: Option<LinuxFuseReadiness>,
     pub projfs_ready: Option<bool>,
+    pub windows: Option<DoctorWindowsDiagnostics>,
+    pub macos: Option<DoctorMacOsDiagnostics>,
     pub recommended_backend: BackendKind,
     pub oz_vfsd: DoctorVfsd,
     pub git_ozone_alias: DoctorGitOzoneAlias,
     pub repo: DoctorRepoStatus,
     pub ssh_signing: SshSigningReport,
     pub github_auth: GitHubAuthProbe,
+    pub checks: Vec<DoctorCheck>,
+    pub remediation_hints: Vec<String>,
 }
 
 /// Entrypoint shared by `oz` and `git-ozone` binaries.
@@ -237,6 +308,27 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
 
     if cli.version || matches!(cli.command, Some(Commands::Version)) {
         return handle_version(invocation, mode);
+    }
+
+    if let Some(ref dir) = cli.directory
+        && !matches!(
+            cli.command,
+            Some(Commands::Clone(_)) | Some(Commands::Git(_)) | Some(Commands::Version) | None
+        )
+        && !dir.exists()
+        && probe_mount_health_os(dir) != MountHealth::DisconnectedEnotconn
+    {
+        let err = OzError::InvalidUsage {
+            message: format!("cannot change to '{}': no such directory", dir.display()),
+            recovery: vec!["Pass an existing directory path to `-C <DIR>`.".to_string()],
+        };
+        if mode.json {
+            let env = Envelope::from_error(&err);
+            print_json_envelope(&env);
+        } else {
+            eprintln!("error: {err}");
+        }
+        return err.exit_code();
     }
 
     match cli.command {
@@ -401,32 +493,38 @@ pub fn build_doctor_envelope(
     let recommended_backend = select_backend(&probe, configured_backend);
 
     let vfsd_bin = find_oz_vfsd_bin().ok();
-    let git_ozone_alias = find_git_ozone_on_path();
+    let git_ozone_alias_path = find_git_ozone_on_path();
+    let git_ozone_sibling = find_sibling_git_ozone_bin();
 
-    let mut warnings = repo_warnings;
-    let mut recovery_commands = Vec::new();
+    let active_mounts = repo_opt
+        .as_ref()
+        .map(collect_active_mounts)
+        .unwrap_or_default();
+    let active_mount_count = active_mounts.iter().filter(|m| m.mounted).count();
+    let unhealthy_mount_count = active_mounts
+        .iter()
+        .filter(|m| m.mounted && m.health != MountHealth::Healthy.as_str())
+        .count();
+    let has_active_daemon_mounts = active_mounts
+        .iter()
+        .any(|m| m.mounted && m.backend.requires_daemon());
 
-    if let Some(ref fuse) = probe.fuse
-        && !fuse.ready
-        && !probe.reflink_supported
-    {
-        warnings.push(
-            "Linux FUSE3 readiness incomplete (/dev/fuse rw or fusermount3 missing); will fall back to cas_hardlink"
-                .to_string(),
-        );
-    }
+    let oz_vfsd = probe_vfsd_status(
+        vfsd_bin,
+        recommended_backend.requires_daemon() || has_active_daemon_mounts,
+        has_active_daemon_mounts,
+        repo_opt.as_ref(),
+    );
 
-    if let Some(ref repo) = repo_opt
-        && repo.mount_health == MountHealth::DisconnectedEnotconn
-    {
-        warnings.push(format!(
-            "Workspace '{}' mountpoint returned ENOTCONN; real host disk .git/ozone state remains intact",
-            repo.workspace.as_deref().unwrap_or("unknown")
-        ));
-        recovery_commands.push("oz ws list --json".to_string());
-    }
+    let git_ozone_alias = DoctorGitOzoneAlias {
+        invoked_as: invocation.binary_name(),
+        resolved: git_ozone_alias_path.is_some() || invocation == CliInvocation::GitOzone,
+        found_on_path: git_ozone_alias_path,
+        sibling_path: git_ozone_sibling,
+    };
 
-    let ssh_signing = inspect_ssh_signing_for_doctor(repo_opt.as_ref());
+    let mut ssh_signing = inspect_ssh_signing_for_doctor(repo_opt.as_ref());
+    sanitize_ssh_signing_report(&mut ssh_signing);
     let github_auth = probe_github_auth(repo_opt.as_ref(), None, None);
 
     let (workspace, branch, head_oid, repo_status) = match repo_opt {
@@ -446,6 +544,9 @@ pub fn build_doctor_envelope(
                 mount_health: Some(repo.mount_health.as_str()),
                 repo_config_present: repo.repo_root.join(".ozone.toml").is_file(),
                 local_config_present: repo.layout.local_config_path().is_file(),
+                active_mount_count,
+                unhealthy_mount_count,
+                active_mounts,
             };
             (repo.workspace, repo.branch, repo.head_oid, status)
         }
@@ -468,9 +569,31 @@ pub fn build_doctor_envelope(
                 mount_health: None,
                 repo_config_present: false,
                 local_config_present: false,
+                active_mount_count: 0,
+                unhealthy_mount_count: 0,
+                active_mounts: Vec::new(),
             },
         ),
     };
+
+    let (windows, macos) = build_platform_diagnostics(&probe);
+    let apfs_clonefile_ready = macos.as_ref().is_some_and(|m| m.clonefile_ready);
+    let dev_drive_refs = windows.as_ref().is_some_and(|w| w.dev_drive_detected);
+
+    let (checks, mut warnings, recovery_commands, remediation_hints) = evaluate_doctor_checks(
+        &probe,
+        recommended_backend,
+        windows.as_ref(),
+        macos.as_ref(),
+        &oz_vfsd,
+        &git_ozone_alias,
+        &repo_status,
+        &ssh_signing,
+        &github_auth,
+    );
+
+    let mut all_warnings = repo_warnings;
+    all_warnings.append(&mut warnings);
 
     let report = DoctorReport {
         invoked_as: invocation.binary_name(),
@@ -483,21 +606,21 @@ pub fn build_doctor_envelope(
             fs_type: probe.fs_kind.as_str().to_string(),
             magic: probe.fs_magic,
             reflink_ready: probe.reflink_supported,
+            apfs_clonefile_ready,
+            dev_drive_refs,
         },
         fuse: probe.fuse,
         projfs_ready: probe.projfs_ready,
+        windows,
+        macos,
         recommended_backend,
-        oz_vfsd: DoctorVfsd {
-            found: vfsd_bin.is_some(),
-            path: vfsd_bin,
-        },
-        git_ozone_alias: DoctorGitOzoneAlias {
-            invoked_as: invocation.binary_name(),
-            found_on_path: git_ozone_alias,
-        },
+        oz_vfsd,
+        git_ozone_alias,
         repo: repo_status,
         ssh_signing,
         github_auth,
+        checks,
+        remediation_hints,
     };
 
     let mut env = Envelope::success(report)
@@ -505,10 +628,696 @@ pub fn build_doctor_envelope(
         .with_branch(branch)
         .with_head_oid(head_oid)
         .with_recovery_commands(recovery_commands);
-    for w in warnings {
+    for w in all_warnings {
         env = env.with_warning(w);
     }
     Ok(env)
+}
+
+fn build_platform_diagnostics(
+    probe: &FilesystemProbe,
+) -> (
+    Option<DoctorWindowsDiagnostics>,
+    Option<DoctorMacOsDiagnostics>,
+) {
+    let windows = if probe.os == "windows" {
+        let dll_path = projected_fs_dll_path();
+        let projfs_ready = probe.projfs_ready.unwrap_or(false);
+        let dev_drive_detected = probe.fs_kind == FilesystemKind::Refs;
+        Some(DoctorWindowsDiagnostics {
+            projfs_feature: "Client-ProjFS",
+            projfs_dll_exists: projfs_ready || dll_path.is_file(),
+            projfs_dll_path: dll_path,
+            projfs_ready,
+            dev_drive_detected,
+            refs_clone_ready: dev_drive_detected && probe.reflink_supported,
+        })
+    } else {
+        None
+    };
+
+    let macos = if probe.os == "macos" {
+        let apfs_detected = probe.fs_kind == FilesystemKind::Apfs;
+        Some(DoctorMacOsDiagnostics {
+            apfs_detected,
+            clonefile_ready: apfs_detected && probe.reflink_supported,
+        })
+    } else {
+        None
+    };
+
+    (windows, macos)
+}
+
+fn find_sibling_git_ozone_bin() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    #[cfg(windows)]
+    let name = "git-ozone.exe";
+    #[cfg(not(windows))]
+    let name = "git-ozone";
+    let cand = dir.join(name);
+    cand.is_file().then_some(cand)
+}
+
+fn collect_active_mounts(repo: &OzoneRepo) -> Vec<DoctorActiveMount> {
+    let ws_dir = repo.layout.ws_dir();
+    let Ok(entries) = std::fs::read_dir(&ws_dir) else {
+        return Vec::new();
+    };
+
+    let mut mounts = Vec::new();
+    for entry in entries.flatten() {
+        let mount_json = entry.path().join("mount.json");
+        let Ok(raw) = std::fs::read_to_string(&mount_json) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<MountRecord>(&raw) else {
+            continue;
+        };
+        let health = probe_mount_health_os(&record.mount_point).as_str();
+        mounts.push(DoctorActiveMount {
+            workspace: record.workspace,
+            branch: record.branch,
+            backend: record.backend,
+            mount_point: record.mount_point,
+            mounted: record.mounted,
+            health,
+            daemon_pid: record.daemon_pid,
+            upper_dir: record.upper_dir,
+        });
+    }
+    mounts.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+    mounts
+}
+
+fn probe_vfsd_status(
+    vfsd_bin: Option<PathBuf>,
+    daemon_required: bool,
+    has_active_daemon_mounts: bool,
+    repo_opt: Option<&OzoneRepo>,
+) -> DoctorVfsd {
+    let found = vfsd_bin.is_some();
+    let socket_path = repo_opt
+        .filter(|r| r.layout.is_initialized())
+        .map(|r| r.layout.vfsd_socket_path());
+
+    let pong = socket_path
+        .as_deref()
+        .filter(|p| p.exists())
+        .and_then(|p| ping_daemon(p).ok());
+
+    let (daemon_running, daemon_pid, daemon_version) = match pong {
+        Some(p) => (true, Some(p.pid), Some(p.version)),
+        None => (false, None, None),
+    };
+
+    let daemon_health = if !found && daemon_required {
+        "binary_missing"
+    } else if daemon_running {
+        "running"
+    } else if has_active_daemon_mounts
+        || repo_opt.is_some_and(|r| r.mount_health == MountHealth::DisconnectedEnotconn)
+    {
+        "stopped_with_active_mounts"
+    } else if daemon_required {
+        "stopped_idle"
+    } else {
+        "not_required"
+    };
+
+    DoctorVfsd {
+        found,
+        path: vfsd_bin,
+        daemon_required,
+        daemon_running,
+        daemon_health,
+        daemon_pid,
+        daemon_version,
+        socket_path,
+    }
+}
+
+fn push_unique(target: &mut Vec<String>, item: impl Into<String>) {
+    let s = item.into();
+    if !s.is_empty() && !target.contains(&s) {
+        target.push(s);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_doctor_checks(
+    probe: &FilesystemProbe,
+    recommended_backend: BackendKind,
+    windows: Option<&DoctorWindowsDiagnostics>,
+    macos: Option<&DoctorMacOsDiagnostics>,
+    oz_vfsd: &DoctorVfsd,
+    git_ozone_alias: &DoctorGitOzoneAlias,
+    repo: &DoctorRepoStatus,
+    ssh_signing: &SshSigningReport,
+    github_auth: &GitHubAuthProbe,
+) -> (Vec<DoctorCheck>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut checks = Vec::with_capacity(8);
+    let mut warnings = Vec::new();
+    let mut recovery_commands = Vec::new();
+    let mut remediation_hints = Vec::new();
+
+    // 1. Linux `/dev/fuse` and `fusermount3`
+    if let Some(ref fuse) = probe.fuse {
+        if fuse.ready {
+            let ver = fuse
+                .fusermount3_version
+                .as_deref()
+                .unwrap_or("version unknown");
+            checks.push(DoctorCheck {
+                id: "linux_fuse",
+                category: "platform",
+                status: DoctorCheckStatus::Ok,
+                summary: format!("/dev/fuse is read/write and fusermount3 is ready ({ver})"),
+                remediation: Vec::new(),
+            });
+        } else {
+            let mut rem = Vec::new();
+            if !fuse.dev_fuse_exists {
+                rem.push(
+                    "sudo modprobe fuse  # or run container with --device /dev/fuse".to_string(),
+                );
+            } else if !fuse.dev_fuse_rw {
+                rem.push("sudo usermod -aG fuse $USER  # then re-login for /dev/fuse rw".to_string());
+            }
+            if fuse.fusermount3_path.is_none() {
+                rem.push("sudo apt-get install -y fuse3".to_string());
+            }
+            if probe.reflink_supported {
+                checks.push(DoctorCheck {
+                    id: "linux_fuse",
+                    category: "platform",
+                    status: DoctorCheckStatus::Ok,
+                    summary: format!(
+                        "Native {} reflinks available; Linux FUSE3 is optional",
+                        probe.fs_kind
+                    ),
+                    remediation: Vec::new(),
+                });
+            } else {
+                warnings.push(
+                    "Linux FUSE3 readiness incomplete (/dev/fuse rw or fusermount3 missing); will fall back to cas_hardlink"
+                        .to_string(),
+                );
+                for r in &rem {
+                    push_unique(&mut recovery_commands, r.clone());
+                    push_unique(&mut remediation_hints, r.clone());
+                }
+                checks.push(DoctorCheck {
+                    id: "linux_fuse",
+                    category: "platform",
+                    status: DoctorCheckStatus::Warn,
+                    summary: format!(
+                        "Linux FUSE3 incomplete (dev_fuse_exists={}, dev_fuse_rw={}, fusermount3={}); falling back to cas_hardlink",
+                        fuse.dev_fuse_exists,
+                        fuse.dev_fuse_rw,
+                        fuse.fusermount3_path.is_some()
+                    ),
+                    remediation: rem,
+                });
+            }
+        }
+    } else {
+        checks.push(DoctorCheck {
+            id: "linux_fuse",
+            category: "platform",
+            status: DoctorCheckStatus::NotApplicable,
+            summary: format!("Linux FUSE3 check not applicable on {}", probe.os),
+            remediation: Vec::new(),
+        });
+    }
+
+    // 2. Windows `Client-ProjFS` / `ProjectedFSLib.dll` and Dev Drive / ReFS
+    if let Some(win) = windows {
+        if win.dev_drive_detected && win.refs_clone_ready {
+            checks.push(DoctorCheck {
+                id: "windows_projfs_dev_drive",
+                category: "platform",
+                status: DoctorCheckStatus::Ok,
+                summary: format!(
+                    "Windows Dev Drive (ReFS) detected with native block-clone support (Client-ProjFS ready={})",
+                    win.projfs_ready
+                ),
+                remediation: Vec::new(),
+            });
+        } else if win.projfs_ready {
+            checks.push(DoctorCheck {
+                id: "windows_projfs_dev_drive",
+                category: "platform",
+                status: DoctorCheckStatus::Ok,
+                summary: format!(
+                    "Windows {} ({}) ready; Dev Drive (ReFS) not detected on target volume",
+                    win.projfs_feature,
+                    win.projfs_dll_path.display()
+                ),
+                remediation: Vec::new(),
+            });
+        } else {
+            let rem = vec![
+                "oz setup --enable-projfs".to_string(),
+                PROJFS_ENABLE_POWERSHELL_CMD.to_string(),
+                "Optional: move repositories onto a Windows Dev Drive (ReFS) for native zero-copy clones"
+                    .to_string(),
+            ];
+            warnings.push(
+                "Windows Client-ProjFS (ProjectedFSLib.dll) is not enabled and target volume is not Dev Drive (ReFS); will fall back to cas_hardlink"
+                    .to_string(),
+            );
+            push_unique(&mut recovery_commands, "oz setup --enable-projfs");
+            for r in &rem {
+                push_unique(&mut remediation_hints, r.clone());
+            }
+            checks.push(DoctorCheck {
+                id: "windows_projfs_dev_drive",
+                category: "platform",
+                status: DoctorCheckStatus::Warn,
+                summary: format!(
+                    "Windows {} ({}) missing and Dev Drive (ReFS) not detected",
+                    win.projfs_feature,
+                    win.projfs_dll_path.display()
+                ),
+                remediation: rem,
+            });
+        }
+    } else {
+        checks.push(DoctorCheck {
+            id: "windows_projfs_dev_drive",
+            category: "platform",
+            status: DoctorCheckStatus::NotApplicable,
+            summary: format!(
+                "Windows Client-ProjFS and Dev Drive (ReFS) check not applicable on {}",
+                probe.os
+            ),
+            remediation: Vec::new(),
+        });
+    }
+
+    // 3. macOS APFS / `clonefile`
+    if let Some(mac) = macos {
+        if mac.apfs_detected && mac.clonefile_ready {
+            checks.push(DoctorCheck {
+                id: "macos_apfs_clonefile",
+                category: "platform",
+                status: DoctorCheckStatus::Ok,
+                summary: "macOS APFS detected with native clonefile(2) CoW support".to_string(),
+                remediation: Vec::new(),
+            });
+        } else {
+            let rem = vec![
+                "Store repositories on an APFS volume to enable zero-byte clonefile(2) workspaces"
+                    .to_string(),
+            ];
+            warnings.push(format!(
+                "macOS APFS clonefile(2) unavailable on {} filesystem; will fall back to cas_hardlink",
+                probe.fs_kind
+            ));
+            for r in &rem {
+                push_unique(&mut remediation_hints, r.clone());
+            }
+            checks.push(DoctorCheck {
+                id: "macos_apfs_clonefile",
+                category: "platform",
+                status: DoctorCheckStatus::Warn,
+                summary: format!(
+                    "macOS APFS clonefile(2) not ready (apfs={}, clonefile_ready={})",
+                    mac.apfs_detected, mac.clonefile_ready
+                ),
+                remediation: rem,
+            });
+        }
+    } else {
+        checks.push(DoctorCheck {
+            id: "macos_apfs_clonefile",
+            category: "platform",
+            status: DoctorCheckStatus::NotApplicable,
+            summary: format!("macOS APFS clonefile(2) check not applicable on {}", probe.os),
+            remediation: Vec::new(),
+        });
+    }
+
+    // 4. `oz-vfsd` binary discovery & daemon health
+    match oz_vfsd.daemon_health {
+        "binary_missing" => {
+            let rem = vec![
+                "Install `oz-vfsd` alongside `oz` or export OZ_VFSD_BIN=/path/to/oz-vfsd".to_string(),
+            ];
+            warnings.push(format!(
+                "oz-vfsd binary not found on PATH or next to oz (required by recommended backend '{recommended_backend}')"
+            ));
+            for r in &rem {
+                push_unique(&mut recovery_commands, r.clone());
+                push_unique(&mut remediation_hints, r.clone());
+            }
+            checks.push(DoctorCheck {
+                id: "oz_vfsd",
+                category: "daemon",
+                status: DoctorCheckStatus::Fail,
+                summary: format!(
+                    "oz-vfsd binary missing (required for {recommended_backend} backend)"
+                ),
+                remediation: rem,
+            });
+        }
+        "stopped_with_active_mounts" => {
+            let rem = vec!["oz ws list --json".to_string(), "oz status --json".to_string()];
+            warnings.push(
+                "oz-vfsd daemon is not running while VFS workspace mounts are registered; run any workspace command to auto-remount"
+                    .to_string(),
+            );
+            for r in &rem {
+                push_unique(&mut recovery_commands, r.clone());
+                push_unique(&mut remediation_hints, r.clone());
+            }
+            checks.push(DoctorCheck {
+                id: "oz_vfsd",
+                category: "daemon",
+                status: DoctorCheckStatus::Warn,
+                summary: "oz-vfsd daemon stopped with active registered VFS mounts".to_string(),
+                remediation: rem,
+            });
+        }
+        "running" => {
+            let version_mismatch = oz_vfsd
+                .daemon_version
+                .as_deref()
+                .is_some_and(|v| v != env!("CARGO_PKG_VERSION"));
+            if version_mismatch {
+                let rem = vec![
+                    "Restart oz-vfsd so the running daemon matches the installed oz CLI version"
+                        .to_string(),
+                ];
+                warnings.push(format!(
+                    "Running oz-vfsd daemon version ({}) differs from oz CLI version ({})",
+                    oz_vfsd.daemon_version.as_deref().unwrap_or("unknown"),
+                    env!("CARGO_PKG_VERSION")
+                ));
+                for r in &rem {
+                    push_unique(&mut remediation_hints, r.clone());
+                }
+                checks.push(DoctorCheck {
+                    id: "oz_vfsd",
+                    category: "daemon",
+                    status: DoctorCheckStatus::Warn,
+                    summary: format!(
+                        "oz-vfsd running (pid={}, version={}) but CLI is {}",
+                        oz_vfsd.daemon_pid.unwrap_or(0),
+                        oz_vfsd.daemon_version.as_deref().unwrap_or("unknown"),
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    remediation: rem,
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    id: "oz_vfsd",
+                    category: "daemon",
+                    status: DoctorCheckStatus::Ok,
+                    summary: format!(
+                        "oz-vfsd binary found and daemon healthy (pid={}, version={})",
+                        oz_vfsd.daemon_pid.unwrap_or(0),
+                        oz_vfsd
+                            .daemon_version
+                            .as_deref()
+                            .unwrap_or(env!("CARGO_PKG_VERSION"))
+                    ),
+                    remediation: Vec::new(),
+                });
+            }
+        }
+        "stopped_idle" => {
+            checks.push(DoctorCheck {
+                id: "oz_vfsd",
+                category: "daemon",
+                status: DoctorCheckStatus::Ok,
+                summary: format!(
+                    "oz-vfsd binary found at {} (daemon idle; auto-spawns on workspace mount)",
+                    oz_vfsd
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ),
+                remediation: Vec::new(),
+            });
+        }
+        _ => {
+            checks.push(DoctorCheck {
+                id: "oz_vfsd",
+                category: "daemon",
+                status: DoctorCheckStatus::Ok,
+                summary: if oz_vfsd.found {
+                    format!(
+                        "oz-vfsd binary found (not required by {recommended_backend} backend)"
+                    )
+                } else {
+                    format!(
+                        "oz-vfsd daemon not required by {recommended_backend} backend"
+                    )
+                },
+                remediation: Vec::new(),
+            });
+        }
+    }
+
+    // 5. `git-ozone` alias resolution
+    if let Some(ref alias_path) = git_ozone_alias.found_on_path {
+        checks.push(DoctorCheck {
+            id: "git_ozone_alias",
+            category: "cli",
+            status: DoctorCheckStatus::Ok,
+            summary: format!("`git ozone` alias resolves via {}", alias_path.display()),
+            remediation: Vec::new(),
+        });
+    } else if git_ozone_alias.resolved {
+        checks.push(DoctorCheck {
+            id: "git_ozone_alias",
+            category: "cli",
+            status: DoctorCheckStatus::Ok,
+            summary: "Invoked directly as `git-ozone`".to_string(),
+            remediation: Vec::new(),
+        });
+    } else {
+        let rem = if let Some(ref sibling) = git_ozone_alias.sibling_path {
+            let parent = sibling
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            vec![format!(
+                "export PATH=\"{parent}:$PATH\"  # enables `git ozone <cmd>`"
+            )]
+        } else {
+            vec![
+                "Install the `git-ozone` binary into a directory on PATH (e.g. ~/.local/bin or /usr/local/bin)"
+                    .to_string(),
+            ]
+        };
+        for r in &rem {
+            push_unique(&mut remediation_hints, r.clone());
+        }
+        checks.push(DoctorCheck {
+            id: "git_ozone_alias",
+            category: "cli",
+            status: DoctorCheckStatus::Warn,
+            summary: "`git-ozone` binary not found on PATH; `git ozone <cmd>` alias unavailable"
+                .to_string(),
+            remediation: rem,
+        });
+    }
+
+    // 6. SSH signing keys
+    if ssh_signing.ready && ssh_signing.issues.is_empty() {
+        let fp = ssh_signing.fingerprint.as_deref().unwrap_or("unknown");
+        checks.push(DoctorCheck {
+            id: "ssh_signing",
+            category: "security",
+            status: DoctorCheckStatus::Ok,
+            summary: if ssh_signing.enabled_by_default {
+                format!("SSH commit signing enabled by default and ready ({fp})")
+            } else {
+                format!("Ed25519 SSH signing key ready ({fp}); pass `oz commit -S` or enable by default")
+            },
+            remediation: Vec::new(),
+        });
+    } else {
+        let mut rem = ssh_signing.recovery_commands.clone();
+        if rem.is_empty() {
+            rem.push("ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519".to_string());
+            rem.push("git config --global gpg.format ssh".to_string());
+            rem.push("git config --global user.signingkey ~/.ssh/id_ed25519".to_string());
+        }
+        if ssh_signing.enabled_by_default {
+            warnings.push(format!(
+                "SSH commit signing is enabled by default but not ready: {}",
+                ssh_signing
+                    .issues
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("no valid unencrypted Ed25519 signing key found")
+            ));
+            for r in &rem {
+                push_unique(&mut recovery_commands, r.clone());
+            }
+        }
+        for r in &rem {
+            push_unique(&mut remediation_hints, r.clone());
+        }
+        let summary = if !ssh_signing.issues.is_empty() {
+            ssh_signing.issues.join("; ")
+        } else {
+            "No valid unencrypted Ed25519 SSH signing key configured".to_string()
+        };
+        checks.push(DoctorCheck {
+            id: "ssh_signing",
+            category: "security",
+            status: DoctorCheckStatus::Warn,
+            summary,
+            remediation: rem,
+        });
+    }
+
+    // 7. GitHub auth availability
+    if github_auth.authenticated {
+        let source = github_auth
+            .token_source
+            .as_ref()
+            .map(|s| s.label())
+            .unwrap_or("unknown");
+        let masked = github_auth.masked_token.as_deref().unwrap_or("****");
+        checks.push(DoctorCheck {
+            id: "github_auth",
+            category: "auth",
+            status: DoctorCheckStatus::Ok,
+            summary: format!(
+                "GitHub auth ready for {} via {source} ({masked})",
+                github_auth.host
+            ),
+            remediation: Vec::new(),
+        });
+    } else {
+        let host_clean = github_auth
+            .host
+            .split(':')
+            .next()
+            .unwrap_or(&github_auth.host);
+        let rem = vec![
+            "export GITHUB_TOKEN=<personal-access-token>".to_string(),
+            format!("gh auth login --hostname {host_clean}"),
+        ];
+        for r in &rem {
+            push_unique(&mut remediation_hints, r.clone());
+        }
+        checks.push(DoctorCheck {
+            id: "github_auth",
+            category: "auth",
+            status: DoctorCheckStatus::Warn,
+            summary: format!(
+                "No GitHub token discovered for {} (checked OZ_GITHUB_TOKEN, GITHUB_TOKEN, GH_TOKEN, gh hosts.yml, git credential helper)",
+                github_auth.host
+            ),
+            remediation: rem,
+        });
+    }
+
+    // 8. Repository status & active mounts
+    if !repo.in_repo {
+        checks.push(DoctorCheck {
+            id: "repository_mounts",
+            category: "repository",
+            status: DoctorCheckStatus::Ok,
+            summary: "Not inside a Git repository; OS and toolchain diagnostics completed"
+                .to_string(),
+            remediation: Vec::new(),
+        });
+    } else if repo.mount_health == Some(MountHealth::DisconnectedEnotconn.as_str())
+        || repo.unhealthy_mount_count > 0
+    {
+        if repo.mount_health == Some(MountHealth::DisconnectedEnotconn.as_str()) {
+            warnings.push(format!(
+                "Workspace '{}' mountpoint returned ENOTCONN; real host disk .git/ozone state remains intact",
+                repo.workspace.as_deref().unwrap_or("unknown")
+            ));
+        }
+        if repo.unhealthy_mount_count > 0 {
+            warnings.push(format!(
+                "{} registered workspace mount(s) reported unhealthy status",
+                repo.unhealthy_mount_count
+            ));
+        }
+        let rem = vec!["oz ws list --json".to_string(), "oz status --json".to_string()];
+        for r in &rem {
+            push_unique(&mut recovery_commands, r.clone());
+            push_unique(&mut remediation_hints, r.clone());
+        }
+        checks.push(DoctorCheck {
+            id: "repository_mounts",
+            category: "repository",
+            status: DoctorCheckStatus::Warn,
+            summary: format!(
+                "Colocated repo detected with {} unhealthy mount(s) out of {} active",
+                repo.unhealthy_mount_count.max(usize::from(
+                    repo.mount_health == Some(MountHealth::DisconnectedEnotconn.as_str())
+                )),
+                repo.active_mount_count
+            ),
+            remediation: rem,
+        });
+    } else {
+        checks.push(DoctorCheck {
+            id: "repository_mounts",
+            category: "repository",
+            status: DoctorCheckStatus::Ok,
+            summary: format!(
+                "Colocated repo ready (branch: {}, ozone_initialized: {}, active_mounts: {})",
+                repo.branch.as_deref().unwrap_or("detached"),
+                repo.ozone_initialized,
+                repo.active_mount_count
+            ),
+            remediation: Vec::new(),
+        });
+    }
+
+    (checks, warnings, recovery_commands, remediation_hints)
+}
+
+fn sanitize_ssh_signing_report(report: &mut SshSigningReport) {
+    let redact = |opt: &mut Option<String>| {
+        if let Some(val) = opt.as_ref()
+            && (val.contains("PRIVATE KEY") || val.contains("-----BEGIN "))
+        {
+            *opt = Some("<redacted-inline-private-key>".to_string());
+        }
+    };
+    redact(&mut report.configured_key);
+    redact(&mut report.git_user_signingkey);
+    redact(&mut report.ozone_signing_key);
+}
+
+fn read_global_git_config(key: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["config", "--global", "--get", key])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!val.is_empty()).then_some(val)
+}
+
+fn parse_git_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn inspect_ssh_signing_for_doctor(repo_opt: Option<&OzoneRepo>) -> SshSigningReport {
@@ -537,76 +1346,102 @@ fn inspect_ssh_signing_for_doctor(repo_opt: Option<&OzoneRepo>) -> SshSigningRep
         };
     }
 
-    let default_spec = "~/.ssh/id_ed25519";
-    let expanded = expand_tilde_path(default_spec);
-    if expanded.is_file() {
-        return match resolve_signing_private_key(default_spec, None) {
-            Ok((priv_key, resolved_path)) => {
+    let git_gpg_format = read_global_git_config("gpg.format");
+    let git_user_signingkey = read_global_git_config("user.signingkey");
+    let git_commit_gpgsign = read_global_git_config("commit.gpgsign")
+        .as_deref()
+        .and_then(parse_git_bool);
+    let git_allowed_signers_file =
+        read_global_git_config("gpg.ssh.allowedSignersFile").map(|v| expand_tilde_path(&v));
+
+    let enabled_by_default = git_commit_gpgsign == Some(true)
+        && git_gpg_format
+            .as_deref()
+            .is_some_and(|f| f.eq_ignore_ascii_case("ssh"));
+
+    let mut issues = Vec::new();
+    let mut recovery_commands = Vec::new();
+
+    if git_commit_gpgsign == Some(true)
+        && !git_gpg_format
+            .as_deref()
+            .is_some_and(|f| f.eq_ignore_ascii_case("ssh"))
+    {
+        issues.push(format!(
+            "git commit.gpgsign is true, but gpg.format is '{}' (set gpg.format=ssh for pure-Rust SSH signing)",
+            git_gpg_format.as_deref().unwrap_or("openpgp")
+        ));
+        recovery_commands.push("git config --global gpg.format ssh".to_string());
+    }
+
+    let (key_source, configured_key) = if let Some(ref k) = git_user_signingkey {
+        (Some("git_config".to_string()), Some(k.clone()))
+    } else {
+        let default_spec = "~/.ssh/id_ed25519";
+        let expanded = expand_tilde_path(default_spec);
+        if expanded.is_file() {
+            (
+                Some("default_ssh_dir".to_string()),
+                Some(default_spec.to_string()),
+            )
+        } else {
+            (None, None)
+        }
+    };
+
+    let mut ready = false;
+    let mut resolved_key_path = None;
+    let mut key_algorithm = None;
+    let mut key_encrypted = false;
+    let mut fingerprint = None;
+    let mut public_key = None;
+
+    if let Some(ref spec) = configured_key {
+        match resolve_signing_private_key(spec, None) {
+            Ok((priv_key, path_opt)) => {
                 let pub_key = priv_key.public_key();
-                SshSigningReport {
-                    enabled_by_default: false,
-                    ready: true,
-                    key_source: Some("default_ssh_dir".to_string()),
-                    configured_key: None,
-                    resolved_key_path: resolved_path,
-                    key_algorithm: Some("ssh-ed25519".to_string()),
-                    key_encrypted: false,
-                    fingerprint: Some(pub_key.fingerprint_sha256()),
-                    public_key: Some(pub_key.to_openssh_line()),
-                    git_gpg_format: None,
-                    git_user_signingkey: None,
-                    git_commit_gpgsign: None,
-                    git_allowed_signers_file: None,
-                    ozone_signing_enabled: None,
-                    ozone_signing_key: None,
-                    issues: Vec::new(),
-                    recovery_commands: Vec::new(),
-                }
+                ready = true;
+                resolved_key_path = path_opt;
+                key_algorithm = Some("ssh-ed25519".to_string());
+                fingerprint = Some(pub_key.fingerprint_sha256());
+                public_key = Some(pub_key.to_openssh_line());
             }
             Err(err) => {
                 let msg = err.to_string();
-                let key_encrypted = msg.contains("encrypted");
-                SshSigningReport {
-                    enabled_by_default: false,
-                    ready: false,
-                    key_source: Some("default_ssh_dir".to_string()),
-                    configured_key: None,
-                    resolved_key_path: Some(expanded),
-                    key_algorithm: None,
-                    key_encrypted,
-                    fingerprint: None,
-                    public_key: None,
-                    git_gpg_format: None,
-                    git_user_signingkey: None,
-                    git_commit_gpgsign: None,
-                    git_allowed_signers_file: None,
-                    ozone_signing_enabled: None,
-                    ozone_signing_key: None,
-                    issues: vec![msg],
-                    recovery_commands: err.recovery_commands(),
+                if msg.contains("encrypted") {
+                    key_encrypted = true;
+                    key_algorithm = Some("ssh-ed25519".to_string());
+                }
+                let candidate = expand_tilde_path(spec);
+                if candidate.exists() {
+                    resolved_key_path = Some(candidate);
+                }
+                issues.push(msg);
+                for cmd in err.recovery_commands() {
+                    push_unique(&mut recovery_commands, cmd);
                 }
             }
-        };
+        }
     }
 
     SshSigningReport {
-        enabled_by_default: false,
-        ready: false,
-        key_source: None,
-        configured_key: None,
-        resolved_key_path: None,
-        key_algorithm: None,
-        key_encrypted: false,
-        fingerprint: None,
-        public_key: None,
-        git_gpg_format: None,
-        git_user_signingkey: None,
-        git_commit_gpgsign: None,
-        git_allowed_signers_file: None,
+        enabled_by_default,
+        ready,
+        key_source,
+        configured_key,
+        resolved_key_path,
+        key_algorithm,
+        key_encrypted,
+        fingerprint,
+        public_key,
+        git_gpg_format,
+        git_user_signingkey,
+        git_commit_gpgsign,
+        git_allowed_signers_file,
         ozone_signing_enabled: None,
         ozone_signing_key: None,
-        issues: Vec::new(),
-        recovery_commands: Vec::new(),
+        issues,
+        recovery_commands,
     }
 }
 
@@ -629,17 +1464,45 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
                 .unwrap_or_else(|| "missing".to_string())
         );
     }
-    if let Some(projfs) = d.projfs_ready {
+    if let Some(ref win) = d.windows {
+        println!(
+            "  Windows ProjFS:      ready={} ({}, dll={})",
+            win.projfs_ready,
+            win.projfs_feature,
+            win.projfs_dll_path.display()
+        );
+        println!(
+            "  Windows Dev Drive:   detected={} (refs_clone_ready={})",
+            win.dev_drive_detected, win.refs_clone_ready
+        );
+    } else if let Some(projfs) = d.projfs_ready {
         println!("  Windows ProjFS:      ready={projfs}");
+    }
+    if let Some(ref mac) = d.macos {
+        println!(
+            "  macOS APFS:          apfs={} (clonefile_ready={})",
+            mac.apfs_detected, mac.clonefile_ready
+        );
     }
     println!("  Recommended backend: {}", d.recommended_backend);
     println!(
-        "  oz-vfsd binary:      {}",
+        "  oz-vfsd:             {} (health={}, running={})",
         d.oz_vfsd
             .path
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "not found".to_string())
+            .unwrap_or_else(|| "not found".to_string()),
+        d.oz_vfsd.daemon_health,
+        d.oz_vfsd.daemon_running
+    );
+    println!(
+        "  git-ozone alias:     resolved={} ({})",
+        d.git_ozone_alias.resolved,
+        d.git_ozone_alias
+            .found_on_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not on PATH".to_string())
     );
     println!(
         "  SSH signing:         ready={} (default={}, fingerprint={})",
@@ -659,17 +1522,33 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
     );
     if d.repo.in_repo {
         println!(
-            "  Repository:          {} (branch: {}, ozone_initialized: {})",
+            "  Repository:          {} (branch: {}, ozone_initialized: {}, active_mounts: {})",
             d.repo
                 .repo_root
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             d.repo.branch.as_deref().unwrap_or("detached"),
-            d.repo.ozone_initialized
+            d.repo.ozone_initialized,
+            d.repo.active_mount_count
         );
+        for m in &d.repo.active_mounts {
+            println!(
+                "    mount [{}]: {} ({}, health={})",
+                m.workspace,
+                m.mount_point.display(),
+                m.backend,
+                m.health
+            );
+        }
     } else {
         println!("  Repository:          not inside a git repository");
+    }
+    if !d.remediation_hints.is_empty() {
+        println!("  Remediation hints:");
+        for hint in &d.remediation_hints {
+            println!("    - {hint}");
+        }
     }
 }
 
@@ -706,6 +1585,7 @@ mod tests {
         assert!(env.data.repo.in_repo);
         assert!(env.data.repo.colocated);
         assert_eq!(env.data.invoked_as, "git-ozone");
+        assert_eq!(env.data.checks.len(), 8);
 
         let json = env.to_json_pretty().expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -714,6 +1594,8 @@ mod tests {
         assert_eq!(parsed["data"]["repo"]["in_repo"], true);
         assert!(parsed["data"]["ssh_signing"].is_object());
         assert!(parsed["data"]["github_auth"].is_object());
+        assert!(parsed["data"]["checks"].is_array());
+        assert!(parsed["data"]["remediation_hints"].is_array());
     }
 
     #[test]
@@ -738,5 +1620,230 @@ mod tests {
             run_with_args(vec!["oz".into(), "--unknown-flag".into(), "--json".into()]),
             ExitCode::UsageOrGuardrail
         );
+        let missing = dir.path().join("does-not-exist");
+        assert_eq!(
+            run_with_args(vec![
+                "oz".into(),
+                "-C".into(),
+                missing.as_os_str().to_os_string(),
+                "doctor".into(),
+                "--json".into(),
+            ]),
+            ExitCode::UsageOrGuardrail
+        );
+    }
+
+    #[test]
+    fn sanitize_ssh_signing_report_redacts_inline_private_keys() {
+        let mut report = SshSigningReport {
+            enabled_by_default: true,
+            ready: true,
+            key_source: Some("ozone_config".to_string()),
+            configured_key: Some(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET_MATERIAL\n-----END OPENSSH PRIVATE KEY-----"
+                    .to_string(),
+            ),
+            resolved_key_path: None,
+            key_algorithm: Some("ssh-ed25519".to_string()),
+            key_encrypted: false,
+            fingerprint: Some("SHA256:test".to_string()),
+            public_key: Some("ssh-ed25519 AAAA".to_string()),
+            git_gpg_format: Some("ssh".to_string()),
+            git_user_signingkey: Some("-----BEGIN OPENSSH PRIVATE KEY-----\nTOPSECRET".to_string()),
+            git_commit_gpgsign: Some(true),
+            git_allowed_signers_file: None,
+            ozone_signing_enabled: Some(true),
+            ozone_signing_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----\nTOPSECRET2".to_string()),
+            issues: Vec::new(),
+            recovery_commands: Vec::new(),
+        };
+
+        sanitize_ssh_signing_report(&mut report);
+        let serialized = serde_json::to_string(&report).expect("serialize");
+        assert!(!serialized.contains("SECRET_MATERIAL"));
+        assert!(!serialized.contains("TOPSECRET"));
+        assert_eq!(
+            report.configured_key.as_deref(),
+            Some("<redacted-inline-private-key>")
+        );
+    }
+
+    #[test]
+    fn evaluate_doctor_checks_emits_platform_remediation_across_linux_windows_and_macos() {
+        let empty_repo = DoctorRepoStatus {
+            in_repo: false,
+            colocated: false,
+            repo_root: None,
+            git_dir: None,
+            git_common_dir: None,
+            ozone_dir: None,
+            ozone_initialized: false,
+            is_linked_worktree: false,
+            workspace: None,
+            branch: None,
+            head_oid: None,
+            mount_health: None,
+            repo_config_present: false,
+            local_config_present: false,
+            active_mount_count: 0,
+            unhealthy_mount_count: 0,
+            active_mounts: Vec::new(),
+        };
+        let vfsd_missing = DoctorVfsd {
+            found: false,
+            path: None,
+            daemon_required: true,
+            daemon_running: false,
+            daemon_health: "binary_missing",
+            daemon_pid: None,
+            daemon_version: None,
+            socket_path: None,
+        };
+        let alias_missing = DoctorGitOzoneAlias {
+            invoked_as: "oz",
+            found_on_path: None,
+            resolved: false,
+            sibling_path: None,
+        };
+        let ssh_unconfigured = SshSigningReport {
+            enabled_by_default: false,
+            ready: false,
+            key_source: None,
+            configured_key: None,
+            resolved_key_path: None,
+            key_algorithm: None,
+            key_encrypted: false,
+            fingerprint: None,
+            public_key: None,
+            git_gpg_format: None,
+            git_user_signingkey: None,
+            git_commit_gpgsign: None,
+            git_allowed_signers_file: None,
+            ozone_signing_enabled: None,
+            ozone_signing_key: None,
+            issues: Vec::new(),
+            recovery_commands: Vec::new(),
+        };
+        let gh_unauth = GitHubAuthProbe {
+            remote_name: "origin".to_string(),
+            remote_url: None,
+            host: "github.com".to_string(),
+            owner: None,
+            repo: None,
+            transport: None,
+            api_base_url: "https://api.github.com".to_string(),
+            authenticated: false,
+            token_source: None,
+            masked_token: None,
+            hints: Vec::new(),
+        };
+
+        // 1. Linux missing FUSE3
+        let linux_probe = FilesystemProbe {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            probed_path: PathBuf::from("/tmp"),
+            fs_kind: FilesystemKind::Ext4,
+            fs_magic: Some("0xef53".to_string()),
+            reflink_supported: false,
+            fuse: Some(LinuxFuseReadiness {
+                dev_fuse_exists: true,
+                dev_fuse_rw: false,
+                fusermount3_path: None,
+                fusermount3_version: None,
+                user_allow_other_enabled: false,
+                ready: false,
+            }),
+            projfs_ready: None,
+            recommended_backend: BackendKind::CasHardlink,
+        };
+        let (checks, warnings, recovery, hints) = evaluate_doctor_checks(
+            &linux_probe,
+            BackendKind::CasHardlink,
+            None,
+            None,
+            &vfsd_missing,
+            &alias_missing,
+            &empty_repo,
+            &ssh_unconfigured,
+            &gh_unauth,
+        );
+        let fuse_chk = checks.iter().find(|c| c.id == "linux_fuse").unwrap();
+        assert_eq!(fuse_chk.status, DoctorCheckStatus::Warn);
+        assert!(fuse_chk.remediation.iter().any(|r| r.contains("fuse3")));
+        assert!(fuse_chk.remediation.iter().any(|r| r.contains("usermod")));
+        assert!(!warnings.is_empty());
+        assert!(!recovery.is_empty());
+        assert!(!hints.is_empty());
+
+        // 2. Windows NTFS without ProjFS / Dev Drive
+        let win_probe = FilesystemProbe {
+            os: "windows".to_string(),
+            arch: "x86_64".to_string(),
+            probed_path: PathBuf::from("C:\\repo"),
+            fs_kind: FilesystemKind::Ntfs,
+            fs_magic: None,
+            reflink_supported: false,
+            fuse: None,
+            projfs_ready: Some(false),
+            recommended_backend: BackendKind::CasHardlink,
+        };
+        let (win_diag, mac_diag) = build_platform_diagnostics(&win_probe);
+        assert!(win_diag.is_some());
+        assert!(mac_diag.is_none());
+        let (win_checks, _, _, _) = evaluate_doctor_checks(
+            &win_probe,
+            BackendKind::CasHardlink,
+            win_diag.as_ref(),
+            None,
+            &vfsd_missing,
+            &alias_missing,
+            &empty_repo,
+            &ssh_unconfigured,
+            &gh_unauth,
+        );
+        let win_chk = win_checks
+            .iter()
+            .find(|c| c.id == "windows_projfs_dev_drive")
+            .unwrap();
+        assert_eq!(win_chk.status, DoctorCheckStatus::Warn);
+        assert!(
+            win_chk
+                .remediation
+                .iter()
+                .any(|r| r.contains("Client-ProjFS"))
+        );
+
+        // 3. macOS APFS clonefile ready
+        let mac_probe = FilesystemProbe {
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+            probed_path: PathBuf::from("/Users/dev/repo"),
+            fs_kind: FilesystemKind::Apfs,
+            fs_magic: None,
+            reflink_supported: true,
+            fuse: None,
+            projfs_ready: None,
+            recommended_backend: BackendKind::ApfsClonefile,
+        };
+        let (win_diag2, mac_diag2) = build_platform_diagnostics(&mac_probe);
+        assert!(win_diag2.is_none());
+        assert!(mac_diag2.as_ref().is_some_and(|m| m.clonefile_ready));
+        let (mac_checks, _, _, _) = evaluate_doctor_checks(
+            &mac_probe,
+            BackendKind::ApfsClonefile,
+            None,
+            mac_diag2.as_ref(),
+            &vfsd_missing,
+            &alias_missing,
+            &empty_repo,
+            &ssh_unconfigured,
+            &gh_unauth,
+        );
+        let mac_chk = mac_checks
+            .iter()
+            .find(|c| c.id == "macos_apfs_clonefile")
+            .unwrap();
+        assert_eq!(mac_chk.status, DoctorCheckStatus::Ok);
     }
 }

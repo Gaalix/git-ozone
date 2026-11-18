@@ -3,7 +3,18 @@ name = "oz-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Ozone CLI (oz and git-ozone binaries)"
+
+# Release archives bundle `oz`, `git-ozone`, and `oz-vfsd` inside `oz-v{ version }-{ target }/`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/oz-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "oz-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [lib]
 path = "src/lib.rs"
