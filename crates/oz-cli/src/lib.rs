@@ -8,17 +8,22 @@ pub mod git_shim;
 pub mod recovery;
 
 use clap::{Parser, Subcommand};
+pub use commands::build_mcp_server;
 use commands::{
-    CheckpointArgs, CommitArgs, DiffArgs, IntegrateArgs, RadarArgs, ResolveArgs, SetupArgs,
-    StackCommand, UndoArgs, WsCommand, handle_checkpoint, handle_commit, handle_diff,
-    handle_integrate, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
-    handle_status, handle_undo, handle_ws, print_json_envelope,
+    AgentCommand, BlameArgs, CheckpointArgs, CiArgs, CloneArgs, CommitArgs, DiffArgs, FetchArgs,
+    IntegrateArgs, McpArgs, PrCommand, PushArgs, RadarArgs, ResolveArgs, SetupArgs, StackCommand,
+    SyncArgs, UndoArgs, WsCommand, handle_agent, handle_blame, handle_checkpoint, handle_ci,
+    handle_clone, handle_commit, handle_diff, handle_fetch, handle_integrate, handle_mcp,
+    handle_pr, handle_push, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
+    handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope,
 };
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, InteractionMode, MountHealth, OzError,
-    OzoneRepo, find_git_ozone_on_path,
+    OzoneRepo, SshSigningReport, expand_tilde_path, find_git_ozone_on_path,
+    inspect_ssh_signing_config, resolve_signing_private_key,
 };
 use oz_cow::{FilesystemProbe, LinuxFuseReadiness, detect_filesystem, select_backend};
+use oz_github::{GitHubAuthProbe, probe_github_auth};
 use oz_vfsd::find_oz_vfsd_bin;
 use serde::Serialize;
 use std::ffi::OsString;
@@ -79,6 +84,26 @@ pub enum Commands {
     /// Manage stacked branches (`rebase`, `status`) preserving `Change-Id:` trailers.
     #[command(subcommand)]
     Stack(StackCommand),
+    /// Clone a remote repository over pure-Rust Git Wire Protocol v2 (supports `--filter=blob:none`).
+    Clone(CloneArgs),
+    /// Fetch remote updates over pure-Rust Git Wire Protocol v2 with OpLog `ref_deltas`.
+    Fetch(FetchArgs),
+    /// Push refs over pure-Rust smart `git-receive-pack` (`--atomic`, `--force-with-lease`).
+    Push(PushArgs),
+    /// Create and orchestrate GitHub Pull Requests (`create`, `stack`).
+    #[command(subcommand)]
+    Pr(PrCommand),
+    /// Sync with remote: fetch, fast-forward base, retarget stacked PRs, rebase, and GC merged workspaces.
+    Sync(SyncArgs),
+    /// Inspect GitHub Check Runs and Actions failing job log excerpts for self-healing loops.
+    Ci(CiArgs),
+    /// Configure coding agent harnesses (`setup` for Claude Code, Cursor, Codex CLI, Windsurf, Antigravity).
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    /// Launch built-in JSON-RPC 2.0 Model Context Protocol (`oz mcp`) stdio server.
+    Mcp(McpArgs),
+    /// Show line-level human vs. AI (`refs/notes/ai`) authorship attribution for a file.
+    Blame(BlameArgs),
     /// Initialize colocated `.git/ozone/` metadata, `systemd --user`, or Windows ProjFS.
     Setup(SetupArgs),
     /// Inspect OS, filesystem (`statfs`), FUSE3/reflink readiness, and colocated repo status.
@@ -154,6 +179,8 @@ pub struct DoctorReport {
     pub oz_vfsd: DoctorVfsd,
     pub git_ozone_alias: DoctorGitOzoneAlias,
     pub repo: DoctorRepoStatus,
+    pub ssh_signing: SshSigningReport,
+    pub github_auth: GitHubAuthProbe,
 }
 
 /// Entrypoint shared by `oz` and `git-ozone` binaries.
@@ -228,6 +255,15 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Stack(stack_cmd)) => {
             handle_stack(stack_cmd, cli.directory.as_deref(), mode)
         }
+        Some(Commands::Clone(args)) => handle_clone(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Fetch(args)) => handle_fetch(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Push(args)) => handle_push(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Pr(pr_cmd)) => handle_pr(pr_cmd, cli.directory.as_deref(), mode),
+        Some(Commands::Sync(args)) => handle_sync(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Ci(args)) => handle_ci(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Agent(agent_cmd)) => handle_agent(agent_cmd, cli.directory.as_deref(), mode),
+        Some(Commands::Mcp(args)) => handle_mcp(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Blame(args)) => handle_blame(&args, cli.directory.as_deref(), mode),
         Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),
         Some(Commands::Version) => handle_version(invocation, mode),
@@ -390,6 +426,9 @@ pub fn build_doctor_envelope(
         recovery_commands.push("oz ws list --json".to_string());
     }
 
+    let ssh_signing = inspect_ssh_signing_for_doctor(repo_opt.as_ref());
+    let github_auth = probe_github_auth(repo_opt.as_ref(), None, None);
+
     let (workspace, branch, head_oid, repo_status) = match repo_opt {
         Some(repo) => {
             let status = DoctorRepoStatus {
@@ -457,6 +496,8 @@ pub fn build_doctor_envelope(
             found_on_path: git_ozone_alias,
         },
         repo: repo_status,
+        ssh_signing,
+        github_auth,
     };
 
     let mut env = Envelope::success(report)
@@ -468,6 +509,105 @@ pub fn build_doctor_envelope(
         env = env.with_warning(w);
     }
     Ok(env)
+}
+
+fn inspect_ssh_signing_for_doctor(repo_opt: Option<&OzoneRepo>) -> SshSigningReport {
+    if let Some(repo) = repo_opt {
+        return match inspect_ssh_signing_config(repo) {
+            Ok(report) => report,
+            Err(err) => SshSigningReport {
+                enabled_by_default: false,
+                ready: false,
+                key_source: None,
+                configured_key: None,
+                resolved_key_path: None,
+                key_algorithm: None,
+                key_encrypted: false,
+                fingerprint: None,
+                public_key: None,
+                git_gpg_format: None,
+                git_user_signingkey: None,
+                git_commit_gpgsign: None,
+                git_allowed_signers_file: None,
+                ozone_signing_enabled: None,
+                ozone_signing_key: None,
+                issues: vec![err.to_string()],
+                recovery_commands: err.recovery_commands(),
+            },
+        };
+    }
+
+    let default_spec = "~/.ssh/id_ed25519";
+    let expanded = expand_tilde_path(default_spec);
+    if expanded.is_file() {
+        return match resolve_signing_private_key(default_spec, None) {
+            Ok((priv_key, resolved_path)) => {
+                let pub_key = priv_key.public_key();
+                SshSigningReport {
+                    enabled_by_default: false,
+                    ready: true,
+                    key_source: Some("default_ssh_dir".to_string()),
+                    configured_key: None,
+                    resolved_key_path: resolved_path,
+                    key_algorithm: Some("ssh-ed25519".to_string()),
+                    key_encrypted: false,
+                    fingerprint: Some(pub_key.fingerprint_sha256()),
+                    public_key: Some(pub_key.to_openssh_line()),
+                    git_gpg_format: None,
+                    git_user_signingkey: None,
+                    git_commit_gpgsign: None,
+                    git_allowed_signers_file: None,
+                    ozone_signing_enabled: None,
+                    ozone_signing_key: None,
+                    issues: Vec::new(),
+                    recovery_commands: Vec::new(),
+                }
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let key_encrypted = msg.contains("encrypted");
+                SshSigningReport {
+                    enabled_by_default: false,
+                    ready: false,
+                    key_source: Some("default_ssh_dir".to_string()),
+                    configured_key: None,
+                    resolved_key_path: Some(expanded),
+                    key_algorithm: None,
+                    key_encrypted,
+                    fingerprint: None,
+                    public_key: None,
+                    git_gpg_format: None,
+                    git_user_signingkey: None,
+                    git_commit_gpgsign: None,
+                    git_allowed_signers_file: None,
+                    ozone_signing_enabled: None,
+                    ozone_signing_key: None,
+                    issues: vec![msg],
+                    recovery_commands: err.recovery_commands(),
+                }
+            }
+        };
+    }
+
+    SshSigningReport {
+        enabled_by_default: false,
+        ready: false,
+        key_source: None,
+        configured_key: None,
+        resolved_key_path: None,
+        key_algorithm: None,
+        key_encrypted: false,
+        fingerprint: None,
+        public_key: None,
+        git_gpg_format: None,
+        git_user_signingkey: None,
+        git_commit_gpgsign: None,
+        git_allowed_signers_file: None,
+        ozone_signing_enabled: None,
+        ozone_signing_key: None,
+        issues: Vec::new(),
+        recovery_commands: Vec::new(),
+    }
 }
 
 fn print_doctor_human(env: &Envelope<DoctorReport>) {
@@ -500,6 +640,22 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "not found".to_string())
+    );
+    println!(
+        "  SSH signing:         ready={} (default={}, fingerprint={})",
+        d.ssh_signing.ready,
+        d.ssh_signing.enabled_by_default,
+        d.ssh_signing.fingerprint.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  GitHub auth:         authenticated={} (host={}, source={})",
+        d.github_auth.authenticated,
+        d.github_auth.host,
+        d.github_auth
+            .token_source
+            .as_ref()
+            .map(|s| s.label())
+            .unwrap_or("none")
     );
     if d.repo.in_repo {
         println!(
@@ -556,6 +712,8 @@ mod tests {
         assert_eq!(parsed["schema"], "oz.v1");
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["data"]["repo"]["in_repo"], true);
+        assert!(parsed["data"]["ssh_signing"].is_object());
+        assert!(parsed["data"]["github_auth"].is_object());
     }
 
     #[test]

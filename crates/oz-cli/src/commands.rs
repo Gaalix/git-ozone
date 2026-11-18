@@ -1,19 +1,30 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Milestone 1 subcommand implementations for `oz` and `git-ozone`.
+//! Primary subcommand implementations for `oz` and `git-ozone`.
 
 use crate::recovery::discover_and_recover_repo;
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
+use oz_agent::{
+    AgentHarness, AgentSetupOptions, AgentSetupReport, BlameOptions, BlameReport, CiLogEntry,
+    CiLogsReport, McpServer, ProvenanceOptions, blame_file, record_commit_provenance,
+    setup_agent_harnesses,
+};
 use oz_core::{
-    BackendKind, CommitOptions, CommitOutcome, DiffReport, Envelope, ExitCode, FileChange,
-    InteractionMode, OzError, OzoneRepo, Result, ScopePolicy, StatusReport, WarningEntry,
-    compute_diff, compute_status, render_unified_diff,
+    BackendKind, CommitOptions, CommitOutcome, DiffReport, Envelope, EnvelopeError, ExitCode,
+    FileChange, InteractionMode, OzError, OzoneRepo, Result, ScopePolicy, StatusReport,
+    WarningEntry, compute_diff, compute_status, normalize_lexical, render_unified_diff,
 };
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, detect_filesystem,
     gc_workspaces, list_workspaces, remove_workspace, select_backend, spawn_workspace,
+};
+use oz_github::{
+    CiQueryOptions, CiReport, CloneOptions, CloneOutcome, DEFAULT_MAX_EXCERPT_LINES, FetchOptions,
+    FetchOutcome, ForceLeaseSpec, HttpAuthScheme, PrCreateOptions, PrCreateOutcome, PrStackOptions,
+    PrStackOutcome, PushOptions, PushOutcome, SyncOptions, SyncOutcome, clone_repo, fetch_remote,
+    pr_create, pr_stack, push_refs, query_ci_status, sync_repo,
 };
 use oz_integrate::{
     AbortOutcome, CollisionSeverity, ContinueOutcome, IntegrateOptions, IntegrateOutcome,
@@ -29,6 +40,7 @@ use oz_oplog::{
 use oz_warm::{BaselineSource, gc_baselines};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Instant;
 
 /// Workspace lifecycle subcommands (`oz ws ...`).
@@ -98,9 +110,9 @@ pub struct DiffArgs {
 
 #[derive(Debug, Args)]
 pub struct CommitArgs {
-    /// Commit message (a `Change-Id:` trailer is appended automatically if missing).
+    /// Commit message (a `Change-Id:` trailer is appended automatically if missing; optional with `--amend`).
     #[arg(short = 'm', long = "message", value_name = "MSG")]
-    pub message: String,
+    pub message: Option<String>,
     /// Select specific file IDs (`f1`), hunk IDs (`h1a`), or paths to commit without staging.
     #[arg(long, num_args = 1.., action = clap::ArgAction::Append, value_name = "ID")]
     pub pick: Vec<String>,
@@ -116,6 +128,21 @@ pub struct CommitArgs {
     /// Allow creating an empty commit when no dirty changes exist.
     #[arg(long)]
     pub allow_empty: bool,
+    /// Sign commit using pure-Rust OpenSSH Ed25519 `SSHSIG` v1 (`namespace = "git"`).
+    #[arg(short = 'S', long = "sign", conflicts_with = "no_sign")]
+    pub sign: bool,
+    /// Disable SSH commit signing even when enabled in `.ozone.toml` or Git config.
+    #[arg(long = "no-sign")]
+    pub no_sign: bool,
+    /// Path or inline OpenSSH Ed25519 signing key override.
+    #[arg(long = "signing-key", value_name = "KEY")]
+    pub signing_key: Option<String>,
+    /// Amend the current `HEAD` commit while preserving its `Change-Id:` trailer.
+    #[arg(long = "amend")]
+    pub amend: bool,
+    /// Reuse `HEAD`'s existing commit message without modification when amending.
+    #[arg(long = "no-edit")]
+    pub no_edit: bool,
 }
 
 #[derive(Debug, Args)]
@@ -246,6 +273,218 @@ pub struct StackStatusArgs {
     /// Base branch to compare stacked branches against (defaults to `main`).
     #[arg(long, value_name = "BRANCH")]
     pub onto: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CloneArgs {
+    /// Remote repository URL or local path.
+    pub url: String,
+    /// Optional target directory (defaults to repository name derived from `<url>`).
+    pub directory: Option<PathBuf>,
+    /// Check out `<BRANCH>` instead of the remote's default branch.
+    #[arg(short = 'b', long = "branch", value_name = "BRANCH")]
+    pub branch: Option<String>,
+    /// Partial-clone object filter specification (e.g., `blob:none`).
+    #[arg(long = "filter", value_name = "SPEC")]
+    pub filter: Option<String>,
+    /// Remote name to configure (defaults to `origin`).
+    #[arg(short = 'o', long = "origin", value_name = "NAME")]
+    pub origin: Option<String>,
+    /// Clone as a bare Git repository.
+    #[arg(long = "bare")]
+    pub bare: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FetchArgs {
+    /// Remote name or URL (defaults to `origin`).
+    pub remote: Option<String>,
+    /// Optional explicit refspecs to fetch.
+    pub refspecs: Vec<String>,
+    /// Prune remote-tracking branches that no longer exist on the remote.
+    #[arg(short = 'p', long = "prune")]
+    pub prune: bool,
+    /// Partial-clone object filter specification (e.g., `blob:none`).
+    #[arg(long = "filter", value_name = "SPEC")]
+    pub filter: Option<String>,
+    /// Fetch remote tags (`refs/tags/*`).
+    #[arg(short = 't', long = "tags")]
+    pub tags: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PushArgs {
+    /// Remote name or URL (defaults to `origin`).
+    pub remote: Option<String>,
+    /// Optional refspecs to push (defaults to active branch).
+    pub refspecs: Vec<String>,
+    /// Negotiate atomic multi-ref push (abort all updates if any ref fails).
+    #[arg(long = "atomic")]
+    pub atomic: bool,
+    /// Safe force push verifying remote tips match expected OIDs (`--force-with-lease[=<ref>[:<oid>]]`).
+    #[arg(
+        long = "force-with-lease",
+        value_name = "SPEC",
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = true,
+        action = clap::ArgAction::Append
+    )]
+    pub force_with_lease: Vec<String>,
+    /// Force non-fast-forward ref updates unconditionally.
+    #[arg(short = 'f', long = "force")]
+    pub force: bool,
+    /// Configure upstream tracking reference (`branch.<name>.remote` and `merge`).
+    #[arg(short = 'u', long = "set-upstream")]
+    pub set_upstream: bool,
+    /// Delete the specified remote references.
+    #[arg(short = 'd', long = "delete")]
+    pub delete: bool,
+}
+
+/// Pull request subcommands (`oz pr ...`).
+#[derive(Debug, Subcommand)]
+pub enum PrCommand {
+    /// Create or idempotently update a GitHub Pull Request preserving `Change-Id:`.
+    Create(PrCreateArgs),
+    /// Push stacked branches atomically and create/update cross-linked stacked PRs.
+    Stack(PrStackArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PrCreateArgs {
+    /// Pull request title (inferred from commit subject when omitted).
+    #[arg(short = 't', long = "title", value_name = "TITLE")]
+    pub title: Option<String>,
+    /// Pull request markdown body (inferred from commit body + `Change-Id:` when omitted).
+    #[arg(short = 'b', long = "body", value_name = "BODY")]
+    pub body: Option<String>,
+    /// Base target branch on GitHub (defaults to `main`).
+    #[arg(short = 'B', long = "base", value_name = "BRANCH")]
+    pub base: Option<String>,
+    /// Head source branch (defaults to active workspace branch).
+    #[arg(short = 'H', long = "head", value_name = "BRANCH")]
+    pub head: Option<String>,
+    /// Open pull request as a draft.
+    #[arg(short = 'd', long = "draft")]
+    pub draft: bool,
+    /// Skip pushing head branch before creating/updating the pull request.
+    #[arg(long = "no-push")]
+    pub no_push: bool,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PrStackArgs {
+    /// Optional explicit stack branch names (auto-discovered from base when omitted).
+    pub branches: Vec<String>,
+    /// Root base branch of the stack (defaults to `main`).
+    #[arg(short = 'B', long = "base", value_name = "BRANCH")]
+    pub base: Option<String>,
+    /// Open newly created stack pull requests as drafts.
+    #[arg(short = 'd', long = "draft")]
+    pub draft: bool,
+    /// Skip atomic push of stack branches before creating/updating pull requests.
+    #[arg(long = "no-push")]
+    pub no_push: bool,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+    /// Base trunk branch (defaults to `main`).
+    #[arg(long = "base", value_name = "BRANCH")]
+    pub base: Option<String>,
+    /// Skip fetching from remote before syncing.
+    #[arg(long = "no-fetch")]
+    pub no_fetch: bool,
+    /// Skip rebasing downstream local stacked branches onto updated base.
+    #[arg(long = "no-rebase")]
+    pub no_rebase: bool,
+    /// Skip merged CoW workspace & checkpoint garbage collection.
+    #[arg(long = "no-gc")]
+    pub no_gc: bool,
+    /// Skip warm build baseline refresh.
+    #[arg(long = "no-warm")]
+    pub no_warm: bool,
+    /// Push rebased downstream stacked branches back to remote with `--force-with-lease`.
+    #[arg(long = "push")]
+    pub push: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CiArgs {
+    /// Target Git revision, branch, or commit SHA to inspect.
+    #[arg(long = "ref", value_name = "REV")]
+    pub target_ref: Option<String>,
+    /// Target branch name to inspect.
+    #[arg(long = "branch", value_name = "BRANCH")]
+    pub branch: Option<String>,
+    /// Pull request number to inspect.
+    #[arg(long = "pr", value_name = "NUMBER")]
+    pub pr: Option<u64>,
+    /// Maximum lines per failing check log excerpt (default: 40).
+    #[arg(
+        long = "max-excerpt-lines",
+        default_value_t = DEFAULT_MAX_EXCERPT_LINES,
+        value_name = "N"
+    )]
+    pub max_excerpt_lines: usize,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+}
+
+/// Coding agent ecosystem subcommands (`oz agent ...`).
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Install idempotent Ozone skills/rules and `oz checkpoint --quiet` hooks for coding agents.
+    Setup(AgentSetupArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentSetupArgs {
+    /// Target agent harness(es): `claude-code`, `cursor`, `codex-cli`, `windsurf`, `antigravity`.
+    #[arg(
+        long = "harness",
+        value_name = "HARNESS",
+        num_args = 1..,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    pub harnesses: Vec<String>,
+    /// Configure all 5 supported coding agent harnesses.
+    #[arg(long = "all")]
+    pub all: bool,
+    /// Check / dry-run mode: compute planned file changes without writing to disk.
+    #[arg(long = "check", visible_alias = "dry-run")]
+    pub check: bool,
+    /// Skip installing `PostToolUse` / edit checkpoint hook configurations.
+    #[arg(long = "no-hooks")]
+    pub no_hooks: bool,
+}
+
+#[derive(Debug, Default, Args)]
+pub struct McpArgs {
+    /// Optional explicit MCP session identifier recorded in `refs/notes/ai`.
+    #[arg(long = "session-id", value_name = "ID")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BlameArgs {
+    /// Repository-relative or filesystem path to the file to blame.
+    pub path: PathBuf,
+    /// Target commit, branch, or revision to blame from (defaults to `HEAD`).
+    #[arg(long = "rev", visible_alias = "revision", value_name = "REV")]
+    pub rev: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -798,18 +1037,54 @@ pub(crate) fn handle_commit(
     mode: InteractionMode,
 ) -> ExitCode {
     let res = (|| -> Result<Envelope<CommitOutcome>> {
+        if args.sign && args.no_sign {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass both `--sign` and `--no-sign` to `oz commit`".to_string(),
+                recovery: vec!["oz commit --sign -m \"...\"".to_string()],
+            });
+        }
+        if !args.amend && args.no_edit {
+            return Err(OzError::InvalidUsage {
+                message: "`--no-edit` is only valid alongside `--amend`".to_string(),
+                recovery: vec!["oz commit --amend --no-edit".to_string()],
+            });
+        }
+        let message = match (&args.message, args.amend) {
+            (Some(msg), _) => msg.clone(),
+            (None, true) => String::new(),
+            (None, false) => {
+                return Err(OzError::InvalidUsage {
+                    message: "missing commit message; pass `-m \"...\"`".to_string(),
+                    recovery: vec!["oz commit -m \"feat: ...\"".to_string()],
+                });
+            }
+        };
+
+        let sign = if args.no_sign {
+            Some(false)
+        } else if args.sign || args.signing_key.is_some() {
+            Some(true)
+        } else {
+            None
+        };
+
         let repo = discover_and_recover_repo(directory, false)?;
         let pre_status = compute_status(&repo)?;
         let actor = actor_from_mode(mode, &repo);
+        let cmd_label = if args.amend {
+            "oz commit --amend"
+        } else {
+            "oz commit"
+        };
         let tx = MutationTransaction::begin(
             &repo,
-            "oz commit",
+            cmd_label,
             actor,
             Some(&pre_status.changes),
         )?;
 
         let opts = CommitOptions {
-            message: args.message.clone(),
+            message,
             pick: args.pick.clone(),
             exclude: args.exclude.clone(),
             force: args.force,
@@ -817,7 +1092,9 @@ pub(crate) fn handle_commit(
             allow_empty: args.allow_empty,
             author_name: None,
             author_email: None,
-            ..Default::default()
+            sign,
+            signing_key: args.signing_key.clone(),
+            amend: args.amend,
         };
         let outcome = oz_core::commit_changes(&repo, &opts)?;
 
@@ -827,6 +1104,25 @@ pub(crate) fn handle_commit(
             let post_status = compute_status(&repo)?;
             tx.finish_with_message(&repo, Some(&outcome.message), Some(&post_status.changes))?
         };
+
+        // Record structured AI provenance into `refs/notes/ai` when `--agent` is active or an
+        // active coding agent session is detected in environment variables, keeping the commit
+        // message itself completely clean.
+        let explicit_agent_disabled = !mode.agent
+            && std::env::var("OZ_AGENT").is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            });
+        if mode.agent || !explicit_agent_disabled {
+            let prov_opts = ProvenanceOptions {
+                force_agent: mode.agent,
+                inspect_env: !explicit_agent_disabled,
+                ..ProvenanceOptions::default()
+            };
+            let _ = record_commit_provenance(&repo, &outcome.commit_oid, &prov_opts)?;
+        }
 
         let branch = outcome.branch.clone();
         let head_oid = Some(outcome.commit_oid.clone());
@@ -842,8 +1138,24 @@ pub(crate) fn handle_commit(
     render_command_result(mode, res, |env| {
         let d = &env.data;
         let short = &d.commit_oid[..d.commit_oid.len().min(12)];
+        let mut extras = Vec::new();
+        if d.amended {
+            extras.push("amended".to_string());
+        }
+        if d.signed {
+            if let Some(ref fp) = d.signature_fingerprint {
+                extras.push(format!("signed {fp}"));
+            } else {
+                extras.push("signed".to_string());
+            }
+        }
+        let extra_suffix = if extras.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", extras.join(", "))
+        };
         println!(
-            "[{} {short}] {} file(s) committed ({} dirty remaining, Change-Id: {})",
+            "[{} {short}] {} file(s) committed ({} dirty remaining, Change-Id: {}){extra_suffix}",
             d.branch.as_deref().unwrap_or("detached"),
             d.committed_paths.len(),
             d.remaining_dirty_count,
@@ -1488,4 +1800,712 @@ fn map_envelope_data<A: Serialize, B: Serialize, F: FnOnce(A) -> B>(
         recovery_commands: env.recovery_commands,
         error: env.error,
     }
+}
+
+fn derive_clone_destination_name(raw_url: &str, bare: bool) -> PathBuf {
+    let trimmed = raw_url.trim().trim_end_matches(['/', '\\']);
+    let without_git = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let last = without_git
+        .rsplit(['/', '\\', ':'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or("repo");
+    if bare && !last.ends_with(".git") {
+        PathBuf::from(format!("{last}.git"))
+    } else {
+        PathBuf::from(last)
+    }
+}
+
+pub(crate) fn handle_clone(
+    args: &CloneArgs,
+    base_directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<CloneOutcome>> {
+        let anchor_dir = match base_directory {
+            Some(dir) => dir.to_path_buf(),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+
+        let raw_dest = args
+            .directory
+            .clone()
+            .unwrap_or_else(|| derive_clone_destination_name(&args.url, args.bare));
+        let destination = if raw_dest.is_absolute() {
+            normalize_lexical(&raw_dest)
+        } else {
+            normalize_lexical(&anchor_dir.join(&raw_dest))
+        };
+
+        let effective_url = if base_directory.is_some()
+            && !args.url.contains("://")
+            && !args.url.contains('@')
+            && !Path::new(&args.url).is_absolute()
+        {
+            let candidate = anchor_dir.join(&args.url);
+            if candidate.exists() {
+                candidate.to_string_lossy().into_owned()
+            } else {
+                args.url.clone()
+            }
+        } else {
+            args.url.clone()
+        };
+
+        let opts = CloneOptions {
+            url: effective_url,
+            destination,
+            branch: args.branch.clone(),
+            filter: args.filter.clone(),
+            bare: args.bare,
+            remote_name: args.origin.clone(),
+            checkout: !args.bare,
+            auth_token: None,
+            auth_scheme: HttpAuthScheme::BasicToken,
+        };
+        let actor = ActorInfo {
+            kind: if mode.agent {
+                ActorKind::Agent
+            } else {
+                ActorKind::Human
+            },
+            client: Some("oz-cli".to_string()),
+            workspace: None,
+        };
+
+        let outcome = clone_repo(&opts, actor)?;
+        let branch = outcome.branch.clone();
+        let head_oid = outcome.head_oid.clone();
+        let op_id = outcome.op_id.clone();
+        let warnings = outcome.warnings.clone();
+        let dest_display = outcome.destination.display().to_string();
+
+        let mut env = Envelope::success(outcome)
+            .with_branch(branch)
+            .with_head_oid(head_oid);
+        if !args.bare {
+            env = env.with_recovery_command(format!("oz -C {dest_display} status"));
+        }
+        if let Some(id) = op_id {
+            env = env.with_op_id(id);
+        }
+        for w in warnings {
+            env = env.with_warning(w);
+        }
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        let filter_note = d
+            .filter
+            .as_deref()
+            .map(|f| format!(", filter={f}"))
+            .unwrap_or_default();
+        println!(
+            "Cloned '{}' into {} (branch: {}, files: {}{filter_note})",
+            d.remote_url,
+            d.destination.display(),
+            d.branch.as_deref().unwrap_or("detached"),
+            d.checked_out_files
+        );
+    })
+}
+
+pub(crate) fn handle_fetch(
+    args: &FetchArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<FetchOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let actor = actor_from_mode(mode, &repo);
+        let opts = FetchOptions {
+            remote: args.remote.clone(),
+            refspecs: args.refspecs.clone(),
+            prune: args.prune,
+            filter: args.filter.clone(),
+            tags: args.tags,
+            auth_token: None,
+            auth_scheme: HttpAuthScheme::BasicToken,
+        };
+
+        let outcome = fetch_remote(&repo, &opts, actor)?;
+        let op_id = outcome.op_id.clone();
+        let warnings = outcome.warnings.clone();
+
+        let mut env = Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid);
+        if let Some(id) = op_id {
+            env = env
+                .with_op_id(id.clone())
+                .with_recovery_command(format!("oz undo {id}"));
+        }
+        for w in warnings {
+            env = env.with_warning(w);
+        }
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        if d.updated_refs.is_empty() && d.pruned_refs.is_empty() {
+            println!("Fetched '{}' ({}): already up to date", d.remote, d.remote_url);
+        } else {
+            println!(
+                "Fetched '{}' ({}): {} updated, {} pruned",
+                d.remote,
+                d.remote_url,
+                d.updated_refs.len(),
+                d.pruned_refs.len()
+            );
+            for u in &d.updated_refs {
+                let short_new = &u.new_oid[..u.new_oid.len().min(10)];
+                println!("  {} -> {} ({short_new})", u.remote_ref, u.local_ref);
+            }
+            for p in &d.pruned_refs {
+                println!("  - [pruned] {p}");
+            }
+        }
+    })
+}
+
+pub(crate) fn handle_push(
+    args: &PushArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PushOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let actor = actor_from_mode(mode, &repo);
+
+        let mut use_default_lease = false;
+        let mut lease_specs = Vec::new();
+        for raw_spec in &args.force_with_lease {
+            if raw_spec.trim().is_empty() {
+                use_default_lease = true;
+            } else {
+                lease_specs.push(ForceLeaseSpec::parse(raw_spec));
+            }
+        }
+
+        let opts = PushOptions {
+            remote: args.remote.clone(),
+            refspecs: args.refspecs.clone(),
+            atomic: args.atomic,
+            force: args.force,
+            force_with_lease: use_default_lease,
+            lease_specs,
+            delete: args.delete,
+            set_upstream: args.set_upstream,
+            auth_token: None,
+            auth_scheme: HttpAuthScheme::BasicToken,
+        };
+
+        let outcome = push_refs(&repo, &opts, actor)?;
+        let op_id = outcome.op_id.clone();
+
+        let mut env = Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid);
+        if let Some(id) = op_id {
+            env = env
+                .with_op_id(id.clone())
+                .with_recovery_command(format!("oz undo {id}"));
+        }
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        println!(
+            "Pushed {} ref(s) to '{}' ({} objects, {} bytes)",
+            d.pushed_refs.len(),
+            d.remote,
+            d.pack_objects_sent,
+            d.pack_bytes_sent
+        );
+        for r in &d.pushed_refs {
+            if r.deleted {
+                println!("  - [deleted] {}", r.remote_ref);
+            } else {
+                let new_short = r
+                    .new_oid
+                    .as_deref()
+                    .map(|s| &s[..s.len().min(10)])
+                    .unwrap_or("-");
+                println!(
+                    "  {} -> {} ({new_short}{})",
+                    r.local_ref.as_deref().unwrap_or("HEAD"),
+                    r.remote_ref,
+                    if r.forced { ", forced" } else { "" }
+                );
+            }
+        }
+    })
+}
+
+pub(crate) fn handle_pr(
+    cmd: PrCommand,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    match cmd {
+        PrCommand::Create(args) => handle_pr_create(&args, directory, mode),
+        PrCommand::Stack(args) => handle_pr_stack(&args, directory, mode),
+    }
+}
+
+fn handle_pr_create(
+    args: &PrCreateArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PrCreateOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let actor = actor_from_mode(mode, &repo);
+        let opts = PrCreateOptions {
+            title: args.title.clone(),
+            body: args.body.clone(),
+            base: args.base.clone(),
+            head: args.head.clone(),
+            draft: args.draft,
+            no_push: args.no_push,
+            remote: args.remote.clone(),
+            auth_token: None,
+            api_url: None,
+            git_auth_scheme: HttpAuthScheme::BasicToken,
+        };
+
+        let outcome = pr_create(&repo, &opts, actor)?;
+        let head_branch = outcome.head_branch.clone();
+        Ok(Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(Some(head_branch))
+            .with_head_oid(repo.head_oid)
+            .with_recovery_command("oz ci --json"))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        let action = if d.created { "Created" } else { "Updated" };
+        println!(
+            "{action} PR #{}: {} ({} -> {}) -> {}",
+            d.pull_request.number,
+            d.pull_request.title,
+            d.head_branch,
+            d.base_branch,
+            d.pull_request.html_url
+        );
+    })
+}
+
+fn handle_pr_stack(
+    args: &PrStackArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PrStackOutcome>> {
+        let repo = discover_and_recover_repo(directory, true)?;
+        let actor = actor_from_mode(mode, &repo);
+        let opts = PrStackOptions {
+            base: args.base.clone(),
+            branches: args.branches.clone(),
+            draft: args.draft,
+            no_push: args.no_push,
+            remote: args.remote.clone(),
+            auth_token: None,
+            api_url: None,
+            git_auth_scheme: HttpAuthScheme::BasicToken,
+        };
+
+        let outcome = pr_stack(&repo, &opts, actor)?;
+        let op_id = outcome.atomic_push_op_id.clone();
+
+        let mut env = Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid);
+        if let Some(id) = op_id {
+            env = env
+                .with_op_id(id.clone())
+                .with_recovery_command(format!("oz undo {id}"));
+        }
+        env = env.with_recovery_command("oz ci --json");
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        println!(
+            "Synced PR stack onto '{}' ({} PR(s))",
+            d.root_base,
+            d.items.len()
+        );
+        for item in &d.items {
+            let verb = if item.created { "created" } else { "updated" };
+            println!(
+                "  #{} [{}] {} ({} -> {}) -> {}",
+                item.number, verb, item.title, item.head_branch, item.base_branch, item.html_url
+            );
+        }
+    })
+}
+
+pub(crate) fn handle_sync(
+    args: &SyncArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<SyncOutcome>> {
+        let _ = (args.no_gc, args.no_warm);
+        let repo = discover_and_recover_repo(directory, true)?;
+        let main_root = repo.repo_root.clone();
+        let actor = actor_from_mode(mode, &repo);
+        let opts = SyncOptions {
+            remote: args.remote.clone(),
+            base_branch: args.base.clone(),
+            no_fetch: args.no_fetch,
+            no_rebase: args.no_rebase,
+            push_rebased: args.push,
+            auth_token: None,
+            api_url: None,
+            git_auth_scheme: HttpAuthScheme::BasicToken,
+        };
+
+        let outcome = sync_repo(&repo, &opts, actor)?;
+        let post_repo = OzoneRepo::discover(directory)
+            .or_else(|_| OzoneRepo::discover(Some(&main_root)))
+            .unwrap_or(repo);
+
+        let op_id = outcome.op_id.clone();
+        let warnings = outcome.warnings.clone();
+        let mut env = Envelope::success(outcome)
+            .with_workspace(post_repo.workspace)
+            .with_branch(post_repo.branch)
+            .with_head_oid(post_repo.head_oid);
+        if let Some(id) = op_id {
+            env = env
+                .with_op_id(id.clone())
+                .with_recovery_command(format!("oz undo {id}"));
+        }
+        for w in warnings {
+            env = env.with_warning(w);
+        }
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        println!(
+            "Synced '{}' against '{}': fast_forwarded={}, merged={}, retargeted_prs={}, rebased={}, removed_ws={}",
+            d.base_branch,
+            d.remote,
+            d.fast_forwarded,
+            d.merged_branches.len(),
+            d.retargeted_prs.len(),
+            d.rebased_branches.len(),
+            d.removed_workspaces.len()
+        );
+    })
+}
+
+pub(crate) fn handle_ci(
+    args: &CiArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    if args.target_ref.is_some() && args.branch.is_some() {
+        let err = OzError::InvalidUsage {
+            message: "cannot pass both `--ref` and `--branch` to `oz ci`".to_string(),
+            recovery: vec![
+                "oz ci --ref <rev> --json".to_string(),
+                "oz ci --branch <branch> --json".to_string(),
+            ],
+        };
+        return render_command_result::<CiReport, _>(mode, Err(err), |_| {});
+    }
+
+    let query_res = (|| -> Result<(OzoneRepo, CiReport)> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let opts = CiQueryOptions {
+            target_ref: args.target_ref.clone().or_else(|| args.branch.clone()),
+            pr_number: args.pr,
+            remote: args.remote.clone(),
+            max_excerpt_lines: args.max_excerpt_lines,
+            auth_token: None,
+            api_url: None,
+        };
+        let report = query_ci_status(&repo, &opts)?;
+        Ok((repo, report))
+    })();
+
+    let (repo, report) = match query_res {
+        Ok(pair) => pair,
+        Err(err) => return render_command_result::<CiReport, _>(mode, Err(err), |_| {}),
+    };
+
+    let has_failures = report.failing_count > 0;
+    let exit_code = if has_failures {
+        ExitCode::ConflictOrCheckFail
+    } else {
+        ExitCode::Success
+    };
+
+    let branch = (!report.ref_name.is_empty())
+        .then(|| report.ref_name.clone())
+        .or(repo.branch);
+    let head_oid = (!report.commit_sha.is_empty())
+        .then(|| report.commit_sha.clone())
+        .or(repo.head_oid);
+
+    let mut env = Envelope::success(report)
+        .with_workspace(repo.workspace)
+        .with_branch(branch)
+        .with_head_oid(head_oid);
+
+    if has_failures {
+        let msg = format!(
+            "{} of {} CI check(s) failing on {}",
+            env.data.failing_count, env.data.total_count, env.data.ref_name
+        );
+        env.ok = false;
+        env.error = Some(EnvelopeError {
+            code: "check_failed".to_string(),
+            exit_code: exit_code.as_i32(),
+            message: msg,
+        });
+        env = env
+            .with_recovery_command("oz status --json")
+            .with_recovery_command("oz commit --amend")
+            .with_recovery_command("oz push --force-with-lease");
+    }
+
+    if mode.json {
+        print_json_envelope(&env);
+    } else {
+        let d = &env.data;
+        let short_sha = &d.commit_sha[..d.commit_sha.len().min(10)];
+        println!(
+            "CI status for {} ({short_sha}): {} ({} total, {} failing, {} pending)",
+            d.ref_name, d.overall_status, d.total_count, d.failing_count, d.pending_count
+        );
+        for check in &d.checks {
+            let conc = check.conclusion.as_deref().unwrap_or(&check.status);
+            println!("  [{}] {}", conc, check.name);
+            if let Some(ref step) = check.failing_step {
+                println!("    failing step: {step}");
+            }
+            if let Some(ref excerpt) = check.log_excerpt {
+                for line in excerpt.lines() {
+                    println!("      {line}");
+                }
+            }
+        }
+    }
+
+    exit_code
+}
+
+pub(crate) fn handle_agent(
+    cmd: AgentCommand,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    match cmd {
+        AgentCommand::Setup(args) => handle_agent_setup(&args, directory, mode),
+    }
+}
+
+fn handle_agent_setup(
+    args: &AgentSetupArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<AgentSetupReport>> {
+        let mut parsed_harnesses = Vec::with_capacity(args.harnesses.len());
+        for raw in &args.harnesses {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                parsed_harnesses.push(AgentHarness::from_str(trimmed)?);
+            }
+        }
+
+        let (target_root, workspace, branch, head_oid) =
+            match discover_and_recover_repo(directory, false) {
+                Ok(repo) => (
+                    repo.repo_root,
+                    repo.workspace,
+                    repo.branch,
+                    repo.head_oid,
+                ),
+                Err(OzError::NotARepository { .. }) => {
+                    let dir = match directory {
+                        Some(d) => d.to_path_buf(),
+                        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    };
+                    (dir, None, None, None)
+                }
+                Err(err) => return Err(err),
+            };
+
+        let opts = AgentSetupOptions {
+            harnesses: parsed_harnesses,
+            all: args.all,
+            check_only: args.check,
+            install_hooks: !args.no_hooks,
+            ..AgentSetupOptions::default()
+        };
+
+        let report = setup_agent_harnesses(&target_root, &opts)?;
+        let needs_apply = args.check && !report.is_up_to_date();
+        let mut env = Envelope::success(report)
+            .with_workspace(workspace)
+            .with_branch(branch)
+            .with_head_oid(head_oid);
+        if needs_apply {
+            env = env.with_recovery_command(if args.all {
+                "oz agent setup --all"
+            } else {
+                "oz agent setup"
+            });
+        }
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        let names: Vec<&str> = d.harnesses.iter().map(|h| h.as_str()).collect();
+        let mode_prefix = if d.check_only {
+            "Agent setup check"
+        } else {
+            "Configured agent harnesses"
+        };
+        println!(
+            "{mode_prefix} [{}] in {}: {} created, {} updated, {} unchanged",
+            names.join(", "),
+            d.repo_root.display(),
+            d.created.len(),
+            d.updated.len(),
+            d.unchanged.len()
+        );
+    })
+}
+
+/// Builds an [`McpServer`] wired with a live `oz-github` [`CiLogProvider`](oz_agent::CiLogProvider)
+/// so the `oz_ci_logs` MCP tool queries GitHub / `OZ_GITHUB_API_URL` directly.
+#[must_use]
+pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -> McpServer {
+    let mut server = McpServer::new(root_dir).with_ci_provider_fn(|repo, req| {
+        let explicit_commit_override = req
+            .commit_oid
+            .as_deref()
+            .filter(|oid| !oid.is_empty() && repo.head_oid.as_deref() != Some(*oid))
+            .map(str::to_string);
+        let target_ref = explicit_commit_override
+            .or_else(|| req.branch.clone())
+            .or_else(|| req.commit_oid.clone());
+
+        let ci_report = query_ci_status(
+            repo,
+            &CiQueryOptions {
+                target_ref,
+                pr_number: req.pr_number,
+                remote: None,
+                max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
+                auth_token: None,
+                api_url: None,
+            },
+        )?;
+
+        let checks = ci_report
+            .checks
+            .into_iter()
+            .filter(|c| {
+                if !req.failing_only {
+                    return true;
+                }
+                matches!(
+                    c.conclusion.as_deref(),
+                    Some(
+                        "failure"
+                            | "timed_out"
+                            | "cancelled"
+                            | "action_required"
+                            | "startup_failure"
+                            | "stale"
+                    )
+                )
+            })
+            .map(|c| CiLogEntry {
+                name: c.name,
+                status: c.status,
+                conclusion: c.conclusion,
+                failing_step: c.failing_step,
+                log_excerpt: c.log_excerpt,
+            })
+            .collect();
+
+        Ok(CiLogsReport {
+            branch: (!ci_report.ref_name.is_empty()).then_some(ci_report.ref_name),
+            commit_oid: (!ci_report.commit_sha.is_empty()).then_some(ci_report.commit_sha),
+            all_passed: ci_report.all_passed,
+            checks,
+        })
+    });
+
+    if let Some(sid) = session_id {
+        server = server.with_session_id(sid);
+    }
+    server
+}
+
+pub(crate) fn handle_mcp(
+    args: &McpArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let mut server = build_mcp_server(directory.map(Path::to_path_buf), args.session_id.clone());
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    match server.serve_stdio(stdin.lock(), stdout.lock()) {
+        Ok(()) => ExitCode::Success,
+        Err(err) => {
+            if mode.json {
+                let env = Envelope::from_error(&err);
+                if let Ok(s) = env.to_json_pretty() {
+                    eprintln!("{s}");
+                }
+            } else {
+                eprintln!("error: {err}");
+            }
+            err.exit_code()
+        }
+    }
+}
+
+pub(crate) fn handle_blame(
+    args: &BlameArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<BlameReport>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let opts = BlameOptions {
+            revision: args.rev.clone(),
+        };
+        let report = blame_file(&repo, &args.path, &opts)?;
+        let head_oid = Some(report.resolved_commit_oid.clone());
+        Ok(Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        print!("{}", env.data.render_human());
+    })
 }
