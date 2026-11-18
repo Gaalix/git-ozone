@@ -9,7 +9,7 @@ use crate::backends::{backend_for_kind, remove_dir_if_exists};
 use crate::backends::Fuse3VfsBackend;
 #[cfg(target_os = "windows")]
 use crate::backends::ProjFsVfsBackend;
-use crate::detect::{detect_filesystem_with_ozone, select_backend};
+use crate::detect::select_backend_fast;
 use crate::{SpawnRequest, SpawnedWorkspace};
 use chrono::Utc;
 use globset::Glob;
@@ -188,9 +188,11 @@ pub fn spawn_workspace(
     let created_branch = prepared_branch.created_branch;
 
     let spawn_result = (|| -> Result<SpawnedWorkspaceInfo> {
-        let probe =
-            detect_filesystem_with_ozone(&repo.repo_root, Some(&repo.layout.ozone_dir))?;
-        let backend_kind = select_backend(&probe, opts.backend.or(repo.config.backend));
+        let backend_kind = select_backend_fast(
+            &repo.repo_root,
+            Some(&repo.layout.ozone_dir),
+            opts.backend.or(repo.config.backend),
+        )?;
 
         let mut baseline_dir: Option<PathBuf> = None;
         let mut baseline_id: Option<String> = None;
@@ -248,6 +250,7 @@ pub fn spawn_workspace(
 
         create_colocated_worktree_metadata(
             &gix_repo,
+            &repo.layout.ozone_dir,
             &wt_git_dir,
             &target_path,
             &branch_ref_name,
@@ -759,6 +762,7 @@ fn collect_checked_out_branches(
 
 fn create_colocated_worktree_metadata(
     gix_repo: &gix::Repository,
+    ozone_dir: &Path,
     wt_git_dir: &Path,
     target_path: &Path,
     branch_ref_name: &str,
@@ -773,19 +777,54 @@ fn create_colocated_worktree_metadata(
     )?;
 
     let index_path = wt_git_dir.join("index");
-    let index_file = if let Some(tree_hex) = base_tree {
+    if let Some(tree_hex) = base_tree {
+        // Cache the clean tree-only Git index per tree OID so spawning N workspaces from the
+        // same base commit builds the index once and copies it via fast kernel copy.
+        let cache_dir = ozone_dir.join("index_cache");
+        let cached_index = cache_dir.join(tree_hex);
+        if cached_index.is_file() && std::fs::copy(&cached_index, &index_path).is_ok() {
+            return Ok(());
+        }
+
         let tree_id = gix::ObjectId::from_hex(tree_hex.as_bytes())
             .map_err(|e| OzError::Git(e.to_string()))?;
-        gix_repo
+        let index_file = gix_repo
             .index_from_tree(&tree_id)
-            .map_err(|e| OzError::Git(e.to_string()))?
-    } else {
-        gix::index::File::from_state(
-            gix::index::State::new(gix_repo.object_hash()),
-            index_path.clone(),
-        )
-    };
+            .map_err(|e| OzError::Git(e.to_string()))?;
 
+        let mut out = BufWriter::new(std::fs::File::create(&index_path)?);
+        index_file
+            .write_to(&mut out, gix::index::write::Options::default())
+            .map_err(|e| OzError::Git(e.to_string()))?;
+        drop(out);
+
+        // Best-effort atomic populate of the single-entry tree index cache (pruning stale entries).
+        if std::fs::create_dir_all(&cache_dir).is_ok() {
+            static IDX_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = IDX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp_cache = cache_dir.join(format!(".tmp_{tree_hex}_{}_{}", std::process::id(), seq));
+            if std::fs::copy(&index_path, &tmp_cache).is_ok() {
+                if std::fs::rename(&tmp_cache, &cached_index).is_err() {
+                    let _ = std::fs::remove_file(&tmp_cache);
+                } else if let Ok(rd) = std::fs::read_dir(&cache_dir) {
+                    for ent in rd.flatten() {
+                        let fname = ent.file_name();
+                        if fname != std::ffi::OsStr::new(tree_hex)
+                            && !fname.to_string_lossy().starts_with(".tmp_")
+                        {
+                            let _ = std::fs::remove_file(ent.path());
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let index_file = gix::index::File::from_state(
+        gix::index::State::new(gix_repo.object_hash()),
+        index_path.clone(),
+    );
     let mut out = BufWriter::new(std::fs::File::create(&index_path)?);
     index_file
         .write_to(&mut out, gix::index::write::Options::default())
@@ -804,14 +843,17 @@ fn load_mount_record(layout: &OzoneLayout, ws: &str) -> Result<Option<MountRecor
 }
 
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = path
         .parent()
         .ok_or_else(|| OzError::Other(format!("path {} has no parent", path.display())))?;
     std::fs::create_dir_all(parent)?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = parent.join(format!(
-        ".tmp_{}_{}",
+        ".tmp_{}_{}_{}",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("json"),
-        std::process::id()
+        std::process::id(),
+        seq
     ));
     let json = serde_json::to_string_pretty(value)?;
     std::fs::write(&tmp, json)?;

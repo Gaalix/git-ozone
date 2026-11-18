@@ -19,8 +19,9 @@ pub mod systemd;
 pub mod windows_setup;
 
 pub use client::{
-    DaemonPong, dirty_paths_via_daemon, ensure_daemon_and_mounts, mount_via_daemon, ping_daemon,
-    send_request, send_tcp_request, shutdown_daemon, socket_path_for_git_dir, unmount_via_daemon,
+    DaemonPong, dirty_paths_via_daemon, ensure_daemon_and_mounts, mount_via_daemon,
+    mount_via_daemon_with_auto_start, ping_daemon, send_request, send_tcp_request, shutdown_daemon,
+    socket_path_for_git_dir, unmount_via_daemon,
 };
 pub use lookup::{OZ_VFSD_BIN_ENV, find_oz_vfsd_bin, resolve_oz_vfsd_bin_with, vfsd_binary_name};
 pub use overlay::{

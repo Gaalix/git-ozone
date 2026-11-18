@@ -20,7 +20,7 @@ use oz_core::{MountHealth, MountRecord, OzoneLayout, OzoneRepo, probe_mount_heal
 use oz_vfsd::lazy_unmount_fuse;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use oz_vfsd::{
-    MountSpec, ensure_daemon_and_mounts, mount_via_daemon, ping_daemon, unmount_via_daemon,
+    MountSpec, mount_via_daemon_with_auto_start, ping_daemon, unmount_via_daemon,
 };
 use std::path::{Path, PathBuf};
 
@@ -475,20 +475,6 @@ fn spawn_daemon_vfs_workspace(
         },
     };
 
-    if auto_start {
-        let _ = ensure_daemon_and_mounts(&git_common_dir).map_err(wrap_mount_err)?;
-    } else if ping_daemon(&sock_path).is_err() {
-        return Err(OzError::MountUnavailable {
-            workspace: req.workspace_name.clone(),
-            path: req.target_path.clone(),
-            errno: None,
-            message: format!(
-                "oz-vfsd socket {} is not listening and daemon.auto_start is disabled",
-                sock_path.display()
-            ),
-        });
-    }
-
     let spec = MountSpec {
         workspace: req.workspace_name.clone(),
         branch: req.branch.clone(),
@@ -504,7 +490,9 @@ fn spawn_daemon_vfs_workspace(
         writeback_cache,
     };
 
-    let _mount_info = mount_via_daemon(&git_common_dir, &spec).map_err(wrap_mount_err)?;
+    let _mount_info =
+        mount_via_daemon_with_auto_start(&git_common_dir, &spec, auto_start)
+            .map_err(wrap_mount_err)?;
 
     // Prefer the MountRecord persisted by live oz-vfsd (includes daemon_pid), or update
     // mounted=true if a test mock listener handled the IPC without writing mount.json.
@@ -770,14 +758,17 @@ fn is_linux_mountpoint(path: &Path) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = path.parent().ok_or_else(|| {
         OzError::Other(format!("path {} has no parent", path.display()))
     })?;
     std::fs::create_dir_all(parent)?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = parent.join(format!(
-        ".tmp_{}_{}",
+        ".tmp_{}_{}_{}",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-        std::process::id()
+        std::process::id(),
+        seq
     ));
     let json = serde_json::to_string_pretty(value)?;
     std::fs::write(&tmp, json)?;

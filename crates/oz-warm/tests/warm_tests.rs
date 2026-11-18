@@ -424,3 +424,86 @@ fn get_mtime_secs(path: &Path) -> i64 {
         .unwrap_or(Duration::ZERO)
         .as_secs() as i64
 }
+
+#[cfg(unix)]
+#[test]
+fn concurrent_baseline_capture_serializes_cleanly_and_hardlinks_non_incremental_cargo_artifacts() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::{Arc, Barrier};
+
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("concurrent-rust");
+    let ozone_dir = repo_root.join(".git/ozone");
+    std::fs::create_dir_all(repo_root.join("src")).expect("mkdir src");
+    std::fs::write(
+        repo_root.join("Cargo.toml"),
+        "[package]\nname = \"concurrent-rust\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(repo_root.join("src/lib.rs"), "pub fn v() -> u32 { 42 }\n").expect("write lib");
+
+    let oid = init_repo(&repo_root);
+    std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
+
+    let dep_path = repo_root.join("target/debug/deps/libdep.rlib");
+    let bin_path = repo_root.join("target/debug/concurrent-rust");
+    let inc_path = repo_root.join("target/debug/incremental/crate/s-1/dep-graph.bin");
+    std::fs::create_dir_all(dep_path.parent().expect("parent")).expect("mkdir deps");
+    std::fs::create_dir_all(inc_path.parent().expect("parent")).expect("mkdir inc");
+    std::fs::write(&dep_path, vec![0x11u8; 64 * 1024]).expect("write dep");
+    std::fs::write(&bin_path, vec![0x22u8; 64 * 1024]).expect("write bin");
+    std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).expect("chmod bin");
+    std::fs::write(&inc_path, vec![0x33u8; 16 * 1024]).expect("write inc");
+
+    let threads = 6usize;
+    let barrier = Arc::new(Barrier::new(threads));
+    let mut results = Vec::new();
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let b = Arc::clone(&barrier);
+            let rr = &repo_root;
+            let od = &ozone_dir;
+            let id = &oid;
+            handles.push(s.spawn(move || {
+                b.wait();
+                capture_baseline(rr, od, id, &OzoneConfig::default())
+            }));
+        }
+        for h in handles {
+            results.push(h.join().expect("thread join").expect("capture ok"));
+        }
+    });
+
+    assert_eq!(results.len(), threads);
+    for meta in &results {
+        assert_eq!(meta.commit_oid, oid);
+    }
+
+    // No leftover `.staging-*` directories after concurrent capture.
+    let leftovers: Vec<_> = std::fs::read_dir(ozone_dir.join("baselines"))
+        .expect("read baselines")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover staging dirs: {leftovers:?}");
+
+    let base_root = ozone_dir.join("baselines").join(&oid).join("root");
+    // Editable source MUST NOT be hardlinked!
+    assert_ne!(
+        std::fs::metadata(repo_root.join("src/lib.rs")).expect("src").ino(),
+        std::fs::metadata(base_root.join("src/lib.rs")).expect("base src").ino()
+    );
+    // Incremental cache uses in-place mmap/SQLite writes -> MUST NOT be hardlinked!
+    assert_ne!(
+        std::fs::metadata(&inc_path).expect("inc").ino(),
+        std::fs::metadata(base_root.join("target/debug/incremental/crate/s-1/dep-graph.bin"))
+            .expect("base inc")
+            .ino()
+    );
+    // Compiled deps and top-level binary in `target/debug/` ARE hardlinked on non-reflink ext4/tmpfs
+    // (or reflinked on APFS/Btrfs/XFS, in which case content and mode still match).
+    let base_bin = base_root.join("target/debug/concurrent-rust");
+    assert_eq!(std::fs::metadata(&base_bin).expect("base bin").len(), 64 * 1024);
+    assert!(base_root.join("target/debug/deps/libdep.rlib").is_file());
+}

@@ -648,6 +648,84 @@ fn windows_projfs_backend_availability_and_shared_seed_layer() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn concurrent_workspace_spawns_reuse_index_and_cas_digest_cache_safely() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::{Arc, Barrier};
+
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("par-spawn");
+    std::fs::create_dir_all(repo_root.join("src")).expect("mkdir src");
+    std::fs::write(repo_root.join(".gitignore"), "/target\n").expect("write .gitignore");
+    std::fs::write(
+        repo_root.join("Cargo.toml"),
+        "[package]\nname = \"par-spawn\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(repo_root.join("src/lib.rs"), "pub fn ok() -> u32 { 7 }\n").expect("write lib");
+
+    let commit_oid = init_repo(&repo_root);
+    let dep = repo_root.join("target/debug/deps/libshared.rlib");
+    std::fs::create_dir_all(dep.parent().expect("parent")).expect("mkdir deps");
+    std::fs::write(&dep, vec![0x5Au8; 1024 * 1024]).expect("write 1MB dep");
+    std::fs::set_permissions(&dep, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+
+    let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover");
+    let count = 8usize;
+    let barrier = Arc::new(Barrier::new(count));
+
+    let spawned_infos: Vec<_> = std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for i in 1..=count {
+            let b = Arc::clone(&barrier);
+            let r = &repo;
+            handles.push(s.spawn(move || {
+                let mut opts = SpawnWorkspaceOptions::new(format!("par-{i}"));
+                opts.branch = Some(format!("feat/par-{i}"));
+                opts.backend = Some(BackendKind::CasHardlink);
+                b.wait();
+                spawn_workspace(r, &opts)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("join").expect("spawn ok"))
+            .collect()
+    });
+
+    assert_eq!(spawned_infos.len(), count);
+    // Digest cache and index cache must both exist cleanly.
+    let cas_digest_file = repo
+        .git_common_dir
+        .join("ozone/cas")
+        .join(format!(".digests_{commit_oid}.json"));
+    assert!(cas_digest_file.is_file(), "CAS digest cache should be persisted");
+
+    // All 8 workspaces share the exact same CAS inode for `libshared.rlib` and distinct inodes for `src/lib.rs`.
+    let first_dep_ino = std::fs::metadata(
+        spawned_infos[0]
+            .workspace
+            .workspace_path
+            .join("target/debug/deps/libshared.rlib"),
+    )
+    .expect("dep meta")
+    .ino();
+    let mut src_inos = std::collections::HashSet::new();
+    for info in &spawned_infos {
+        let ws_path = &info.workspace.workspace_path;
+        assert!(info.git_worktree_dir.join("index").is_file());
+        let dep_ino = std::fs::metadata(ws_path.join("target/debug/deps/libshared.rlib"))
+            .expect("dep meta")
+            .ino();
+        assert_eq!(dep_ino, first_dep_ino);
+        let src_ino = std::fs::metadata(ws_path.join("src/lib.rs"))
+            .expect("src meta")
+            .ino();
+        assert!(src_inos.insert(src_ino), "editable source files must have distinct inodes");
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[test]
 fn projfs_backend_fails_fast_when_auto_start_disabled_and_socket_missing() {

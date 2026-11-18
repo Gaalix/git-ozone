@@ -12,10 +12,11 @@ use crate::trampoline::{is_venv_bin_script, rewrite_python_trampoline_bytes};
 use crate::{BaselineMetadata, EcosystemKind, WarmCacheTarget, detect_warm_targets};
 use chrono::{DateTime, Utc};
 use filetime::FileTime;
+use fs4::FileExt as Fs4FileExt;
 use oz_core::{OzError, OzoneConfig, Result};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::Metadata;
+use std::fs::{Metadata, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
@@ -65,11 +66,32 @@ pub fn capture_baseline(
         return Ok(serde_json::from_str(&raw)?);
     }
 
+    // Serialize concurrent baseline captures for the same commit so N parallel spawns
+    // capture the warm baseline once instead of N redundant copies.
+    let capture_lock_path = baselines_dir.join(format!(".capture-{commit_oid}.lock"));
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&capture_lock_path)?;
+    Fs4FileExt::lock(&lock_file)?;
+
+    // Re-check after acquiring lock in case a racing peer just finished capturing.
+    if final_meta_path.is_file() && final_dir.join("root").is_dir() {
+        let raw = std::fs::read_to_string(&final_meta_path)?;
+        return Ok(serde_json::from_str(&raw)?);
+    }
+
     let staging = tempfile::Builder::new()
         .prefix(".staging-")
         .tempdir_in(&baselines_dir)?;
     let staging_root = staging.path().join("root");
     std::fs::create_dir_all(&staging_root)?;
+
+    // Probe reflink support ONCE for this staging directory so ext4/NTFS never waste
+    // syscalls attempting `reflink` on every single file.
+    let reflink_supported = probe_reflink_once(staging.path());
 
     let mut file_mtimes_secs = BTreeMap::new();
     let mut total_bytes = 0u64;
@@ -79,11 +101,12 @@ pub fn capture_baseline(
         commit_oid,
         &targets,
         &staging_root,
+        reflink_supported,
         &mut file_mtimes_secs,
     )?;
 
     for target in &targets {
-        total_bytes += capture_warm_target(repo_root, &staging_root, target)?;
+        total_bytes += capture_warm_target(repo_root, &staging_root, target, reflink_supported)?;
     }
 
     let created_at = Utc::now();
@@ -104,7 +127,7 @@ pub fn capture_baseline(
     let _ = set_file_mtime_compat(&staging_meta_path, meta_ft);
 
     let staging_path = staging.keep();
-    match std::fs::rename(&staging_path, &final_dir) {
+    let result = match std::fs::rename(&staging_path, &final_dir) {
         Ok(()) => Ok(metadata),
         Err(err) => {
             let _ = std::fs::remove_dir_all(&staging_path);
@@ -114,7 +137,22 @@ pub fn capture_baseline(
             }
             Err(OzError::Io(err))
         }
+    };
+    drop(lock_file);
+    result
+}
+
+fn probe_reflink_once(dir: &Path) -> bool {
+    let src = dir.join(".reflink_probe_src");
+    let dst = dir.join(".reflink_probe_dst");
+    if std::fs::write(&src, b"x").is_err() {
+        let _ = std::fs::remove_file(&src);
+        return false;
     }
+    let ok = reflink_copy::reflink(&src, &dst).is_ok();
+    let _ = std::fs::remove_file(&dst);
+    let _ = std::fs::remove_file(&src);
+    ok
 }
 
 fn capture_tracked_files(
@@ -122,16 +160,30 @@ fn capture_tracked_files(
     commit_oid: &str,
     targets: &[WarmCacheTarget],
     staging_root: &Path,
+    reflink_supported: bool,
     file_mtimes_secs: &mut BTreeMap<String, i64>,
 ) -> Result<u64> {
     if let Ok(repo) = gix::open(repo_root)
         && let Ok(oid) = gix::ObjectId::from_hex(commit_oid.as_bytes())
         && let Ok(commit) = repo.find_commit(oid)
     {
-        return capture_git_commit_tree(repo_root, &repo, &commit, staging_root, file_mtimes_secs);
+        return capture_git_commit_tree(
+            repo_root,
+            &repo,
+            &commit,
+            staging_root,
+            reflink_supported,
+            file_mtimes_secs,
+        );
     }
 
-    capture_non_git_source_files(repo_root, targets, staging_root, file_mtimes_secs)
+    capture_non_git_source_files(
+        repo_root,
+        targets,
+        staging_root,
+        reflink_supported,
+        file_mtimes_secs,
+    )
 }
 
 fn capture_git_commit_tree(
@@ -139,6 +191,7 @@ fn capture_git_commit_tree(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     staging_root: &Path,
+    reflink_supported: bool,
     file_mtimes_secs: &mut BTreeMap<String, i64>,
 ) -> Result<u64> {
     let commit_secs = commit
@@ -152,65 +205,89 @@ fn capture_git_commit_tree(
         .files()
         .map_err(|e| OzError::Git(e.to_string()))?;
 
-    let mut total_bytes = 0u64;
+    let mut jobs = Vec::with_capacity(entries.len());
+    let mut dirs = HashSet::new();
     for entry in entries {
-        if entry.mode.is_tree() || entry.mode.is_commit() {
+        if entry.mode.is_tree() || entry.mode.kind() == gix::objs::tree::EntryKind::Commit {
             continue;
         }
         let Ok(rel_str) = std::str::from_utf8(entry.filepath.as_ref()) else {
             continue;
         };
-        let rel_path = Path::new(rel_str);
-        let work_file = repo_root.join(rel_path);
-        let mtime_secs = match std::fs::symlink_metadata(&work_file) {
-            Ok(meta) => metadata_modified_unix_secs(&meta),
-            Err(_) => commit_secs,
-        };
-        file_mtimes_secs.insert(rel_str.to_string(), mtime_secs);
-
-        let dst_path = staging_root.join(rel_path);
+        let dst_path = staging_root.join(rel_str);
         if let Some(parent) = dst_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            dirs.insert(parent.to_path_buf());
         }
-
-        let blob = repo
-            .find_blob(entry.oid)
-            .map_err(|e| OzError::Git(e.to_string()))?;
-        let data = &blob.data;
-
-        if entry.mode.is_link() {
-            write_symlink_bytes(&dst_path, data)?;
-            let _ = set_symlink_mtime_secs(&dst_path, mtime_secs);
-            total_bytes += data.len() as u64;
-            continue;
-        }
-
-        // Editable source files are NEVER hardlinked. Try reflink only when clean on disk,
-        // otherwise write directly from the Git blob.
-        let mut materialized = false;
-        if let Ok(meta) = std::fs::symlink_metadata(&work_file)
-            && meta.is_file()
-            && meta.len() == data.len() as u64
-            && reflink_copy::reflink(&work_file, &dst_path).is_ok()
-        {
-            materialized = true;
-        }
-        if !materialized {
-            std::fs::write(&dst_path, data)?;
-        }
-
-        apply_git_mode(&dst_path, entry.mode.is_executable())?;
-        set_file_mtime_compat(&dst_path, FileTime::from_unix_time(mtime_secs, 0))?;
-        total_bytes += data.len() as u64;
+        jobs.push((rel_str.to_string(), dst_path, entry.oid, entry.mode));
     }
 
-    Ok(total_bytes)
+    for dir in dirs {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let git_dir = repo.git_dir().to_path_buf();
+    let total = AtomicU64::new(0);
+    let mtime_pairs: Vec<(String, i64)> = jobs
+        .par_iter()
+        .map_init(
+            || gix::open(&git_dir).map_err(|e| OzError::Git(e.to_string())),
+            |thread_repo_res, (rel_str, dst_path, oid, mode)| -> Result<(String, i64)> {
+                let thread_repo = thread_repo_res
+                    .as_ref()
+                    .map_err(|e| OzError::Git(e.to_string()))?;
+                let work_file = repo_root.join(rel_str.as_str());
+                let work_meta = std::fs::symlink_metadata(&work_file).ok();
+                let mtime_secs = work_meta
+                    .as_ref()
+                    .map_or(commit_secs, metadata_modified_unix_secs);
+
+                let blob = thread_repo
+                    .find_blob(*oid)
+                    .map_err(|e| OzError::Git(e.to_string()))?;
+                let data = &blob.data;
+
+                if mode.is_link() {
+                    write_symlink_bytes(dst_path, data)?;
+                    let _ = set_symlink_mtime_secs(dst_path, mtime_secs);
+                    total.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    return Ok((rel_str.clone(), mtime_secs));
+                }
+
+                // Editable source files are NEVER hardlinked. Try reflink only when supported and
+                // clean on disk, otherwise write directly from the Git blob.
+                let mut materialized = false;
+                if reflink_supported
+                    && let Some(ref meta) = work_meta
+                    && meta.is_file()
+                    && meta.len() == data.len() as u64
+                    && reflink_copy::reflink(&work_file, dst_path).is_ok()
+                {
+                    materialized = true;
+                }
+                if !materialized {
+                    std::fs::write(dst_path, data)?;
+                }
+
+                apply_git_mode(dst_path, mode.is_executable())?;
+                set_file_mtime_compat(dst_path, FileTime::from_unix_time(mtime_secs, 0))?;
+                total.fetch_add(data.len() as u64, Ordering::Relaxed);
+                Ok((rel_str.clone(), mtime_secs))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    for (rel_str, mtime_secs) in mtime_pairs {
+        file_mtimes_secs.insert(rel_str, mtime_secs);
+    }
+
+    Ok(total.load(Ordering::Relaxed))
 }
 
 fn capture_non_git_source_files(
     repo_root: &Path,
     targets: &[WarmCacheTarget],
     staging_root: &Path,
+    reflink_supported: bool,
     file_mtimes_secs: &mut BTreeMap<String, i64>,
 ) -> Result<u64> {
     let warm_roots: HashSet<String> = targets
@@ -268,7 +345,7 @@ fn capture_non_git_source_files(
 
         if meta.is_file() {
             // NEVER hardlink editable source files!
-            if reflink_copy::reflink(entry.path(), &dst).is_err() {
+            if !(reflink_supported && reflink_copy::reflink(entry.path(), &dst).is_ok()) {
                 std::fs::copy(entry.path(), &dst)?;
             }
             std::fs::set_permissions(&dst, meta.permissions())?;
@@ -293,6 +370,7 @@ fn capture_warm_target(
     repo_root: &Path,
     staging_root: &Path,
     target: &WarmCacheTarget,
+    reflink_supported: bool,
 ) -> Result<u64> {
     let src_root = repo_root.join(&target.relative_path);
     if !src_root.exists() {
@@ -312,10 +390,12 @@ fn capture_warm_target(
             is_symlink: meta.file_type().is_symlink(),
             meta,
         };
-        return process_warm_file_job(&job, &target.ecosystem);
+        return process_warm_file_job(&job, &target.ecosystem, reflink_supported);
     }
 
     std::fs::create_dir_all(&dst_root)?;
+    let mut created_dirs = HashSet::new();
+    created_dirs.insert(dst_root.clone());
     let mut jobs = Vec::new();
 
     for entry in WalkDir::new(&src_root).follow_links(false) {
@@ -332,11 +412,16 @@ fn capture_warm_target(
         }
         let dst = dst_root.join(rel);
         if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&dst)?;
+            if created_dirs.insert(dst.clone()) {
+                std::fs::create_dir_all(&dst)?;
+            }
             continue;
         }
-        if let Some(parent) = dst.parent() {
+        if let Some(parent) = dst.parent()
+            && !created_dirs.contains(parent)
+        {
             std::fs::create_dir_all(parent)?;
+            created_dirs.insert(parent.to_path_buf());
         }
         let meta = std::fs::symlink_metadata(entry.path())?;
         jobs.push(WarmFileJob {
@@ -351,7 +436,7 @@ fn capture_warm_target(
     let total = AtomicU64::new(0);
     jobs.par_iter()
         .try_for_each(|job| -> Result<()> {
-            let bytes = process_warm_file_job(job, &target.ecosystem)?;
+            let bytes = process_warm_file_job(job, &target.ecosystem, reflink_supported)?;
             total.fetch_add(bytes, Ordering::Relaxed);
             Ok(())
         })?;
@@ -359,7 +444,11 @@ fn capture_warm_target(
     Ok(total.load(Ordering::Relaxed))
 }
 
-fn process_warm_file_job(job: &WarmFileJob, ecosystem: &EcosystemKind) -> Result<u64> {
+fn process_warm_file_job(
+    job: &WarmFileJob,
+    ecosystem: &EcosystemKind,
+    reflink_supported: bool,
+) -> Result<u64> {
     if job.is_symlink {
         copy_symlink(&job.src, &job.dst)?;
         return Ok(job.meta.len());
@@ -379,7 +468,7 @@ fn process_warm_file_job(job: &WarmFileJob, ecosystem: &EcosystemKind) -> Result
             set_file_mtime_compat(&job.dst, mtime)?;
             return Ok(rewritten.len() as u64);
         }
-        if reflink_copy::reflink(&job.src, &job.dst).is_err() {
+        if !(reflink_supported && reflink_copy::reflink(&job.src, &job.dst).is_ok()) {
             std::fs::write(&job.dst, &bytes)?;
         }
         std::fs::set_permissions(&job.dst, job.meta.permissions())?;
@@ -387,7 +476,7 @@ fn process_warm_file_job(job: &WarmFileJob, ecosystem: &EcosystemKind) -> Result
         return Ok(bytes.len() as u64);
     }
 
-    if reflink_copy::reflink(&job.src, &job.dst).is_ok() {
+    if reflink_supported && reflink_copy::reflink(&job.src, &job.dst).is_ok() {
         std::fs::set_permissions(&job.dst, job.meta.permissions())?;
         set_file_mtime_compat(&job.dst, mtime)?;
         return Ok(job.meta.len());
@@ -439,9 +528,9 @@ fn is_immutable_cache_artifact(
         .collect();
 
     match ecosystem {
-        EcosystemKind::RustCargo => comps
-            .iter()
-            .any(|c| matches!(*c, "deps" | ".fingerprint" | "build" | "doc")),
+        // Cargo's `incremental/` directory uses in-place SQLite/mmap writes and must be copied;
+        // compiled artifacts (`deps/`, `.fingerprint/`, `build/`, `doc/`, binaries) are replaced atomically.
+        EcosystemKind::RustCargo => !comps.contains(&"incremental"),
         EcosystemKind::NodeJs => true,
         EcosystemKind::Python => !comps.contains(&"bin")
             && rel_in_target.file_name().and_then(|s| s.to_str()) != Some("pyvenv.cfg"),
@@ -519,11 +608,9 @@ pub fn gc_baselines(ozone_dir: &Path, max_baseline_gb: f64) -> Result<GcReport> 
             None
         };
 
-        let walked_size = directory_logical_bytes(&path.join("root"));
-        let size_bytes = if walked_size > 0 {
-            walked_size
-        } else {
-            parsed_meta.as_ref().map_or(0, |m| m.total_bytes)
+        let size_bytes = match parsed_meta.as_ref() {
+            Some(meta) if meta.total_bytes > 0 => meta.total_bytes,
+            _ => directory_logical_bytes(&path.join("root")),
         };
 
         let lru_nanos = read_baseline_lru_nanos(&path, &meta_path, parsed_meta.as_ref());

@@ -33,7 +33,7 @@ impl VfsDaemon {
     pub fn new(git_dir: impl Into<PathBuf>, socket_path: Option<PathBuf>) -> Self {
         let git_dir = git_dir.into();
         let socket_path =
-            socket_path.unwrap_or_else(|| git_dir.join("ozone").join("vfsd.sock"));
+            socket_path.unwrap_or_else(|| crate::client::socket_path_for_git_dir(&git_dir));
         Self {
             git_dir,
             socket_path,
@@ -573,6 +573,11 @@ async fn prepare_daemon_runtime(
     std::fs::create_dir_all(ozone_dir.join("ws"))?;
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        if parent != ozone_dir {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     let lock_file = acquire_daemon_lock(git_dir)?;
@@ -611,6 +616,73 @@ async fn cleanup_daemon_runtime(socket_path: &Path, manager: Arc<Mutex<DaemonMan
     let _ = std::fs::remove_file(socket_path);
 }
 
+fn handle_request_concurrent(
+    manager: &Mutex<DaemonManager>,
+    req: VfsRequest,
+) -> (VfsResponse, bool) {
+    if let VfsRequest::Mount { spec } = req {
+        let spec = *spec;
+        let old_mount = {
+            let mut guard = manager.lock().expect("daemon lock poisoned");
+            if let Some(existing) = guard.mounts.get(&spec.workspace) {
+                let healthy = std::fs::symlink_metadata(&existing.spec.mount_point).is_ok();
+                if healthy && existing.spec == spec {
+                    return (
+                        VfsResponse::Mounted {
+                            mount: existing.info(),
+                        },
+                        false,
+                    );
+                }
+            }
+            guard.mounts.remove(&spec.workspace)
+        };
+
+        if let Some(old) = old_mount {
+            let _ = old.mounted.unmount(true);
+        }
+
+        // Perform the blocking FUSE3/ProjFS mount syscall OUTSIDE the global daemon mutex so
+        // concurrent `oz ws spawn` calls mount in parallel instead of serializing behind one lock.
+        let (backend, mounted) = match mount_platform_vfs(&spec) {
+            Ok(pair) => pair,
+            Err(err) => {
+                return (
+                    VfsResponse::Error {
+                        code: err.error_code().to_string(),
+                        message: err.to_string(),
+                    },
+                    false,
+                );
+            }
+        };
+
+        let active = ActiveMount {
+            spec: spec.clone(),
+            backend,
+            mounted,
+        };
+        let info = active.info();
+
+        let displaced = {
+            let mut guard = manager.lock().expect("daemon lock poisoned");
+            let prev = guard.mounts.insert(spec.workspace.clone(), active);
+            guard.persist_mount_state(&spec, backend, true);
+            prev
+        };
+        if let Some(old) = displaced {
+            let _ = old.mounted.unmount(true);
+        }
+
+        return (VfsResponse::Mounted { mount: info }, false);
+    }
+
+    manager
+        .lock()
+        .expect("daemon lock poisoned")
+        .handle_request(req)
+}
+
 async fn serve_ipc_stream<S>(
     stream: S,
     manager: Arc<Mutex<DaemonManager>>,
@@ -647,10 +719,7 @@ async fn serve_ipc_stream<S>(
                 };
                 let mgr_call = Arc::clone(&manager);
                 let call_res = tokio::task::spawn_blocking(move || {
-                    mgr_call
-                        .lock()
-                        .expect("daemon lock poisoned")
-                        .handle_request(req)
+                    handle_request_concurrent(&mgr_call, req)
                 })
                 .await;
 

@@ -10,7 +10,7 @@
 
 use crate::protocol::{DirtyPathEntry, MountSpec};
 use oz_core::{ChangeKind, OzError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::FileType as StdFileType;
 use std::path::{Component, Path, PathBuf};
@@ -319,6 +319,42 @@ fn baseline_blocked_at_dir(cfg: &OverlayMountConfig, rel_dir: &Path) -> bool {
     false
 }
 
+/// Reads all `<name>.oz_wh` marker basenames inside `root/<rel_dir>` in a single `read_dir`
+/// pass (returning an empty set immediately if the marker directory does not exist), avoiding
+/// O(N) per-entry `stat()` syscalls while merging large baseline directories.
+fn read_dir_whiteout_names(root: &Path, rel_dir: &Path) -> HashSet<OsString> {
+    let mut names = HashSet::new();
+    let dir = if rel_dir.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_dir)
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return names;
+    };
+    let suffix_bytes = WHITEOUT_SUFFIX.as_bytes();
+    for item in rd.flatten() {
+        let fname = item.file_name();
+        let bytes = fname.as_encoded_bytes();
+        if bytes.len() > suffix_bytes.len() && bytes.ends_with(suffix_bytes) {
+            let trimmed = &bytes[..bytes.len() - suffix_bytes.len()];
+            // SAFETY: `trimmed` is a prefix of valid `OsStr` encoded bytes cut at an ASCII suffix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                names.insert(OsStr::from_bytes(trimmed).to_os_string());
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(s) = std::str::from_utf8(trimmed) {
+                    names.insert(OsString::from(s));
+                }
+            }
+        }
+    }
+    names
+}
+
 /// Collects and deduplicates directory entries across `[upper_dir, seed_dir, baseline_dir]`
 /// in deterministic lexicographical order.
 pub fn list_merged_dir_entries(
@@ -355,8 +391,7 @@ pub fn list_merged_dir_entries(
         return Ok(entries.into_values().collect());
     }
 
-    let whiteouts = cfg.whiteouts_dir();
-    let seed_whiteouts = cfg.seed_whiteouts_dir();
+    let whiteout_names = read_dir_whiteout_names(&cfg.whiteouts_dir(), rel_dir);
 
     if let Some(ref seed) = cfg.seed_dir {
         let seed_path = if rel_dir.as_os_str().is_empty() {
@@ -370,15 +405,7 @@ pub fn list_merged_dir_entries(
             for item in std::fs::read_dir(&seed_path)? {
                 let item = item?;
                 let name = item.file_name();
-                if entries.contains_key(&name) {
-                    continue;
-                }
-                let child_rel = if rel_dir.as_os_str().is_empty() {
-                    PathBuf::from(&name)
-                } else {
-                    rel_dir.join(&name)
-                };
-                if marker_path(&whiteouts, &child_rel, WHITEOUT_SUFFIX).exists() {
+                if entries.contains_key(&name) || whiteout_names.contains(&name) {
                     continue;
                 }
                 let ft = item.file_type()?;
@@ -399,6 +426,8 @@ pub fn list_merged_dir_entries(
         return Ok(entries.into_values().collect());
     }
 
+    let seed_whiteout_names = read_dir_whiteout_names(&cfg.seed_whiteouts_dir(), rel_dir);
+
     if let Some(ref base) = cfg.baseline_dir {
         let base_path = if rel_dir.as_os_str().is_empty() {
             base.clone()
@@ -411,16 +440,9 @@ pub fn list_merged_dir_entries(
             for item in std::fs::read_dir(&base_path)? {
                 let item = item?;
                 let name = item.file_name();
-                if entries.contains_key(&name) {
-                    continue;
-                }
-                let child_rel = if rel_dir.as_os_str().is_empty() {
-                    PathBuf::from(&name)
-                } else {
-                    rel_dir.join(&name)
-                };
-                if marker_path(&whiteouts, &child_rel, WHITEOUT_SUFFIX).exists()
-                    || marker_path(&seed_whiteouts, &child_rel, WHITEOUT_SUFFIX).exists()
+                if entries.contains_key(&name)
+                    || whiteout_names.contains(&name)
+                    || seed_whiteout_names.contains(&name)
                 {
                     continue;
                 }
@@ -933,11 +955,14 @@ mod linux_impl {
         writable: bool,
     }
 
+    type DirSnapshot = Arc<Vec<(INodeNo, FileType, OsString)>>;
+
     #[derive(Debug)]
     struct InnerState {
         inodes: InodeTable,
         next_fh: u64,
         open_files: HashMap<FileHandle, OpenFile>,
+        open_dirs: HashMap<FileHandle, Option<DirSnapshot>>,
         next_tmp: u64,
     }
 
@@ -954,6 +979,7 @@ mod linux_impl {
                     inodes: InodeTable::new(),
                     next_fh: 1,
                     open_files: HashMap::new(),
+                    open_dirs: HashMap::new(),
                     next_tmp: 1,
                 }),
             }
@@ -1514,6 +1540,22 @@ mod linux_impl {
             }
             let upper_path = self.upper_path(&rel);
 
+            // If `mode` grants owner write alongside a size change (e.g. chmod +w + truncate on a
+            // read-only lower file), apply `mode` before opening `upper_path` for truncation.
+            let mut mode_applied = false;
+            if let Some(m) = mode
+                && size.is_some()
+                && (m & 0o200) != 0
+            {
+                if let Err(e) =
+                    std::fs::set_permissions(&upper_path, Permissions::from_mode(m & 0o7777))
+                {
+                    reply.error(errno_from_io(&e));
+                    return;
+                }
+                mode_applied = true;
+            }
+
             if let Some(new_size) = size
                 && !truncate_zero
             {
@@ -1539,7 +1581,8 @@ mod linux_impl {
                 return;
             }
 
-            if let Some(m) = mode
+            if !mode_applied
+                && let Some(m) = mode
                 && let Err(e) =
                     std::fs::set_permissions(&upper_path, Permissions::from_mode(m & 0o7777))
             {
@@ -2158,6 +2201,18 @@ mod linux_impl {
                 let upper_path = self.upper_path(&rel);
                 match OpenOptions::new().read(true).write(true).open(&upper_path) {
                     Ok(f) => f,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::PermissionDenied
+                            && acc == OpenAccMode::O_WRONLY =>
+                    {
+                        match OpenOptions::new().write(true).open(&upper_path) {
+                            Ok(f) => f,
+                            Err(err) => {
+                                reply.error(errno_from_io(&err));
+                                return;
+                            }
+                        }
+                    }
                     Err(e) => {
                         reply.error(errno_from_io(&e));
                         return;
@@ -2354,13 +2409,14 @@ mod linux_impl {
 
             let excl = (flags & libc::O_EXCL) != 0;
             let trunc = (flags & libc::O_TRUNC) != 0;
-            if excl && resolve_rel_path(&self.cfg, &rel).is_some() {
+            let existed = resolve_rel_path(&self.cfg, &rel).is_some();
+            if excl && existed {
                 reply.error(Errno::EEXIST);
                 return;
             }
             if !excl
                 && !trunc
-                && resolve_rel_path(&self.cfg, &rel).is_some()
+                && existed
                 && let Err(e) = self.copy_up_entry(&mut inner, &rel, false)
             {
                 reply.error(e);
@@ -2393,7 +2449,11 @@ mod linux_impl {
                 }
             };
 
-            let _ = std::fs::set_permissions(&upper_path, Permissions::from_mode(eff_mode));
+            // POSIX: O_CREAT must only set permissions when creating a brand-new file;
+            // opening an existing executable file with O_CREAT|O_WRONLY must preserve its mode.
+            if !existed {
+                let _ = std::fs::set_permissions(&upper_path, Permissions::from_mode(eff_mode));
+            }
 
             let attr = match self.stat_resolved(&mut inner, &rel, true) {
                 Ok(a) => a,
@@ -2416,7 +2476,7 @@ mod linux_impl {
         }
 
         fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-            let inner = self.state.lock().expect("vfsd lock poisoned");
+            let mut inner = self.state.lock().expect("vfsd lock poisoned");
             let Ok(rel) = inner.inodes.resolve_ino_path(ino) else {
                 reply.error(Errno::ENOENT);
                 return;
@@ -2427,7 +2487,10 @@ mod linux_impl {
             };
             match std::fs::symlink_metadata(&resolved.host_path) {
                 Ok(meta) if meta.file_type().is_dir() => {
-                    reply.opened(FileHandle(0), FopenFlags::empty());
+                    let fh = FileHandle(inner.next_fh);
+                    inner.next_fh += 1;
+                    inner.open_dirs.insert(fh, None);
+                    reply.opened(fh, FopenFlags::empty());
                 }
                 Ok(_) => reply.error(Errno::ENOTDIR),
                 Err(e) => reply.error(errno_from_io(&e)),
@@ -2438,76 +2501,104 @@ mod linux_impl {
             &self,
             _req: &Request,
             ino: INodeNo,
-            _fh: FileHandle,
+            fh: FileHandle,
             offset: u64,
             mut reply: ReplyDirectory,
         ) {
             let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(rel_dir) = inner.inodes.resolve_ino_path(ino) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let Some(resolved) = resolve_rel_path(&self.cfg, &rel_dir) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            match std::fs::symlink_metadata(&resolved.host_path) {
-                Ok(meta) if meta.file_type().is_dir() => {}
-                Ok(_) => {
-                    reply.error(Errno::ENOTDIR);
-                    return;
-                }
-                Err(e) => {
-                    reply.error(errno_from_io(&e));
-                    return;
-                }
-            }
 
-            let merged = match list_merged_dir_entries(&self.cfg, &rel_dir) {
-                Ok(m) => m,
-                Err(e) => {
-                    reply.error(errno_from_io(&e));
-                    return;
-                }
-            };
-
-            let parent_ino = if rel_dir.as_os_str().is_empty() {
-                INodeNo::ROOT
+            // Reuse the directory snapshot across paginated `readdir` calls (`offset > 0`) on
+            // the same directory handle so large directories enumerate in O(M) instead of O(M^2).
+            // Re-reading at `offset == 0` (fresh opendir / rewinddir) always refreshes from disk
+            // so host-side mutations (`oz undo`) remain immediately visible.
+            let snapshot: DirSnapshot = if offset > 0
+                && let Some(Some(cached)) = inner.open_dirs.get(&fh)
+            {
+                Arc::clone(cached)
             } else {
-                let parent_rel = rel_dir.parent().map(Path::to_path_buf).unwrap_or_default();
-                if parent_rel.as_os_str().is_empty() {
+                let Ok(rel_dir) = inner.inodes.resolve_ino_path(ino) else {
+                    reply.error(Errno::ENOENT);
+                    return;
+                };
+                let Some(resolved) = resolve_rel_path(&self.cfg, &rel_dir) else {
+                    reply.error(Errno::ENOENT);
+                    return;
+                };
+                match std::fs::symlink_metadata(&resolved.host_path) {
+                    Ok(meta) if meta.file_type().is_dir() => {}
+                    Ok(_) => {
+                        reply.error(Errno::ENOTDIR);
+                        return;
+                    }
+                    Err(e) => {
+                        reply.error(errno_from_io(&e));
+                        return;
+                    }
+                }
+
+                let merged = match list_merged_dir_entries(&self.cfg, &rel_dir) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        reply.error(errno_from_io(&e));
+                        return;
+                    }
+                };
+
+                let parent_ino = if rel_dir.as_os_str().is_empty() {
                     INodeNo::ROOT
                 } else {
-                    inner.inodes.lookup_or_insert(&parent_rel, true, false)
-                }
-            };
-
-            let mut all_entries: Vec<(INodeNo, FileType, OsString)> =
-                Vec::with_capacity(merged.len() + 2);
-            all_entries.push((ino, FileType::Directory, OsString::from(".")));
-            all_entries.push((parent_ino, FileType::Directory, OsString::from("..")));
-
-            for item in merged {
-                let child_rel = if rel_dir.as_os_str().is_empty() {
-                    PathBuf::from(&item.name)
-                } else {
-                    rel_dir.join(&item.name)
+                    let parent_rel = rel_dir.parent().map(Path::to_path_buf).unwrap_or_default();
+                    if parent_rel.as_os_str().is_empty() {
+                        INodeNo::ROOT
+                    } else {
+                        inner.inodes.lookup_or_insert(&parent_rel, true, false)
+                    }
                 };
-                let is_dir = item.file_type.is_dir();
-                let child_ino = inner.inodes.lookup_or_insert(&child_rel, is_dir, false);
-                let kind = FileType::from_std(item.file_type).unwrap_or(FileType::RegularFile);
-                all_entries.push((child_ino, kind, item.name));
-            }
+
+                let mut all_entries: Vec<(INodeNo, FileType, OsString)> =
+                    Vec::with_capacity(merged.len() + 2);
+                all_entries.push((ino, FileType::Directory, OsString::from(".")));
+                all_entries.push((parent_ino, FileType::Directory, OsString::from("..")));
+
+                for item in merged {
+                    let child_rel = if rel_dir.as_os_str().is_empty() {
+                        PathBuf::from(&item.name)
+                    } else {
+                        rel_dir.join(&item.name)
+                    };
+                    let is_dir = item.file_type.is_dir();
+                    let child_ino = inner.inodes.lookup_or_insert(&child_rel, is_dir, false);
+                    let kind = FileType::from_std(item.file_type).unwrap_or(FileType::RegularFile);
+                    all_entries.push((child_ino, kind, item.name));
+                }
+
+                let arc = Arc::new(all_entries);
+                if let Some(slot) = inner.open_dirs.get_mut(&fh) {
+                    *slot = Some(Arc::clone(&arc));
+                }
+                arc
+            };
             drop(inner);
 
-            for (idx, (entry_ino, kind, name)) in
-                all_entries.into_iter().enumerate().skip(offset as usize)
-            {
+            for (idx, (entry_ino, kind, name)) in snapshot.iter().enumerate().skip(offset as usize) {
                 let next_offset = (idx + 1) as u64;
-                if reply.add(entry_ino, next_offset, kind, name) {
+                if reply.add(*entry_ino, next_offset, *kind, name) {
                     break;
                 }
             }
+            reply.ok();
+        }
+
+        fn releasedir(
+            &self,
+            _req: &Request,
+            _ino: INodeNo,
+            fh: FileHandle,
+            _flags: OpenFlags,
+            reply: ReplyEmpty,
+        ) {
+            let mut inner = self.state.lock().expect("vfsd lock poisoned");
+            inner.open_dirs.remove(&fh);
             reply.ok();
         }
 
@@ -2726,5 +2817,63 @@ mod tests {
                 ("tracked.txt".to_string(), ChangeKind::Modified),
             ]
         );
+    }
+
+    #[test]
+    fn list_merged_dir_entries_handles_large_dirs_spaces_unicode_and_whiteouts() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = test_cfg(dir.path());
+        let base = cfg.baseline_dir.as_ref().expect("base");
+        let seed = cfg.seed_dir.as_ref().expect("seed");
+
+        let sub_base = base.join("big dir");
+        std::fs::create_dir_all(&sub_base).expect("mkdir big dir");
+        for i in 0..500 {
+            std::fs::write(sub_base.join(format!("item_{i:04}.txt")), b"v").expect("write");
+        }
+        std::fs::write(sub_base.join("café report.txt"), b"unicode").expect("write unicode");
+        std::fs::write(sub_base.join("seed_hidden.txt"), b"hidden").expect("write seed_hidden");
+
+        let sub_seed = seed.join("big dir");
+        std::fs::create_dir_all(&sub_seed).expect("mkdir seed big dir");
+        std::fs::write(sub_seed.join("item_0001.txt"), b"seed-override").expect("write seed");
+
+        // Whiteout 3 entries in user whiteouts and 1 entry in seed_whiteouts.
+        std::fs::create_dir_all(cfg.whiteouts_dir().join("big dir")).expect("mkdir wh");
+        for idx in [0, 10, 499] {
+            std::fs::write(
+                marker_path(
+                    &cfg.whiteouts_dir(),
+                    &PathBuf::from(format!("big dir/item_{idx:04}.txt")),
+                    WHITEOUT_SUFFIX,
+                ),
+                b"",
+            )
+            .expect("write wh");
+        }
+        std::fs::create_dir_all(cfg.seed_whiteouts_dir().join("big dir")).expect("mkdir swh");
+        std::fs::write(
+            marker_path(
+                &cfg.seed_whiteouts_dir(),
+                Path::new("big dir/seed_hidden.txt"),
+                WHITEOUT_SUFFIX,
+            ),
+            b"",
+        )
+        .expect("write swh");
+
+        let merged = list_merged_dir_entries(&cfg, Path::new("big dir")).expect("merge");
+        // 500 + café + seed_hidden - 3 user whiteouts - 1 seed whiteout = 498
+        assert_eq!(merged.len(), 498);
+        assert!(merged.iter().any(|e| e.name == "café report.txt"));
+        assert!(!merged.iter().any(|e| e.name == "item_0000.txt"));
+        assert!(!merged.iter().any(|e| e.name == "item_0010.txt"));
+        assert!(!merged.iter().any(|e| e.name == "item_0499.txt"));
+        assert!(!merged.iter().any(|e| e.name == "seed_hidden.txt"));
+        let overridden = merged
+            .iter()
+            .find(|e| e.name == "item_0001.txt")
+            .expect("item_0001");
+        assert_eq!(overridden.layer, LayerKind::Seed);
     }
 }

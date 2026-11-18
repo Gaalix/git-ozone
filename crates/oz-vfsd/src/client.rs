@@ -17,10 +17,11 @@ pub struct DaemonPong {
     pub pid: u32,
 }
 
-/// Returns the canonical IPC endpoint path `.git/ozone/vfsd.sock` for `git_dir`.
+/// Returns the canonical IPC endpoint path for `git_dir` (`.git/ozone/vfsd.sock`, or a
+/// short hashed Unix runtime socket path when `.git/ozone/vfsd.sock` would exceed `SUN_LEN`).
 #[must_use]
 pub fn socket_path_for_git_dir(git_dir: &Path) -> PathBuf {
-    git_dir.join("ozone").join("vfsd.sock")
+    OzoneLayout::from_git_common_dir(git_dir).vfsd_socket_path()
 }
 
 fn exchange_ipc_line<S: std::io::Read + std::io::Write>(
@@ -218,11 +219,12 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
             )));
         }
 
-        if ping_daemon(&sock).is_ok()
-            && all_mount_points_stat_healthy(&records)
-            && daemon_lists_all_mounts(&sock, &records)
-        {
-            return list_mounts_via_socket(&sock);
+        // Once `ping_daemon` succeeds, `restore_mounts_on_startup()` in `oz-vfsd` has already
+        // completed (the IPC listener binds only after startup restore finishes). Break immediately
+        // so `verify_or_repair_live_mounts` either returns the live mounts or surfaces any real
+        // mount failure without waiting out the 10-second startup deadline.
+        if ping_daemon(&sock).is_ok() {
+            break;
         }
 
         if Instant::now() >= deadline {
@@ -249,14 +251,36 @@ pub fn ensure_daemon_and_mounts(_git_dir: &Path) -> Result<Vec<MountInfo>> {
 /// Mounts a workspace through `oz-vfsd` (auto-spawning the daemon if needed) and verifies
 /// that `spec.mount_point` passes `stat()`.
 pub fn mount_via_daemon(git_dir: &Path, spec: &MountSpec) -> Result<MountInfo> {
-    let _ = ensure_daemon_and_mounts(git_dir)?;
+    mount_via_daemon_with_auto_start(git_dir, spec, true)
+}
+
+/// Mounts a workspace through `oz-vfsd`, controlling whether the daemon is auto-started when
+/// not already listening, and verifies that `spec.mount_point` passes `stat()`.
+pub fn mount_via_daemon_with_auto_start(
+    git_dir: &Path,
+    spec: &MountSpec,
+    auto_start: bool,
+) -> Result<MountInfo> {
+    let sock = socket_path_for_git_dir(git_dir);
+    if auto_start {
+        let _ = ensure_daemon_and_mounts(git_dir)?;
+    } else if ping_daemon(&sock).is_err() {
+        return Err(OzError::MountUnavailable {
+            workspace: spec.workspace.clone(),
+            path: spec.mount_point.clone(),
+            errno: None,
+            message: format!(
+                "oz-vfsd socket {} is not listening and daemon.auto_start is disabled",
+                sock.display()
+            ),
+        });
+    }
     if let Err(err) = std::fs::symlink_metadata(&spec.mount_point)
         && oz_core::is_enotconn(&err)
     {
         lazy_unmount_fuse(&spec.mount_point)?;
     }
 
-    let sock = socket_path_for_git_dir(git_dir);
     let resp = send_request(
         &sock,
         &VfsRequest::Mount {
@@ -383,6 +407,7 @@ fn verify_or_repair_live_mounts(
     records: &[MountRecord],
 ) -> Result<Vec<MountInfo>> {
     let current = list_mounts_via_socket(sock)?;
+    let mut repaired = false;
     for record in records {
         let is_listed = current.iter().any(|m| m.workspace == record.workspace && m.mounted);
         let is_healthy = std::fs::symlink_metadata(&record.mount_point).is_ok();
@@ -392,15 +417,37 @@ fn verify_or_repair_live_mounts(
             }
             let ws_dir = git_dir.join("ozone").join("ws").join(&record.workspace);
             let spec = crate::server::load_or_reconstruct_spec(git_dir, &ws_dir, record);
-            let _ = send_request(
+            match send_request(
                 sock,
                 &VfsRequest::Mount {
                     spec: Box::new(spec),
                 },
-            )?;
+            )? {
+                VfsResponse::Mounted { .. } => {
+                    repaired = true;
+                }
+                VfsResponse::Error { code, message } => {
+                    return Err(OzError::MountUnavailable {
+                        workspace: record.workspace.clone(),
+                        path: record.mount_point.clone(),
+                        errno: None,
+                        message: format!("oz-vfsd mount repair error ({code}): {message}"),
+                    });
+                }
+                other => {
+                    return Err(OzError::Other(format!(
+                        "unexpected oz-vfsd response while repairing mount '{}': {other:?}",
+                        record.workspace
+                    )));
+                }
+            }
         }
     }
-    list_mounts_via_socket(sock)
+    if repaired {
+        list_mounts_via_socket(sock)
+    } else {
+        Ok(current)
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -473,26 +520,6 @@ fn is_fuse_mount_in_proc_mountinfo(mount_point: &Path) -> bool {
         };
         after_sep.starts_with("fuse")
     })
-}
-
-#[cfg(any(unix, windows))]
-fn all_mount_points_stat_healthy(records: &[MountRecord]) -> bool {
-    records
-        .iter()
-        .all(|r| std::fs::symlink_metadata(&r.mount_point).is_ok())
-}
-
-#[cfg(any(unix, windows))]
-fn daemon_lists_all_mounts(sock: &Path, records: &[MountRecord]) -> bool {
-    if records.is_empty() {
-        return true;
-    }
-    let Ok(mounts) = list_mounts_via_socket(sock) else {
-        return false;
-    };
-    records
-        .iter()
-        .all(|r| mounts.iter().any(|m| m.workspace == r.workspace && m.mounted))
 }
 
 #[cfg(any(unix, windows))]
