@@ -16,9 +16,12 @@ use crate::commands::{
 };
 use crate::recovery::discover_and_recover_repo;
 use clap::Args;
+use oz_agent::{
+    AiProvenanceNote, ProvenanceOptions, detect_agent_session, record_commit_provenance,
+};
 use oz_core::{
     CheckoutPathsOptions, CommitOptions, DiffReport, Envelope, ExitCode, FileChange,
-    InteractionMode, OzError, OzoneLayout, OzoneRepo, PathspecMatcher, Result, SwitchOptions,
+    InteractionMode, OzError, OzoneRepo, PathspecMatcher, Result, SwitchOptions,
     add_pinned_paths, checkout_paths, clear_pinned_paths, commit_changes,
     commit_changes_ignoring_pinned, compute_diff, compute_status, create_or_reset_local_branch,
     is_local_branch, list_git_worktree_entries, list_tracked_paths_in_head, normalize_lexical,
@@ -28,6 +31,10 @@ use oz_core::{
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, gc_workspaces,
     list_workspaces, remove_workspace, spawn_workspace,
+};
+use oz_github::{
+    CloneOptions, FetchOptions, FetchOutcome, ForceLeaseSpec, HttpAuthScheme, PushOptions,
+    PushOutcome, RemoteScheme, clone_repo, fetch_remote, parse_git_remote, push_refs,
 };
 use oz_integrate::{
     IntegrateOptions, IntegrationMode, StackRebaseOptions, StackRebaseOutcome, abort_integration,
@@ -74,9 +81,32 @@ struct GitResetPinnedData {
 struct GitCloneData {
     url: String,
     path: PathBuf,
-    ozone_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ozone_dir: Option<PathBuf>,
     branch: Option<String>,
     head_oid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<u8>,
+    #[serde(default)]
+    partial_clone: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<String>,
+    #[serde(default)]
+    filter_negotiated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checked_out_files: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    op_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GitCommitData {
+    #[serde(flatten)]
+    outcome: oz_core::CommitOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<AiProvenanceNote>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,14 +372,36 @@ fn invocation_dir(parsed: &ParsedGitGlobals) -> PathBuf {
 }
 
 fn actor_from_mode(mode: InteractionMode, repo: &OzoneRepo) -> ActorInfo {
+    let detected = detect_agent_session();
+    let is_agent = mode.agent || detected.is_some();
+    let client = detected
+        .map(|s| s.client)
+        .unwrap_or_else(|| "oz-git".to_string());
     ActorInfo {
-        kind: if mode.agent {
+        kind: if is_agent {
             ActorKind::Agent
         } else {
             ActorKind::Human
         },
-        client: Some("oz-git".to_string()),
+        client: Some(client),
         workspace: repo.workspace.clone(),
+    }
+}
+
+fn standalone_actor_from_mode(mode: InteractionMode) -> ActorInfo {
+    let detected = detect_agent_session();
+    let is_agent = mode.agent || detected.is_some();
+    let client = detected
+        .map(|s| s.client)
+        .unwrap_or_else(|| "oz-git".to_string());
+    ActorInfo {
+        kind: if is_agent {
+            ActorKind::Agent
+        } else {
+            ActorKind::Human
+        },
+        client: Some(client),
+        workspace: None,
     }
 }
 
@@ -2029,15 +2081,27 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
     let mut allow_out_of_scope = false;
     let mut amend = false;
     let mut no_edit = false;
+    let mut quiet = false;
+    let mut explicit_sign: Option<bool> = None;
+    let mut explicit_signing_key: Option<String> = None;
+    let mut config_gpgsign: Option<bool> = None;
+    let mut config_gpg_format: Option<String> = None;
+    let mut config_signing_key: Option<String> = None;
     let mut author_name: Option<String> = None;
     let mut author_email: Option<String> = None;
     let mut pathspecs: Vec<String> = Vec::new();
 
     for (k, v) in &parsed.config_overrides {
-        if k == "user.name" {
+        if k.eq_ignore_ascii_case("user.name") {
             author_name = Some(v.clone());
-        } else if k == "user.email" {
+        } else if k.eq_ignore_ascii_case("user.email") {
             author_email = Some(v.clone());
+        } else if k.eq_ignore_ascii_case("user.signingkey") {
+            config_signing_key = Some(v.clone());
+        } else if k.eq_ignore_ascii_case("gpg.format") {
+            config_gpg_format = Some(v.clone());
+        } else if k.eq_ignore_ascii_case("commit.gpgsign") {
+            config_gpgsign = parse_git_bool(v);
         }
     }
 
@@ -2103,6 +2167,26 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             continue;
         }
 
+        if arg == "-S" || arg == "--gpg-sign" {
+            explicit_sign = Some(true);
+            i += 1;
+            continue;
+        }
+        if arg == "--no-gpg-sign" {
+            explicit_sign = Some(false);
+            explicit_signing_key = None;
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--gpg-sign=") {
+            explicit_sign = Some(true);
+            if !val.trim().is_empty() {
+                explicit_signing_key = Some(val.trim().to_string());
+            }
+            i += 1;
+            continue;
+        }
+
         if arg == "-a" || arg == "--all" {
             all_flag = true;
             i += 1;
@@ -2133,6 +2217,11 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             i += 1;
             continue;
         }
+        if arg == "-q" || arg == "--quiet" {
+            quiet = true;
+            i += 1;
+            continue;
+        }
         if arg == "--author"
             && let Some(val) = args.get(i + 1)
         {
@@ -2151,28 +2240,77 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             i += 1;
             continue;
         }
-        if arg == "-n" || arg == "--no-verify" || arg == "-v" || arg == "--verbose" || arg == "-q" || arg == "--quiet" {
+        if arg == "-n" || arg == "--no-verify" || arg == "-v" || arg == "--verbose" {
             i += 1;
             continue;
         }
-        // Combined short flags like `-am`
+
+        // Combined short flags starting with boolean short flags (`-am`, `-aS`, `-nvq`, etc.)
         if let Some(short) = arg.strip_prefix('-')
             && !short.starts_with('-')
-            && short.contains('a')
-            && short.contains('m')
+            && short.len() > 1
+            && short
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, 'a' | 'n' | 'v' | 'q' | 'f'))
         {
-            all_flag = true;
-            if let Some(after_m) = short.split_once('m').map(|(_, r)| r) {
-                if !after_m.is_empty() {
-                    messages.push(after_m.to_string());
-                    i += 1;
-                    continue;
-                } else if let Some(val) = args.get(i + 1) {
-                    messages.push(val.clone());
-                    i += 2;
-                    continue;
+            let mut handled = true;
+            let mut consumed_next = false;
+            for (byte_idx, ch) in short.char_indices() {
+                match ch {
+                    'a' => all_flag = true,
+                    'n' | 'v' => {}
+                    'q' => quiet = true,
+                    'f' => force = true,
+                    'S' => {
+                        explicit_sign = Some(true);
+                        let rest = &short[byte_idx + ch.len_utf8()..];
+                        if !rest.is_empty() {
+                            explicit_signing_key = Some(rest.to_string());
+                        }
+                        break;
+                    }
+                    'm' => {
+                        let rest = &short[byte_idx + ch.len_utf8()..];
+                        if !rest.is_empty() {
+                            messages.push(rest.to_string());
+                        } else if let Some(val) = args.get(i + 1) {
+                            messages.push(val.clone());
+                            consumed_next = true;
+                        } else {
+                            return emit_error(
+                                mode,
+                                &OzError::InvalidUsage {
+                                    message: "option `-m` requires a value".to_string(),
+                                    recovery: vec![
+                                        "Pass `oz git commit -m \"feat: ...\"`.".to_string(),
+                                    ],
+                                },
+                            );
+                        }
+                        break;
+                    }
+                    _ => {
+                        handled = false;
+                        break;
+                    }
                 }
             }
+            if handled {
+                i += if consumed_next { 2 } else { 1 };
+                continue;
+            }
+        }
+
+        // Sticked `-S<keyid>` form (`git commit -S~/.ssh/id_ed25519 -m "..."`)
+        if let Some(keyid) = arg.strip_prefix("-S")
+            && !arg.starts_with("--")
+            && !keyid.is_empty()
+        {
+            explicit_sign = Some(true);
+            explicit_signing_key = Some(keyid.to_string());
+            i += 1;
+            continue;
         }
 
         if arg.starts_with('-') {
@@ -2181,7 +2319,7 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
                 &OzError::InvalidUsage {
                     message: format!("unsupported flag `{arg}` for `oz git commit`"),
                     recovery: vec![
-                        "Use `oz git commit -m \"<message>\" [-a] [--allow-empty] [--force]`."
+                        "Use `oz git commit [-S] [--amend [--no-edit]] -m \"<message>\" [-a] [--allow-empty] [--force]`."
                             .to_string(),
                     ],
                 },
@@ -2200,42 +2338,75 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
         }
     }
 
-    if amend {
-        if messages.is_empty() && !no_edit && mode.non_interactive {
+    let full_message = if amend {
+        if messages.is_empty() {
+            if !no_edit {
+                let err = OzError::InvalidUsage {
+                    message: "`oz git commit --amend` requires `-m <msg>`, `-F <file>`, or `--no-edit` (never spawns $EDITOR)"
+                        .to_string(),
+                    recovery: vec!["Pass `--amend --no-edit` or `--amend -m \"...\"`.".to_string()],
+                };
+                return emit_error(mode, &err);
+            }
+            String::new()
+        } else {
+            let joined = messages.join("\n\n");
+            if joined.trim().is_empty() {
+                let err = OzError::InvalidUsage {
+                    message: "commit message cannot be empty".to_string(),
+                    recovery: vec!["oz git commit --amend -m \"feat: ...\"".to_string()],
+                };
+                return emit_error(mode, &err);
+            }
+            joined
+        }
+    } else {
+        if messages.is_empty() {
             let err = OzError::InvalidUsage {
-                message: "non-interactive `oz git commit --amend` requires `-m <msg>`, `-F <file>`, or `--no-edit` (never spawns $EDITOR)"
+                message: "missing commit message; pass `-m <message>` or `-F <file>` (never spawns $EDITOR in non-interactive mode)"
                     .to_string(),
-                recovery: vec!["Pass `--amend --no-edit` or `--amend -m \"...\"`.".to_string()],
+                recovery: vec!["oz git commit -m \"feat: ...\"".to_string()],
             };
             return emit_error(mode, &err);
         }
-        return delegate_mutating(parsed, "commit", &parsed.subcommand_args, false, true);
-    }
+        let joined = messages.join("\n\n");
+        if joined.trim().is_empty() {
+            let err = OzError::InvalidUsage {
+                message: "commit message cannot be empty".to_string(),
+                recovery: vec!["oz git commit -m \"feat: ...\"".to_string()],
+            };
+            return emit_error(mode, &err);
+        }
+        joined
+    };
 
-    if messages.is_empty() {
-        let err = OzError::InvalidUsage {
-            message: "missing commit message; pass `-m <message>` or `-F <file>` (never spawns $EDITOR in non-interactive mode)"
-                .to_string(),
-            recovery: vec!["oz git commit -m \"feat: ...\"".to_string()],
-        };
-        return emit_error(mode, &err);
-    }
-
-    let full_message = messages.join("\n\n");
-    if full_message.trim().is_empty() {
-        let err = OzError::InvalidUsage {
-            message: "commit message cannot be empty".to_string(),
-            recovery: vec!["oz git commit -m \"feat: ...\"".to_string()],
-        };
-        return emit_error(mode, &err);
-    }
+    let sign = explicit_sign.or_else(|| match config_gpgsign {
+        Some(false) => Some(false),
+        Some(true) => {
+            if config_gpg_format
+                .as_deref()
+                .is_none_or(|f| f.trim().eq_ignore_ascii_case("ssh"))
+            {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        None => None,
+    });
+    let signing_key = explicit_signing_key.or(config_signing_key);
 
     let inv_dir = invocation_dir(parsed);
-    let res = (|| -> Result<Envelope<oz_core::CommitOutcome>> {
+    let res = (|| -> Result<Envelope<GitCommitData>> {
         let repo = discover_and_recover_repo(parsed.effective_dir.as_deref(), false)?;
         let pre_status = compute_status(&repo)?;
         let actor = actor_from_mode(mode, &repo);
-        let tx = MutationTransaction::begin(&repo, "oz git commit", actor, Some(&pre_status.changes))?;
+        let cmd_label = if amend {
+            "oz git commit --amend"
+        } else {
+            "oz git commit"
+        };
+        let tx = MutationTransaction::begin(&repo, cmd_label, actor, Some(&pre_status.changes))?;
 
         let pick: Vec<String> = pathspecs
             .iter()
@@ -2251,7 +2422,9 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             allow_empty,
             author_name,
             author_email,
-            ..Default::default()
+            sign,
+            signing_key,
+            amend,
         };
         let outcome = if all_flag {
             commit_changes_ignoring_pinned(&repo, &opts)?
@@ -2266,28 +2439,51 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             tx.finish_with_message(&repo, Some(&outcome.message), Some(&post_status.changes))?
         };
 
+        let prov_opts = ProvenanceOptions {
+            force_agent: mode.agent,
+            inspect_env: true,
+            ..Default::default()
+        };
+        let provenance = record_commit_provenance(&repo, &outcome.commit_oid, &prov_opts)?;
+
         let branch = outcome.branch.clone();
         let head_oid = Some(outcome.commit_oid.clone());
         let op_id = entry.op_id;
-        Ok(Envelope::success(outcome)
-            .with_op_id(op_id.clone())
-            .with_workspace(repo.workspace)
-            .with_branch(branch)
-            .with_head_oid(head_oid)
-            .with_recovery_command(format!("oz undo {op_id}")))
+        Ok(Envelope::success(GitCommitData {
+            outcome,
+            provenance,
+        })
+        .with_op_id(op_id.clone())
+        .with_workspace(repo.workspace)
+        .with_branch(branch)
+        .with_head_oid(head_oid)
+        .with_recovery_command(format!("oz undo {op_id}")))
     })();
 
     emit_json_or_human(mode, res, |env| {
-        let d = &env.data;
+        if quiet {
+            return;
+        }
+        let d = &env.data.outcome;
         let short = &d.commit_oid[..d.commit_oid.len().min(12)];
+        let amend_tag = if d.amended { " (amended)" } else { "" };
+        let sign_tag = if d.signed { ", signed" } else { "" };
         println!(
-            "[{} {short}] {} file(s) committed ({} dirty remaining, Change-Id: {})",
+            "[{} {short}]{amend_tag} {} file(s) committed ({} dirty remaining, Change-Id: {}{sign_tag})",
             d.branch.as_deref().unwrap_or("detached"),
             d.committed_paths.len(),
             d.remaining_dirty_count,
             d.change_id
         );
     })
+}
+
+fn parse_git_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_author_spec(spec: &str) -> Option<(String, String)> {
@@ -3101,11 +3297,273 @@ pub fn handle_git_rebase(parsed: &ParsedGitGlobals) -> ExitCode {
 // Native Wrappers: `clone`, `fetch`, `push`
 // ============================================================================
 
+fn has_exotic_git_globals(parsed: &ParsedGitGlobals) -> bool {
+    if !parsed.config_overrides.is_empty() {
+        return true;
+    }
+    parsed.delegated_globals.iter().any(|g| {
+        let s = g.to_string_lossy();
+        !matches!(
+            s.as_ref(),
+            "--no-pager" | "-p" | "--paginate" | "--no-optional-locks"
+        )
+    })
+}
+
+enum GitCloneAction {
+    Native {
+        url: String,
+        explicit_dest: Option<PathBuf>,
+        branch: Option<String>,
+        filter: Option<String>,
+        remote_name: Option<String>,
+        checkout: bool,
+        quiet: bool,
+    },
+    Fallback,
+}
+
+fn parse_git_clone_action(args: &[String], has_exotic_globals: bool) -> Result<GitCloneAction> {
+    if has_exotic_globals {
+        return Ok(GitCloneAction::Fallback);
+    }
+
+    let mut branch: Option<String> = None;
+    let mut filter: Option<String> = None;
+    let mut remote_name: Option<String> = None;
+    let mut checkout = true;
+    let mut quiet = false;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut after_sep = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            after_sep = true;
+            i += 1;
+            continue;
+        }
+        if !after_sep && arg.starts_with('-') {
+            match arg.as_str() {
+                "-b" | "--branch" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: format!("option `{arg}` requires a branch or tag name"),
+                            recovery: vec!["oz git clone -b <branch> <url> [<dir>]".to_string()],
+                        });
+                    };
+                    branch = Some(val.clone());
+                    i += 2;
+                    continue;
+                }
+                "--filter" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: "option `--filter` requires an object filter specification"
+                                .to_string(),
+                            recovery: vec![
+                                "oz git clone --filter=blob:none <url> [<dir>]".to_string(),
+                            ],
+                        });
+                    };
+                    filter = Some(val.clone());
+                    i += 2;
+                    continue;
+                }
+                "-o" | "--origin" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: format!("option `{arg}` requires a remote name"),
+                            recovery: vec!["oz git clone -o origin <url> [<dir>]".to_string()],
+                        });
+                    };
+                    if val.trim() != "origin" {
+                        return Ok(GitCloneAction::Fallback);
+                    }
+                    remote_name = Some("origin".to_string());
+                    i += 2;
+                    continue;
+                }
+                "-q" | "--quiet" => {
+                    quiet = true;
+                    i += 1;
+                    continue;
+                }
+                "-n" | "--no-checkout" => {
+                    checkout = false;
+                    i += 1;
+                    continue;
+                }
+                "-v" | "--verbose" | "--progress" | "--no-progress" => {
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    if let Some(val) = arg.strip_prefix("--branch=") {
+                        branch = Some(val.to_string());
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(val) = arg.strip_prefix("-b")
+                        && !arg.starts_with("--")
+                        && !val.is_empty()
+                    {
+                        branch = Some(val.to_string());
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(val) = arg.strip_prefix("--filter=") {
+                        filter = Some(val.to_string());
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(val) = arg.strip_prefix("--origin=") {
+                        if val.trim() != "origin" {
+                            return Ok(GitCloneAction::Fallback);
+                        }
+                        remote_name = Some("origin".to_string());
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(val) = arg.strip_prefix("-o")
+                        && !arg.starts_with("--")
+                        && !val.is_empty()
+                    {
+                        if val.trim() != "origin" {
+                            return Ok(GitCloneAction::Fallback);
+                        }
+                        remote_name = Some("origin".to_string());
+                        i += 1;
+                        continue;
+                    }
+                    return Ok(GitCloneAction::Fallback);
+                }
+            }
+        }
+        positionals.push(arg.clone());
+        i += 1;
+    }
+
+    if positionals.is_empty() || positionals.len() > 2 {
+        return Ok(GitCloneAction::Fallback);
+    }
+
+    let url = positionals[0].clone();
+    let explicit_dest = positionals.get(1).map(PathBuf::from);
+    Ok(GitCloneAction::Native {
+        url,
+        explicit_dest,
+        branch,
+        filter,
+        remote_name,
+        checkout,
+        quiet,
+    })
+}
+
+fn resolve_clone_url_for_inv_dir(raw_url: &str, inv_dir: &Path) -> String {
+    let trimmed = raw_url.trim();
+    if let Ok(parsed) = parse_git_remote(trimmed, None)
+        && parsed.scheme == RemoteScheme::File
+        && !trimmed.starts_with("file://")
+    {
+        let p = Path::new(trimmed);
+        if !p.is_absolute() {
+            return normalize_lexical(&inv_dir.join(p))
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    raw_url.to_string()
+}
+
 fn handle_git_clone(parsed: &ParsedGitGlobals) -> ExitCode {
     let (clean_args, mut mode) = extract_json_agent_flags(&parsed.subcommand_args, parsed.mode);
     mode.non_interactive = true;
     let os_args: Vec<OsString> = clean_args.iter().map(OsString::from).collect();
 
+    let action = match parse_git_clone_action(&clean_args, has_exotic_git_globals(parsed)) {
+        Ok(a) => a,
+        Err(err) => return emit_error(mode, &err),
+    };
+
+    if let GitCloneAction::Native {
+        url,
+        explicit_dest,
+        branch,
+        filter,
+        remote_name,
+        checkout,
+        quiet,
+    } = action
+    {
+        let base_dir = invocation_dir(parsed);
+        let dest_rel_or_abs = explicit_dest.unwrap_or_else(|| derive_clone_dir_name(&url, false));
+        let dest_dir = if dest_rel_or_abs.is_absolute() {
+            normalize_lexical(&dest_rel_or_abs)
+        } else {
+            normalize_lexical(&base_dir.join(&dest_rel_or_abs))
+        };
+        let effective_url = resolve_clone_url_for_inv_dir(&url, &base_dir);
+        let actor = standalone_actor_from_mode(mode);
+
+        let res = (|| -> Result<Envelope<GitCloneData>> {
+            let outcome = clone_repo(
+                &CloneOptions {
+                    url: effective_url,
+                    destination: dest_dir,
+                    branch,
+                    filter,
+                    bare: false,
+                    remote_name,
+                    checkout,
+                    auth_token: None,
+                    auth_scheme: HttpAuthScheme::BasicToken,
+                },
+                actor,
+            )?;
+
+            let ozone_dir = outcome.git_dir.join("ozone");
+            let out_branch = outcome.branch.clone();
+            let out_head = outcome.head_oid.clone();
+            let out_op_id = outcome.op_id.clone();
+            let warnings = outcome.warnings.clone();
+
+            let mut env = Envelope::success(GitCloneData {
+                url,
+                path: outcome.destination,
+                ozone_dir: Some(ozone_dir),
+                branch: out_branch.clone(),
+                head_oid: out_head.clone(),
+                remote_name: Some(outcome.remote_name),
+                protocol_version: Some(outcome.protocol_version),
+                partial_clone: outcome.partial_clone,
+                filter: outcome.filter,
+                filter_negotiated: outcome.filter_negotiated,
+                checked_out_files: Some(outcome.checked_out_files),
+                op_id: out_op_id.clone(),
+            })
+            .with_branch(out_branch)
+            .with_head_oid(out_head);
+
+            if let Some(op_id) = out_op_id {
+                env = env.with_op_id(op_id);
+            }
+            for w in warnings {
+                env = env.with_warning(w);
+            }
+            Ok(env)
+        })();
+
+        return emit_json_or_human(mode, res, |env| {
+            if !quiet {
+                println!("Cloned '{}' into '{}'", env.data.url, env.data.path.display());
+            }
+        });
+    }
+
+    // Legacy fallback (`--bare`, `--mirror`, `--depth`, `--recurse-submodules`, custom `-c`, etc.)
     let Some((url, dest_rel_or_abs, is_bare)) = parse_clone_targets(&clean_args) else {
         return delegate_readonly(parsed, &["clone"], &os_args);
     };
@@ -3164,14 +3622,19 @@ fn handle_git_clone(parsed: &ParsedGitGlobals) -> ExitCode {
 
     let init_res = (|| -> Result<Envelope<GitCloneData>> {
         if is_bare {
-            let layout = OzoneLayout::from_git_common_dir(&dest_dir);
-            layout.ensure_initialized()?;
             Ok(Envelope::success(GitCloneData {
                 url,
                 path: dest_dir,
-                ozone_dir: layout.ozone_dir,
+                ozone_dir: None,
                 branch: None,
                 head_oid: None,
+                remote_name: None,
+                protocol_version: None,
+                partial_clone: false,
+                filter: None,
+                filter_negotiated: false,
+                checked_out_files: None,
+                op_id: None,
             }))
         } else {
             let repo = OzoneRepo::discover(Some(&dest_dir))?;
@@ -3179,9 +3642,16 @@ fn handle_git_clone(parsed: &ParsedGitGlobals) -> ExitCode {
             Ok(Envelope::success(GitCloneData {
                 url,
                 path: repo.repo_root,
-                ozone_dir: repo.layout.ozone_dir,
+                ozone_dir: Some(repo.layout.ozone_dir),
                 branch: repo.branch.clone(),
                 head_oid: repo.head_oid.clone(),
+                remote_name: None,
+                protocol_version: None,
+                partial_clone: false,
+                filter: None,
+                filter_negotiated: false,
+                checked_out_files: None,
+                op_id: None,
             })
             .with_branch(repo.branch)
             .with_head_oid(repo.head_oid))
@@ -3274,6 +3744,115 @@ fn derive_clone_dir_name(url: &str, is_bare: bool) -> PathBuf {
     })
 }
 
+enum GitFetchAction {
+    Native {
+        remote: Option<String>,
+        refspecs: Vec<String>,
+        prune: bool,
+        filter: Option<String>,
+        quiet: bool,
+    },
+    Fallback,
+}
+
+fn parse_git_fetch_action(args: &[String], has_exotic_globals: bool) -> Result<GitFetchAction> {
+    if has_exotic_globals {
+        return Ok(GitFetchAction::Fallback);
+    }
+
+    let mut prune = false;
+    let mut filter: Option<String> = None;
+    let mut quiet = false;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut after_sep = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            after_sep = true;
+            i += 1;
+            continue;
+        }
+        if !after_sep && arg.starts_with('-') {
+            match arg.as_str() {
+                "-p" | "--prune" => {
+                    prune = true;
+                    i += 1;
+                    continue;
+                }
+                "--no-prune" => {
+                    prune = false;
+                    i += 1;
+                    continue;
+                }
+                "--filter" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Err(OzError::InvalidUsage {
+                            message: "option `--filter` requires an object filter specification"
+                                .to_string(),
+                            recovery: vec!["oz git fetch --filter=blob:none [<remote>]".to_string()],
+                        });
+                    };
+                    filter = Some(val.clone());
+                    i += 2;
+                    continue;
+                }
+                "-q" | "--quiet" => {
+                    quiet = true;
+                    i += 1;
+                    continue;
+                }
+                "-v" | "--verbose" | "--progress" | "--no-progress" => {
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    if let Some(val) = arg.strip_prefix("--filter=") {
+                        filter = Some(val.to_string());
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(short) = arg.strip_prefix('-')
+                        && !short.starts_with('-')
+                        && short.len() > 1
+                        && short.chars().all(|c| matches!(c, 'p' | 'q' | 'v'))
+                    {
+                        for ch in short.chars() {
+                            match ch {
+                                'p' => prune = true,
+                                'q' => quiet = true,
+                                'v' => {}
+                                _ => {}
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    return Ok(GitFetchAction::Fallback);
+                }
+            }
+        }
+        positionals.push(arg.clone());
+        i += 1;
+    }
+
+    let remote = positionals.first().cloned();
+    let refspecs = if positionals.len() > 1 {
+        positionals[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok(GitFetchAction::Native {
+        remote,
+        refspecs,
+        prune,
+        filter,
+        quiet,
+    })
+}
+
 fn handle_git_fetch(parsed: &ParsedGitGlobals) -> ExitCode {
     let (clean_args, mode) = extract_json_agent_flags(&parsed.subcommand_args, parsed.mode);
     let os_args: Vec<OsString> = clean_args.iter().map(OsString::from).collect();
@@ -3289,8 +3868,240 @@ fn handle_git_fetch(parsed: &ParsedGitGlobals) -> ExitCode {
     if clean_args.iter().any(|a| a == "--dry-run" || a == "-n") {
         return delegate_readonly(&adjusted, &["fetch"], &os_args);
     }
-    adjusted.mode.non_interactive = true;
-    delegate_mutating(&adjusted, "fetch", &os_args, true, false)
+
+    let action = match parse_git_fetch_action(&clean_args, has_exotic_git_globals(parsed)) {
+        Ok(a) => a,
+        Err(err) => return emit_error(mode, &err),
+    };
+
+    match action {
+        GitFetchAction::Fallback => {
+            adjusted.mode.non_interactive = true;
+            delegate_mutating(&adjusted, "fetch", &os_args, true, false)
+        }
+        GitFetchAction::Native {
+            remote,
+            refspecs,
+            prune,
+            filter,
+            quiet,
+        } => {
+            let res = (|| -> Result<Envelope<FetchOutcome>> {
+                let repo = discover_and_recover_repo(parsed.effective_dir.as_deref(), false)?;
+                let actor = actor_from_mode(mode, &repo);
+                let outcome = fetch_remote(
+                    &repo,
+                    &FetchOptions {
+                        remote,
+                        refspecs,
+                        prune,
+                        filter,
+                        tags: false,
+                        auth_token: None,
+                        auth_scheme: HttpAuthScheme::BasicToken,
+                    },
+                    actor,
+                )?;
+
+                let op_id = outcome.op_id.clone();
+                let warnings = outcome.warnings.clone();
+                let mut env = Envelope::success(outcome)
+                    .with_workspace(repo.workspace)
+                    .with_branch(repo.branch)
+                    .with_head_oid(repo.head_oid);
+                if let Some(id) = op_id {
+                    env = env
+                        .with_op_id(id.clone())
+                        .with_recovery_command(format!("oz undo {id}"));
+                }
+                for w in warnings {
+                    env = env.with_warning(w);
+                }
+                Ok(env)
+            })();
+
+            emit_json_or_human(mode, res, |env| {
+                if quiet {
+                    return;
+                }
+                let d = &env.data;
+                if d.updated_refs.is_empty() && d.pruned_refs.is_empty() {
+                    return;
+                }
+                println!("From {}", d.remote_url);
+                for u in &d.updated_refs {
+                    let new_short = &u.new_oid[..u.new_oid.len().min(7)];
+                    match &u.old_oid {
+                        Some(old) => {
+                            let old_short = &old[..old.len().min(7)];
+                            let sep = if u.forced { "..." } else { ".." };
+                            let prefix = if u.forced { " + " } else { "   " };
+                            println!("{prefix}{old_short}{sep}{new_short}  {} -> {}", u.remote_ref, u.local_ref);
+                        }
+                        None => {
+                            println!(" * [new ref]         {} -> {}", u.remote_ref, u.local_ref);
+                        }
+                    }
+                }
+                for p in &d.pruned_refs {
+                    println!(" - [deleted]         (none)     -> {p}");
+                }
+            })
+        }
+    }
+}
+
+enum GitPushAction {
+    Native {
+        remote: Option<String>,
+        refspecs: Vec<String>,
+        atomic: bool,
+        force: bool,
+        force_with_lease: bool,
+        lease_specs: Vec<ForceLeaseSpec>,
+        set_upstream: bool,
+        quiet: bool,
+    },
+    Fallback,
+}
+
+fn parse_git_push_action(args: &[String], has_exotic_globals: bool) -> GitPushAction {
+    if has_exotic_globals {
+        return GitPushAction::Fallback;
+    }
+
+    let mut atomic = false;
+    let mut force = false;
+    let mut force_with_lease = false;
+    let mut lease_specs: Vec<ForceLeaseSpec> = Vec::new();
+    let mut set_upstream = false;
+    let mut quiet = false;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut after_sep = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            after_sep = true;
+            i += 1;
+            continue;
+        }
+        if !after_sep && arg.starts_with('-') {
+            match arg.as_str() {
+                "--atomic" => {
+                    atomic = true;
+                    i += 1;
+                    continue;
+                }
+                "--no-atomic" => {
+                    atomic = false;
+                    i += 1;
+                    continue;
+                }
+                "--force-with-lease" => {
+                    force_with_lease = true;
+                    i += 1;
+                    continue;
+                }
+                "--no-force-with-lease" => {
+                    force_with_lease = false;
+                    lease_specs.clear();
+                    i += 1;
+                    continue;
+                }
+                "-f" | "--force" => {
+                    force = true;
+                    i += 1;
+                    continue;
+                }
+                "-u" | "--set-upstream" => {
+                    set_upstream = true;
+                    i += 1;
+                    continue;
+                }
+                "-q" | "--quiet" => {
+                    quiet = true;
+                    i += 1;
+                    continue;
+                }
+                "-v" | "--verbose" | "--progress" | "--no-progress" | "--no-verify" => {
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    if let Some(spec) = arg.strip_prefix("--force-with-lease=") {
+                        lease_specs.push(ForceLeaseSpec::parse(spec));
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(short) = arg.strip_prefix('-')
+                        && !short.starts_with('-')
+                        && short.len() > 1
+                        && short.chars().all(|c| matches!(c, 'f' | 'u' | 'q' | 'v'))
+                    {
+                        for ch in short.chars() {
+                            match ch {
+                                'f' => force = true,
+                                'u' => set_upstream = true,
+                                'q' => quiet = true,
+                                'v' => {}
+                                _ => {}
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    return GitPushAction::Fallback;
+                }
+            }
+        }
+        positionals.push(arg.clone());
+        i += 1;
+    }
+
+    let remote = positionals.first().cloned();
+    let refspecs = if positionals.len() > 1 {
+        positionals[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    GitPushAction::Native {
+        remote,
+        refspecs,
+        atomic,
+        force,
+        force_with_lease,
+        lease_specs,
+        set_upstream,
+        quiet,
+    }
+}
+
+fn read_configured_branch_remote(repo: &OzoneRepo) -> Option<String> {
+    let branch = repo.branch.as_deref()?;
+    let cfg_path = repo.git_common_dir.join("config");
+    let raw = std::fs::read_to_string(cfg_path).ok()?;
+    let target_header = format!("[branch \"{branch}\"]");
+    let mut inside = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            inside = trimmed == target_header;
+            continue;
+        }
+        if inside
+            && let Some((k, v)) = trimmed.split_once('=')
+            && k.trim().eq_ignore_ascii_case("remote")
+        {
+            let val = v.trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn handle_git_push(parsed: &ParsedGitGlobals) -> ExitCode {
@@ -3308,8 +4119,87 @@ fn handle_git_push(parsed: &ParsedGitGlobals) -> ExitCode {
     if clean_args.iter().any(|a| a == "--dry-run" || a == "-n") {
         return delegate_readonly(&adjusted, &["push"], &os_args);
     }
-    adjusted.mode.non_interactive = true;
-    delegate_mutating(&adjusted, "push", &os_args, true, false)
+
+    match parse_git_push_action(&clean_args, has_exotic_git_globals(parsed)) {
+        GitPushAction::Fallback => {
+            adjusted.mode.non_interactive = true;
+            delegate_mutating(&adjusted, "push", &os_args, true, false)
+        }
+        GitPushAction::Native {
+            remote,
+            refspecs,
+            atomic,
+            force,
+            force_with_lease,
+            lease_specs,
+            set_upstream,
+            quiet,
+        } => {
+            let res = (|| -> Result<Envelope<PushOutcome>> {
+                let repo = discover_and_recover_repo(parsed.effective_dir.as_deref(), false)?;
+                let effective_remote = remote.or_else(|| read_configured_branch_remote(&repo));
+                let actor = actor_from_mode(mode, &repo);
+                let outcome = push_refs(
+                    &repo,
+                    &PushOptions {
+                        remote: effective_remote,
+                        refspecs,
+                        atomic,
+                        force,
+                        force_with_lease,
+                        lease_specs,
+                        delete: false,
+                        set_upstream,
+                        auth_token: None,
+                        auth_scheme: HttpAuthScheme::BasicToken,
+                    },
+                    actor,
+                )?;
+
+                let op_id = outcome.op_id.clone();
+                let mut env = Envelope::success(outcome)
+                    .with_workspace(repo.workspace)
+                    .with_branch(repo.branch)
+                    .with_head_oid(repo.head_oid);
+                if let Some(id) = op_id {
+                    env = env
+                        .with_op_id(id.clone())
+                        .with_recovery_command(format!("oz undo {id}"));
+                }
+                Ok(env)
+            })();
+
+            emit_json_or_human(mode, res, |env| {
+                if quiet {
+                    return;
+                }
+                let d = &env.data;
+                println!("To {}", d.remote_url);
+                for p in &d.pushed_refs {
+                    let local_label = p.local_ref.as_deref().unwrap_or("HEAD");
+                    if p.deleted {
+                        println!(" - [deleted]         {}", p.remote_ref);
+                    } else if let (Some(old), Some(new)) = (&p.old_oid, &p.new_oid) {
+                        let old_short = &old[..old.len().min(7)];
+                        let new_short = &new[..new.len().min(7)];
+                        if p.forced {
+                            println!(
+                                " + {old_short}...{new_short} {local_label} -> {} (forced update)",
+                                p.remote_ref
+                            );
+                        } else {
+                            println!("   {old_short}..{new_short}  {local_label} -> {}", p.remote_ref);
+                        }
+                    } else {
+                        println!(" * [new branch]      {local_label} -> {}", p.remote_ref);
+                    }
+                }
+                for br in &d.upstream_configured {
+                    println!("branch '{br}' set up to track '{}/{br}'.", d.remote);
+                }
+            })
+        }
+    }
 }
 
 // ============================================================================
