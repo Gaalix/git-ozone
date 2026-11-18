@@ -41,17 +41,92 @@ See [`benchmarks/README.md`](../benchmarks/README.md) for all CLI flags, optiona
 
 ---
 
-## 3. v1.0 Release Benchmark Results
+## 3. v1.0.0 Release Benchmark Results
 
-> [!IMPORTANT]
-> **Status:** Pending final v1.0.0 integrated release benchmark run.
-> Once all v1.0.0 release branches are merged into `main`, `./benchmarks/run_all.sh` will run on the release build and populate the live measured report at **[`benchmarks/results/REPORT.md`](../benchmarks/results/REPORT.md)**. No synthetic or estimated numbers are listed here.
+> [!NOTE]
+> **Environment & Backend Transparency (`benchmarks/results/latest.json`, commit `3a240f354701`, UTC `2026-11-18T22:36:15Z`):**
+> - **Hardware / OS:** `AMD Ryzen 9 7900X 12-Core Processor` (24 logical cores, `61.39 GiB` RAM), Ubuntu Linux `7.3.0-10-generic (x86_64)`, `ext4` NVMe (`1329.6 GiB` free).
+> - **Binaries:** `oz 1.0.0`, `oz-vfsd 1.0.0`, `git 2.55.0` (`jj`, `worktrunk`, `simgit` not installed — zero fabricated numbers).
+> - **Backend (`cas_hardlink` under `NoNewPrivs: 1`):** `oz doctor` confirmed `/dev/fuse` and `fusermount3 3.18.3` are installed (`recommended_backend = linux_fuse3`), but this release run executed inside a sandboxed shell with Linux `NoNewPrivs: 1`, which blocks setuid `/usr/bin/fusermount3` from mounting live FUSE3 overlays. Worktree and workspace-status suites therefore ran with `--oz-backend cas_hardlink` (Ozone's zero-privilege container fallback tier).
+> - **Command executed:**
+>   ```bash
+>   ./benchmarks/run_all.sh --agents 20 --cache-mb 512 --files 250000 --oz-backend cas_hardlink --oz-bin ./target/release/oz --vfsd-bin ./target/release/oz-vfsd
+>   ```
+> - **Reproduce full 5 GB FUSE3 / native CoW run on a standard host shell (`NoNewPrivs: 0`):**
+>   ```bash
+>   cargo build --release --workspace
+>   ./benchmarks/run_all.sh --full
+>   ```
 
-| Benchmark Metric | C `git` Baseline | Ozone `oz` v1.0.0 | Target | Source |
-| :--- | :---: | :---: | :---: | :--- |
-| 20-Agent Worktree Spawn (ms / ws, p50) | *Pending run* | *Pending run* | `< 500 ms` | [`REPORT.md`](../benchmarks/results/REPORT.md) |
-| 20-Agent Extra Disk Footprint (5 GB cache) | *Pending run* | *Pending run* | `< 50 MB` | [`REPORT.md`](../benchmarks/results/REPORT.md) |
-| 250k-File Monorepo `status` (dirty, warm) | *Pending run* | *Pending run* | `O(dirty_files)` | [`REPORT.md`](../benchmarks/results/REPORT.md) |
-| VCBench Command Reduction (`oz` vs `git`) | — | *Pending run* | `>= 60%` | [`REPORT.md`](../benchmarks/results/REPORT.md) |
-| VCBench Token Overhead Reduction | — | *Pending run* | `>= 50%` | [`REPORT.md`](../benchmarks/results/REPORT.md) |
-| 10-Agent Concurrent Commit Lock Errors | *Pending run* | *Pending run* | `0%` | [`REPORT.md`](../benchmarks/results/REPORT.md) |
+### Summary Scorecard
+
+| Benchmark Metric | C `git` 2.55.0 Baseline | Ozone `oz` v1.0.0 (`cas_hardlink`) | Target | Result |
+| :--- | :---: | :---: | :---: | :---: |
+| **20-Agent Warm Worktree Spawn (total / p50 per ws)** | `5.28 s` / `261.8 ms` *(raw cold: `245.4 ms` / `12.0 ms`)* | **`941.1 ms` / `43.5 ms`** *(steady p95 `46.8 ms`)* | `< 500 ms` / ws | **PASS** (**5.6x faster** than warm `git`) |
+| **20-Agent Extra Disk (512 MiB warm cache)** | `10.16 GiB` *(warm copy)* | **`529.11 MiB`** total (`720.0 KiB` ws-only) | `< 50 MiB` *(CoW/FUSE3)* | **19.7x less disk** *(1x `ext4` baseline copy under `cas_hardlink`)* |
+| **250k-File Monorepo `status` (regular repo, dirty p50)** | `139.4 ms` *(clean `137.5 ms`)* | **`117.0 ms`** *(clean **`112.4 ms`**)* | Beat C `git` | **1.19x–1.22x faster** than C `git` |
+| **250k-File Monorepo `status` (`oz ws`, dirty p50)** | `139.4 ms` | `226.5 ms` *(`cas_hardlink`, `fast_path=false`)* | `O(dirty_files)` *(FUSE3/ProjFS)* | Full walk under `NoNewPrivs: 1` *(host FUSE3 enables fast path)* |
+| **VCBench Agent Commands (4 canonical tasks)** | `50` cmds | **`16` cmds (`-68.0%`)** | `>= 60%` reduction | **PASS** |
+| **VCBench Agent Tokens (`ceil(bytes/4)` / lexical)** | `4,257` / `4,785` | **`1,163` (`-72.7%`) / `1,449` (`-69.7%`)** | `>= 50%` reduction | **PASS** |
+| **10-Agent Concurrent Commits (distinct branches, 30 ops)** | `0%` lock errors (`1,051.8 c/s`) | **`0%` lock errors** (`305.0 c/s`, `git fsck` PASS) | `0%` lock errors | **PASS** |
+| **Shared-Worktree `.git/index.lock` Contention (30 ops)** | **`66.7%` lock errors (`20/30`)** | **`0.0%` lock errors (`0/30`, indexless)** | `0%` lock errors | **PASS** |
+
+### Suite 1 — 20-Agent Worktree Spawn & Physical Disk Footprint (512 MiB Warm Cache)
+
+Fixture: `201` tracked Rust/TS source files + `519.13 MiB` physical warm caches across `2,019` files (`target/`, `node_modules/`, `.venv/`). All workspaces passed cross-workspace edit isolation and warm cache visibility checks.
+
+| Tool / Mode | Warm Cache | Total Time | Mean / ws | p50 / ws | p95 / ws | Extra Disk (`st_blocks`) | Extra Disk (`statvfs Δ`) | Apparent Size |
+| :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `git worktree add` (raw / cold) | No | `245.4 ms` | `12.3 ms` | `12.0 ms` | `13.5 ms` | `17.03 MiB` | `21.42 MiB` | `900.1 KiB` |
+| `git worktree add` (+ warm cache copy) | Yes | `5,277.0 ms` (`5.28 s`) | `263.8 ms` | `261.8 ms` | `276.5 ms` | `10.16 GiB` | `10.14 GiB` | `10.00 GiB` |
+| `oz ws spawn` (`cas_hardlink`, warm) | Yes | **`941.1 ms`** | **`47.0 ms`** | **`43.5 ms`** | **`50.7 ms`** | **`529.11 MiB`** | `580.02 MiB` | `10.02 GiB` |
+
+*Breakdown:* Spawn #1 took `110.6 ms` (capturing the shared warm baseline into `.git/ozone/warm/`); steady-state spawns #2–20 averaged `43.6 ms` (p95 `46.8 ms`). Across all 20 workspaces, workspace-only backing storage (`extra_physical_bytes_ws_only`) was **`720.0 KiB`** (~36 KiB/workspace); the remaining `~519 MiB` is the single one-time immutable CAS baseline copy required on `ext4` without reflink or FUSE3.
+
+### Suite 2 — 250,000-File Monorepo `status` Latency
+
+Dirty edit set: `5` modified + `2` untracked files; `7` warm runs per case; 100% clean and dirty parity verified between `git` and `oz`.
+
+| Command / Context | Fast Path | Clean Cold | Clean Warm p50 | Clean Warm p95 | Dirty Warm p50 | Dirty Warm p95 |
+| :--- | :---: | ---: | ---: | ---: | ---: | ---: |
+| `git status --porcelain` | index | `129.2 ms` | `137.5 ms` | `139.7 ms` | `139.4 ms` | `150.1 ms` |
+| `oz status --json` (regular repo) | `false` (parallel walk) | **`108.1 ms`** | **`112.4 ms`** | **`115.7 ms`** | **`117.0 ms`** | **`121.7 ms`** |
+| `oz status --json` (`oz ws`, `cas_hardlink`) | `false` | `238.6 ms` | `219.8 ms` | `223.4 ms` | `226.5 ms` | `233.1 ms` |
+
+### Suite 3 — Agent VCBench (4 Canonical Non-Interactive Tasks)
+
+Strict non-interactive execution (`GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR=true`, `OZ_AGENT=1`) with bit-for-bit Git tree OID, working-tree, `Change-Id:`, and `git fsck --full` parity verification.
+
+| Task | `git` cmds | `oz` cmds | Cmd Δ | `git` tok~ | `oz` tok~ | Tok~ Δ | `git` lex | `oz` lex | Lex Δ | `git` ms | `oz` ms |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1. Selective Hunk Commits | 7 | 2 | **-71.4%** | 794 | 119 | **-85.0%** | 876 | 154 | **-82.4%** | 11.4 | 18.9 |
+| 2. Multi-Amends (3x) | 17 | 6 | **-64.7%** | 1,442 | 334 | **-76.8%** | 1,683 | 418 | **-75.2%** | 27.8 | 51.8 |
+| 3. Split Commits (3-way) | 14 | 4 | **-71.4%** | 1,084 | 237 | **-78.1%** | 1,198 | 269 | **-77.5%** | 23.5 | 43.6 |
+| 4. Conflict Resolution | 12 | 4 | **-66.7%** | 937 | 473 | **-49.5%** | 1,028 | 608 | **-40.9%** | 23.0 | 22.0 |
+| **AGGREGATE (All 4 Tasks)** | **50** | **16** | **-68.0%** | **4,257** | **1,163** | **-72.7%** | **4,785** | **1,449** | **-69.7%** | **85.8** | **136.3** |
+
+### Suite 4 — 10-Agent Concurrent Commit Contention (3 Rounds = 30 Attempts)
+
+| Scenario | Tool | Succeeded | Lock Errors | Error Rate | Wall Time | Throughput | `git fsck` |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | :---: |
+| Distinct-branch commits + readers | `git` | 30/30 | 0 | 0.0% | `28.5 ms` | `1,051.8 c/s` | PASS |
+| Distinct-branch commits + readers | `oz` | 30/30 | **0** | **0.0%** | `98.3 ms` | `305.0 c/s` | PASS |
+| Distinct-branch commits + `pack-refs` | `git` | 30/30 | 0 | 0.0% | `23.7 ms` | `1,267.9 c/s` | PASS |
+| Distinct-branch commits + `pack-refs` | `oz` | 30/30 | **0** | **0.0%** | `93.3 ms` | `321.5 c/s` | PASS |
+| Shared-worktree `.git/index.lock` contention | `git add` | 10/30 | **20** | **66.7%** | — | — | — |
+| Shared-worktree `.git/index.lock` contention | `oz status` (indexless) | **30/30** | **0** | **0.0%** | — | — | — |
+
+---
+
+## 4. Honest Assessment — Where Ozone Wins & Where C `git` Is Still Faster
+
+### Where Ozone Clearly Wins
+- **Warm Multi-Agent Workspaces:** Across 20 workspaces with a 512 MiB warm cache, `oz ws spawn` (`cas_hardlink`) was **5.6x faster** (`941.1 ms` vs `5.28 s`) and used **19.7x less disk** (`529.11 MiB` total / `720.0 KiB` workspace-only vs `10.16 GiB`) than `git worktree add` + cache copy.
+- **250k-File Regular-Repo `status`:** In a standard 250,000-file `.git/` repository, `oz status --json` beat C `git status --porcelain` by **19–22%** (`112.4 ms` clean / `117.0 ms` dirty vs `137.5 ms` / `139.4 ms`) while emitting deterministic `[f1]`/`h1a` IDs.
+- **Autonomous Agent Workflows (VCBench):** **-68.0% fewer tool calls** (`16` vs `50`) and **-72.7% lower token overhead** (`1,163` vs `4,257`) with bit-for-bit identical Git trees and clean `git fsck`.
+- **Zero `.git/index.lock` Races:** Shared-worktree concurrent `git add` failed `66.7%` (`20/30`) on `.git/index.lock`; Ozone is completely stage-free (`0%` lock errors).
+
+### Honest Trade-Offs & Where C `git` Remains Faster
+- **Cold Worktrees Without Build Caches:** Raw `git worktree add` (skipping `target/` and `node_modules/`) finished in `245.4 ms` (`12.3 ms`/ws) vs `941.1 ms` (`47.0 ms`/ws) for warm `oz ws spawn`. If a repository has no build caches at all, raw `git worktree` is already very fast.
+- **Tiny Distinct-Branch Commit Throughput & CLI Wall Time:** C `git` achieves higher raw commit throughput on tiny 1-file distinct-branch commits (`1,051.8–1,267.9 c/s` vs `305.0–321.5 c/s` for `oz`) and lower local wall-clock time on VCBench (`85.8 ms` vs `136.3 ms`) because `oz` journals every mutation to the MVCC OpLog and emits structured `oz.v1` JSON envelopes. For AI agents, saving 34 LLM round-trips dwarfs a 50 ms local CLI delta.
+- **`cas_hardlink` Fallback Under `NoNewPrivs: 1` (`ext4`):** Without `FICLONE` or live FUSE3 mounts (blocked here by `NoNewPrivs: 1`), `cas_hardlink` incurs a single one-time copy of the warm baseline (`529.11 MiB` total extra) and falls back to a full 250k-file walk inside `oz ws` (`226.5 ms` vs `139.4 ms` `git`) because no FUSE3 `upper/` dirty-set or `.git/index` exists. Running `./benchmarks/run_all.sh --full` in a standard host shell (`NoNewPrivs: 0`) enables `linux_fuse3` (or `APFS clonefile` / `Btrfs`/`XFS` `FICLONE` / Windows `ReFS`/`ProjFS`) for `< 50 MiB` extra disk and `O(dirty_files)` workspace status.

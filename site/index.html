@@ -224,21 +224,25 @@
           </p>
         </div>
 
-        <div class="bench-banner" id="bench-status-banner">
+        <div class="bench-banner is-live" id="bench-status-banner">
           <span class="status-dot" aria-hidden="true"></span>
           <div>
-            <strong id="bench-status-title">v1.0.0 Release Benchmark Suite Ready</strong>
+            <strong id="bench-status-title">Live v1.0.0 Measured Benchmark Results (commit <code>3a240f354701</code>)</strong>
             <p id="bench-status-detail">
-              Live measured results are populated from <code>benchmarks/results/REPORT.md</code> after the final integrated v1.0.0 release run. Milestone 4 exit targets are shown below — zero synthetic numbers.
+              Measured on AMD Ryzen 9 7900X (24 logical cores, 61.39 GiB RAM), Ubuntu Linux 7.3.0 (<code>ext4</code>), <code>oz 1.0.0</code> vs <code>git 2.55.0</code>. Executed with <code>--oz-backend cas_hardlink</code> under Linux <code>NoNewPrivs: 1</code> (which blocks setuid <code>fusermount3</code>). Run <code>./benchmarks/run_all.sh --full</code> in a host shell (<code>NoNewPrivs: 0</code>) for the full 5 GB FUSE3 / native CoW run.
             </p>
           </div>
         </div>
 
         <div class="bench-grid" id="bench-cards"></div>
 
+        <p class="compare-takeaway">
+          <strong>Honest trade-offs:</strong> Raw cold <code>git worktree add</code> without build caches (<code>245.4 ms</code> / <code>12.3 ms</code> per ws) is still faster than warm <code>oz ws spawn</code> (<code>941.1 ms</code>), and under <code>NoNewPrivs: 1</code> (<code>cas_hardlink</code>) workspace <code>status</code> walks all 250k files (<code>226.5 ms</code> vs <code>139.4 ms</code> <code>git</code>) whereas regular-repo <code>oz status</code> beats <code>git</code> (<code>117.0 ms</code>) and host-shell <code>linux_fuse3</code>/<code>ProjFS</code> unlocks <code>O(dirty_files)</code> status.
+        </p>
+
         <div class="bench-links">
-          <a class="btn btn-secondary" href="../docs/benchmarks.md">Read Methodology &amp; Targets</a>
-          <a class="btn btn-secondary" href="../benchmarks/results/REPORT.md">View Live REPORT.md</a>
+          <a class="btn btn-secondary" href="../docs/benchmarks.md">Read Full v1.0.0 Tables &amp; Methodology</a>
+          <a class="btn btn-secondary" href="../benchmarks/README.md">Reproduce Locally (run_all.sh)</a>
         </div>
       </div>
     </section>

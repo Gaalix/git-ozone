@@ -111,45 +111,48 @@ oz blame crates/auth/src/token.rs --json`,
     }
   };
 
-  // Structured for live v1.0 release benchmark results from `benchmarks/results/latest.json`.
-  // `measured: false` renders honest Milestone 4 targets until the release benchmark run populates values.
+  // Real v1.0.0 release benchmark results measured from `benchmarks/results/latest.json`
+  // (commit 3a240f354701, 2026-11-18T22:36:15Z, AMD Ryzen 9 7900X, Ubuntu Linux 7.3.0 ext4,
+  // oz 1.0.0 vs git 2.55.0, --oz-backend cas_hardlink under NoNewPrivs: 1).
   const BENCHMARK_DATA = window.OZONE_BENCHMARKS || {
-    measured: false,
+    measured: true,
+    environment:
+      "AMD Ryzen 9 7900X (24 logical cores, 61.39 GiB RAM) · Ubuntu Linux 7.3.0 (ext4) · oz 1.0.0 vs git 2.55.0 · --oz-backend cas_hardlink under NoNewPrivs: 1 (reproduce 5 GB FUSE3/CoW on host shell with ./benchmarks/run_all.sh --full).",
     suites: [
       {
-        title: "20-Agent Worktree Spawn & Disk",
-        target: "< 500 ms/ws · < 50 MB",
+        title: "20-Agent Worktree Spawn & Disk (512 MiB Cache)",
+        target: "5.6x faster · 19.7x less disk",
         metrics: [
-          { label: "Per-workspace spawn latency (p50)", value: "Pending v1.0 run" },
-          { label: "Total extra disk (5 GB cache)", value: "Pending v1.0 run" },
-          { label: "Script", value: "benchmarks/bench_worktrees.py" }
+          { label: "oz ws spawn (cas_hardlink, warm)", value: "941.1 ms total · 43.5 ms p50/ws" },
+          { label: "git worktree + warm copy (vs cold raw)", value: "5.28 s (261.8 ms p50) · cold: 245.4 ms" },
+          { label: "Extra disk (oz total / ws-only vs git)", value: "529.11 MiB / 720 KiB vs 10.16 GiB" }
         ]
       },
       {
-        title: "250k-File Monorepo Status",
-        target: "O(dirty_files)",
+        title: "250k-File Monorepo Status (100% Parity)",
+        target: "1.19x–1.22x faster (regular repo)",
         metrics: [
-          { label: "Clean / dirty warm status (oz vs git)", value: "Pending v1.0 run" },
-          { label: "Dirty-file parity check", value: "Verified per run" },
-          { label: "Script", value: "benchmarks/bench_status_250k.py" }
+          { label: "oz status --json (regular repo, dirty/clean)", value: "117.0 ms / 112.4 ms p50" },
+          { label: "git status --porcelain (dirty/clean)", value: "139.4 ms / 137.5 ms p50" },
+          { label: "oz ws cas_hardlink (full walk, no FUSE3)", value: "226.5 ms dirty p50 (host FUSE3: O(dirty))" }
         ]
       },
       {
         title: "Agent VCBench (4 Canonical Tasks)",
-        target: ">= 60% fewer cmds · >= 50% fewer tokens",
+        target: "-68.0% cmds · -72.7% tokens",
         metrics: [
-          { label: "Command count reduction", value: "Pending v1.0 run" },
-          { label: "Token overhead reduction", value: "Pending v1.0 run" },
-          { label: "Script", value: "benchmarks/bench_agent_vcbench.py" }
+          { label: "Total non-interactive commands", value: "16 oz vs 50 git (-68.0%)" },
+          { label: "Approx / lexical token overhead", value: "1,163 vs 4,257 (-72.7%) · lex -69.7%" },
+          { label: "Local CLI wall time & tree parity", value: "136.3 ms vs 85.8 ms · 4/4 fsck PASS" }
         ]
       },
       {
-        title: "10-Agent Concurrent Commits",
-        target: "0% lock errors",
+        title: "10-Agent Concurrent Commits (30 Ops)",
+        target: "0% lock errors · git fsck PASS",
         metrics: [
-          { label: "oz commit lock contention", value: "Pending v1.0 run" },
-          { label: "C git lock contention baseline", value: "Pending v1.0 run" },
-          { label: "Script", value: "benchmarks/bench_concurrency.py" }
+          { label: "Distinct-branch commits (+ pack-refs)", value: "oz 0% (305–322 c/s) · git 0% (1,052–1,268 c/s)" },
+          { label: "Shared-worktree .git/index.lock contention", value: "oz 0/30 (0.0%) vs git add 20/30 (66.7%)" },
+          { label: "Integrity verification", value: "30/30 refs + git fsck --full PASS" }
         ]
       }
     ]
