@@ -28,7 +28,7 @@ brew install ozone-vcs/tap/oz
 ### Linux & macOS (Shell Installer)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.sh | bash
 ```
 
 Supports `--version v1.0.0`, `--prefix ~/.local`, and `--dry-run`.

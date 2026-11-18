@@ -7,7 +7,7 @@
       note: "Installs <code>oz</code>, <code>git-ozone</code>, and <code>oz-vfsd</code> on macOS &amp; Linux. Verify with <code>oz doctor</code>."
     },
     shell: {
-      command: "curl -fsSL https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.sh | sh",
+      command: "curl -fsSL https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.sh | bash",
       note: "Detects OS/arch, verifies <code>SHA256SUMS.txt</code>, and installs static binaries. Supports <code>--version</code>, <code>--prefix</code>, and <code>--dry-run</code>."
     },
     deb: {
