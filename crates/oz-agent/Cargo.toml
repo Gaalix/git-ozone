@@ -7,10 +7,17 @@ description = "Agent harness setup, MCP stdio server, and refs/notes/ai provenan
 
 [dependencies]
 chrono.workspace = true
+gix.workspace = true
+imara-diff.workspace = true
 oz-core.workspace = true
+oz-cow.workspace = true
 oz-integrate.workspace = true
 oz-oplog.workspace = true
+oz-warm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[dev-dependencies]
+tempfile.workspace = true

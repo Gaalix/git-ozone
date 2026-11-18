@@ -2251,6 +2251,7 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             allow_empty,
             author_name,
             author_email,
+            ..Default::default()
         };
         let outcome = if all_flag {
             commit_changes_ignoring_pinned(&repo, &opts)?

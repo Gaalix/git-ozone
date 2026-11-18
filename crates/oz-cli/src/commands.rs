@@ -817,6 +817,7 @@ pub(crate) fn handle_commit(
             allow_empty: args.allow_empty,
             author_name: None,
             author_email: None,
+            ..Default::default()
         };
         let outcome = oz_core::commit_changes(&repo, &opts)?;
 
