@@ -102,13 +102,29 @@ fn run_oz(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> CmdOut {
     }
 }
 
+fn sys_git_bin() -> &'static str {
+    if Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else {
+        "git"
+    }
+}
+
+fn ssh_keygen_bin() -> &'static str {
+    if Path::new("/usr/bin/ssh-keygen").is_file() {
+        "/usr/bin/ssh-keygen"
+    } else {
+        "ssh-keygen"
+    }
+}
+
 fn sys_git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("/usr/bin/git")
+    let out = Command::new(sys_git_bin())
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()
-        .expect("execute /usr/bin/git");
+        .expect("execute git");
     assert!(
         out.status.success(),
         "git {:?} failed in {}:\nstdout: {}\nstderr: {}",
@@ -163,7 +179,7 @@ impl MockGitHubState {
 
     fn resolve_branch_sha(&self, branch: &str) -> String {
         if let Some(ref bare) = self.bare_repo
-            && let Ok(out) = Command::new("/usr/bin/git")
+            && let Ok(out) = Command::new(sys_git_bin())
                 .args(["rev-parse", &format!("refs/heads/{branch}")])
                 .current_dir(bare)
                 .output()
@@ -524,7 +540,7 @@ fn commit_sign_verify_commit_and_amend_preserves_change_id() {
     init_ozone_repo(&repo_dir);
 
     let key_path = tmp.path().join("id_ed25519_test");
-    let keygen = Command::new("/usr/bin/ssh-keygen")
+    let keygen = Command::new(ssh_keygen_bin())
         .args([
             "-t",
             "ed25519",
@@ -587,8 +603,8 @@ fn commit_sign_verify_commit_and_amend_preserves_change_id() {
     let original_change_id = c1_json["data"]["change_id"].as_str().unwrap().to_string();
     let c1_oid = c1_json["data"]["commit_oid"].as_str().unwrap().to_string();
 
-    // Verify with `/usr/bin/git verify-commit`!
-    let verify1 = Command::new("/usr/bin/git")
+    // Verify with `git verify-commit`!
+    let verify1 = Command::new(sys_git_bin())
         .args(["verify-commit", &c1_oid])
         .current_dir(&repo_dir)
         .output()
@@ -660,7 +676,7 @@ fn commit_sign_verify_commit_and_amend_preserves_change_id() {
             .contains("feat: signed auth with logout")
     );
 
-    let verify3 = Command::new("/usr/bin/git")
+    let verify3 = Command::new(sys_git_bin())
         .args(["verify-commit", &c3_oid])
         .current_dir(&repo_dir)
         .output()
@@ -701,7 +717,7 @@ fn commit_agent_auto_records_ai_notes_and_blame_reports_human_vs_agent() {
         .to_string();
 
     // Human commit must NOT create a `refs/notes/ai` entry.
-    let human_note = Command::new("/usr/bin/git")
+    let human_note = Command::new(sys_git_bin())
         .args(["notes", "--ref=ai", "show", &human_oid])
         .current_dir(&repo_dir)
         .output()
@@ -1604,7 +1620,7 @@ fn doctor_json_verifies_ssh_signing_and_github_auth_fields() {
     init_ozone_repo(&repo_dir);
 
     let key_path = tmp.path().join("doctor_ed25519");
-    let keygen = Command::new("/usr/bin/ssh-keygen")
+    let keygen = Command::new(ssh_keygen_bin())
         .args([
             "-t",
             "ed25519",

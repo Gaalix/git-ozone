@@ -13,13 +13,21 @@ use oz_core::{CommitOptions, OzoneRepo, commit_changes};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
-fn init_git_repo(dir: &std::path::Path) -> OzoneRepo {
+fn sys_git_bin() -> &'static str {
+    if Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else {
+        "git"
+    }
+}
+
+fn init_git_repo(dir: &Path) -> OzoneRepo {
     fs::create_dir_all(dir).expect("mkdir repo");
-    let status = Command::new("/usr/bin/git")
+    let status = Command::new(sys_git_bin())
         .args(["init", "-b", "main"])
         .current_dir(dir)
         .status()
@@ -30,7 +38,7 @@ fn init_git_repo(dir: &std::path::Path) -> OzoneRepo {
         ("user.name", "Integration Human"),
         ("user.email", "human@example.com"),
     ] {
-        let s = Command::new("/usr/bin/git")
+        let s = Command::new(sys_git_bin())
             .args(["config", k, v])
             .current_dir(dir)
             .status()
@@ -63,7 +71,7 @@ fn bidirectional_c_git_notes_interop_and_revision_blame() {
     let c1 = commit_changes(&repo, &CommitOptions::new("feat: step_one")).expect("commit c1");
 
     let c_git_note_json = r#"{"schema_version":1,"session_id":"c-git-sess","client":"codex-cli","model":"gpt-5-codex","timestamp":"2026-11-18T10:00:00Z","line_ranges":[{"path":"engine.rs","start_line":1,"end_line":3,"author_kind":"agent"}]}"#;
-    let add_note = Command::new("/usr/bin/git")
+    let add_note = Command::new(sys_git_bin())
         .args([
             "notes",
             "--ref=ai",
@@ -77,7 +85,7 @@ fn bidirectional_c_git_notes_interop_and_revision_blame() {
         .expect("git notes add");
     assert!(add_note.success());
 
-    // `oz-agent` reads the note created by `/usr/bin/git notes`!
+    // `oz-agent` reads the note created by `git notes`!
     let read_from_c_git = read_provenance_note(&repo, &c1.commit_oid)
         .expect("read c1 note")
         .expect("note present");
@@ -108,9 +116,9 @@ fn bidirectional_c_git_notes_interop_and_revision_blame() {
     )
     .expect("record c3 provenance");
 
-    // Both C1's C-git note and C3's oz-agent note must be readable via `/usr/bin/git notes --ref=ai show`!
+    // Both C1's C-git note and C3's oz-agent note must be readable via `git notes --ref=ai show`!
     for oid in [&c1.commit_oid, &c3.commit_oid] {
-        let show = Command::new("/usr/bin/git")
+        let show = Command::new(sys_git_bin())
             .args(["notes", "--ref=ai", "show", oid])
             .current_dir(&repo_dir)
             .output()

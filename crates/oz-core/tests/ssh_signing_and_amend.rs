@@ -17,12 +17,28 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
+fn git_bin() -> &'static str {
+    if Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else {
+        "git"
+    }
+}
+
+fn ssh_keygen_bin() -> &'static str {
+    if Path::new("/usr/bin/ssh-keygen").is_file() {
+        "/usr/bin/ssh-keygen"
+    } else {
+        "ssh-keygen"
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("/usr/bin/git")
+    let out = Command::new(git_bin())
         .args(args)
         .current_dir(dir)
         .output()
-        .expect("run /usr/bin/git");
+        .expect("run git");
     assert!(
         out.status.success(),
         "git {:?} failed in {}:\nstdout: {}\nstderr: {}",
@@ -35,10 +51,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn ssh_keygen(args: &[&str]) -> String {
-    let out = Command::new("/usr/bin/ssh-keygen")
+    let out = Command::new(ssh_keygen_bin())
         .args(args)
         .output()
-        .expect("run /usr/bin/ssh-keygen");
+        .expect("run ssh-keygen");
     assert!(
         out.status.success(),
         "ssh-keygen {:?} failed:\nstdout: {}\nstderr: {}",
@@ -76,7 +92,7 @@ fn generate_ed25519_keypair(dir: &Path, filename: &str, passphrase: &str, commen
 /// Extracts `(unsigned_commit_bytes, armored_gpgsig)` directly from `git cat-file commit <rev>`
 /// so `/usr/bin/ssh-keygen -Y verify -n git` can verify the exact commit payload independently.
 fn extract_raw_commit_and_gpgsig(repo_dir: &Path, rev: &str) -> (Vec<u8>, String) {
-    let out = Command::new("/usr/bin/git")
+    let out = Command::new(git_bin())
         .args(["cat-file", "commit", rev])
         .current_dir(repo_dir)
         .output()
@@ -207,7 +223,7 @@ fn pure_rust_signed_commits_pass_both_ssh_keygen_y_verify_and_git_verify_commit(
     let sig_path = tmp.path().join("commit_gpgsig.sig");
     fs::write(&sig_path, &gpgsig_armored).expect("write extracted sig");
 
-    let mut child = Command::new("/usr/bin/ssh-keygen")
+    let mut child = Command::new(ssh_keygen_bin())
         .args([
             "-Y",
             "verify",
@@ -245,8 +261,8 @@ fn pure_rust_signed_commits_pass_both_ssh_keygen_y_verify_and_git_verify_commit(
     );
     assert!(combined.contains("Good \"git\" signature"));
 
-    // 5. Verify commit directly with `/usr/bin/git verify-commit` AND `git fsck` AND `%G?`!
-    let git_verify = Command::new("/usr/bin/git")
+    // 5. Verify commit directly with `git verify-commit` AND `git fsck` AND `%G?`!
+    let git_verify = Command::new(git_bin())
         .args(["verify-commit", "-v", &out.commit_oid])
         .current_dir(&repo_root)
         .output()

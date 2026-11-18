@@ -57,8 +57,24 @@ fn run_oz(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> CmdOut {
     }
 }
 
+fn sys_git_bin() -> &'static str {
+    if Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else {
+        "git"
+    }
+}
+
+fn ssh_keygen_bin() -> &'static str {
+    if Path::new("/usr/bin/ssh-keygen").is_file() {
+        "/usr/bin/ssh-keygen"
+    } else {
+        "ssh-keygen"
+    }
+}
+
 fn sys_git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = Command::new(sys_git_bin())
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -748,7 +764,7 @@ fn m3_git_clone_partial_blob_none_and_exotic_fallbacks() {
     );
 
     // Verify historical `legacy_blob_oid` from c1 was NOT downloaded into local `.git/objects`!
-    let has_legacy = Command::new("/usr/bin/git")
+    let has_legacy = Command::new(sys_git_bin())
         .args(["--no-lazy-fetch", "cat-file", "-e", &legacy_blob_oid])
         .current_dir(&partial_dir)
         .output()
@@ -869,7 +885,7 @@ fn m3_git_fetch_prune_and_push_atomic_and_force_with_lease() {
         sys_git(&work_dir, &["rev-parse", "refs/remotes/origin/main"]).trim(),
         new_main_tip
     );
-    let check_alpha = Command::new("/usr/bin/git")
+    let check_alpha = Command::new(sys_git_bin())
         .args(["rev-parse", "--verify", "refs/remotes/origin/feat/alpha"])
         .current_dir(&work_dir)
         .output()
@@ -1030,12 +1046,12 @@ fn m3_git_commit_ssh_signing_and_native_amend_change_id() {
     let repo_dir = tmp.path().join("sign-amend-repo");
     init_repo(&repo_dir);
 
-    // Generate an unencrypted Ed25519 SSH signing keypair via `/usr/bin/ssh-keygen`.
+    // Generate an unencrypted Ed25519 SSH signing keypair via `ssh-keygen`.
     let key_dir = tmp.path().join("keys");
     fs::create_dir_all(&key_dir).unwrap();
     let priv_key = key_dir.join("id_ed25519");
     let pub_key = key_dir.join("id_ed25519.pub");
-    let keygen = Command::new("/usr/bin/ssh-keygen")
+    let keygen = Command::new(ssh_keygen_bin())
         .args([
             "-q",
             "-t",
@@ -1095,7 +1111,7 @@ fn m3_git_commit_ssh_signing_and_native_amend_change_id() {
         .to_string();
     assert!(orig_change_id.starts_with('I'));
 
-    let verify_initial = Command::new("/usr/bin/git")
+    let verify_initial = Command::new(sys_git_bin())
         .args(["verify-commit", "HEAD"])
         .current_dir(&repo_dir)
         .output()
@@ -1174,7 +1190,7 @@ fn m3_git_commit_ssh_signing_and_native_amend_change_id() {
     assert!(head_body.contains("feat: amended and re-signed commit"));
     assert!(head_body.contains(&format!("Change-Id: {orig_change_id}")));
 
-    let verify_amended = Command::new("/usr/bin/git")
+    let verify_amended = Command::new(sys_git_bin())
         .args(["verify-commit", "HEAD"])
         .current_dir(&repo_dir)
         .output()
@@ -1219,7 +1235,7 @@ fn m3_git_commit_agent_provenance_notes() {
     );
     assert_eq!(human_commit.code, 0, "stderr={}", human_commit.stderr);
     assert!(human_commit.json.unwrap()["data"].get("provenance").is_none());
-    let no_note = Command::new("/usr/bin/git")
+    let no_note = Command::new(sys_git_bin())
         .args(["notes", "--ref=ai", "show", "HEAD"])
         .current_dir(&repo_dir)
         .output()

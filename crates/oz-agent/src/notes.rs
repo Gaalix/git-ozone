@@ -847,12 +847,21 @@ mod tests {
     use super::*;
     use oz_core::{CommitOptions, commit_changes};
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
 
+    fn sys_git_bin() -> &'static str {
+        if Path::new("/usr/bin/git").is_file() {
+            "/usr/bin/git"
+        } else {
+            "git"
+        }
+    }
+
     fn init_test_repo() -> (TempDir, OzoneRepo) {
         let dir = TempDir::new().expect("tempdir");
-        let status = Command::new("git")
+        let status = Command::new(sys_git_bin())
             .args(["init", "-b", "main"])
             .current_dir(dir.path())
             .status()
@@ -907,7 +916,7 @@ mod tests {
         );
 
         // Verify commit message itself remained 100% clean (only subject + Change-Id trailer).
-        let log_out = Command::new("/usr/bin/git")
+        let log_out = Command::new(sys_git_bin())
             .args(["log", "-1", "--format=%B", &c1.commit_oid])
             .current_dir(dir.path())
             .output()
@@ -918,8 +927,8 @@ mod tests {
         assert!(!commit_body.contains("sess-001"));
         assert!(!commit_body.contains("claude-code"));
 
-        // Verify `/usr/bin/git notes --ref=ai show <oid>` reads the note written by oz-agent!
-        let git_note_out = Command::new("/usr/bin/git")
+        // Verify `git notes --ref=ai show <oid>` reads the note written by oz-agent!
+        let git_note_out = Command::new(sys_git_bin())
             .args(["notes", "--ref=ai", "show", &c1.commit_oid])
             .current_dir(dir.path())
             .output()
@@ -981,7 +990,7 @@ mod tests {
         let all_notes = list_provenance_notes(&repo).expect("list all notes");
         assert_eq!(all_notes.len(), 2);
 
-        let git_show_c2 = Command::new("/usr/bin/git")
+        let git_show_c2 = Command::new(sys_git_bin())
             .args(["notes", "--ref=ai", "show", &c2.commit_oid])
             .current_dir(dir.path())
             .output()
@@ -1081,7 +1090,7 @@ mod tests {
         let all = list_provenance_notes(&repo).expect("list all after concurrent CAS");
         assert_eq!(all.len(), 6);
         for oid in &commit_oids {
-            let out = Command::new("/usr/bin/git")
+            let out = Command::new(sys_git_bin())
                 .args(["notes", "--ref=ai", "show", oid])
                 .current_dir(dir.path())
                 .output()
