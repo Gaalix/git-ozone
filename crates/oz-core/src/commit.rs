@@ -9,12 +9,19 @@ use crate::diff::{apply_selected_hunks, target_matches_file};
 use crate::error::{OzError, Result};
 use crate::guardrails::{GuardrailOptions, GuardrailTarget, check_guardrails};
 use crate::repo::OzoneRepo;
+use crate::ssh_sign::{
+    CommitSignatureVerification, GIT_SSHSIG_NAMESPACE, expand_tilde_path,
+    match_allowed_signers_file, resolve_signing_private_key, verify_sshsig,
+};
 use crate::status::{
-    StatusContext, compute_status_context, read_blob_bytes, read_disk_bytes,
+    StatusContext, compute_status_context, open_gix_for_workspace, read_blob_bytes, read_disk_bytes,
 };
 use crate::types::{ChangeKind, WorkspaceState};
 use gix::bstr::ByteSlice;
+use gix::objs::WriteTo as _;
 use gix::objs::tree::EntryKind;
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -40,6 +47,17 @@ pub struct CommitOptions {
     pub author_name: Option<String>,
     /// Optional override for author/committer email.
     pub author_email: Option<String>,
+    /// SSH commit signing override:
+    /// - `Some(true)`: force pure-Rust SSH signing
+    /// - `Some(false)`: disable signing
+    /// - `None`: auto-check `.ozone.toml` `[signing].enabled` or Git `commit.gpgsign = true` when `gpg.format = ssh`
+    pub sign: Option<bool>,
+    /// Optional SSH signing key path or inline key override (overrides `[signing].key`,
+    /// Git `user.signingkey`, and default `~/.ssh/id_ed25519`).
+    pub signing_key: Option<String>,
+    /// Amend the current `HEAD` commit (`HEAD`'s parent(s) become parent(s), preserving
+    /// `HEAD`'s `Change-Id:` trailer unless another is explicitly present).
+    pub amend: bool,
 }
 
 impl CommitOptions {
@@ -73,6 +91,27 @@ impl CommitOptions {
         self.exclude = exclude.into_iter().map(Into::into).collect();
         self
     }
+
+    /// Forces (`true`) or disables (`false`) SSH commit signing.
+    #[must_use]
+    pub const fn with_sign(mut self, sign: bool) -> Self {
+        self.sign = Some(sign);
+        self
+    }
+
+    /// Overrides the SSH signing key path or inline key specification.
+    #[must_use]
+    pub fn with_signing_key(mut self, key: impl Into<String>) -> Self {
+        self.signing_key = Some(key.into());
+        self
+    }
+
+    /// Enables or disables `--amend` mode on the current `HEAD` commit.
+    #[must_use]
+    pub const fn with_amend(mut self, amend: bool) -> Self {
+        self.amend = amend;
+        self
+    }
 }
 
 /// Summary returned by [`commit_changes`].
@@ -90,6 +129,12 @@ pub struct CommitOutcome {
     #[serde(default)]
     pub partial_hunk_paths: Vec<String>,
     pub remaining_dirty_count: usize,
+    #[serde(default)]
+    pub signed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_fingerprint: Option<String>,
+    #[serde(default)]
+    pub amended: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -147,12 +192,20 @@ pub fn commit_changes_ignoring_pinned(
     commit_changes_inner(repo, opts, true)
 }
 
+#[derive(Debug, Clone)]
+struct AmendedHeadInfo {
+    parents: Vec<gix::ObjectId>,
+    message: String,
+    existing_change_id: Option<String>,
+    author: Option<gix::actor::Signature>,
+}
+
 fn commit_changes_inner(
     repo: &OzoneRepo,
     opts: &CommitOptions,
     ignore_pinned: bool,
 ) -> Result<CommitOutcome> {
-    if opts.message.trim().is_empty() {
+    if !opts.amend && opts.message.trim().is_empty() {
         return Err(OzError::InvalidUsage {
             message: "commit message cannot be empty".to_string(),
             recovery: vec!["Provide a non-empty message with `-m \"...\"`.".to_string()],
@@ -162,20 +215,54 @@ fn commit_changes_inner(
     let ctx = compute_status_context(repo)?;
     let mut gix_repo = open_gix_for_commit(repo)?;
 
-    if ctx.changes.is_empty() && !opts.allow_empty {
+    let amended_head = if opts.amend {
+        let Some(head_oid) = ctx.head.commit_oid else {
+            return Err(OzError::InvalidUsage {
+                message: "cannot amend on an unborn branch with no commits".to_string(),
+                recovery: vec![
+                    "Run `oz commit -m \"...\"` without `--amend` to create the initial commit."
+                        .to_string(),
+                ],
+            });
+        };
+        let head_obj = gix_repo
+            .find_commit(head_oid)
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        let decoded = head_obj
+            .decode()
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        let parents: Vec<gix::ObjectId> = decoded.parents().collect();
+        let raw_msg = decoded.message.to_str_lossy().into_owned();
+        let existing_change_id =
+            find_existing_change_id(raw_msg.trim_end_matches(['\r', '\n']));
+        let author = decoded
+            .author()
+            .ok()
+            .and_then(|a| a.to_owned().ok());
+        Some(AmendedHeadInfo {
+            parents,
+            message: raw_msg,
+            existing_change_id,
+            author,
+        })
+    } else {
+        None
+    };
+
+    if ctx.changes.is_empty() && !opts.allow_empty && !opts.amend {
         return Err(OzError::InvalidUsage {
             message: "nothing to commit; working tree is clean".to_string(),
             recovery: vec!["Edit files in the workspace or pass `--allow-empty`.".to_string()],
         });
     }
 
-    let selection = if ctx.changes.is_empty() && opts.allow_empty {
+    let selection = if ctx.changes.is_empty() && opts.pick.is_empty() && opts.exclude.is_empty() {
         BTreeMap::new()
     } else {
         resolve_selection(repo, &ctx, &opts.pick, &opts.exclude, ignore_pinned)?
     };
 
-    if selection.is_empty() && !opts.allow_empty {
+    if selection.is_empty() && !opts.allow_empty && !opts.amend {
         return Err(OzError::InvalidUsage {
             message: "no changes selected to commit".to_string(),
             recovery: vec!["Run `oz status` to inspect file and hunk IDs.".to_string()],
@@ -338,6 +425,16 @@ fn commit_changes_inner(
         },
     )?;
 
+    // Resolve and validate SSH signing key BEFORE mutating any objects or refs.
+    let should_sign = resolve_should_sign(repo, &gix_repo, opts.sign);
+    let active_signing_key = if should_sign {
+        let key_spec = resolve_signing_key_spec(repo, &gix_repo, opts.signing_key.as_deref());
+        let (priv_key, _) = resolve_signing_private_key(&key_spec, Some(&repo.repo_root))?;
+        Some(priv_key)
+    } else {
+        None
+    };
+
     // Build the new tree in memory via gix `tree::Editor`.
     // Apply removals before upserts to cleanly handle file <-> directory replacements.
     let mut editor = gix_repo
@@ -390,15 +487,47 @@ fn commit_changes_inner(
         .map_err(|err| OzError::Git(err.to_string()))?
         .detach();
 
-    let (author_sig, committer_sig) = resolve_signatures(&mut gix_repo, opts)?;
-    let parents: Vec<gix::ObjectId> = ctx.head.commit_oid.into_iter().collect();
+    let (mut author_sig, committer_sig) = resolve_signatures(&mut gix_repo, opts)?;
+    if let Some(ref head_info) = amended_head
+        && opts.author_name.is_none()
+        && opts.author_email.is_none()
+        && let Some(ref orig_author) = head_info.author
+    {
+        author_sig = orig_author.clone();
+    }
 
-    let (final_message, change_id) = ensure_change_id_trailer(
-        &opts.message,
-        new_tree_id,
-        &parents,
-        &author_sig,
-    );
+    let parents: Vec<gix::ObjectId> = match amended_head {
+        Some(ref head_info) => head_info.parents.clone(),
+        None => ctx.head.commit_oid.into_iter().collect(),
+    };
+
+    let raw_message = if opts.amend && opts.message.trim().is_empty() {
+        amended_head
+            .as_ref()
+            .map(|h| h.message.clone())
+            .unwrap_or_default()
+    } else {
+        opts.message.clone()
+    };
+
+    if raw_message.trim().is_empty() {
+        return Err(OzError::InvalidUsage {
+            message: "commit message cannot be empty".to_string(),
+            recovery: vec!["Provide a non-empty message with `-m \"...\"`.".to_string()],
+        });
+    }
+
+    let (final_message, change_id) = if let Some(ref head_info) = amended_head
+        && find_existing_change_id(raw_message.trim_end_matches(['\r', '\n'])).is_none()
+        && let Some(ref preserved_cid) = head_info.existing_change_id
+    {
+        (
+            format_message_with_change_id(&raw_message, preserved_cid),
+            preserved_cid.clone(),
+        )
+    } else {
+        ensure_change_id_trailer(&raw_message, new_tree_id, &parents, &author_sig)
+    };
 
     let target_ref = if repo.workspace.is_some() && !repo.is_linked_worktree {
         if let Some(ref branch) = ctx.head.branch {
@@ -414,22 +543,79 @@ fn commit_changes_inner(
         "HEAD".to_string()
     };
 
-    let mut author_buf = gix::date::parse::TimeBuf::default();
-    let mut committer_buf = gix::date::parse::TimeBuf::default();
-    let author_ref = author_sig.to_ref(&mut author_buf);
-    let committer_ref = committer_sig.to_ref(&mut committer_buf);
+    let mut commit_obj = gix::objs::Commit {
+        message: final_message.as_bytes().into(),
+        tree: new_tree_id,
+        author: author_sig,
+        committer: committer_sig.clone(),
+        encoding: None,
+        parents: parents.iter().copied().collect(),
+        extra_headers: Vec::new(),
+    };
+
+    let (signed, signature_fingerprint) = if let Some(ref priv_key) = active_signing_key {
+        let mut unsigned_payload = Vec::with_capacity(commit_obj.size() as usize);
+        commit_obj
+            .write_to(&mut unsigned_payload)
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        let armored_sig = priv_key.sign_sshsig(&unsigned_payload, GIT_SSHSIG_NAMESPACE)?;
+        let fp = priv_key.public_key().fingerprint_sha256();
+        let sig_field = gix::objs::commit::signature_field_name(gix_repo.object_hash());
+        commit_obj
+            .extra_headers
+            .push((sig_field.into(), armored_sig.into()));
+        (true, Some(fp))
+    } else {
+        (false, None)
+    };
 
     let commit_id = gix_repo
-        .commit_as(
-            committer_ref,
-            author_ref,
-            target_ref.as_str(),
-            &final_message,
-            new_tree_id,
-            parents,
-        )
+        .write_object(&commit_obj)
         .map_err(|err| OzError::Git(err.to_string()))?
         .detach();
+
+    let ref_full_name =
+        FullName::try_from(target_ref.as_str()).map_err(|err| OzError::Git(err.to_string()))?;
+    let expected = match ctx.head.commit_oid.map(Target::Object) {
+        Some(previous) => {
+            if ref_full_name.as_bstr() == "HEAD" {
+                PreviousValue::MustExistAndMatch(previous)
+            } else {
+                PreviousValue::ExistingMustMatch(previous)
+            }
+        }
+        None => PreviousValue::MustNotExist,
+    };
+    let log_op = if opts.amend {
+        "commit (amend)"
+    } else {
+        "commit"
+    };
+    let log_msg = gix::reference::log::message(
+        log_op,
+        commit_obj.message.as_bstr(),
+        commit_obj.parents.len(),
+    );
+    let mut committer_buf = gix::date::parse::TimeBuf::default();
+    let committer_ref = committer_sig.to_ref(&mut committer_buf);
+    gix_repo
+        .edit_references_as(
+            Some(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: log_msg,
+                    },
+                    expected,
+                    new: Target::Object(commit_id),
+                },
+                name: ref_full_name,
+                deref: true,
+            }),
+            Some(committer_ref),
+        )
+        .map_err(|err| OzError::Git(err.to_string()))?;
 
     // Update `.git/index` / `.git/worktrees/<ws>/index` if applicable.
     update_git_index(repo, &gix_repo, &ctx, &index_deltas)?;
@@ -444,13 +630,16 @@ fn commit_changes_inner(
     Ok(CommitOutcome {
         commit_oid: commit_id.to_hex().to_string(),
         tree_oid: new_tree_id.to_hex().to_string(),
-        parent_oid: ctx.head.commit_oid.map(|id| id.to_hex().to_string()),
+        parent_oid: parents.first().map(|id| id.to_hex().to_string()),
         branch: ctx.head.branch,
         change_id,
         message: final_message,
         committed_paths,
         partial_hunk_paths,
         remaining_dirty_count,
+        signed,
+        signature_fingerprint,
+        amended: opts.amend,
     })
 }
 
@@ -669,14 +858,221 @@ pub fn ensure_change_id_trailer(
     }
 
     let change_id = compute_change_id(tree_id, parents, author, base);
-    let has_trailing_trailer_block = last_paragraph_is_trailers(base);
+    (format_message_with_change_id(base, &change_id), change_id)
+}
 
-    let formatted = if has_trailing_trailer_block {
+fn format_message_with_change_id(message: &str, change_id: &str) -> String {
+    let base = message.trim_end_matches(['\r', '\n']);
+    if last_paragraph_is_trailers(base) {
         format!("{base}\nChange-Id: {change_id}\n")
     } else {
         format!("{base}\n\nChange-Id: {change_id}\n")
+    }
+}
+
+fn resolve_should_sign(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    explicit_sign: Option<bool>,
+) -> bool {
+    if let Some(sign) = explicit_sign {
+        return sign;
+    }
+    if let Some(enabled) = repo.config.signing.enabled {
+        return enabled;
+    }
+    let snap = gix_repo.config_snapshot();
+    let gpgsign = snap.boolean("commit.gpgsign").unwrap_or(false);
+    let gpg_format = snap.string("gpg.format");
+    gpgsign
+        && gpg_format
+            .as_deref()
+            .is_some_and(|f| f.to_str_lossy().trim().eq_ignore_ascii_case("ssh"))
+}
+
+fn resolve_signing_key_spec(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    explicit_key: Option<&str>,
+) -> String {
+    if let Some(k) = explicit_key.map(str::trim).filter(|k| !k.is_empty()) {
+        return k.to_string();
+    }
+    if let Some(k) = repo
+        .config
+        .signing
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        return k.to_string();
+    }
+    if let Some(k) = gix_repo
+        .config_snapshot()
+        .string("user.signingkey")
+        .map(|v| v.to_str_lossy().trim().to_string())
+        .filter(|k| !k.is_empty())
+    {
+        return k;
+    }
+    "~/.ssh/id_ed25519".to_string()
+}
+
+/// Trait allowing [`verify_commit_signature`] to accept `&str` hex OIDs / revisions,
+/// `&String`, `String`, or [`gix::ObjectId`].
+pub trait CommitOidArg {
+    fn resolve_commit_oid(&self, gix_repo: &gix::Repository) -> Result<gix::ObjectId>;
+}
+
+impl CommitOidArg for gix::ObjectId {
+    fn resolve_commit_oid(&self, _gix_repo: &gix::Repository) -> Result<gix::ObjectId> {
+        Ok(*self)
+    }
+}
+
+impl CommitOidArg for &gix::ObjectId {
+    fn resolve_commit_oid(&self, _gix_repo: &gix::Repository) -> Result<gix::ObjectId> {
+        Ok(**self)
+    }
+}
+
+impl CommitOidArg for str {
+    fn resolve_commit_oid(&self, gix_repo: &gix::Repository) -> Result<gix::ObjectId> {
+        let trimmed = self.trim();
+        if let Ok(oid) = gix::ObjectId::from_hex(trimmed.as_bytes()) {
+            return Ok(oid);
+        }
+        gix_repo
+            .rev_parse_single(trimmed)
+            .map(|id| id.detach())
+            .map_err(|err| OzError::InvalidUsage {
+                message: format!("cannot resolve commit '{trimmed}': {err}"),
+                recovery: Vec::new(),
+            })
+    }
+}
+
+impl CommitOidArg for &str {
+    fn resolve_commit_oid(&self, gix_repo: &gix::Repository) -> Result<gix::ObjectId> {
+        (*self).resolve_commit_oid(gix_repo)
+    }
+}
+
+impl CommitOidArg for String {
+    fn resolve_commit_oid(&self, gix_repo: &gix::Repository) -> Result<gix::ObjectId> {
+        self.as_str().resolve_commit_oid(gix_repo)
+    }
+}
+
+impl CommitOidArg for &String {
+    fn resolve_commit_oid(&self, gix_repo: &gix::Repository) -> Result<gix::ObjectId> {
+        self.as_str().resolve_commit_oid(gix_repo)
+    }
+}
+
+/// Verifies the OpenSSH `SSHSIG` v1 signature (`gpgsig` header, `namespace = "git"`) on a commit.
+pub fn verify_commit_signature<C: CommitOidArg + ?Sized>(
+    repo: &OzoneRepo,
+    commit_oid: &C,
+) -> Result<CommitSignatureVerification> {
+    verify_commit_signature_inner(repo, commit_oid, None)
+}
+
+/// Verifies a commit's OpenSSH `SSHSIG` v1 signature AND enforces that the signing key
+/// matches an entry in `allowed_signers_path`.
+pub fn verify_commit_signature_with_allowed_signers<C: CommitOidArg + ?Sized>(
+    repo: &OzoneRepo,
+    commit_oid: &C,
+    allowed_signers_path: &Path,
+) -> Result<CommitSignatureVerification> {
+    verify_commit_signature_inner(repo, commit_oid, Some(allowed_signers_path))
+}
+
+fn verify_commit_signature_inner<C: CommitOidArg + ?Sized>(
+    repo: &OzoneRepo,
+    commit_oid: &C,
+    explicit_allowed_signers: Option<&Path>,
+) -> Result<CommitSignatureVerification> {
+    let gix_repo = open_gix_for_workspace(repo)?;
+    let oid = commit_oid.resolve_commit_oid(&gix_repo)?;
+    let commit_obj = gix_repo
+        .find_commit(oid)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+
+    let hash_kind = gix_repo.object_hash();
+    let mut commit_ref = gix::objs::CommitRef::from_bytes(&commit_obj.data, hash_kind)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+
+    let sig_field = gix::objs::commit::signature_field_name(hash_kind);
+    let Some(sig_bstr) = commit_ref.extra_headers().find(sig_field) else {
+        return Err(OzError::CheckFailed {
+            message: format!("commit {oid} is not signed (missing '{sig_field}' header)"),
+            recovery: vec!["oz commit --amend --sign -m \"...\"".to_string()],
+        });
     };
-    (formatted, change_id)
+    let armored_sig = sig_bstr.to_str_lossy().into_owned();
+
+    let committer_email = commit_ref
+        .committer()
+        .ok()
+        .map(|c| c.email.to_str_lossy().into_owned());
+
+    // Strip the signature header and reconstruct the exact unsigned commit payload bytes.
+    commit_ref
+        .extra_headers
+        .retain(|(k, _)| *k != sig_field.as_bytes().as_bstr());
+    let mut unsigned_payload = Vec::with_capacity(commit_obj.data.len());
+    commit_ref
+        .write_to(&mut unsigned_payload)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+
+    let parsed = verify_sshsig(&unsigned_payload, &armored_sig, GIT_SSHSIG_NAMESPACE)?;
+
+    let configured_allowed = explicit_allowed_signers
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            gix_repo
+                .config_snapshot()
+                .string("gpg.ssh.allowedSignersFile")
+                .map(|v| expand_tilde_path(&v.to_str_lossy()))
+                .filter(|p| p.is_file())
+        });
+
+    let (allowed_signer_matched, matched_principal) = if let Some(ref as_path) = configured_allowed
+    {
+        let (matched, principal) = match_allowed_signers_file(
+            as_path,
+            &parsed.public_key,
+            committer_email.as_deref(),
+        )?;
+        if explicit_allowed_signers.is_some() && !matched {
+            return Err(OzError::CheckFailed {
+                message: format!(
+                    "valid SSH signature on commit {oid} ({}) is not trusted by {}",
+                    parsed.public_key.fingerprint_sha256(),
+                    as_path.display()
+                ),
+                recovery: Vec::new(),
+            });
+        }
+        (Some(matched), principal)
+    } else {
+        (None, None)
+    };
+
+    Ok(CommitSignatureVerification {
+        commit_oid: oid.to_hex().to_string(),
+        valid: true,
+        namespace: parsed.namespace,
+        hash_algorithm: parsed.hash_algorithm,
+        key_algorithm: "ssh-ed25519".to_string(),
+        fingerprint: parsed.public_key.fingerprint_sha256(),
+        public_key: parsed.public_key.to_openssh_line(),
+        committer_email,
+        allowed_signer_matched,
+        matched_principal,
+    })
 }
 
 fn find_existing_change_id(message: &str) -> Option<String> {

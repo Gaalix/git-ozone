@@ -32,6 +32,9 @@ pub struct OzoneConfig {
     pub backend: Option<BackendKind>,
     /// Background `oz-vfsd` lifecycle settings.
     pub daemon: DaemonConfig,
+    /// Optional SSH commit signing settings (`[signing]`).
+    #[serde(default)]
+    pub signing: SigningConfig,
 }
 
 impl Default for OzoneConfig {
@@ -44,6 +47,7 @@ impl Default for OzoneConfig {
             guardrails: GuardrailsConfig::default(),
             backend: None,
             daemon: DaemonConfig::default(),
+            signing: SigningConfig::default(),
         }
     }
 }
@@ -114,6 +118,18 @@ impl Default for DaemonConfig {
     }
 }
 
+/// SSH commit signing settings (`[signing]` in `.ozone.toml` or `.git/ozone/config.toml`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SigningConfig {
+    /// Whether commits should be signed by default (`Some(true)` forces signing,
+    /// `Some(false)` disables signing, `None` defers to Git `commit.gpgsign` when `gpg.format = ssh`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Optional signing key path (`~/.ssh/id_ed25519`, relative path) or inline `key::ssh-ed25519 ...`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PartialOzoneConfig {
@@ -128,6 +144,7 @@ struct PartialOzoneConfig {
     guardrails: Option<PartialGuardrailsConfig>,
     backend: Option<BackendKind>,
     daemon: Option<PartialDaemonConfig>,
+    signing: Option<PartialSigningConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -171,6 +188,13 @@ struct PartialGuardrailsConfig {
 struct PartialDaemonConfig {
     auto_start: Option<bool>,
     allow_other: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PartialSigningConfig {
+    enabled: Option<bool>,
+    key: Option<String>,
 }
 
 fn de_opt_f64<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
@@ -302,6 +326,14 @@ impl OzoneConfig {
                 self.daemon.allow_other = v;
             }
         }
+        if let Some(signing) = layer.signing {
+            if let Some(v) = signing.enabled {
+                self.signing.enabled = Some(v);
+            }
+            if let Some(v) = signing.key {
+                self.signing.key = Some(v);
+            }
+        }
         Ok(())
     }
 
@@ -323,6 +355,14 @@ impl OzoneConfig {
             return Err(OzError::InvalidConfig {
                 path: path.to_path_buf(),
                 message: "workspace_template must contain the '{ws}' placeholder".to_string(),
+            });
+        }
+        if let Some(ref key) = self.signing.key
+            && key.trim().is_empty()
+        {
+            return Err(OzError::InvalidConfig {
+                path: path.to_path_buf(),
+                message: "signing.key must not be empty".to_string(),
             });
         }
         Ok(())
@@ -499,5 +539,41 @@ backend = "linux_fuse3"
         assert!(validate_workspace_name("../escape").is_err());
         assert!(validate_workspace_name("a/b").is_err());
         assert!(validate_workspace_name("-flag").is_err());
+        assert!(OzoneConfig::parse_str("[signing]\nkey = \"   \"").is_err());
+    }
+
+    #[test]
+    fn parses_and_layers_signing_section() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo_root = dir.path().join("signed-app");
+        let ozone_dir = repo_root.join(".git/ozone");
+        std::fs::create_dir_all(&ozone_dir).expect("mkdir");
+
+        std::fs::write(
+            repo_root.join(".ozone.toml"),
+            r#"
+[signing]
+enabled = true
+key = "~/.ssh/team_ed25519"
+"#,
+        )
+        .expect("write .ozone.toml");
+
+        let cfg1 = OzoneConfig::load_for_repo(&repo_root, &ozone_dir).expect("load repo config");
+        assert_eq!(cfg1.signing.enabled, Some(true));
+        assert_eq!(cfg1.signing.key.as_deref(), Some("~/.ssh/team_ed25519"));
+
+        std::fs::write(
+            ozone_dir.join("config.toml"),
+            r#"
+[signing]
+key = "~/.ssh/local_ed25519"
+"#,
+        )
+        .expect("write local config");
+
+        let cfg2 = OzoneConfig::load_for_repo(&repo_root, &ozone_dir).expect("load layered config");
+        assert_eq!(cfg2.signing.enabled, Some(true));
+        assert_eq!(cfg2.signing.key.as_deref(), Some("~/.ssh/local_ed25519"));
     }
 }
