@@ -32,6 +32,20 @@ jobs:
           done
           echo "OK: Cargo.lock is free of openssl-sys, libgit2-sys, curl-sys, and libfuse/fuse-sys bindings."
 
+  packaging-validate:
+    name: Validate Packaging & Release Assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Python PyYAML is available
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-yaml)
+
+      - name: Run packaging validation suite
+        run: ./packaging/validate.sh
+
   test:
     name: Build & Test (${{ matrix.os }})
     strategy:
@@ -83,6 +97,9 @@ jobs:
 
       - name: Run Milestone 3 VCBench & exit gates
         run: cargo test --locked -p oz-cli --test m3_exit_gates -- --nocapture
+
+      - name: Run Milestone 4 release & exit gates
+        run: cargo test --locked -p oz-cli --test m4_exit_gates -- --nocapture
 
       - name: Verify oz --version --json and git-ozone doctor --json
         shell: bash

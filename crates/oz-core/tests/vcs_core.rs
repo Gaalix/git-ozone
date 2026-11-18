@@ -893,4 +893,185 @@ fn main_repo_pinned_main_json_and_windows_projfs_fast_path_and_switch() {
     );
 }
 
+#[test]
+fn status_hardening_spaces_unicode_empty_dirs_anchored_gitignore_racy_index_and_large_tree() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_root = tmp.path().join("edge-mono");
+    init_repo_with_user(&repo_root);
+
+    // Anchored root-only gitignore rule `/root_only.tmp` vs nested `nested/root_only.tmp`,
+    // plus `*.log` with `!keep.log`.
+    fs::write(
+        repo_root.join(".gitignore"),
+        "/root_only.tmp\n/build_out/\n*.log\n!keep.log\n",
+    )
+    .expect("write .gitignore");
+
+    // Tracked files with spaces, unicode, and 1,500 files across 30 subdirs (parallel walk + stat cache).
+    fs::create_dir_all(repo_root.join("docs/my folder")).expect("mkdir spaces");
+    fs::write(repo_root.join("docs/my folder/report (v1).txt"), "hello spaces\n").expect("write spaces");
+    fs::create_dir_all(repo_root.join("café")).expect("mkdir unicode");
+    fs::write(repo_root.join("café/日本語.rs"), "pub fn greet() -> &'static str { \"こんにちは\" }\n")
+        .expect("write unicode");
+    fs::write(repo_root.join("same_len.txt"), "AAAA\n").expect("write same_len");
+
+    for d in 0..30 {
+        let dir = repo_root.join(format!("pkg_{d:02}/src"));
+        fs::create_dir_all(&dir).expect("mkdir pkg");
+        for f in 0..50 {
+            fs::write(
+                dir.join(format!("mod_{f:02}.rs")),
+                format!("pub const V_{d}_{f}: usize = {};\n", d * 100 + f),
+            )
+            .expect("write mod");
+        }
+    }
+
+    git(&repo_root, &["add", "."]);
+    git(&repo_root, &["commit", "-m", "seed edge-case repo"]);
+    git(&repo_root, &["branch", "feat/edge-fuse"]);
+    let head_oid = git(&repo_root, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // 1. Empty directory must not produce spurious dirty entries.
+    fs::create_dir_all(repo_root.join("empty_dir/deep_empty")).expect("mkdir empty");
+
+    // 2. Special FIFO file on Unix must be skipped without blocking `compute_status`.
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let fifo_path = repo_root.join("live.fifo");
+        let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("cstr");
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    }
+
+    // 3. Anchored `.gitignore` verification on general workdir:
+    fs::write(repo_root.join("root_only.tmp"), "ignored at root\n").expect("write root_only");
+    fs::create_dir_all(repo_root.join("nested")).expect("mkdir nested");
+    fs::write(repo_root.join("nested/root_only.tmp"), "tracked candidate in nested\n")
+        .expect("write nested root_only");
+    fs::write(repo_root.join("noise.log"), "ignored\n").expect("write noise.log");
+    fs::write(repo_root.join("keep.log"), "whitelisted\n").expect("write keep.log");
+
+    // 4. Racy same-second / same-length modification AND `git add` staged-only change:
+    //    `compute_status` MUST still compare against HEAD even when `.git/index` matches disk!
+    fs::write(repo_root.join("same_len.txt"), "BBBB\n").expect("modify same_len");
+    git(&repo_root, &["add", "same_len.txt"]);
+    fs::write(repo_root.join("docs/my folder/report (v1).txt"), "hello spaces v2\n")
+        .expect("edit spaces");
+    fs::write(repo_root.join("café/日本語.rs"), "pub fn greet() -> &'static str { \"やあ\" }\n")
+        .expect("edit unicode");
+    fs::remove_file(repo_root.join("pkg_05/src/mod_10.rs")).expect("delete tracked");
+
+    let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover");
+    let st = compute_status(&repo).expect("status general");
+    let summary: Vec<(&str, ChangeKind)> = st
+        .changes
+        .iter()
+        .map(|c| (c.path.as_str(), c.kind))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("café/日本語.rs", ChangeKind::Modified),
+            ("docs/my folder/report (v1).txt", ChangeKind::Modified),
+            ("keep.log", ChangeKind::Added),
+            ("nested/root_only.tmp", ChangeKind::Added),
+            ("pkg_05/src/mod_10.rs", ChangeKind::Deleted),
+            ("same_len.txt", ChangeKind::Modified),
+        ]
+    );
+
+    // 5. Verify anchored `.gitignore`, spaces, unicode, FIFO skip, and 300 clean upper files
+    //    on the FUSE3 fast path (`scan_fuse_fast_path`)!
+    let layout = OzoneLayout::from_git_common_dir(repo_root.join(".git"));
+    layout.ensure_initialized().expect("init ozone");
+    let ws_name = "ws-edge";
+    let upper_dir = layout.ws_upper_dir(ws_name);
+    let meta_dir = layout.ws_tombstone_dir(ws_name);
+    let mount_point = tmp.path().join("edge-mono.oz").join(ws_name);
+    fs::create_dir_all(&upper_dir).expect("mkdir upper");
+    fs::create_dir_all(meta_dir.join("whiteouts")).expect("mkdir wh");
+    fs::create_dir_all(meta_dir.join("opaque")).expect("mkdir opq");
+    fs::create_dir_all(&mount_point).expect("mkdir mp");
+
+    let record = MountRecord {
+        schema_version: MountRecord::CURRENT_SCHEMA_VERSION,
+        workspace: ws_name.to_string(),
+        branch: "feat/edge-fuse".to_string(),
+        backend: BackendKind::LinuxFuse3,
+        repo_root: repo_root.clone(),
+        git_dir: repo_root.join(".git"),
+        mount_point: mount_point.clone(),
+        upper_dir: Some(upper_dir.clone()),
+        meta_dir: Some(meta_dir.clone()),
+        base_tree: None,
+        base_commit: Some(head_oid),
+        socket_path: Some(layout.vfsd_socket_path()),
+        daemon_pid: None,
+        mounted: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    fs::create_dir_all(layout.ws_meta_dir(ws_name)).expect("mkdir ws meta");
+    fs::write(
+        layout.ws_mount_record_path(ws_name),
+        serde_json::to_string_pretty(&record).expect("json"),
+    )
+    .expect("write mount.json");
+
+    // 300 committed-identical files in upper_dir -> must all be detected as CLEAN in parallel!
+    for d in 0..6 {
+        let dir = upper_dir.join(format!("pkg_{d:02}/src"));
+        fs::create_dir_all(&dir).expect("mkdir upper pkg");
+        for f in 0..50 {
+            fs::write(
+                dir.join(format!("mod_{f:02}.rs")),
+                format!("pub const V_{d}_{f}: usize = {};\n", d * 100 + f),
+            )
+            .expect("write clean upper");
+        }
+    }
+
+    // Anchored gitignore + spaces + unicode + empty dir + FIFO in upper_dir
+    fs::create_dir_all(upper_dir.join("empty_upper")).expect("mkdir empty_upper");
+    fs::write(upper_dir.join("root_only.tmp"), "ignored\n").expect("write root_only");
+    fs::create_dir_all(upper_dir.join("build_out")).expect("mkdir build_out");
+    fs::write(upper_dir.join("build_out/a.o"), b"\x00\x01").expect("write ignored build_out");
+    fs::create_dir_all(upper_dir.join("nested")).expect("mkdir upper nested");
+    fs::write(upper_dir.join("nested/root_only.tmp"), "not ignored\n").expect("write nested");
+    fs::write(upper_dir.join("noise.log"), "ignored\n").expect("write noise");
+    fs::write(upper_dir.join("keep.log"), "kept\n").expect("write keep");
+    fs::create_dir_all(upper_dir.join("café")).expect("mkdir upper unicode");
+    fs::write(upper_dir.join("café/日本語.rs"), "pub fn greet() -> &'static str { \"edited\" }\n")
+        .expect("write upper unicode");
+
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let fifo_path = upper_dir.join("upper.fifo");
+        let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("cstr");
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    }
+
+    let fuse_repo = OzoneRepo::discover(Some(&mount_point)).expect("discover fuse");
+    let fuse_st = compute_status(&fuse_repo).expect("status fuse");
+    assert!(fuse_st.used_fuse_fast_path);
+    let fuse_summary: Vec<(&str, ChangeKind)> = fuse_st
+        .changes
+        .iter()
+        .map(|c| (c.path.as_str(), c.kind))
+        .collect();
+    assert_eq!(
+        fuse_summary,
+        vec![
+            ("café/日本語.rs", ChangeKind::Modified),
+            ("keep.log", ChangeKind::Added),
+            ("nested/root_only.tmp", ChangeKind::Added),
+        ]
+    );
+}
+
+
 

@@ -11,10 +11,12 @@ use gix::object::tree::diff::Change;
 use oz_core::{OzError, OzoneConfig, Result, normalize_lexical};
 use oz_warm::detect_warm_targets;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use walkdir::WalkDir;
 
 /// File-level difference between a baseline Git tree and a target branch tree.
@@ -255,6 +257,8 @@ fn write_git_entry(
 /// Clones `src_root` into `dst_root` using `reflink_copy::reflink` in parallel.
 pub fn clone_dir_with_reflink(src_root: &Path, dst_root: &Path) -> Result<()> {
     std::fs::create_dir_all(dst_root)?;
+    let mut created_dirs = HashSet::new();
+    created_dirs.insert(dst_root.to_path_buf());
     let mut jobs = Vec::new();
 
     for entry in WalkDir::new(src_root).follow_links(false) {
@@ -268,11 +272,16 @@ pub fn clone_dir_with_reflink(src_root: &Path, dst_root: &Path) -> Result<()> {
         }
         let dst = dst_root.join(rel);
         if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&dst)?;
+            if created_dirs.insert(dst.clone()) {
+                std::fs::create_dir_all(&dst)?;
+            }
             continue;
         }
-        if let Some(parent) = dst.parent() {
+        if let Some(parent) = dst.parent()
+            && !created_dirs.contains(parent)
+        {
             std::fs::create_dir_all(parent)?;
+            created_dirs.insert(parent.to_path_buf());
         }
         let meta = std::fs::symlink_metadata(entry.path())?;
         jobs.push((entry.path().to_path_buf(), dst, entry.path_is_symlink(), meta));
@@ -294,6 +303,44 @@ pub fn clone_dir_with_reflink(src_root: &Path, dst_root: &Path) -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedCasDigest {
+    size: u64,
+    mtime_secs: i64,
+    mtime_nsecs: u32,
+    digest: String,
+}
+
+fn cas_digest_cache_path(cas_dir: &Path, baseline_dir: &Path) -> Option<PathBuf> {
+    let baseline_id = baseline_dir.parent()?.file_name()?.to_str()?;
+    if baseline_id.is_empty() || baseline_id.contains('/') || baseline_id.contains('\\') {
+        return None;
+    }
+    Some(cas_dir.join(format!(".digests_{baseline_id}.json")))
+}
+
+fn load_cas_digest_cache(path: &Path) -> HashMap<String, CachedCasDigest> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_cas_digest_cache(path: &Path, map: &HashMap<String, CachedCasDigest>) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".tmp_digests_{}_{}", std::process::id(), seq));
+    if let Ok(json) = serde_json::to_vec(map)
+        && std::fs::write(&tmp, json).is_ok()
+        && std::fs::rename(&tmp, path).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Materializes a workspace using the CAS hardlink store (`0444`/`0555`) for immutable cache
@@ -325,38 +372,90 @@ pub fn materialize_cas_workspace(
         return Ok(());
     }
 
+    let mut created_dirs = HashSet::new();
+    created_dirs.insert(req.target_path.clone());
     let mut dep_jobs = Vec::new();
     let mut source_jobs = Vec::new();
 
-    for entry in WalkDir::new(baseline_dir).follow_links(false) {
-        let entry = entry.map_err(|e| OzError::Other(e.to_string()))?;
-        let rel = entry
-            .path()
-            .strip_prefix(baseline_dir)
-            .map_err(|e| OzError::Other(e.to_string()))?;
-        if rel.as_os_str().is_empty() {
-            continue;
+    if tracked_from_odb {
+        // Editable tracked files were already freshly written from ODB with distinct inodes;
+        // walk ONLY the warm dependency root directories inside `baseline_dir` instead of
+        // re-traversing every tracked source file!
+        let mut sorted_roots: Vec<&String> = warm_roots.iter().collect();
+        sorted_roots.sort();
+        for root_name in sorted_roots {
+            let warm_src = baseline_dir.join(root_name);
+            if !warm_src.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&warm_src).follow_links(false) {
+                let entry = entry.map_err(|e| OzError::Other(e.to_string()))?;
+                let rel = entry
+                    .path()
+                    .strip_prefix(baseline_dir)
+                    .map_err(|e| OzError::Other(e.to_string()))?;
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                let dst = req.target_path.join(rel);
+                if entry.file_type().is_dir() {
+                    if created_dirs.insert(dst.clone()) {
+                        std::fs::create_dir_all(&dst)?;
+                    }
+                    continue;
+                }
+                if let Some(parent) = dst.parent()
+                    && !created_dirs.contains(parent)
+                {
+                    std::fs::create_dir_all(parent)?;
+                    created_dirs.insert(parent.to_path_buf());
+                }
+                let meta = std::fs::symlink_metadata(entry.path())?;
+                dep_jobs.push((
+                    rel.to_string_lossy().into_owned(),
+                    entry.path().to_path_buf(),
+                    dst,
+                    entry.path_is_symlink(),
+                    meta,
+                ));
+            }
         }
-        let is_warm_dep = is_under_warm_root(rel, &warm_roots);
-        if tracked_from_odb && !is_warm_dep {
-            // Editable tracked files were already freshly written from ODB with distinct inodes.
-            continue;
-        }
-
-        let dst = req.target_path.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&dst)?;
-            continue;
-        }
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let meta = std::fs::symlink_metadata(entry.path())?;
-        let job = (entry.path().to_path_buf(), dst, entry.path_is_symlink(), meta);
-        if is_warm_dep {
-            dep_jobs.push(job);
-        } else {
-            source_jobs.push(job);
+    } else {
+        for entry in WalkDir::new(baseline_dir).follow_links(false) {
+            let entry = entry.map_err(|e| OzError::Other(e.to_string()))?;
+            let rel = entry
+                .path()
+                .strip_prefix(baseline_dir)
+                .map_err(|e| OzError::Other(e.to_string()))?;
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let is_warm_dep = is_under_warm_root(rel, &warm_roots);
+            let dst = req.target_path.join(rel);
+            if entry.file_type().is_dir() {
+                if created_dirs.insert(dst.clone()) {
+                    std::fs::create_dir_all(&dst)?;
+                }
+                continue;
+            }
+            if let Some(parent) = dst.parent()
+                && !created_dirs.contains(parent)
+            {
+                std::fs::create_dir_all(parent)?;
+                created_dirs.insert(parent.to_path_buf());
+            }
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            if is_warm_dep {
+                dep_jobs.push((
+                    rel.to_string_lossy().into_owned(),
+                    entry.path().to_path_buf(),
+                    dst,
+                    entry.path_is_symlink(),
+                    meta,
+                ));
+            } else {
+                source_jobs.push((entry.path().to_path_buf(), dst, entry.path_is_symlink(), meta));
+            }
         }
     }
 
@@ -377,37 +476,89 @@ pub fn materialize_cas_workspace(
             Ok(())
         })?;
 
+    // Load cached BLAKE3 digests for this immutable baseline so spawns #2..N hardlink
+    // directly from `.git/ozone/cas/` without re-reading or re-hashing gigabytes of artifacts.
+    let cache_path = cas_digest_cache_path(cas_dir, baseline_dir);
+    let existing_digests = cache_path
+        .as_deref()
+        .map(load_cas_digest_cache)
+        .unwrap_or_default();
+    let new_digests: Mutex<Vec<(String, CachedCasDigest)>> = Mutex::new(Vec::new());
+
     // Parallel CAS hardlinking (`0444` / `0555`) for immutable dependencies.
     dep_jobs
         .par_iter()
-        .try_for_each(|(src, dst, is_symlink, meta)| -> Result<()> {
+        .try_for_each(|(rel_key, src, dst, is_symlink, meta)| -> Result<()> {
             if *is_symlink {
                 copy_symlink(src, dst)?;
                 return Ok(());
             }
             if meta.is_file() {
-                link_file_via_cas(src, dst, meta, cas_dir)?;
+                let ft = metadata_modified_filetime(meta);
+                let cached_hex = existing_digests
+                    .get(rel_key)
+                    .filter(|c| {
+                        c.size == meta.len()
+                            && c.mtime_secs == ft.unix_seconds()
+                            && c.mtime_nsecs == ft.nanoseconds()
+                    })
+                    .map(|c| c.digest.as_str());
+                let digest = link_file_via_cas(src, dst, meta, cas_dir, cached_hex)?;
+                if cached_hex.is_none() && cache_path.is_some() {
+                    new_digests.lock().expect("digest cache lock poisoned").push((
+                        rel_key.clone(),
+                        CachedCasDigest {
+                            size: meta.len(),
+                            mtime_secs: ft.unix_seconds(),
+                            mtime_nsecs: ft.nanoseconds(),
+                            digest,
+                        },
+                    ));
+                }
             }
             Ok(())
         })?;
 
+    if let Some(ref cpath) = cache_path {
+        let computed = new_digests
+            .into_inner()
+            .expect("digest cache lock poisoned");
+        if !computed.is_empty() {
+            let mut merged = existing_digests;
+            for (k, v) in computed {
+                merged.insert(k, v);
+            }
+            save_cas_digest_cache(cpath, &merged);
+        }
+    }
+
     Ok(())
 }
 
-fn link_file_via_cas(src: &Path, dst: &Path, src_meta: &Metadata, cas_dir: &Path) -> Result<()> {
-    let digest = blake3_file_hex(src)?;
+fn link_file_via_cas(
+    src: &Path,
+    dst: &Path,
+    src_meta: &Metadata,
+    cas_dir: &Path,
+    cached_digest: Option<&str>,
+) -> Result<String> {
+    let digest = match cached_digest {
+        Some(hex) if hex.len() > 2 => hex.to_string(),
+        _ => blake3_file_hex(src)?,
+    };
     let (shard, rest) = digest.split_at(2);
     let shard_dir = cas_dir.join(shard);
-    std::fs::create_dir_all(&shard_dir)?;
     let cas_obj = shard_dir.join(rest);
 
     if !cas_obj.exists() {
+        std::fs::create_dir_all(&shard_dir)?;
         let pid = std::process::id();
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = shard_dir.join(format!(".tmp_{rest}_{pid}_{seq}"));
 
-        let linked_from_readonly = is_readonly_mode(src_meta) && std::fs::hard_link(src, &tmp_path).is_ok();
+        let linked_from_readonly =
+            is_readonly_mode(src_meta) && std::fs::hard_link(src, &tmp_path).is_ok();
         if !linked_from_readonly {
             std::fs::copy(src, &tmp_path)?;
             set_readonly_permissions(&tmp_path, is_executable(src_meta))?;
@@ -433,7 +584,7 @@ fn link_file_via_cas(src: &Path, dst: &Path, src_meta: &Metadata, cas_dir: &Path
         let ft = metadata_modified_filetime(src_meta);
         let _ = set_file_mtime_compat(dst, ft);
     }
-    Ok(())
+    Ok(digest)
 }
 
 fn blake3_file_hex(path: &Path) -> Result<String> {

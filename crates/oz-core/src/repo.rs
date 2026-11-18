@@ -159,10 +159,22 @@ impl OzoneLayout {
         self.ws_meta_dir(ws).join("meta")
     }
 
-    /// `.git/ozone/vfsd.sock` (local IPC socket for `oz-vfsd`).
+    /// `.git/ozone/vfsd.sock` (local IPC socket for `oz-vfsd`), automatically falling back
+    /// on Unix to a short hashed runtime path (`$XDG_RUNTIME_DIR/ozone/v-<hash>.sock` or
+    /// `/tmp/oz-<uid>/v-<hash>.sock`) when the colocated path would exceed `sockaddr_un::sun_path`
+    /// (`SUN_LEN` ~104-108 bytes).
     #[must_use]
     pub fn vfsd_socket_path(&self) -> PathBuf {
-        self.ozone_dir.join("vfsd.sock")
+        let colocated = self.ozone_dir.join("vfsd.sock");
+        #[cfg(unix)]
+        {
+            // Keep safely under macOS (104) and Linux (108) `sun_path` limits including NUL.
+            const MAX_UNIX_SOCK_BYTES: usize = 100;
+            if colocated.as_os_str().as_encoded_bytes().len() > MAX_UNIX_SOCK_BYTES {
+                return short_unix_socket_path(&self.git_common_dir);
+            }
+        }
+        colocated
     }
 
     /// Returns `true` if `.git/ozone/` already exists on disk.
@@ -740,6 +752,36 @@ pub fn is_enotconn(err: &std::io::Error) -> bool {
     }
 }
 
+#[cfg(unix)]
+fn short_unix_socket_path(git_common_dir: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(git_common_dir)
+        .unwrap_or_else(|_| normalize_lexical(git_common_dir));
+    let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
+    let hex = digest.to_hex();
+    let short_hash = &hex.as_str()[..16];
+    let file_name = format!("v-{short_hash}.sock");
+
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !xdg.is_empty()
+    {
+        let cand = PathBuf::from(xdg).join("ozone").join(&file_name);
+        if cand.as_os_str().as_encoded_bytes().len() <= 100 {
+            return cand;
+        }
+    }
+
+    let uid = unsafe { libc::geteuid() };
+    let tmp_dir = PathBuf::from(format!("/tmp/oz-{uid}"));
+    let cand = tmp_dir.join(&file_name);
+    if cand.as_os_str().as_encoded_bytes().len() <= 100 {
+        return cand;
+    }
+
+    std::env::temp_dir()
+        .join(format!("oz-{uid}"))
+        .join(file_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1036,41 @@ mod tests {
             CliInvocation::from_arg0(Some(OsStr::new("oz"))),
             CliInvocation::Oz
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vfsd_socket_path_hashes_overlong_unix_paths_below_sun_len() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().expect("tempdir");
+        let short_git = dir.path().join("r/.git");
+        let short_layout = OzoneLayout::from_git_common_dir(&short_git);
+        assert_eq!(short_layout.vfsd_socket_path(), short_git.join("ozone/vfsd.sock"));
+
+        // Construct a deeply nested path whose `.git/ozone/vfsd.sock` exceeds Unix SUN_LEN (~108B).
+        let deep_git = dir
+            .path()
+            .join("very-long-workspace-parent-segment-0123456789")
+            .join("another-very-long-worktree-uuid-segment-9b09e381-0f74-40cc-a460-95d7d1beabd7")
+            .join("repo/.git");
+        std::fs::create_dir_all(&deep_git).expect("mkdir deep git");
+        let deep_layout = OzoneLayout::from_git_common_dir(&deep_git);
+        let sock = deep_layout.vfsd_socket_path();
+        assert!(
+            sock.as_os_str().as_encoded_bytes().len() <= 100,
+            "hashed socket path '{}' exceeds 100 bytes",
+            sock.display()
+        );
+        assert_eq!(sock, deep_layout.vfsd_socket_path(), "hash must be deterministic");
+
+        // Verify a real UnixListener can bind to the shortened socket path without EINVAL/SUN_LEN.
+        if let Some(parent) = sock.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir sock parent");
+        }
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind hashed unix socket");
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
     }
 }

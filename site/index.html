@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ozone (oz) — Pure-Rust CoW Git Client for the Multi-Agent Era</title>
+  <meta name="description" content="Zero-byte Copy-on-Write workspaces, warm build caches, stage-free hunk commits, sub-10ms undo, collision radar, and MCP — 100% colocated inside standard .git/ repositories.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="#top" aria-label="Ozone Home">
+        <span class="brand-mark" aria-hidden="true">O<sub>3</sub></span>
+        <span class="brand-name">ozone</span>
+        <span class="version-pill">v1.0.0</span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <a href="#install">Install</a>
+        <a href="#compare">git vs oz</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#docs">Docs</a>
+      </nav>
+
+      <div class="header-actions">
+        <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle color theme" title="Toggle dark/light theme">
+          <span class="theme-icon" aria-hidden="true"></span>
+          <span class="theme-label">Theme</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="top" class="hero">
+      <div class="container">
+        <div class="hero-badges">
+          <span class="badge">Pure Rust &middot; Zero C Bindings</span>
+          <span class="badge">100% Colocated <code>.git/</code></span>
+          <span class="badge">MIT / Apache-2.0</span>
+        </div>
+
+        <h1 class="hero-title">
+          Git speed &amp; zero-byte workspaces for the <span class="accent">multi-agent era</span>.
+        </h1>
+
+        <p class="hero-subtitle">
+          <strong>Ozone (<code>oz</code> / <code>git-ozone</code>)</strong> spawns 20 isolated Copy-on-Write worktrees with warm <code>target/</code>, <code>node_modules/</code>, and <code>.venv/</code> caches in milliseconds — with lock-free MVCC <code>oz undo</code>, stage-free hunk commits, collision radar, GitHub stacked PRs, and built-in <code>oz mcp</code>.
+        </p>
+
+        <div id="install" class="install-card" aria-label="Install Ozone">
+          <div class="install-header">
+            <div class="tab-list" role="tablist" aria-label="Install method">
+              <button class="tab-btn is-active" role="tab" aria-selected="true" data-install-tab="homebrew" type="button">macOS / Brew</button>
+              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="shell" type="button">Linux / macOS</button>
+              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="deb" type="button">Ubuntu / .deb</button>
+              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="winget" type="button">Windows winget</button>
+              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="powershell" type="button">PowerShell</button>
+              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="cargo" type="button">Cargo</button>
+            </div>
+            <button id="copy-install-btn" class="copy-btn" type="button">Copy</button>
+          </div>
+
+          <pre class="install-code"><code id="install-command">brew install ozone-vcs/tap/oz</code></pre>
+
+          <div class="install-footer">
+            <span id="install-note" class="install-note">Installs <code>oz</code>, <code>git-ozone</code>, and <code>oz-vfsd</code>. Run <code>oz doctor</code> to verify filesystem &amp; auth readiness.</span>
+            <span id="copy-status" class="sr-only" aria-live="polite"></span>
+          </div>
+        </div>
+
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="../docs/quickstart.md">60-Second Quickstart</a>
+          <a class="btn btn-secondary" href="../docs/migration-from-git-worktree.md">Migrate from git worktree</a>
+          <a class="btn btn-secondary" href="../docs/json-schema-reference.md">oz.v1 JSON Schema</a>
+        </div>
+      </div>
+    </section>
+
+    <section id="compare" class="section">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow">Interactive CLI Comparison</p>
+          <h2>Fewer commands. Zero lock races. Zero interactive traps.</h2>
+          <p class="section-desc">Compare canonical C <code>git</code> workflows against native <code>oz</code> across everyday solo and parallel AI agent tasks.</p>
+        </div>
+
+        <div class="compare-tabs" role="tablist" aria-label="Workflow comparison">
+          <button class="pill-btn is-active" role="tab" aria-selected="true" data-compare-tab="worktrees" type="button">Parallel Worktrees</button>
+          <button class="pill-btn" role="tab" aria-selected="false" data-compare-tab="hunk" type="button">Surgical Hunk Commit</button>
+          <button class="pill-btn" role="tab" aria-selected="false" data-compare-tab="integrate" type="button">Radar &amp; Atomic Merge</button>
+          <button class="pill-btn" role="tab" aria-selected="false" data-compare-tab="undo" type="button">Undo &amp; AI Provenance</button>
+        </div>
+
+        <div class="compare-grid">
+          <article class="code-panel panel-git">
+            <div class="panel-header">
+              <span class="panel-label">Traditional C <code>git</code></span>
+              <span id="compare-git-meta" class="panel-meta">Cold caches &middot; high disk &amp; lock contention</span>
+            </div>
+            <pre><code id="compare-git-code"></code></pre>
+          </article>
+
+          <article class="code-panel panel-oz">
+            <div class="panel-header">
+              <span class="panel-label">Ozone <code>oz</code></span>
+              <span id="compare-oz-meta" class="panel-meta">Zero-byte CoW &middot; warm caches &middot; scoped</span>
+            </div>
+            <pre><code id="compare-oz-code"></code></pre>
+          </article>
+        </div>
+
+        <p id="compare-takeaway" class="compare-takeaway"></p>
+      </div>
+    </section>
+
+    <section id="architecture" class="section section-alt">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow">Architecture Highlights</p>
+          <h2>Engineered from the filesystem up — in pure Rust.</h2>
+          <p class="section-desc">Zero <code>libgit2</code>, <code>OpenSSL</code>, or <code>libfuse</code> C library dependencies. Static binaries that probe your OS and automatically pick the fastest CoW backend.</p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>Warm Cache &amp; <code>mtime</code> Preservation</h3>
+            <p>Auto-detects Rust (<code>target/</code>), Node/TS (<code>node_modules/</code>, <code>.next/</code>, <code>.turbo/</code>, <code>.vite/</code>), and Python (<code>.venv/</code> with shebang trampolines). Preserves baseline <code>mtime</code> on untouched files so Cargo and <code>tsc</code> hit warm artifacts immediately.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3>Lock-Free MVCC OpLog &amp; <code>oz undo</code></h3>
+            <p>Concurrent commits across 10+ workspaces never fail on <code>.git/index.lock</code> or <code>packed-refs.lock</code>. Every mutation and <code>oz checkpoint</code> appends an immutable OpLog entry for sub-10 ms <code>oz undo</code> / <code>oz redo</code>.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3>Addressable IDs &amp; Built-In Guardrails</h3>
+            <p><code>oz status</code> and <code>oz diff</code> assign deterministic file (<code>f1</code>) and hunk (<code>h1a</code>) IDs. <code>oz commit --pick</code> builds trees in RAM while guarding against secrets, conflict markers, <code>&gt; 50 MB</code> blobs, and out-of-scope edits.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3>Built-In <code>oz mcp</code> &amp; 5 Agent Harnesses</h3>
+            <p><code>oz agent setup</code> configures skills/rules and <code>oz checkpoint --quiet</code> hooks for Claude Code, Cursor, Codex CLI, Windsurf, and Antigravity. <code>oz mcp</code> serves 8 structured tools over stdio JSON-RPC 2.0.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3>Native GitHub Stacked PRs &amp; CI Logs</h3>
+            <p>Pure-Rust Wire Protocol v2 (<code>--filter=blob:none</code>, <code>--atomic</code>, <code>--force-with-lease</code>), native Ed25519 SSH signing, <code>oz pr stack</code>, <code>oz sync</code>, and compact <code>oz ci --json</code> error excerpts for self-healing agent loops.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3>Zero Lock-In &amp; <code>oz git</code> Shim</h3>
+            <p>Colocated inside <code>.git/</code> with real named branches and standard <code>refs/notes/ai</code> provenance. Optional <code>alias git="oz git"</code> intercepts 13 hot commands natively and wraps delegated legacy mutations in OpLog undo snapshots.</p>
+          </article>
+        </div>
+
+        <div class="matrix-wrap">
+          <h3 class="matrix-title">Tiered Cross-Platform CoW Matrix</h3>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Platform &amp; Filesystem</th>
+                  <th>Backend</th>
+                  <th>Untouched Disk Overhead</th>
+                  <th>Daemon</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>macOS (<code>APFS</code>)</td>
+                  <td><code>apfs_clonefile</code> (<code>clonefile(2)</code>)</td>
+                  <td>Metadata only (0 data blocks)</td>
+                  <td>None</td>
+                </tr>
+                <tr>
+                  <td>Linux (<code>Btrfs</code>, <code>XFS</code>, <code>bcachefs</code>)</td>
+                  <td><code>linux_ficlone</code> (<code>ioctl(FICLONE)</code>)</td>
+                  <td>Metadata only (0 data blocks)</td>
+                  <td>None</td>
+                </tr>
+                <tr>
+                  <td>Linux (<code>ext4</code> default)</td>
+                  <td><code>linux_fuse3</code> (<code>oz-vfsd</code> + persistent <code>upper/</code>)</td>
+                  <td>0 bytes for untouched files</td>
+                  <td>Auto-managed user daemon</td>
+                </tr>
+                <tr>
+                  <td>Windows 11 (<code>Dev Drive / ReFS</code>)</td>
+                  <td><code>windows_refs_clone</code> (block clone)</td>
+                  <td>Metadata only (0 data blocks)</td>
+                  <td>None</td>
+                </tr>
+                <tr>
+                  <td>Windows 11 (<code>NTFS</code>)</td>
+                  <td><code>windows_proj_fs</code> (<code>oz-vfsd</code> ProjFS)</td>
+                  <td>0 bytes for untouched files</td>
+                  <td>Auto-managed user provider</td>
+                </tr>
+                <tr>
+                  <td>Containers / Fallback</td>
+                  <td><code>cas_hardlink</code> (immutable <code>0444</code>/<code>0555</code> deps)</td>
+                  <td>0 extra blocks for deps</td>
+                  <td>None</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="benchmarks" class="section">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow">Reproducible Benchmarks</p>
+          <h2>Measured honestly against real binaries.</h2>
+          <p class="section-desc">
+            Run <code>./benchmarks/run_all.sh</code> on your own machine to compare release <code>oz</code> vs. C <code>git</code> (and <code>jj</code> / <code>worktrunk</code> / <code>simgit</code> when installed).
+          </p>
+        </div>
+
+        <div class="bench-banner" id="bench-status-banner">
+          <span class="status-dot" aria-hidden="true"></span>
+          <div>
+            <strong id="bench-status-title">v1.0.0 Release Benchmark Suite Ready</strong>
+            <p id="bench-status-detail">
+              Live measured results are populated from <code>benchmarks/results/REPORT.md</code> after the final integrated v1.0.0 release run. Milestone 4 exit targets are shown below — zero synthetic numbers.
+            </p>
+          </div>
+        </div>
+
+        <div class="bench-grid" id="bench-cards"></div>
+
+        <div class="bench-links">
+          <a class="btn btn-secondary" href="../docs/benchmarks.md">Read Methodology &amp; Targets</a>
+          <a class="btn btn-secondary" href="../benchmarks/results/REPORT.md">View Live REPORT.md</a>
+        </div>
+      </div>
+    </section>
+
+    <section id="docs" class="section section-alt">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow">Documentation</p>
+          <h2>Everything you need to adopt Ozone cleanly.</h2>
+        </div>
+
+        <div class="docs-grid">
+          <a class="doc-card" href="../docs/quickstart.md">
+            <h3>Quickstart Guide</h3>
+            <p>Solo workflows, <code>.ozone.toml</code> config, <code>oz agent setup</code> for 5 harnesses, and <code>oz mcp</code>.</p>
+            <span class="doc-link">docs/quickstart.md &rarr;</span>
+          </a>
+
+          <a class="doc-card" href="../docs/migration-from-git-worktree.md">
+            <h3>Migrating from git worktree</h3>
+            <p>Command mapping table, colocated <code>.git/</code> safety, <code>oz git</code> shim, and zero-lock-in uninstall.</p>
+            <span class="doc-link">docs/migration-from-git-worktree.md &rarr;</span>
+          </a>
+
+          <a class="doc-card" href="../docs/json-schema-reference.md">
+            <h3>oz.v1 JSON Schema Reference</h3>
+            <p>Envelope contract, exit codes (<code>0</code>/<code>1</code>/<code>2</code>), deterministic IDs, command payloads, and 8 MCP tools.</p>
+            <span class="doc-link">docs/json-schema-reference.md &rarr;</span>
+          </a>
+
+          <a class="doc-card" href="../ARCHITECTURE.md">
+            <h3>Architecture Specification</h3>
+            <p>Crate boundaries, CoW &amp; VFS durability model, warm caches, MVCC OpLog, and open-core trait seams.</p>
+            <span class="doc-link">ARCHITECTURE.md &rarr;</span>
+          </a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <strong>Ozone (<code>oz</code> / <code>git-ozone</code>)</strong>
+        <span>Dual-licensed MIT OR Apache-2.0</span>
+      </div>
+      <div class="footer-links">
+        <a href="../README.md">README</a>
+        <a href="../ROADMAP.md">Roadmap</a>
+        <a href="../docs/schemas/oz.v1.envelope.schema.json">JSON Schema</a>
+        <a href="../LICENSE-MIT">MIT</a>
+        <a href="../LICENSE-APACHE">Apache-2.0</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

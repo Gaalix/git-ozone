@@ -1,0 +1,951 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ozone-vcs.dev/schemas/oz.v1.envelope.schema.json",
+  "title": "Ozone oz.v1 Canonical JSON Output Envelope",
+  "description": "Versioned machine-readable JSON response envelope emitted by all `oz <command> --json` and `git-ozone <command> --json` invocations.",
+  "type": "object",
+  "required": [
+    "schema",
+    "ok",
+    "op_id",
+    "workspace",
+    "branch",
+    "head_oid",
+    "data",
+    "warnings",
+    "conflicts",
+    "recovery_commands"
+  ],
+  "properties": {
+    "schema": {
+      "const": "oz.v1",
+      "description": "Canonical schema version identifier."
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "True when the command succeeded without error or check failure."
+    },
+    "op_id": {
+      "type": ["string", "null"],
+      "description": "MVCC OpLog operation identifier (e.g. `op_01J...`) for mutating commands, or null for read-only commands."
+    },
+    "workspace": {
+      "type": ["string", "null"],
+      "description": "Active Ozone workspace name when operating inside a spawned workspace, or null in the main repository."
+    },
+    "branch": {
+      "type": ["string", "null"],
+      "description": "Active Git branch name (short name, e.g. `main`), or null if detached/unborn/non-repo."
+    },
+    "head_oid": {
+      "type": ["string", "null"],
+      "description": "Full 40-hex commit OID of HEAD (or target commit), or null if unborn/non-repo."
+    },
+    "data": {
+      "description": "Command-specific response payload (empty object `{}` on failure unless partial structured data such as `oz ci` is returned)."
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/WarningEntry" },
+      "description": "Non-fatal warnings (plain text strings or structured diagnostics such as `out_of_scope`)."
+    },
+    "conflicts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ConflictEntry" },
+      "description": "Structured merge/rebase conflict entries with deterministic IDs (`c1`, `c2`, ...)."
+    },
+    "recovery_commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Actionable next-step or undo CLI commands."
+    },
+    "error": {
+      "$ref": "#/$defs/EnvelopeError",
+      "description": "Present only when `ok` is false (omitted on success)."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ok": { "const": false } } },
+      "then": { "required": ["error"] }
+    }
+  ],
+  "$defs": {
+    "WarningEntry": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "path": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ConflictEntry": {
+      "type": "object",
+      "required": ["id", "path", "message", "suggested_commands"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^c[0-9]+$",
+          "description": "Deterministic conflict identifier (`c1`, `c2`, ...)."
+        },
+        "path": { "type": "string" },
+        "message": { "type": "string" },
+        "base": { "type": "string" },
+        "ours": { "type": "string" },
+        "theirs": { "type": "string" },
+        "suggested_commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "EnvelopeError": {
+      "type": "object",
+      "required": ["code", "exit_code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "not_a_repository",
+            "invalid_config",
+            "invalid_usage",
+            "guardrail_violation",
+            "conflict",
+            "check_failed",
+            "mount_unavailable",
+            "workspace_not_found",
+            "binary_not_found",
+            "git_error",
+            "io_error",
+            "json_error",
+            "internal_error"
+          ]
+        },
+        "exit_code": {
+          "type": "integer",
+          "enum": [1, 2]
+        },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "BackendKind": {
+      "type": "string",
+      "enum": [
+        "apfs_clonefile",
+        "linux_ficlone",
+        "linux_fuse3",
+        "windows_refs_clone",
+        "windows_proj_fs",
+        "cas_hardlink"
+      ]
+    },
+    "ChangeKind": {
+      "type": "string",
+      "enum": [
+        "added",
+        "modified",
+        "deleted",
+        "renamed",
+        "copied",
+        "type_changed",
+        "untracked",
+        "conflicted"
+      ]
+    },
+    "DiffLineKind": {
+      "type": "string",
+      "enum": ["context", "add", "delete"]
+    },
+    "DiffLine": {
+      "type": "object",
+      "required": ["kind", "content"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/DiffLineKind" },
+        "content": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "DiffHunk": {
+      "type": "object",
+      "required": [
+        "id",
+        "file_id",
+        "path",
+        "old_start",
+        "old_lines",
+        "new_start",
+        "new_lines",
+        "header",
+        "lines"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^h[0-9]+[a-z]+$",
+          "description": "Deterministic hunk ID (`h1a`, `h1b`, ..., `h1aa`)."
+        },
+        "file_id": {
+          "type": "string",
+          "pattern": "^f[0-9]+$"
+        },
+        "path": { "type": "string" },
+        "old_start": { "type": "integer", "minimum": 0 },
+        "old_lines": { "type": "integer", "minimum": 0 },
+        "new_start": { "type": "integer", "minimum": 0 },
+        "new_lines": { "type": "integer", "minimum": 0 },
+        "header": { "type": "string" },
+        "lines": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/DiffLine" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileChange": {
+      "type": "object",
+      "required": [
+        "id",
+        "path",
+        "kind",
+        "additions",
+        "deletions",
+        "is_binary",
+        "pinned",
+        "out_of_scope",
+        "hunks"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^f[0-9]+$",
+          "description": "Deterministic 1-based file ID (`f1`, `f2`, ...)."
+        },
+        "path": { "type": "string" },
+        "old_path": { "type": "string" },
+        "kind": { "$ref": "#/$defs/ChangeKind" },
+        "additions": { "type": "integer", "minimum": 0 },
+        "deletions": { "type": "integer", "minimum": 0 },
+        "is_binary": { "type": "boolean" },
+        "pinned": { "type": "boolean" },
+        "out_of_scope": { "type": "boolean" },
+        "hunks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/DiffHunk" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RefDelta": {
+      "type": "object",
+      "required": ["old", "new"],
+      "properties": {
+        "old": { "type": ["string", "null"] },
+        "new": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "StatusData": {
+      "type": "object",
+      "required": [
+        "workspace",
+        "branch",
+        "head_oid",
+        "base_tree",
+        "used_fuse_fast_path",
+        "changes"
+      ],
+      "properties": {
+        "workspace": { "type": ["string", "null"] },
+        "branch": { "type": ["string", "null"] },
+        "head_oid": { "type": ["string", "null"] },
+        "base_tree": { "type": ["string", "null"] },
+        "used_fuse_fast_path": { "type": "boolean" },
+        "changes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/FileChange" }
+        }
+      }
+    },
+    "DiffData": {
+      "type": "object",
+      "required": [
+        "workspace",
+        "branch",
+        "head_oid",
+        "files",
+        "total_additions",
+        "total_deletions",
+        "unified_diff"
+      ],
+      "properties": {
+        "workspace": { "type": ["string", "null"] },
+        "branch": { "type": ["string", "null"] },
+        "head_oid": { "type": ["string", "null"] },
+        "files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/FileChange" }
+        },
+        "total_additions": { "type": "integer", "minimum": 0 },
+        "total_deletions": { "type": "integer", "minimum": 0 },
+        "unified_diff": { "type": "string" }
+      }
+    },
+    "CommitData": {
+      "type": "object",
+      "required": [
+        "commit_oid",
+        "tree_oid",
+        "change_id",
+        "message",
+        "committed_paths",
+        "partial_hunk_paths",
+        "remaining_dirty_count",
+        "signed",
+        "amended"
+      ],
+      "properties": {
+        "commit_oid": { "type": "string" },
+        "tree_oid": { "type": "string" },
+        "parent_oid": { "type": "string" },
+        "branch": { "type": "string" },
+        "change_id": { "type": "string", "pattern": "^I[0-9a-f]{40}$" },
+        "message": { "type": "string" },
+        "committed_paths": { "type": "array", "items": { "type": "string" } },
+        "partial_hunk_paths": { "type": "array", "items": { "type": "string" } },
+        "remaining_dirty_count": { "type": "integer", "minimum": 0 },
+        "signed": { "type": "boolean" },
+        "signature_fingerprint": { "type": "string" },
+        "amended": { "type": "boolean" }
+      }
+    },
+    "WsSpawnData": {
+      "type": "object",
+      "required": [
+        "workspace",
+        "branch",
+        "worktree_path",
+        "git_worktree_dir",
+        "backend",
+        "base_commit",
+        "base_tree",
+        "baseline_id",
+        "baseline_source",
+        "scope",
+        "deny",
+        "mounted",
+        "spawn_elapsed_ms"
+      ],
+      "properties": {
+        "workspace": { "type": "string" },
+        "branch": { "type": "string" },
+        "worktree_path": { "type": "string" },
+        "git_worktree_dir": { "type": "string" },
+        "backend": { "$ref": "#/$defs/BackendKind" },
+        "base_commit": { "type": ["string", "null"] },
+        "base_tree": { "type": "string" },
+        "baseline_id": { "type": ["string", "null"] },
+        "baseline_source": {
+          "type": ["string", "null"],
+          "enum": ["existing", "captured", "fallback_prior", null]
+        },
+        "scope": { "type": "array", "items": { "type": "string" } },
+        "deny": { "type": "array", "items": { "type": "string" } },
+        "mounted": { "type": "boolean" },
+        "spawn_elapsed_ms": { "type": "number", "minimum": 0 }
+      }
+    },
+    "WsListData": {
+      "type": "object",
+      "required": ["workspaces"],
+      "properties": {
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "branch",
+              "backend",
+              "worktree_path",
+              "base_commit",
+              "branch_head_oid",
+              "mount_health",
+              "healthy",
+              "mounted",
+              "daemon_pid",
+              "dirty_count",
+              "pinned_count",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "name": { "type": "string" },
+              "branch": { "type": "string" },
+              "backend": { "$ref": "#/$defs/BackendKind" },
+              "worktree_path": { "type": "string" },
+              "base_commit": { "type": ["string", "null"] },
+              "branch_head_oid": { "type": ["string", "null"] },
+              "mount_health": { "type": "string" },
+              "healthy": { "type": "boolean" },
+              "mounted": { "type": ["boolean", "null"] },
+              "daemon_pid": { "type": ["integer", "null"] },
+              "dirty_count": { "type": "integer", "minimum": 0 },
+              "pinned_count": { "type": "integer", "minimum": 0 },
+              "created_at": { "type": "string", "format": "date-time" },
+              "updated_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        }
+      }
+    },
+    "WsRmData": {
+      "type": "object",
+      "required": ["name", "worktree_path", "branch", "branch_deleted"],
+      "properties": {
+        "name": { "type": "string" },
+        "worktree_path": { "type": "string" },
+        "branch": { "type": ["string", "null"] },
+        "branch_deleted": { "type": "boolean" }
+      }
+    },
+    "WsGcData": {
+      "type": "object",
+      "required": [
+        "removed_workspaces",
+        "skipped_dirty_workspaces",
+        "removed_baselines",
+        "reclaimed_baseline_bytes",
+        "remaining_baseline_bytes",
+        "remaining_baseline_count",
+        "max_baseline_gb",
+        "dry_run"
+      ],
+      "properties": {
+        "removed_workspaces": { "type": "array", "items": { "type": "string" } },
+        "skipped_dirty_workspaces": { "type": "array", "items": { "type": "string" } },
+        "removed_baselines": { "type": "array", "items": { "type": "string" } },
+        "reclaimed_baseline_bytes": { "type": "integer", "minimum": 0 },
+        "remaining_baseline_bytes": { "type": "integer", "minimum": 0 },
+        "remaining_baseline_count": { "type": "integer", "minimum": 0 },
+        "max_baseline_gb": { "type": "number" },
+        "dry_run": { "type": "boolean" }
+      }
+    },
+    "RadarData": {
+      "type": "object",
+      "required": ["base_branch", "scanned_workspaces", "collisions"],
+      "properties": {
+        "base_branch": { "type": "string" },
+        "base_commit": { "type": "string" },
+        "scanned_workspaces": { "type": "array", "items": { "type": "string" } },
+        "collisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "severity", "workspaces", "suggested_action"],
+            "properties": {
+              "path": { "type": "string" },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "overlapping_hunks",
+                  "same_file_different_lines",
+                  "out_of_scope"
+                ]
+              },
+              "workspaces": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["ws", "lines"],
+                  "properties": {
+                    "ws": { "type": "string" },
+                    "lines": { "type": "string" }
+                  }
+                }
+              },
+              "suggested_action": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "IntegrateData": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "into_branch",
+            "previous_oid",
+            "commit_oid",
+            "tree_oid",
+            "merged_sources",
+            "already_integrated",
+            "main_worktree_synced"
+          ],
+          "properties": {
+            "into_branch": { "type": "string" },
+            "previous_oid": { "type": "string" },
+            "commit_oid": { "type": "string" },
+            "tree_oid": { "type": "string" },
+            "merged_sources": { "type": "array", "items": { "type": "string" } },
+            "already_integrated": { "type": "array", "items": { "type": "string" } },
+            "op_id": { "type": "string" },
+            "main_worktree_synced": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["aborted", "sandbox_removed", "session_removed"],
+          "properties": {
+            "aborted": { "type": "boolean" },
+            "mode": { "type": "string", "enum": ["integrate", "stack_rebase"] },
+            "sandbox_removed": { "type": "boolean" },
+            "session_removed": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "ResolveData": {
+      "type": "object",
+      "required": ["mode", "resolved_ids", "remaining_unresolved", "sandbox_path"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["integrate", "stack_rebase"] },
+        "resolved_ids": { "type": "array", "items": { "type": "string" } },
+        "remaining_unresolved": { "type": "array", "items": { "type": "string" } },
+        "sandbox_path": { "type": "string" },
+        "continued": { "type": "object" }
+      }
+    },
+    "UndoData": {
+      "type": "object",
+      "required": [
+        "op_id",
+        "workspace",
+        "undone_op_ids",
+        "restored_base_tree",
+        "restored_dirty_tree",
+        "restored_files",
+        "ref_deltas",
+        "entry",
+        "engine_elapsed_ms"
+      ],
+      "properties": {
+        "op_id": { "type": "string" },
+        "workspace": { "type": "string" },
+        "undone_op_ids": { "type": "array", "items": { "type": "string" } },
+        "restored_base_tree": { "type": "string" },
+        "restored_dirty_tree": { "type": ["string", "null"] },
+        "restored_files": { "type": "integer", "minimum": 0 },
+        "ref_deltas": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/RefDelta" }
+        },
+        "entry": { "type": "object" },
+        "engine_elapsed_ms": { "type": "number", "minimum": 0 }
+      }
+    },
+    "DoctorCheck": {
+      "type": "object",
+      "required": ["id", "category", "status", "summary"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "enum": [
+            "linux_fuse",
+            "windows_projfs_dev_drive",
+            "macos_apfs_clonefile",
+            "oz_vfsd",
+            "git_ozone_alias",
+            "ssh_signing",
+            "github_auth",
+            "repository_mounts"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "enum": ["platform", "daemon", "cli", "security", "auth", "repository"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ok", "warn", "fail", "not_applicable"]
+        },
+        "summary": { "type": "string" },
+        "remediation": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DoctorActiveMount": {
+      "type": "object",
+      "required": [
+        "workspace",
+        "branch",
+        "backend",
+        "mount_point",
+        "mounted",
+        "health"
+      ],
+      "properties": {
+        "workspace": { "type": "string" },
+        "branch": { "type": "string" },
+        "backend": { "$ref": "#/$defs/BackendKind" },
+        "mount_point": { "type": "string" },
+        "mounted": { "type": "boolean" },
+        "health": { "type": "string" },
+        "daemon_pid": { "type": "integer", "minimum": 0 },
+        "upper_dir": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "DoctorData": {
+      "type": "object",
+      "required": [
+        "invoked_as",
+        "version",
+        "non_interactive",
+        "os",
+        "arch",
+        "target_path",
+        "filesystem",
+        "fuse",
+        "projfs_ready",
+        "windows",
+        "macos",
+        "recommended_backend",
+        "oz_vfsd",
+        "git_ozone_alias",
+        "repo",
+        "ssh_signing",
+        "github_auth",
+        "checks",
+        "remediation_hints"
+      ],
+      "properties": {
+        "invoked_as": { "type": "string" },
+        "version": { "type": "string" },
+        "non_interactive": { "type": "boolean" },
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "target_path": { "type": "string" },
+        "filesystem": {
+          "type": "object",
+          "required": [
+            "type",
+            "reflink_ready",
+            "apfs_clonefile_ready",
+            "dev_drive_refs"
+          ],
+          "properties": {
+            "type": { "type": "string" },
+            "magic": { "type": "string" },
+            "reflink_ready": { "type": "boolean" },
+            "apfs_clonefile_ready": { "type": "boolean" },
+            "dev_drive_refs": { "type": "boolean" }
+          }
+        },
+        "fuse": {
+          "type": ["object", "null"],
+          "properties": {
+            "dev_fuse_exists": { "type": "boolean" },
+            "dev_fuse_rw": { "type": "boolean" },
+            "fusermount3_path": { "type": ["string", "null"] },
+            "fusermount3_version": { "type": ["string", "null"] },
+            "user_allow_other_enabled": { "type": "boolean" },
+            "ready": { "type": "boolean" }
+          }
+        },
+        "projfs_ready": { "type": ["boolean", "null"] },
+        "windows": {
+          "type": ["object", "null"],
+          "required": [
+            "projfs_feature",
+            "projfs_dll_path",
+            "projfs_dll_exists",
+            "projfs_ready",
+            "dev_drive_detected",
+            "refs_clone_ready"
+          ],
+          "properties": {
+            "projfs_feature": { "type": "string" },
+            "projfs_dll_path": { "type": "string" },
+            "projfs_dll_exists": { "type": "boolean" },
+            "projfs_ready": { "type": "boolean" },
+            "dev_drive_detected": { "type": "boolean" },
+            "refs_clone_ready": { "type": "boolean" }
+          }
+        },
+        "macos": {
+          "type": ["object", "null"],
+          "required": ["apfs_detected", "clonefile_ready"],
+          "properties": {
+            "apfs_detected": { "type": "boolean" },
+            "clonefile_ready": { "type": "boolean" }
+          }
+        },
+        "recommended_backend": { "$ref": "#/$defs/BackendKind" },
+        "oz_vfsd": {
+          "type": "object",
+          "required": [
+            "found",
+            "path",
+            "daemon_required",
+            "daemon_running",
+            "daemon_health"
+          ],
+          "properties": {
+            "found": { "type": "boolean" },
+            "path": { "type": ["string", "null"] },
+            "daemon_required": { "type": "boolean" },
+            "daemon_running": { "type": "boolean" },
+            "daemon_health": {
+              "type": "string",
+              "enum": [
+                "binary_missing",
+                "running",
+                "stopped_with_active_mounts",
+                "stopped_idle",
+                "not_required"
+              ]
+            },
+            "daemon_pid": { "type": "integer", "minimum": 0 },
+            "daemon_version": { "type": "string" },
+            "socket_path": { "type": "string" }
+          }
+        },
+        "git_ozone_alias": {
+          "type": "object",
+          "required": ["invoked_as", "found_on_path", "resolved"],
+          "properties": {
+            "invoked_as": { "type": "string" },
+            "found_on_path": { "type": ["string", "null"] },
+            "resolved": { "type": "boolean" },
+            "sibling_path": { "type": "string" }
+          }
+        },
+        "repo": {
+          "type": "object",
+          "required": [
+            "in_repo",
+            "colocated",
+            "repo_root",
+            "git_dir",
+            "git_common_dir",
+            "ozone_dir",
+            "ozone_initialized",
+            "is_linked_worktree",
+            "workspace",
+            "branch",
+            "head_oid",
+            "mount_health",
+            "repo_config_present",
+            "local_config_present",
+            "active_mount_count",
+            "unhealthy_mount_count",
+            "active_mounts"
+          ],
+          "properties": {
+            "in_repo": { "type": "boolean" },
+            "colocated": { "type": "boolean" },
+            "repo_root": { "type": ["string", "null"] },
+            "git_dir": { "type": ["string", "null"] },
+            "git_common_dir": { "type": ["string", "null"] },
+            "ozone_dir": { "type": ["string", "null"] },
+            "ozone_initialized": { "type": "boolean" },
+            "is_linked_worktree": { "type": "boolean" },
+            "workspace": { "type": ["string", "null"] },
+            "branch": { "type": ["string", "null"] },
+            "head_oid": { "type": ["string", "null"] },
+            "mount_health": { "type": ["string", "null"] },
+            "repo_config_present": { "type": "boolean" },
+            "local_config_present": { "type": "boolean" },
+            "active_mount_count": { "type": "integer", "minimum": 0 },
+            "unhealthy_mount_count": { "type": "integer", "minimum": 0 },
+            "active_mounts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/DoctorActiveMount" }
+            }
+          }
+        },
+        "ssh_signing": { "type": "object" },
+        "github_auth": { "type": "object" },
+        "checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/DoctorCheck" }
+        },
+        "remediation_hints": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "PrCreateData": {
+      "type": "object",
+      "required": [
+        "pull_request",
+        "created",
+        "pushed",
+        "head_branch",
+        "base_branch",
+        "change_ids"
+      ],
+      "properties": {
+        "pull_request": { "type": "object" },
+        "created": { "type": "boolean" },
+        "pushed": { "type": "boolean" },
+        "head_branch": { "type": "string" },
+        "base_branch": { "type": "string" },
+        "change_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "PrStackData": {
+      "type": "object",
+      "required": ["root_base", "pushed", "atomic_push_op_id", "items"],
+      "properties": {
+        "root_base": { "type": "string" },
+        "pushed": { "type": "boolean" },
+        "atomic_push_op_id": { "type": ["string", "null"] },
+        "items": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "SyncData": {
+      "type": "object",
+      "required": [
+        "remote",
+        "base_branch",
+        "fetched",
+        "fast_forwarded",
+        "merged_branches",
+        "retargeted_prs",
+        "rebased_branches",
+        "removed_workspaces",
+        "deleted_branches",
+        "pruned_checkpoints",
+        "baseline_refreshed"
+      ],
+      "properties": {
+        "remote": { "type": "string" },
+        "base_branch": { "type": "string" },
+        "previous_base_oid": { "type": "string" },
+        "base_oid": { "type": "string" },
+        "fetched": { "type": "boolean" },
+        "fast_forwarded": { "type": "boolean" },
+        "merged_branches": { "type": "array", "items": { "type": "string" } },
+        "retargeted_prs": { "type": "array", "items": { "type": "object" } },
+        "rebased_branches": { "type": "array", "items": { "type": "string" } },
+        "removed_workspaces": { "type": "array", "items": { "type": "string" } },
+        "deleted_branches": { "type": "array", "items": { "type": "string" } },
+        "pruned_checkpoints": { "type": "array", "items": { "type": "string" } },
+        "baseline_refreshed": { "type": "boolean" },
+        "op_id": { "type": "string" },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "CiData": {
+      "type": "object",
+      "required": [
+        "ref_name",
+        "commit_sha",
+        "overall_status",
+        "all_passed",
+        "total_count",
+        "failing_count",
+        "pending_count",
+        "checks"
+      ],
+      "properties": {
+        "ref_name": { "type": "string" },
+        "commit_sha": { "type": "string" },
+        "pr_number": { "type": "integer" },
+        "overall_status": {
+          "type": "string",
+          "enum": ["passing", "failing", "pending", "no_checks"]
+        },
+        "all_passed": { "type": "boolean" },
+        "total_count": { "type": "integer", "minimum": 0 },
+        "failing_count": { "type": "integer", "minimum": 0 },
+        "pending_count": { "type": "integer", "minimum": 0 },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "status", "conclusion", "failing_step", "log_excerpt"],
+            "properties": {
+              "name": { "type": "string" },
+              "status": { "type": "string" },
+              "conclusion": { "type": ["string", "null"] },
+              "failing_step": { "type": ["string", "null"] },
+              "log_excerpt": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "BlameData": {
+      "type": "object",
+      "required": [
+        "path",
+        "revision",
+        "resolved_commit_oid",
+        "total_lines",
+        "human_lines",
+        "agent_lines",
+        "agent_percentage",
+        "lines"
+      ],
+      "properties": {
+        "path": { "type": "string" },
+        "revision": { "type": "string" },
+        "resolved_commit_oid": { "type": "string" },
+        "total_lines": { "type": "integer", "minimum": 0 },
+        "human_lines": { "type": "integer", "minimum": 0 },
+        "agent_lines": { "type": "integer", "minimum": 0 },
+        "agent_percentage": { "type": "number", "minimum": 0, "maximum": 100 },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "line_number",
+              "origin_line_number",
+              "content",
+              "commit_oid",
+              "short_oid",
+              "author_name",
+              "author_email",
+              "timestamp",
+              "summary",
+              "author_kind"
+            ],
+            "properties": {
+              "line_number": { "type": "integer", "minimum": 1 },
+              "origin_line_number": { "type": "integer", "minimum": 1 },
+              "content": { "type": "string" },
+              "commit_oid": { "type": "string" },
+              "short_oid": { "type": "string" },
+              "author_name": { "type": "string" },
+              "author_email": { "type": "string" },
+              "timestamp": { "type": "string", "format": "date-time" },
+              "summary": { "type": "string" },
+              "author_kind": { "type": "string", "enum": ["human", "agent"] },
+              "client": { "type": "string" },
+              "model": { "type": "string" },
+              "session_id": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

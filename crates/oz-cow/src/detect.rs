@@ -44,6 +44,56 @@ pub fn select_backend(probe: &FilesystemProbe, configured: Option<BackendKind>) 
     probe.recommended_backend
 }
 
+/// Fast-path backend selection for `spawn_workspace`: avoids spawning external `fusermount3 --version`
+/// and avoids empirical `.probe` reflink I/O when a backend override is already configured or the
+/// host filesystem cannot support reflinks (e.g., Linux `ext4`).
+pub(crate) fn select_backend_fast(
+    path: &Path,
+    ozone_dir: Option<&Path>,
+    configured: Option<BackendKind>,
+) -> Result<BackendKind> {
+    if let Some(override_backend) = configured {
+        return Ok(override_backend);
+    }
+    let existing = nearest_existing_ancestor(path);
+    let (fs_kind, _) = probe_fs_kind(&existing)?;
+    let reflink_supported = if !fs_kind.supports_reflinks() {
+        false
+    } else if let Some(oz) = ozone_dir {
+        probe_ozone_reflink(oz)
+    } else {
+        probe_reflink_ephemeral(&existing).unwrap_or(true)
+    };
+    let fuse_ready = detect_linux_fuse_ready_fast();
+    let projfs_ready = detect_windows_projfs();
+    let fuse = fuse_ready.map(|ready| LinuxFuseReadiness {
+        dev_fuse_exists: ready,
+        dev_fuse_rw: ready,
+        fusermount3_path: None,
+        fusermount3_version: None,
+        user_allow_other_enabled: false,
+        ready,
+    });
+    Ok(recommend_backend(
+        &fs_kind,
+        reflink_supported,
+        fuse.as_ref(),
+        projfs_ready,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_fuse_ready_fast() -> Option<bool> {
+    let dev_fuse_rw =
+        unsafe { libc::access(c"/dev/fuse".as_ptr(), libc::R_OK | libc::W_OK) == 0 };
+    Some(dev_fuse_rw && find_fusermount3().is_some())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_linux_fuse_ready_fast() -> Option<bool> {
+    None
+}
+
 /// Probes OS, host filesystem type, reflink support, and VFS daemon readiness for `path`.
 pub fn detect_filesystem(path: &Path) -> Result<FilesystemProbe> {
     let existing = nearest_existing_ancestor(path);

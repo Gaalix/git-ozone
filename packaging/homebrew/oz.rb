@@ -1,0 +1,67 @@
+# typed: false
+# frozen_string_literal: true
+
+# Homebrew formula for Ozone (oz / git-ozone / oz-vfsd)
+# Tap usage: brew install ozone-vcs/tap/oz
+class Oz < Formula
+  desc "Pure-Rust CoW Git client and multi-agent workspace engine"
+  homepage "https://github.com/ozone-vcs/ozone"
+  version "1.0.0"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  # Release checksums are populated from SHA256SUMS.txt on tag publish.
+  on_macos do
+    on_arm do
+      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-aarch64-apple-darwin.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    end
+    on_intel do
+      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-x86_64-apple-darwin.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    end
+    on_intel do
+      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    end
+  end
+
+  def install
+    bin.install "oz"
+    bin.install "git-ozone"
+    bin.install "oz-vfsd"
+  end
+
+  def caveats
+    <<~EOS
+      Ozone installs three binaries:
+        - oz         (primary CLI)
+        - git-ozone  (enables `git ozone ...` subcommand alias)
+        - oz-vfsd    (unprivileged FUSE3 / VFS CoW daemon)
+
+      Run `oz doctor` to verify filesystem CoW support, SSH signing keys, and GitHub auth.
+      On Linux ext4 filesystems, install `fuse3` so `oz-vfsd` can mount zero-copy workspaces.
+    EOS
+  end
+
+  test do
+    require "json"
+
+    version_out = shell_output("#{bin}/oz --version --json")
+    version_json = JSON.parse(version_out)
+    assert_equal "oz.v1", version_json["schema"]
+    assert_equal true, version_json["ok"]
+    assert_equal version.to_s, version_json.dig("data", "version")
+
+    doctor_out = shell_output("#{bin}/git-ozone doctor --json")
+    doctor_json = JSON.parse(doctor_out)
+    assert_equal "oz.v1", doctor_json["schema"]
+    assert_equal true, doctor_json["ok"]
+  end
+end
