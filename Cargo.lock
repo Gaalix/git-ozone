@@ -1882,11 +1882,16 @@ name = "oz-agent"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "gix",
+ "imara-diff",
  "oz-core",
+ "oz-cow",
  "oz-integrate",
  "oz-oplog",
+ "oz-warm",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
