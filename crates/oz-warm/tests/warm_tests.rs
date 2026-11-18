@@ -65,6 +65,25 @@ fn commit_all(dir: &Path, msg: &str) -> String {
     String::from_utf8_lossy(&rev.stdout).trim().to_string()
 }
 
+#[cfg(unix)]
+fn run_script_retry_etxtbsy(script: &Path) -> std::process::Output {
+    // On Linux, a concurrent test thread calling `fork()` while another thread briefly holds a
+    // writable FD during `std::fs::copy` can transiently trigger ETXTBSY (`ExecutableFileBusy`)
+    // until the forked child completes `exec()` and closes its `O_CLOEXEC` descriptors.
+    for attempt in 0..20 {
+        match Command::new(script).output() {
+            Ok(out) => return out,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt + 1 < 20 =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("run {}: {err}", script.display()),
+        }
+    }
+    unreachable!()
+}
+
 fn find_system_python3() -> Option<std::path::PathBuf> {
     for cand in ["/usr/bin/python3", "/bin/python3"] {
         let p = Path::new(cand);
@@ -159,9 +178,7 @@ fn venv_trampoline_rewrites_and_executes_from_cloned_workspace_path() {
         assert!(content.starts_with("#!/bin/sh\n'''exec' \"$(dirname \"$0\")/python"));
     }
 
-    let out1 = Command::new(cloned_ws.join(".venv/bin/my-tool"))
-        .output()
-        .expect("run my-tool");
+    let out1 = run_script_retry_etxtbsy(&cloned_ws.join(".venv/bin/my-tool"));
     assert!(
         out1.status.success(),
         "stderr: {}",
@@ -177,9 +194,7 @@ fn venv_trampoline_rewrites_and_executes_from_cloned_workspace_path() {
         "unexpected stdout: {stdout1}"
     );
 
-    let out2 = Command::new(cloned_ws.join(".venv/bin/my-tool-py"))
-        .output()
-        .expect("run my-tool-py");
+    let out2 = run_script_retry_etxtbsy(&cloned_ws.join(".venv/bin/my-tool-py"));
     assert!(
         out2.status.success(),
         "stderr: {}",
