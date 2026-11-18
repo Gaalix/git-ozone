@@ -29,6 +29,18 @@ fn run_oz(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> CmdOut {
         .env_remove("OZ_AGENT")
         .env_remove("CI")
         .stdin(Stdio::null());
+    for (k, _) in std::env::vars() {
+        if k.starts_with("OZ_AGENT")
+            || k.starts_with("CLAUDE")
+            || k.starts_with("CURSOR_")
+            || k.starts_with("CODEX_")
+            || k.starts_with("WINDSURF_")
+            || k.starts_with("ANTIGRAVITY_")
+            || k.starts_with("AGY_")
+        {
+            cmd.env_remove(&k);
+        }
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -619,4 +631,662 @@ fn git_clone_fetch_push_merge_and_rebase_wrappers() {
         feat_before_rebase
     );
     assert!(!cloned_dir.join("main_m.txt").exists());
+}
+
+fn seed_m3_bare_remote(root: &Path) -> (PathBuf, PathBuf, String, String, String) {
+    let bare = root.join("m3-origin.git");
+    fs::create_dir_all(&bare).unwrap();
+    sys_git(&bare, &["init", "--bare", "-b", "main"]);
+    sys_git(&bare, &["config", "uploadpack.allowfilter", "true"]);
+    sys_git(&bare, &["config", "uploadpack.allowanysha1inwant", "true"]);
+    sys_git(&bare, &["config", "receive.advertiseAtomic", "true"]);
+
+    let seed = root.join("m3-seed");
+    fs::create_dir_all(&seed).unwrap();
+    sys_git(&seed, &["init", "-b", "main"]);
+    sys_git(&seed, &["config", "user.name", "M3 Seed"]);
+    sys_git(&seed, &["config", "user.email", "seed@ozone.dev"]);
+
+    // Commit 1 adds a historical blob that Commit 2 deletes, so `--filter=blob:none` at HEAD
+    // never downloads `legacy_blob.bin` into `.git/objects`!
+    fs::write(
+        seed.join("legacy_blob.bin"),
+        "HISTORICAL_BLOB_PAYLOAD_".repeat(256),
+    )
+    .unwrap();
+    sys_git(&seed, &["add", "legacy_blob.bin"]);
+    let legacy_blob_oid = sys_git(&seed, &["rev-parse", ":legacy_blob.bin"])
+        .trim()
+        .to_string();
+    sys_git(&seed, &["commit", "-m", "chore: add legacy blob"]);
+
+    fs::remove_file(seed.join("legacy_blob.bin")).unwrap();
+    fs::create_dir_all(seed.join("src")).unwrap();
+    fs::write(seed.join("README.md"), "# M3 Shim Wire v2\n").unwrap();
+    fs::write(seed.join("src/lib.rs"), "pub fn version() -> u32 { 3 }\n").unwrap();
+    sys_git(&seed, &["add", "-A"]);
+    sys_git(&seed, &["commit", "-m", "feat: active main tree"]);
+    let main_tip = sys_git(&seed, &["rev-parse", "HEAD"]).trim().to_string();
+
+    sys_git(&seed, &["checkout", "-b", "feat/alpha"]);
+    fs::write(seed.join("alpha.txt"), "alpha branch\n").unwrap();
+    sys_git(&seed, &["add", "alpha.txt"]);
+    sys_git(&seed, &["commit", "-m", "feat: alpha"]);
+    let alpha_tip = sys_git(&seed, &["rev-parse", "HEAD"]).trim().to_string();
+    sys_git(&seed, &["checkout", "main"]);
+
+    sys_git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    sys_git(&seed, &["push", "origin", "main:main", "feat/alpha:feat/alpha"]);
+
+    (bare, seed, legacy_blob_oid, main_tip, alpha_tip)
+}
+
+#[test]
+fn m3_git_clone_partial_blob_none_and_exotic_fallbacks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (bare_remote, _seed, legacy_blob_oid, main_tip, alpha_tip) =
+        seed_m3_bare_remote(tmp.path());
+
+    // 1. Native `oz git clone --filter=blob:none <remote> <dest> --json`
+    let clone_out = run_oz(
+        tmp.path(),
+        &[
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "-o",
+            "origin",
+            bare_remote.to_str().unwrap(),
+            "partial-dest",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        clone_out.code, 0,
+        "stdout={} stderr={}",
+        clone_out.stdout, clone_out.stderr
+    );
+    let cj = clone_out.json.expect("clone json");
+    assert_eq!(cj["schema"], OZ_SCHEMA_V1);
+    assert_eq!(cj["ok"], true);
+    assert_eq!(cj["data"]["protocol_version"], 2);
+    assert_eq!(cj["data"]["partial_clone"], true);
+    assert_eq!(cj["data"]["filter"], "blob:none");
+    assert_eq!(cj["data"]["filter_negotiated"], true);
+    assert_eq!(cj["data"]["branch"], "main");
+    assert_eq!(cj["data"]["head_oid"], main_tip);
+    assert!(
+        cj["op_id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("op_")),
+        "expected initial OpLog op_id in {cj}"
+    );
+
+    let partial_dir = tmp.path().join("partial-dest");
+    assert!(partial_dir.join(".git/ozone/oplog/HEAD").is_file());
+    assert!(partial_dir.join(".git/ozone/state").is_dir());
+    assert_eq!(
+        fs::read_to_string(partial_dir.join("src/lib.rs")).unwrap(),
+        "pub fn version() -> u32 { 3 }\n"
+    );
+
+    let git_cfg = fs::read_to_string(partial_dir.join(".git/config")).unwrap();
+    assert!(git_cfg.contains("promisor = true"), "config:\n{git_cfg}");
+    assert!(
+        git_cfg.contains("partialclonefilter = blob:none"),
+        "config:\n{git_cfg}"
+    );
+
+    let pack_files: Vec<String> = fs::read_dir(partial_dir.join(".git/objects/pack"))
+        .unwrap()
+        .filter_map(|e| e.ok().and_then(|d| d.file_name().into_string().ok()))
+        .collect();
+    assert!(
+        pack_files.iter().any(|n| n.ends_with(".promisor")),
+        "expected .promisor marker in {pack_files:?}"
+    );
+
+    // Verify historical `legacy_blob_oid` from c1 was NOT downloaded into local `.git/objects`!
+    let has_legacy = Command::new("/usr/bin/git")
+        .args(["--no-lazy-fetch", "cat-file", "-e", &legacy_blob_oid])
+        .current_dir(&partial_dir)
+        .output()
+        .expect("git cat-file -e");
+    assert!(
+        !has_legacy.status.success(),
+        "partial clone blob:none should not fetch historical unreachable-from-HEAD-tree blob"
+    );
+
+    // 2. Native `-b feat/alpha --filter blob:none -q`
+    let branch_clone = run_oz(
+        tmp.path(),
+        &[
+            "git",
+            "clone",
+            "-q",
+            "-b",
+            "feat/alpha",
+            "--filter",
+            "blob:none",
+            bare_remote.to_str().unwrap(),
+            "alpha-dest",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(branch_clone.code, 0, "stderr={}", branch_clone.stderr);
+    let aj = branch_clone.json.expect("alpha clone json");
+    assert_eq!(aj["data"]["branch"], "feat/alpha");
+    assert_eq!(aj["data"]["head_oid"], alpha_tip);
+    assert!(tmp.path().join("alpha-dest/alpha.txt").is_file());
+
+    // 3. Exotic clone flags (`--depth 1` and `--bare`) fall back cleanly to system `git clone`,
+    // initializing `.git/ozone/` only when non-bare.
+    let file_url = format!("file://{}", bare_remote.display());
+    let shallow_clone = run_oz(
+        tmp.path(),
+        &[
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            &file_url,
+            "shallow-dest",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(shallow_clone.code, 0, "stderr={}", shallow_clone.stderr);
+    assert!(tmp.path().join("shallow-dest/.git/ozone/oplog").is_dir());
+    assert!(tmp.path().join("shallow-dest/.git/shallow").is_file());
+
+    let bare_clone = run_oz(
+        tmp.path(),
+        &["git", "clone", "--bare", &file_url, "bare-copy.git", "--json"],
+        &[],
+    );
+    assert_eq!(bare_clone.code, 0, "stderr={}", bare_clone.stderr);
+    assert!(tmp.path().join("bare-copy.git/HEAD").is_file());
+    assert!(
+        !tmp.path().join("bare-copy.git/ozone").exists(),
+        "bare fallback clone must not initialize colocated .git/ozone/"
+    );
+}
+
+#[test]
+fn m3_git_fetch_prune_and_push_atomic_and_force_with_lease() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (bare_remote, seed, _legacy_blob_oid, main_tip, alpha_tip) =
+        seed_m3_bare_remote(tmp.path());
+
+    let clone_out = run_oz(
+        tmp.path(),
+        &[
+            "git",
+            "clone",
+            bare_remote.to_str().unwrap(),
+            "work",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(clone_out.code, 0, "stderr={}", clone_out.stderr);
+    let work_dir = tmp.path().join("work");
+    sys_git(&work_dir, &["config", "user.name", "M3 Worker"]);
+    sys_git(&work_dir, &["config", "user.email", "worker@ozone.dev"]);
+
+    assert_eq!(
+        sys_git(&work_dir, &["rev-parse", "refs/remotes/origin/feat/alpha"]).trim(),
+        alpha_tip
+    );
+
+    // Advance `main` on `seed` -> push to `bare_remote`, AND delete `feat/alpha` on `bare_remote`.
+    fs::write(seed.join("upstream_v2.txt"), "v2\n").unwrap();
+    sys_git(&seed, &["add", "upstream_v2.txt"]);
+    sys_git(&seed, &["commit", "-m", "feat: upstream v2"]);
+    sys_git(&seed, &["push", "origin", "main"]);
+    let new_main_tip = sys_git(&seed, &["rev-parse", "HEAD"]).trim().to_string();
+    sys_git(&bare_remote, &["branch", "-D", "feat/alpha"]);
+
+    // 1. `oz git fetch --prune` updates `refs/remotes/origin/main` AND prunes `refs/remotes/origin/feat/alpha` natively!
+    let fetch_out = run_oz(&work_dir, &["git", "fetch", "--prune", "--json"], &[]);
+    assert_eq!(
+        fetch_out.code, 0,
+        "stdout={} stderr={}",
+        fetch_out.stdout, fetch_out.stderr
+    );
+    let fj = fetch_out.json.expect("fetch json");
+    assert_eq!(fj["schema"], OZ_SCHEMA_V1);
+    assert_eq!(fj["ok"], true);
+    assert_eq!(fj["data"]["protocol_version"], 2);
+    assert_eq!(
+        fj["data"]["pruned_refs"],
+        serde_json::json!(["refs/remotes/origin/feat/alpha"])
+    );
+    assert!(fj["op_id"].as_str().is_some());
+    assert_eq!(
+        sys_git(&work_dir, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+        new_main_tip
+    );
+    let check_alpha = Command::new("/usr/bin/git")
+        .args(["rev-parse", "--verify", "refs/remotes/origin/feat/alpha"])
+        .current_dir(&work_dir)
+        .output()
+        .unwrap();
+    assert!(!check_alpha.status.success(), "feat/alpha should be pruned");
+
+    // `oz undo` reverses BOTH the updated `origin/main` ref AND the pruned `origin/feat/alpha` ref!
+    let undo_fetch = run_oz(&work_dir, &["undo", "--json"], &[]);
+    assert_eq!(undo_fetch.code, 0, "stderr={}", undo_fetch.stderr);
+    assert_eq!(
+        sys_git(&work_dir, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+        main_tip
+    );
+    assert_eq!(
+        sys_git(&work_dir, &["rev-parse", "refs/remotes/origin/feat/alpha"]).trim(),
+        alpha_tip
+    );
+
+    // Re-fetch `-p -q` so remote-tracking refs are up to date again.
+    assert_eq!(run_oz(&work_dir, &["git", "fetch", "-p", "-q"], &[]).code, 0);
+
+    // 2. `oz git push -u origin feat/stack --atomic --json`
+    assert_eq!(
+        run_oz(&work_dir, &["git", "switch", "-c", "feat/stack"], &[]).code,
+        0
+    );
+    fs::write(work_dir.join("stack.rs"), "pub fn s() -> i32 { 1 }\n").unwrap();
+    assert_eq!(
+        run_oz(&work_dir, &["git", "commit", "-m", "feat: stack v1"], &[]).code,
+        0
+    );
+    let stack_v1 = sys_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let push_atomic = run_oz(
+        &work_dir,
+        &["git", "push", "-u", "origin", "feat/stack", "--atomic", "--json"],
+        &[],
+    );
+    assert_eq!(
+        push_atomic.code, 0,
+        "stdout={} stderr={}",
+        push_atomic.stdout, push_atomic.stderr
+    );
+    let pj = push_atomic.json.expect("push json");
+    assert_eq!(pj["schema"], OZ_SCHEMA_V1);
+    assert_eq!(pj["ok"], true);
+    assert_eq!(pj["data"]["atomic"], true);
+    assert_eq!(
+        pj["data"]["upstream_configured"],
+        serde_json::json!(["feat/stack"])
+    );
+    assert_eq!(
+        sys_git(&bare_remote, &["rev-parse", "refs/heads/feat/stack"]).trim(),
+        stack_v1
+    );
+    assert_eq!(
+        sys_git(&work_dir, &["config", "--get", "branch.feat/stack.remote"]).trim(),
+        "origin"
+    );
+
+    // 3. Amend locally -> non-ff push without lease fails (exit 1), `--force-with-lease` succeeds!
+    fs::write(work_dir.join("stack.rs"), "pub fn s() -> i32 { 2 }\n").unwrap();
+    assert_eq!(
+        run_oz(
+            &work_dir,
+            &["git", "commit", "--amend", "-m", "feat: stack v2"],
+            &[]
+        )
+        .code,
+        0
+    );
+    let stack_v2 = sys_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(stack_v1, stack_v2);
+
+    let rejected_non_ff = run_oz(&work_dir, &["git", "push", "--json"], &[]);
+    assert_eq!(
+        rejected_non_ff.code, 1,
+        "expected exit 1 on non-ff push, got {}: {}",
+        rejected_non_ff.code, rejected_non_ff.stdout
+    );
+    let rj = rejected_non_ff.json.expect("rejected push json");
+    assert_eq!(rj["schema"], OZ_SCHEMA_V1);
+    assert_eq!(rj["ok"], false);
+    assert_eq!(rj["error"]["exit_code"], 1);
+
+    let lease_ok = run_oz(
+        &work_dir,
+        &["git", "push", "--force-with-lease", "--json"],
+        &[],
+    );
+    assert_eq!(
+        lease_ok.code, 0,
+        "stdout={} stderr={}",
+        lease_ok.stdout, lease_ok.stderr
+    );
+    let lj = lease_ok.json.expect("lease push json");
+    assert_eq!(lj["ok"], true);
+    assert_eq!(lj["data"]["pushed_refs"][0]["forced"], true);
+    assert_eq!(
+        sys_git(&bare_remote, &["rev-parse", "refs/heads/feat/stack"]).trim(),
+        stack_v2
+    );
+
+    // 4. Simulate concurrent teammate updating `feat/stack` on `bare_remote` behind `work_dir`'s back,
+    // then verify `oz git push --force-with-lease --json` rejects with ExitCode::ConflictOrCheckFail (1)!
+    sys_git(&seed, &["fetch", "origin", "feat/stack:feat/stack"]);
+    sys_git(&seed, &["checkout", "feat/stack"]);
+    fs::write(seed.join("teammate.rs"), "pub fn teammate() {}\n").unwrap();
+    sys_git(&seed, &["add", "teammate.rs"]);
+    sys_git(&seed, &["commit", "-m", "feat: teammate concurrent push"]);
+    sys_git(&seed, &["push", "origin", "feat/stack"]);
+    let teammate_oid = sys_git(&seed, &["rev-parse", "HEAD"]).trim().to_string();
+
+    fs::write(work_dir.join("stack.rs"), "pub fn s() -> i32 { 3 }\n").unwrap();
+    assert_eq!(
+        run_oz(&work_dir, &["git", "commit", "--amend", "--no-edit"], &[]).code,
+        0
+    );
+
+    let stale_lease = run_oz(
+        &work_dir,
+        &["git", "push", "--force-with-lease", "--json"],
+        &[],
+    );
+    assert_eq!(
+        stale_lease.code, 1,
+        "expected exit 1 on stale lease, got {}: {}",
+        stale_lease.code, stale_lease.stdout
+    );
+    let sj = stale_lease.json.expect("stale lease json");
+    assert_eq!(sj["schema"], OZ_SCHEMA_V1);
+    assert_eq!(sj["ok"], false);
+    assert_eq!(sj["error"]["exit_code"], 1);
+    assert_eq!(sj["conflicts"][0]["id"], "stale-lease");
+    assert_eq!(
+        sys_git(&bare_remote, &["rev-parse", "refs/heads/feat/stack"]).trim(),
+        teammate_oid,
+        "remote ref must remain untouched after stale-lease rejection"
+    );
+
+    // Explicit `--force-with-lease=feat/stack:<teammate_oid>` succeeds once caller supplies expected OID!
+    let explicit_lease_arg = format!("--force-with-lease=feat/stack:{teammate_oid}");
+    let explicit_lease_ok = run_oz(
+        &work_dir,
+        &["git", "push", "origin", "feat/stack", &explicit_lease_arg, "--json"],
+        &[],
+    );
+    assert_eq!(
+        explicit_lease_ok.code, 0,
+        "stdout={} stderr={}",
+        explicit_lease_ok.stdout, explicit_lease_ok.stderr
+    );
+}
+
+#[test]
+fn m3_git_commit_ssh_signing_and_native_amend_change_id() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("sign-amend-repo");
+    init_repo(&repo_dir);
+
+    // Generate an unencrypted Ed25519 SSH signing keypair via `/usr/bin/ssh-keygen`.
+    let key_dir = tmp.path().join("keys");
+    fs::create_dir_all(&key_dir).unwrap();
+    let priv_key = key_dir.join("id_ed25519");
+    let pub_key = key_dir.join("id_ed25519.pub");
+    let keygen = Command::new("/usr/bin/ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "shim@ozone.dev",
+            "-f",
+            priv_key.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run ssh-keygen");
+    assert!(keygen.status.success(), "ssh-keygen failed");
+
+    let pub_line = fs::read_to_string(&pub_key).unwrap();
+    let allowed_signers = key_dir.join("allowed_signers");
+    fs::write(&allowed_signers, format!("shim@ozone.dev {}", pub_line)).unwrap();
+
+    sys_git(&repo_dir, &["config", "gpg.format", "ssh"]);
+    sys_git(
+        &repo_dir,
+        &["config", "user.signingkey", pub_key.to_str().unwrap()],
+    );
+    sys_git(
+        &repo_dir,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            allowed_signers.to_str().unwrap(),
+        ],
+    );
+
+    // 1. `oz git commit -S -m "..."` signs natively and passes `/usr/bin/git verify-commit`!
+    fs::write(repo_dir.join("signed.rs"), "pub fn verified() -> bool { true }\n").unwrap();
+    let signed_out = run_oz(
+        &repo_dir,
+        &["git", "commit", "-S", "-m", "feat: ssh signed commit", "--json"],
+        &[],
+    );
+    assert_eq!(
+        signed_out.code, 0,
+        "stdout={} stderr={}",
+        signed_out.stdout, signed_out.stderr
+    );
+    assert!(!repo_dir.join(".git/index.lock").exists());
+    let signed_json = signed_out.json.expect("signed commit json");
+    assert_eq!(signed_json["data"]["signed"], true);
+    assert!(
+        signed_json["data"]["signature_fingerprint"]
+            .as_str()
+            .is_some_and(|fp| fp.starts_with("SHA256:"))
+    );
+    let orig_change_id = signed_json["data"]["change_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(orig_change_id.starts_with('I'));
+
+    let verify_initial = Command::new("/usr/bin/git")
+        .args(["verify-commit", "HEAD"])
+        .current_dir(&repo_dir)
+        .output()
+        .expect("git verify-commit");
+    assert!(
+        verify_initial.status.success(),
+        "git verify-commit failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify_initial.stdout),
+        String::from_utf8_lossy(&verify_initial.stderr)
+    );
+
+    // 2. `oz git add` + `oz git commit --amend --no-edit` honors virtual `pinned_paths`,
+    // preserves `HEAD`'s message + `Change-Id:`, and never touches `.git/index.lock`!
+    fs::write(repo_dir.join("pinned_amend.rs"), "pub fn pinned() {}\n").unwrap();
+    fs::write(repo_dir.join("unpinned_dirty.rs"), "pub fn keep_dirty() {}\n").unwrap();
+    assert_eq!(
+        run_oz(&repo_dir, &["git", "add", "pinned_amend.rs"], &[]).code,
+        0
+    );
+
+    let amend_no_edit = run_oz(
+        &repo_dir,
+        &["git", "commit", "--amend", "--no-edit", "--json"],
+        &[],
+    );
+    assert_eq!(
+        amend_no_edit.code, 0,
+        "stdout={} stderr={}",
+        amend_no_edit.stdout, amend_no_edit.stderr
+    );
+    assert!(!repo_dir.join(".git/index.lock").exists());
+    let ane_json = amend_no_edit.json.expect("amend --no-edit json");
+    assert_eq!(ane_json["data"]["amended"], true);
+    assert_eq!(ane_json["data"]["change_id"], orig_change_id);
+    assert_eq!(
+        ane_json["data"]["committed_paths"],
+        serde_json::json!(["pinned_amend.rs"])
+    );
+    assert_eq!(ane_json["data"]["remaining_dirty_count"], 1);
+    assert!(
+        ane_json["data"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("feat: ssh signed commit")
+    );
+
+    // 3. `oz git commit --gpg-sign=<key> --amend -m "..."` folds remaining dirty file, rewords,
+    // signs, AND still preserves `HEAD`'s `Change-Id:` trailer!
+    let gpg_sign_arg = format!("--gpg-sign={}", priv_key.display());
+    let amend_reword = run_oz(
+        &repo_dir,
+        &[
+            "git",
+            "commit",
+            &gpg_sign_arg,
+            "--amend",
+            "-m",
+            "feat: amended and re-signed commit",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        amend_reword.code, 0,
+        "stdout={} stderr={}",
+        amend_reword.stdout, amend_reword.stderr
+    );
+    assert!(!repo_dir.join(".git/index.lock").exists());
+    let ar_json = amend_reword.json.expect("amend -m json");
+    assert_eq!(ar_json["data"]["amended"], true);
+    assert_eq!(ar_json["data"]["signed"], true);
+    assert_eq!(ar_json["data"]["change_id"], orig_change_id);
+    assert_eq!(ar_json["data"]["remaining_dirty_count"], 0);
+
+    let head_body = sys_git(&repo_dir, &["log", "-1", "--pretty=%B"]);
+    assert!(head_body.contains("feat: amended and re-signed commit"));
+    assert!(head_body.contains(&format!("Change-Id: {orig_change_id}")));
+
+    let verify_amended = Command::new("/usr/bin/git")
+        .args(["verify-commit", "HEAD"])
+        .current_dir(&repo_dir)
+        .output()
+        .expect("git verify-commit amended");
+    assert!(
+        verify_amended.status.success(),
+        "git verify-commit failed after amend:\nstderr: {}",
+        String::from_utf8_lossy(&verify_amended.stderr)
+    );
+
+    // 4. Verify `--no-gpg-sign` overrides `commit.gpgsign = true`.
+    sys_git(&repo_dir, &["config", "commit.gpgsign", "true"]);
+    fs::write(repo_dir.join("unsigned.rs"), "pub fn u() {}\n").unwrap();
+    let unsigned_out = run_oz(
+        &repo_dir,
+        &[
+            "git",
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            "chore: explicit unsigned",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(unsigned_out.code, 0, "stderr={}", unsigned_out.stderr);
+    assert_eq!(unsigned_out.json.unwrap()["data"]["signed"], false);
+}
+
+#[test]
+fn m3_git_commit_agent_provenance_notes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("agent-notes-repo");
+    init_repo(&repo_dir);
+
+    // 1. Human commit (`oz git commit` without `--agent` or agent env vars) does NOT write `refs/notes/ai`.
+    fs::write(repo_dir.join("human.rs"), "pub fn human() -> i32 { 1 }\n").unwrap();
+    let human_commit = run_oz(
+        &repo_dir,
+        &["git", "commit", "-m", "feat: human authored", "--json"],
+        &[],
+    );
+    assert_eq!(human_commit.code, 0, "stderr={}", human_commit.stderr);
+    assert!(human_commit.json.unwrap()["data"].get("provenance").is_none());
+    let no_note = Command::new("/usr/bin/git")
+        .args(["notes", "--ref=ai", "show", "HEAD"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    assert!(!no_note.status.success(), "human commit should not create refs/notes/ai");
+
+    // 2. `oz --agent git commit -m "..."` writes `refs/notes/ai` readable by `git notes --ref=ai show HEAD`!
+    fs::write(
+        repo_dir.join("agent_mod.rs"),
+        "pub fn generated() -> &'static str {\n    \"hello from agent\"\n}\n",
+    )
+    .unwrap();
+    let agent_commit = run_oz(
+        &repo_dir,
+        &[
+            "--agent",
+            "git",
+            "commit",
+            "-m",
+            "feat: agent generated module",
+            "--json",
+        ],
+        &[
+            ("OZ_AGENT_SESSION", "sess-m3-shim-01"),
+            ("OZ_AGENT_MODEL", "claude-opus-4-6"),
+            ("OZ_AGENT_PROMPT", "add generated() helper"),
+        ],
+    );
+    assert_eq!(
+        agent_commit.code, 0,
+        "stdout={} stderr={}",
+        agent_commit.stdout, agent_commit.stderr
+    );
+    let ac_json = agent_commit.json.expect("agent commit json");
+    assert_eq!(ac_json["data"]["provenance"]["session_id"], "sess-m3-shim-01");
+    assert_eq!(ac_json["data"]["provenance"]["model"], "claude-opus-4-6");
+
+    let note_raw = sys_git(&repo_dir, &["notes", "--ref=ai", "show", "HEAD"]);
+    let note_json: Value = serde_json::from_str(&note_raw).expect("valid JSON in refs/notes/ai");
+    assert_eq!(note_json["schema_version"], 1);
+    assert_eq!(note_json["session_id"], "sess-m3-shim-01");
+    assert_eq!(note_json["model"], "claude-opus-4-6");
+    assert_eq!(note_json["prompt_summary"], "add generated() helper");
+    assert_eq!(note_json["line_ranges"][0]["path"], "agent_mod.rs");
+    assert_eq!(note_json["line_ranges"][0]["start_line"], 1);
+    assert_eq!(note_json["line_ranges"][0]["end_line"], 3);
+    assert_eq!(note_json["line_ranges"][0]["author_kind"], "agent");
+
+    // Human commit message stays clean without AI metadata bloat.
+    let commit_msg = sys_git(&repo_dir, &["log", "-1", "--pretty=%B"]);
+    assert!(!commit_msg.contains("sess-m3-shim-01"));
+
+    // 3. Ambient agent harness env vars (without `--agent` flag) ALSO auto-record `refs/notes/ai`!
+    fs::write(repo_dir.join("env_agent.rs"), "pub const X: usize = 7;\n").unwrap();
+    let env_commit = run_oz(
+        &repo_dir,
+        &["git", "commit", "-m", "feat: env detected agent commit", "--json"],
+        &[
+            ("CLAUDE_CODE_SESSION_ID", "claude-auto-77"),
+            ("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        ],
+    );
+    assert_eq!(env_commit.code, 0, "stderr={}", env_commit.stderr);
+    let env_note_raw = sys_git(&repo_dir, &["notes", "--ref=ai", "show", "HEAD"]);
+    let env_note: Value = serde_json::from_str(&env_note_raw).expect("valid env note JSON");
+    assert_eq!(env_note["client"], "claude-code");
+    assert_eq!(env_note["session_id"], "claude-auto-77");
+    assert_eq!(env_note["model"], "claude-sonnet-4-6");
+    assert_eq!(env_note["line_ranges"][0]["path"], "env_agent.rs");
 }
