@@ -1506,13 +1506,13 @@ fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
 
     fs::write(repo_dir.join("feat.txt"), "hello\n").unwrap();
 
-    // 1. `oz commit --json` fails with exit code 1 + structured `oz.v1` `hook_failed`
+    // 1. `oz commit --json` fails with exit code 1 + structured `oz.v1` `check_failed`
     let c_fail = run_oz(&repo_dir, &["commit", "-m", "feat: fail", "--json"], &[]);
     assert_eq!(c_fail.code, 1, "stdout={}", c_fail.stdout);
     let c_json = c_fail.json.expect("json envelope");
     assert_eq!(c_json["schema"], OZ_SCHEMA_V1);
     assert_eq!(c_json["ok"], false);
-    assert_eq!(c_json["error"]["code"], "hook_failed");
+    assert_eq!(c_json["error"]["code"], "check_failed");
     assert!(
         c_json["error"]["message"]
             .as_str()
@@ -1533,13 +1533,13 @@ fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
     let shim_ok = run_oz(&repo_dir, &["git", "commit", "-nm", "feat: shim -n"], &[]);
     assert_eq!(shim_ok.code, 0, "stderr={}", shim_ok.stderr);
 
-    // 4. `oz push --json` fails with exit code 1 + `hook_failed`
+    // 4. `oz push --json` fails with exit code 1 + `check_failed`
     let p_fail = run_oz(&repo_dir, &["push", "origin", "main", "--json"], &[]);
     assert_eq!(p_fail.code, 1, "stdout={}", p_fail.stdout);
     let p_json = p_fail.json.expect("push json envelope");
     assert_eq!(p_json["schema"], OZ_SCHEMA_V1);
     assert_eq!(p_json["ok"], false);
-    assert_eq!(p_json["error"]["code"], "hook_failed");
+    assert_eq!(p_json["error"]["code"], "check_failed");
     assert!(
         p_json["error"]["message"]
             .as_str()

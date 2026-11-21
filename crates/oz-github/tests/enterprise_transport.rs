@@ -228,7 +228,7 @@ fn pre_push_hook_receives_remote_args_and_stdin_and_respects_no_verify() {
     )
     .unwrap_err();
     assert!(matches!(err, OzError::HookFailed { .. }), "got {err:?}");
-    assert_eq!(err.error_code(), "hook_failed");
+    assert_eq!(err.error_code(), "check_failed");
     assert_eq!(err.exit_code().as_i32(), 1);
     assert!(err.to_string().contains("blocked by policy"));
 

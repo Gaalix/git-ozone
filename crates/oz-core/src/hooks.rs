@@ -378,7 +378,7 @@ mod tests {
         // Now mark executable -> fails with HookFailed (exit code 1)
         write_exec(&hook, "#!/bin/sh\necho 'lint error' >&2\nexit 3\n");
         let err = run_pre_commit(&repo, &cfg, &CommitHookEnv::default(), false).unwrap_err();
-        assert_eq!(err.error_code(), "hook_failed");
+        assert_eq!(err.error_code(), "check_failed");
         assert_eq!(err.exit_code().as_i32(), 1);
         assert!(err.to_string().contains("lint error"));
 

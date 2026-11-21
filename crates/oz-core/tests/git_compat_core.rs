@@ -109,7 +109,7 @@ fn hooks_husky_lefthook_pre_commit_style_and_no_verify() {
     // 1. Failing pre-commit aborts with OzError::HookFailed (exit code 1)
     let err = commit_changes(&repo, &CommitOptions::new("feat: attempt")).unwrap_err();
     assert!(matches!(err, OzError::HookFailed { .. }), "got {err:?}");
-    assert_eq!(err.error_code(), "hook_failed");
+    assert_eq!(err.error_code(), "check_failed");
     assert_eq!(err.exit_code().as_i32(), 1);
     assert!(err.to_string().contains("pre-commit rejected blocked.txt"));
 
