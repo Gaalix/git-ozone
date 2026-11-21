@@ -470,6 +470,76 @@ fn materialize_tree_delta(
     Ok(updated)
 }
 
+fn write_index_no_ext(index: &mut gix::index::File) -> Result<()> {
+    index
+        .write(gix::index::write::Options {
+            extensions: gix::index::write::Extensions::None,
+            skip_hash: true,
+        })
+        .map_err(|err| OzError::Git(err.to_string()))
+}
+
+fn load_or_rebuild_index(
+    index_path: &Path,
+    gix_repo: &gix::Repository,
+    target_tree_id: ObjectId,
+) -> Result<(gix::index::File, bool)> {
+    if !index_path.is_file() {
+        let mut rebuilt = gix_repo
+            .index_from_tree(&target_tree_id)
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        write_index_no_ext(&mut rebuilt)?;
+        return Ok((rebuilt, true));
+    }
+    match gix::index::File::at(
+        index_path,
+        gix_repo.object_hash(),
+        true,
+        gix::index::decode::Options::default(),
+    ) {
+        Ok(idx) => Ok((idx, false)),
+        Err(_) => {
+            let mut rebuilt = gix_repo
+                .index_from_tree(&target_tree_id)
+                .map_err(|err| OzError::Git(err.to_string()))?;
+            write_index_no_ext(&mut rebuilt)?;
+            Ok((rebuilt, true))
+        }
+    }
+}
+
+fn patch_and_write_index<'a, I>(index: &mut gix::index::File, updates: I) -> Result<()>
+where
+    I: IntoIterator<
+        Item = (
+            &'a str,
+            Option<(ObjectId, gix::index::entry::Mode, gix::index::entry::Stat)>,
+        ),
+    >,
+{
+    let items: Vec<_> = updates.into_iter().collect();
+    if items.is_empty() {
+        return Ok(());
+    }
+    let touched: BTreeSet<&str> = items.iter().map(|(path, _)| *path).collect();
+    index.remove_tree();
+    index.remove_entries(|_, path, _| touched.contains(path.to_str_lossy().as_ref()));
+
+    for (path, entry) in items {
+        if let Some((oid, mode, stat)) = entry {
+            index.dangerously_push_entry(
+                stat,
+                oid,
+                gix::index::entry::Flags::empty(),
+                mode,
+                path.as_bytes().as_bstr(),
+            );
+        }
+    }
+    index.sort_entries();
+    write_index_no_ext(index)
+}
+
 fn sync_index_for_delta(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
@@ -480,72 +550,101 @@ fn sync_index_for_delta(
         return Ok(());
     }
     let index_path = repo.git_dir.join("index");
-    if !index_path.is_file() {
-        let mut index = gix_repo
-            .index_from_tree(&target_tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        index
-            .write(gix::index::write::Options {
-                extensions: gix::index::write::Extensions::None,
-                skip_hash: true,
-            })
-            .map_err(|err| OzError::Git(err.to_string()))?;
+    let (mut index, already_rebuilt) =
+        load_or_rebuild_index(&index_path, gix_repo, target_tree_id)?;
+    if already_rebuilt {
         return Ok(());
     }
 
-    let mut index = match gix::index::File::at(
-        &index_path,
-        gix_repo.object_hash(),
-        true,
-        gix::index::decode::Options::default(),
-    ) {
-        Ok(idx) => idx,
-        Err(_) => {
-            let mut rebuilt = gix_repo
-                .index_from_tree(&target_tree_id)
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            rebuilt
-                .write(gix::index::write::Options {
-                    extensions: gix::index::write::Extensions::None,
-                    skip_hash: true,
-                })
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            return Ok(());
-        }
-    };
-
-    let touched: BTreeSet<&str> = delta.iter().map(TreeDeltaOp::path).collect();
-    index.remove_tree();
-    index.remove_entries(|_, path, _| touched.contains(path.to_str_lossy().as_ref()));
-
-    for op in delta {
-        if let TreeDeltaOp::Upsert { path, oid, kind } = op {
+    let updates = delta.iter().map(|op| match op {
+        TreeDeltaOp::Upsert { path, oid, kind } => {
             let disk_path = repo.workdir_path.join(path);
             let stat = gix::index::fs::Metadata::from_path_no_follow(&disk_path)
                 .ok()
                 .and_then(|meta| gix::index::entry::Stat::from_fs(&meta).ok())
                 .unwrap_or_default();
-            index.dangerously_push_entry(
-                stat,
-                *blob_oid_ref(oid),
-                gix::index::entry::Flags::empty(),
-                (*kind).into(),
-                path.as_bytes().as_bstr(),
-            );
+            (path.as_str(), Some((*oid, (*kind).into(), stat)))
         }
-    }
-    index.sort_entries();
-    index
-        .write(gix::index::write::Options {
-            extensions: gix::index::write::Extensions::None,
-            skip_hash: true,
-        })
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    Ok(())
+        TreeDeltaOp::Delete(path) => (path.as_str(), None),
+    });
+    patch_and_write_index(&mut index, updates)
 }
 
-const fn blob_oid_ref(oid: &ObjectId) -> &ObjectId {
-    oid
+/// Ensures `.git/index` entries for `paths` match `target_tree_id` (`HEAD`), without staging
+/// working-tree modifications or untracked files created by `oz stash pop`.
+fn sync_index_paths_to_tree(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    target_tree_id: ObjectId,
+    paths: &[String],
+) -> Result<()> {
+    if paths.is_empty() || (repo.workspace.is_some() && !repo.is_linked_worktree) {
+        return Ok(());
+    }
+    let index_path = repo.git_dir.join("index");
+    if !index_path.is_file() {
+        return Ok(());
+    }
+    let (mut index, already_rebuilt) =
+        load_or_rebuild_index(&index_path, gix_repo, target_tree_id)?;
+    if already_rebuilt {
+        return Ok(());
+    }
+
+    let empty_tree_id = ObjectId::empty_tree(gix_repo.object_hash());
+    let target_tree = if target_tree_id == empty_tree_id {
+        None
+    } else {
+        Some(
+            gix_repo
+                .find_tree(target_tree_id)
+                .map_err(|err| OzError::Git(err.to_string()))?,
+        )
+    };
+    let mut patches = Vec::new();
+    for rel in paths {
+        let lookup = match target_tree.as_ref() {
+            Some(tree) => tree
+                .lookup_entry_by_path(rel.as_str())
+                .map_err(|err| OzError::Git(err.to_string()))?,
+            None => None,
+        };
+        let target = match lookup {
+            Some(entry) if !entry.mode().is_tree() => {
+                Some((entry.object_id(), entry.mode().kind().into()))
+            }
+            _ => None,
+        };
+        let bstr = rel.as_bytes().as_bstr();
+        let unconflicted =
+            index.entry_by_path_and_stage(bstr, gix::index::entry::Stage::Unconflicted);
+        let matches = match (target, unconflicted) {
+            (Some((oid, mode)), Some(entry)) => {
+                entry.id == oid
+                    && entry.mode == mode
+                    && index
+                        .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Base)
+                        .is_none()
+                    && index
+                        .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Ours)
+                        .is_none()
+                    && index
+                        .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Theirs)
+                        .is_none()
+            }
+            (None, None) => index.entry_by_path(bstr).is_none(),
+            _ => false,
+        };
+        if !matches {
+            // Use zeroed stat so dirty files popped onto disk are never marked clean against HEAD.
+            patches.push((
+                rel.as_str(),
+                target.map(|(oid, mode)| (oid, mode, gix::index::entry::Stat::default())),
+            ));
+        }
+    }
+
+    patch_and_write_index(&mut index, patches)
 }
 
 /// Pure-Rust Thompson-NFA regular expression matcher used for `oz log -G` and `--grep`.
@@ -2415,8 +2514,13 @@ pub fn apply_stash_pop(repo: &OzoneRepo, prepared: PreparedStashPop) -> Result<S
     let _ = prepared.live_tree_id;
     materialize_tree_delta(repo, &gix_repo, &prepared.delta)?;
 
+    let applied_paths: Vec<String> = prepared
+        .delta
+        .iter()
+        .map(|d| d.path().to_string())
+        .collect();
     let head = resolve_workspace_head(repo, &gix_repo)?;
-    sync_index_for_delta(repo, &gix_repo, head.tree_id, &prepared.delta)?;
+    sync_index_paths_to_tree(repo, &gix_repo, head.tree_id, &applied_paths)?;
 
     let (prev_commit, mut entries) = read_stash_manifest(&gix_repo)?;
     if prepared.index < entries.len() && entries[prepared.index].id == prepared.record.id {
@@ -2426,11 +2530,6 @@ pub fn apply_stash_pop(repo: &OzoneRepo, prepared: PreparedStashPop) -> Result<S
     }
     write_stash_manifest(&mut gix_repo, prev_commit, &entries, "oz stash pop")?;
 
-    let applied_paths: Vec<String> = prepared
-        .delta
-        .iter()
-        .map(|d| d.path().to_string())
-        .collect();
     let _ = prepared.merged_tree_id;
 
     Ok(StashPopOutcome {

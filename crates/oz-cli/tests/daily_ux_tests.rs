@@ -329,6 +329,16 @@ fn stash_push_pop_list_drop_are_reversed_by_oz_undo_and_redo() {
     fs::remove_file(repo.join("to_delete.txt")).unwrap();
     std::os::unix::fs::symlink("tracked.txt", repo.join("link_to_tracked")).unwrap();
 
+    // Capture pre-stash `oz status --json` and `git status --short` for exact parity after pop.
+    let pre_stash_oz_status = run_oz(&repo, &["status", "--json"], &[]).unwrap_json().clone();
+    let pre_stash_changes = pre_stash_oz_status["data"]["changes"].as_array().unwrap().clone();
+    assert!(
+        pre_stash_changes
+            .iter()
+            .any(|c| c["path"] == "new_file.txt" && c["kind"] == "added" && c["pinned"] == false),
+        "pre-stash oz status changes: {pre_stash_changes:?}"
+    );
+
     // 1. `oz stash push`
     let push_out = run_oz(&repo, &["stash", "push", "-m", "wip feature", "--json"], &[]);
     assert_eq!(push_out.code, 0, "stash push stderr: {}", push_out.stderr);
@@ -404,6 +414,62 @@ fn stash_push_pop_list_drop_are_reversed_by_oz_undo_and_redo() {
     assert_eq!(fs::read_to_string(repo.join("new_file.txt")).unwrap(), "untracked payload\n");
     assert!(!repo.join("to_delete.txt").exists());
     assert_eq!(run_oz(&repo, &["stash", "list", "--json"], &[]).unwrap_json()["data"]["count"], 0);
+
+    // Popping must NOT stage dirty or untracked files in `.git/index` or `oz status`.
+    assert_eq!(
+        sys_git(&repo, &["diff", "--cached", "--name-only"]),
+        "",
+        "oz stash pop must leave .git/index clean against HEAD"
+    );
+    let raw_git_st = Command::new(sys_git_bin())
+        .args(["status", "--short"])
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git status --short");
+    assert!(raw_git_st.status.success());
+    let raw_git_st_str = String::from_utf8_lossy(&raw_git_st.stdout);
+    let git_lines: Vec<&str> = raw_git_st_str.lines().collect();
+    assert!(
+        git_lines.contains(&" M tracked.txt"),
+        "expected unstaged ` M tracked.txt`, got:\n{raw_git_st_str}"
+    );
+    assert!(
+        git_lines.contains(&" D to_delete.txt"),
+        "expected unstaged ` D to_delete.txt`, got:\n{raw_git_st_str}"
+    );
+    assert!(
+        git_lines.contains(&"?? new_file.txt"),
+        "expected untracked `?? new_file.txt`, got:\n{raw_git_st_str}"
+    );
+    assert!(
+        !git_lines
+            .iter()
+            .any(|l| l.starts_with("A ") || l.starts_with("M ") || l.starts_with("D ")),
+        "no popped file should be staged in column 1:\n{raw_git_st_str}"
+    );
+
+    let post_pop_oz_status = run_oz(&repo, &["status", "--json"], &[]).unwrap_json().clone();
+    let post_pop_changes = post_pop_oz_status["data"]["changes"].as_array().unwrap();
+    for pre in &pre_stash_changes {
+        assert!(
+            post_pop_changes.iter().any(|post| {
+                post["path"] == pre["path"]
+                    && post["kind"] == pre["kind"]
+                    && post["pinned"] == pre["pinned"]
+            }),
+            "post-pop oz status drifted for {}:\npre={pre:?}\npost={post_pop_changes:?}",
+            pre["path"]
+        );
+    }
+    let oz_git_st = run_oz(&repo, &["git", "status", "--short"], &[]);
+    assert_eq!(oz_git_st.code, 0);
+    assert!(
+        oz_git_st.stdout.lines().any(|l| l == "?? new_file.txt")
+            && oz_git_st.stdout.lines().any(|l| l == " M tracked.txt"),
+        "oz git status --short after pop:\n{}",
+        oz_git_st.stdout
+    );
 
     // 5. `oz undo` reverses `oz stash pop`!
     let undo_pop = run_oz(&repo, &["undo", "--json"], &[]);
