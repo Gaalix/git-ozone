@@ -58,7 +58,11 @@ pub fn compact_oplog(repo: &OzoneRepo, opts: &OpLogGcOptions) -> Result<OpLogGcO
         recovery: vec!["Run `oz fsck --repair` first.".to_string()],
     })?;
 
-    let (entries, file_sizes, temp_files) = load_all_ops_strict(layout)?;
+    let LoadedOps {
+        entries,
+        file_sizes,
+        temp_files,
+    } = load_all_ops_strict(layout)?;
     let total_entries_before = entries.len();
 
     let entries_by_id: HashMap<String, OpLogEntry> = entries
@@ -266,9 +270,13 @@ fn compute_cutoff(now: DateTime<Utc>, oplog_days: u64) -> DateTime<Utc> {
     now - Duration::days(clamped)
 }
 
-fn load_all_ops_strict(
-    layout: &OzoneLayout,
-) -> Result<(Vec<OpLogEntry>, HashMap<String, u64>, Vec<PathBuf>)> {
+struct LoadedOps {
+    entries: Vec<OpLogEntry>,
+    file_sizes: HashMap<String, u64>,
+    temp_files: Vec<PathBuf>,
+}
+
+fn load_all_ops_strict(layout: &OzoneLayout) -> Result<LoadedOps> {
     let oplog = layout.oplog_dir();
     let ops = ops_dir(layout);
     let mut temp_files = Vec::new();
@@ -338,7 +346,11 @@ fn load_all_ops_strict(
             .then_with(|| a.op_id.cmp(&b.op_id))
     });
 
-    Ok((entries, sizes, temp_files))
+    Ok(LoadedOps {
+        entries,
+        file_sizes: sizes,
+        temp_files,
+    })
 }
 
 fn discover_active_workspaces(repo: &OzoneRepo) -> HashSet<String> {

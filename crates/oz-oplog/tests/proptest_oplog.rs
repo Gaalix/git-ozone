@@ -164,6 +164,7 @@ impl OracleModel {
         self.redo_stack.clear();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_commit(
         &mut self,
         repo: &OzoneRepo,

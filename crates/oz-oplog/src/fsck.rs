@@ -813,18 +813,16 @@ fn check_and_repair_oplog(
         if !bad_parents.is_empty() {
             let mut repaired = false;
             let mut action = None;
-            if repair {
-                if let Some(e) = valid_entries.get_mut(op_id) {
-                    e.parents.retain(|p| p != op_id && !bad_parents.contains(p));
-                    dirty_entries.insert(op_id.clone());
-                    repaired = true;
-                    let msg = format!(
-                        "removed dangling parent reference(s) {} from {op_id}",
-                        bad_parents.join(", ")
-                    );
-                    repaired_actions.push(msg.clone());
-                    action = Some(msg);
-                }
+            if repair && let Some(e) = valid_entries.get_mut(op_id) {
+                e.parents.retain(|p| p != op_id && !bad_parents.contains(p));
+                dirty_entries.insert(op_id.clone());
+                repaired = true;
+                let msg = format!(
+                    "removed dangling parent reference(s) {} from {op_id}",
+                    bad_parents.join(", ")
+                );
+                repaired_actions.push(msg.clone());
+                action = Some(msg);
             }
             issues.push(FsckIssue {
                 code: "dangling_oplog_parent".to_string(),
