@@ -6,6 +6,8 @@
 
 pub mod checkpoint;
 pub mod dirty;
+pub mod fsck;
+pub mod gc;
 pub mod mutation;
 pub mod store;
 pub mod types;
@@ -13,6 +15,8 @@ pub mod undo;
 
 pub use checkpoint::checkpoint;
 pub use dirty::workspace_key;
+pub use fsck::fsck_repo;
+pub use gc::compact_oplog;
 pub use mutation::{
     MutationTransaction, record_mutation, record_mutation_all_branches, record_mutation_with_refs,
 };
@@ -21,9 +25,10 @@ pub use store::{
     load_entry, ops_dir, read_head_op_id,
 };
 pub use types::{
-    ActorInfo, ActorKind, CheckpointOutcome, DEFAULT_WORKSPACE_KEY, DirtyFileSnapshot,
-    DirtyFileState, OpKind, OpLogEntry, RedoOutcome, RefDelta, UndoOutcome, UndoTarget,
-    WsSnapshot,
+    ActorInfo, ActorKind, CheckpointOutcome, DEFAULT_OPLOG_RETENTION_DAYS, DEFAULT_WORKSPACE_KEY,
+    DirtyFileSnapshot, DirtyFileState, FsckCategory, FsckCheckStatus, FsckCheckSummary, FsckIssue,
+    FsckOptions, FsckReport, FsckSeverity, OpKind, OpLogEntry, OpLogGcOptions, OpLogGcOutcome,
+    RedoOutcome, RefDelta, UndoOutcome, UndoTarget, WsSnapshot,
 };
 pub use undo::{redo, undo, undo_with_dirty};
 

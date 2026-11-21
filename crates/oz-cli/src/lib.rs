@@ -7,6 +7,7 @@ pub mod aliases;
 pub mod commands;
 pub mod daily;
 pub mod git_shim;
+pub mod maintenance;
 pub mod pager;
 pub mod recovery;
 
@@ -133,6 +134,10 @@ pub enum Commands {
     Setup(SetupArgs),
     /// Inspect OS, filesystem (`statfs`), FUSE3/reflink readiness, and colocated repo status.
     Doctor,
+    /// Compact `.git/ozone/oplog/` and prune expired OpLog entries/snapshots safely.
+    Gc(maintenance::GcArgs),
+    /// Verify colocated `.git/`, OpLog chain, snapshot reachability, and orphaned mounts/baselines.
+    Fsck(maintenance::FsckArgs),
     /// Print version information (equivalent to `--version`).
     Version,
     /// Git-compatible command shim (`alias git="oz git"`) backed by Ozone + MVCC OpLog.
@@ -413,6 +418,10 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Completions(args)) => handle_completions(&args, Cli::command(), mode),
         Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),
+        Some(Commands::Gc(args)) => maintenance::handle_gc(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Fsck(args)) => {
+            maintenance::handle_fsck(&args, cli.directory.as_deref(), mode)
+        }
         Some(Commands::Version) => handle_version(invocation, mode),
         Some(Commands::Git(mut git_args)) => {
             if let Some(raw_tail) = trailing_git_args {
