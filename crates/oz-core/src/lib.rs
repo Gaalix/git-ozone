@@ -11,6 +11,7 @@ pub mod attributes;
 pub mod checkout;
 pub mod commit;
 pub mod config;
+pub mod daily;
 pub mod diff;
 pub mod envelope;
 pub mod error;
@@ -40,8 +41,19 @@ pub use commit::{
 };
 pub use config::{
     DEFAULT_MAX_BASELINE_GB, DEFAULT_MAX_BLOB_MB, DEFAULT_WORKSPACE_TEMPLATE, DaemonConfig,
-    GuardrailsConfig, OzoneConfig, SigningConfig, WarmConfig, normalize_lexical,
+    GuardrailsConfig, OzoneConfig, SigningConfig, WarmConfig, default_aliases, normalize_lexical,
     validate_workspace_name,
+};
+pub use daily::{
+    BranchCreateOutcome, BranchDeleteOutcome, BranchInfo, BranchListReport, BranchRenameOutcome,
+    CherryPickOptions, CherryPickOutcome, LogCommitEntry, LogOptions, LogReport, OZ_STASH_REF,
+    PreparedStashPop, RevertOptions, RevertOutcome, ShowFileStat, ShowOptions, ShowReport,
+    ShowStatSummary, StashDropOutcome, StashEntryRecord, StashItem, StashListReport,
+    StashPopOutcome, StashPushOutcome, TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport,
+    TagVerifyOutcome, apply_stash_pop, branch_create, branch_delete, branch_list, branch_rename,
+    cherry_pick_commit, extract_change_id, log_commits, parse_since_timestamp,
+    parse_stash_selector, prepare_stash_pop, revert_commit, show_commit, stash_drop, stash_list,
+    stash_push, tag_create, tag_delete, tag_list, tag_verify,
 };
 pub use diff::{
     BINARY_SNIFF_BYTES, DEFAULT_CONTEXT_LINES, DiffReport, compute_diff,

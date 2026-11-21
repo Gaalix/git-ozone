@@ -6,6 +6,7 @@
 use crate::error::{OzError, Result};
 use crate::types::BackendKind;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 /// Default maximum disk budget (in GiB) retained for warm baseline caches.
@@ -35,6 +36,21 @@ pub struct OzoneConfig {
     /// Optional SSH commit signing settings (`[signing]`).
     #[serde(default)]
     pub signing: SigningConfig,
+    /// Configurable CLI subcommand aliases (`[aliases]`).
+    #[serde(default = "default_aliases")]
+    pub aliases: BTreeMap<String, String>,
+}
+
+/// Returns the built-in default CLI aliases (`st`, `ci`, `co`, `lg`, `br`).
+#[must_use]
+pub fn default_aliases() -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    map.insert("st".to_string(), "status".to_string());
+    map.insert("ci".to_string(), "commit".to_string());
+    map.insert("co".to_string(), "git checkout".to_string());
+    map.insert("lg".to_string(), "log".to_string());
+    map.insert("br".to_string(), "branch".to_string());
+    map
 }
 
 impl Default for OzoneConfig {
@@ -48,6 +64,7 @@ impl Default for OzoneConfig {
             backend: None,
             daemon: DaemonConfig::default(),
             signing: SigningConfig::default(),
+            aliases: default_aliases(),
         }
     }
 }
@@ -145,6 +162,7 @@ struct PartialOzoneConfig {
     backend: Option<BackendKind>,
     daemon: Option<PartialDaemonConfig>,
     signing: Option<PartialSigningConfig>,
+    aliases: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -334,6 +352,16 @@ impl OzoneConfig {
                 self.signing.key = Some(v);
             }
         }
+        if let Some(aliases) = layer.aliases {
+            for (name, expansion) in aliases {
+                let key = name.trim().to_string();
+                if expansion.trim().is_empty() {
+                    self.aliases.remove(&key);
+                } else {
+                    self.aliases.insert(key, expansion);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -364,6 +392,16 @@ impl OzoneConfig {
                 path: path.to_path_buf(),
                 message: "signing.key must not be empty".to_string(),
             });
+        }
+        for key in self.aliases.keys() {
+            if key.is_empty() || key.starts_with('-') || key.chars().any(char::is_whitespace) {
+                return Err(OzError::InvalidConfig {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "invalid alias name '{key}': must be non-empty, not start with '-', and contain no whitespace"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -575,5 +613,55 @@ key = "~/.ssh/local_ed25519"
         let cfg2 = OzoneConfig::load_for_repo(&repo_root, &ozone_dir).expect("load layered config");
         assert_eq!(cfg2.signing.enabled, Some(true));
         assert_eq!(cfg2.signing.key.as_deref(), Some("~/.ssh/local_ed25519"));
+    }
+
+    #[test]
+    fn default_and_layered_custom_aliases() {
+        let defaults = OzoneConfig::default();
+        assert_eq!(defaults.aliases.get("st").map(String::as_str), Some("status"));
+        assert_eq!(defaults.aliases.get("ci").map(String::as_str), Some("commit"));
+        assert_eq!(
+            defaults.aliases.get("co").map(String::as_str),
+            Some("git checkout")
+        );
+        assert_eq!(defaults.aliases.get("lg").map(String::as_str), Some("log"));
+        assert_eq!(defaults.aliases.get("br").map(String::as_str), Some("branch"));
+
+        let dir = TempDir::new().expect("tempdir");
+        let repo_root = dir.path().join("aliased-app");
+        let ozone_dir = repo_root.join(".git/ozone");
+        std::fs::create_dir_all(&ozone_dir).expect("mkdir");
+
+        std::fs::write(
+            repo_root.join(".ozone.toml"),
+            r#"
+[aliases]
+lg = "log --oneline -n 10"
+cm = "commit -m"
+co = ""
+"#,
+        )
+        .expect("write .ozone.toml");
+
+        std::fs::write(
+            ozone_dir.join("config.toml"),
+            r#"
+[aliases]
+lg = "log --oneline -n 5"
+"#,
+        )
+        .expect("write local config");
+
+        let cfg = OzoneConfig::load_for_repo(&repo_root, &ozone_dir).expect("load aliases");
+        assert_eq!(cfg.aliases.get("st").map(String::as_str), Some("status"));
+        assert_eq!(
+            cfg.aliases.get("lg").map(String::as_str),
+            Some("log --oneline -n 5")
+        );
+        assert_eq!(cfg.aliases.get("cm").map(String::as_str), Some("commit -m"));
+        assert!(!cfg.aliases.contains_key("co"));
+
+        assert!(OzoneConfig::parse_str("[aliases]\n\"-bad\" = \"status\"").is_err());
+        assert!(OzoneConfig::parse_str("[aliases]\n\"bad name\" = \"status\"").is_err());
     }
 }
