@@ -4,12 +4,17 @@
 //! Quiescent baseline capture into `.git/ozone/baselines/<commit_oid>/` and LRU disk-cap GC.
 
 use crate::mtime::{
-    metadata_modified_filetime, metadata_modified_unix_secs, set_file_mtime_compat,
+    metadata_modified_filetime, metadata_modified_secs_nanos, set_file_mtime_compat,
     set_symlink_times_compat,
 };
 use crate::quiescent::{is_repo_quiescent, validate_baseline_id};
-use crate::trampoline::{is_venv_bin_script, rewrite_python_trampoline_bytes};
-use crate::{BaselineMetadata, EcosystemKind, WarmCacheTarget, detect_warm_targets};
+use crate::trampoline::{
+    is_venv_bin_script, is_venv_pth_file, rewrite_python_pth_bytes,
+    rewrite_python_trampoline_bytes, rewrite_pyvenv_cfg_bytes, rewrite_venv_activate_bytes,
+};
+use crate::{
+    BaselineMetadata, EcosystemKind, WarmCacheTarget, detect_warm_targets, is_cargo_lock_filename,
+};
 use chrono::{DateTime, Utc};
 use filetime::FileTime;
 use fs4::FileExt as Fs4FileExt;
@@ -94,6 +99,7 @@ pub fn capture_baseline(
     let reflink_supported = probe_reflink_once(staging.path());
 
     let mut file_mtimes_secs = BTreeMap::new();
+    let mut file_mtimes_nanos = BTreeMap::new();
     let mut total_bytes = 0u64;
 
     total_bytes += capture_tracked_files(
@@ -103,6 +109,7 @@ pub fn capture_baseline(
         &staging_root,
         reflink_supported,
         &mut file_mtimes_secs,
+        &mut file_mtimes_nanos,
     )?;
 
     for target in &targets {
@@ -116,14 +123,13 @@ pub fn capture_baseline(
         targets,
         total_bytes,
         file_mtimes_secs,
+        file_mtimes_nanos,
     };
 
     let staging_meta_path = staging.path().join("metadata.json");
     std::fs::write(&staging_meta_path, serde_json::to_string_pretty(&metadata)?)?;
-    let meta_ft = FileTime::from_unix_time(
-        created_at.timestamp(),
-        created_at.timestamp_subsec_nanos(),
-    );
+    let meta_ft =
+        FileTime::from_unix_time(created_at.timestamp(), created_at.timestamp_subsec_nanos());
     let _ = set_file_mtime_compat(&staging_meta_path, meta_ft);
 
     let staging_path = staging.keep();
@@ -162,6 +168,7 @@ fn capture_tracked_files(
     staging_root: &Path,
     reflink_supported: bool,
     file_mtimes_secs: &mut BTreeMap<String, i64>,
+    file_mtimes_nanos: &mut BTreeMap<String, u32>,
 ) -> Result<u64> {
     if let Ok(repo) = gix::open(repo_root)
         && let Ok(oid) = gix::ObjectId::from_hex(commit_oid.as_bytes())
@@ -174,6 +181,7 @@ fn capture_tracked_files(
             staging_root,
             reflink_supported,
             file_mtimes_secs,
+            file_mtimes_nanos,
         );
     }
 
@@ -183,6 +191,7 @@ fn capture_tracked_files(
         staging_root,
         reflink_supported,
         file_mtimes_secs,
+        file_mtimes_nanos,
     )
 }
 
@@ -193,6 +202,7 @@ fn capture_git_commit_tree(
     staging_root: &Path,
     reflink_supported: bool,
     file_mtimes_secs: &mut BTreeMap<String, i64>,
+    file_mtimes_nanos: &mut BTreeMap<String, u32>,
 ) -> Result<u64> {
     let commit_secs = commit
         .time()
@@ -227,19 +237,19 @@ fn capture_git_commit_tree(
 
     let git_dir = repo.git_dir().to_path_buf();
     let total = AtomicU64::new(0);
-    let mtime_pairs: Vec<(String, i64)> = jobs
+    let mtime_pairs: Vec<(String, i64, u32)> = jobs
         .par_iter()
         .map_init(
             || gix::open(&git_dir).map_err(|e| OzError::Git(e.to_string())),
-            |thread_repo_res, (rel_str, dst_path, oid, mode)| -> Result<(String, i64)> {
+            |thread_repo_res, (rel_str, dst_path, oid, mode)| -> Result<(String, i64, u32)> {
                 let thread_repo = thread_repo_res
                     .as_ref()
                     .map_err(|e| OzError::Git(e.to_string()))?;
                 let work_file = repo_root.join(rel_str.as_str());
                 let work_meta = std::fs::symlink_metadata(&work_file).ok();
-                let mtime_secs = work_meta
+                let (mtime_secs, mtime_nanos) = work_meta
                     .as_ref()
-                    .map_or(commit_secs, metadata_modified_unix_secs);
+                    .map_or((commit_secs, 0), metadata_modified_secs_nanos);
 
                 let blob = thread_repo
                     .find_blob(*oid)
@@ -248,9 +258,9 @@ fn capture_git_commit_tree(
 
                 if mode.is_link() {
                     write_symlink_bytes(dst_path, data)?;
-                    let _ = set_symlink_mtime_secs(dst_path, mtime_secs);
+                    let _ = set_symlink_mtime_secs_nanos(dst_path, mtime_secs, mtime_nanos);
                     total.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    return Ok((rel_str.clone(), mtime_secs));
+                    return Ok((rel_str.clone(), mtime_secs, mtime_nanos));
                 }
 
                 // Editable source files are NEVER hardlinked. Try reflink only when supported and
@@ -269,15 +279,16 @@ fn capture_git_commit_tree(
                 }
 
                 apply_git_mode(dst_path, mode.is_executable())?;
-                set_file_mtime_compat(dst_path, FileTime::from_unix_time(mtime_secs, 0))?;
+                set_file_mtime_compat(dst_path, FileTime::from_unix_time(mtime_secs, mtime_nanos))?;
                 total.fetch_add(data.len() as u64, Ordering::Relaxed);
-                Ok((rel_str.clone(), mtime_secs))
+                Ok((rel_str.clone(), mtime_secs, mtime_nanos))
             },
         )
         .collect::<Result<Vec<_>>>()?;
 
-    for (rel_str, mtime_secs) in mtime_pairs {
-        file_mtimes_secs.insert(rel_str, mtime_secs);
+    for (rel_str, mtime_secs, mtime_nanos) in mtime_pairs {
+        file_mtimes_secs.insert(rel_str.clone(), mtime_secs);
+        file_mtimes_nanos.insert(rel_str, mtime_nanos);
     }
 
     Ok(total.load(Ordering::Relaxed))
@@ -289,6 +300,7 @@ fn capture_non_git_source_files(
     staging_root: &Path,
     reflink_supported: bool,
     file_mtimes_secs: &mut BTreeMap<String, i64>,
+    file_mtimes_nanos: &mut BTreeMap<String, u32>,
 ) -> Result<u64> {
     let warm_roots: HashSet<String> = targets
         .iter()
@@ -333,12 +345,14 @@ fn capture_non_git_source_files(
             std::fs::create_dir_all(parent)?;
         }
         let meta = std::fs::symlink_metadata(entry.path())?;
-        let mtime_secs = metadata_modified_unix_secs(&meta);
-        file_mtimes_secs.insert(path_to_posix(rel), mtime_secs);
+        let (mtime_secs, mtime_nanos) = metadata_modified_secs_nanos(&meta);
+        let posix_rel = path_to_posix(rel);
+        file_mtimes_secs.insert(posix_rel.clone(), mtime_secs);
+        file_mtimes_nanos.insert(posix_rel, mtime_nanos);
 
         if entry.path_is_symlink() {
             copy_symlink(entry.path(), &dst)?;
-            let _ = set_symlink_mtime_secs(&dst, mtime_secs);
+            let _ = set_symlink_mtime_secs_nanos(&dst, mtime_secs, mtime_nanos);
             total_bytes += meta.len();
             continue;
         }
@@ -349,12 +363,20 @@ fn capture_non_git_source_files(
                 std::fs::copy(entry.path(), &dst)?;
             }
             std::fs::set_permissions(&dst, meta.permissions())?;
-            set_file_mtime_compat(&dst, FileTime::from_unix_time(mtime_secs, 0))?;
+            set_file_mtime_compat(&dst, FileTime::from_unix_time(mtime_secs, mtime_nanos))?;
             total_bytes += meta.len();
         }
     }
 
     Ok(total_bytes)
+}
+
+#[derive(Debug)]
+struct WarmTargetCtx<'a> {
+    repo_root: &'a Path,
+    src_root: &'a Path,
+    target_rel_path: &'a str,
+    ecosystem: &'a EcosystemKind,
 }
 
 #[derive(Debug)]
@@ -377,6 +399,13 @@ fn capture_warm_target(
         return Ok(0);
     }
 
+    let ctx = WarmTargetCtx {
+        repo_root,
+        src_root: &src_root,
+        target_rel_path: &target.relative_path,
+        ecosystem: &target.ecosystem,
+    };
+
     let dst_root = staging_root.join(&target.relative_path);
     if src_root.is_file() {
         if let Some(parent) = dst_root.parent() {
@@ -384,13 +413,13 @@ fn capture_warm_target(
         }
         let meta = std::fs::symlink_metadata(&src_root)?;
         let job = WarmFileJob {
-            src: src_root,
+            src: src_root.clone(),
             dst: dst_root,
             rel_in_target: PathBuf::from(&target.relative_path),
             is_symlink: meta.file_type().is_symlink(),
             meta,
         };
-        return process_warm_file_job(&job, &target.ecosystem, reflink_supported);
+        return process_warm_file_job(&job, &ctx, reflink_supported);
     }
 
     std::fs::create_dir_all(&dst_root)?;
@@ -434,23 +463,45 @@ fn capture_warm_target(
     }
 
     let total = AtomicU64::new(0);
-    jobs.par_iter()
-        .try_for_each(|job| -> Result<()> {
-            let bytes = process_warm_file_job(job, &target.ecosystem, reflink_supported)?;
-            total.fetch_add(bytes, Ordering::Relaxed);
-            Ok(())
-        })?;
+    jobs.par_iter().try_for_each(|job| -> Result<()> {
+        let bytes = process_warm_file_job(job, &ctx, reflink_supported)?;
+        total.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    })?;
 
     Ok(total.load(Ordering::Relaxed))
 }
 
+fn write_independent_warm_file(
+    src: &Path,
+    dst: &Path,
+    meta: &Metadata,
+    rewritten: Option<Vec<u8>>,
+    reflink_supported: bool,
+) -> Result<u64> {
+    let mtime = metadata_modified_filetime(meta);
+    let len = if let Some(data) = rewritten {
+        let n = data.len() as u64;
+        std::fs::write(dst, &data)?;
+        n
+    } else {
+        if !(reflink_supported && reflink_copy::reflink(src, dst).is_ok()) {
+            std::fs::copy(src, dst)?;
+        }
+        meta.len()
+    };
+    std::fs::set_permissions(dst, meta.permissions())?;
+    set_file_mtime_compat(dst, mtime)?;
+    Ok(len)
+}
+
 fn process_warm_file_job(
     job: &WarmFileJob,
-    ecosystem: &EcosystemKind,
+    ctx: &WarmTargetCtx<'_>,
     reflink_supported: bool,
 ) -> Result<u64> {
     if job.is_symlink {
-        copy_symlink(&job.src, &job.dst)?;
+        copy_symlink_portable(&job.src, &job.dst, ctx.repo_root)?;
         return Ok(job.meta.len());
     }
     if !job.meta.is_file() {
@@ -459,21 +510,44 @@ fn process_warm_file_job(
 
     let mtime = metadata_modified_filetime(&job.meta);
 
-    // Python `.venv/bin/*` trampoline rewriting writes an independent file (never hardlinked).
-    if matches!(ecosystem, EcosystemKind::Python) && is_venv_bin_script(&job.rel_in_target) {
-        let bytes = std::fs::read(&job.src)?;
-        if let Some(rewritten) = rewrite_python_trampoline_bytes(&bytes) {
-            std::fs::write(&job.dst, &rewritten)?;
-            std::fs::set_permissions(&job.dst, job.meta.permissions())?;
-            set_file_mtime_compat(&job.dst, mtime)?;
-            return Ok(rewritten.len() as u64);
+    if matches!(ctx.ecosystem, EcosystemKind::Python) {
+        let fname = job.rel_in_target.file_name().and_then(|s| s.to_str());
+        if is_venv_bin_script(&job.rel_in_target) {
+            let bytes = std::fs::read(&job.src)?;
+            let rewritten = rewrite_python_trampoline_bytes(&bytes).or_else(|| {
+                fname.and_then(|name| rewrite_venv_activate_bytes(name, &bytes, ctx.src_root))
+            });
+            return write_independent_warm_file(
+                &job.src,
+                &job.dst,
+                &job.meta,
+                rewritten,
+                reflink_supported,
+            );
         }
-        if !(reflink_supported && reflink_copy::reflink(&job.src, &job.dst).is_ok()) {
-            std::fs::write(&job.dst, &bytes)?;
+        if job.rel_in_target == Path::new("pyvenv.cfg") {
+            let bytes = std::fs::read(&job.src)?;
+            let rewritten =
+                rewrite_pyvenv_cfg_bytes(&bytes, ctx.repo_root, ctx.src_root, ctx.target_rel_path);
+            return write_independent_warm_file(
+                &job.src,
+                &job.dst,
+                &job.meta,
+                rewritten,
+                reflink_supported,
+            );
         }
-        std::fs::set_permissions(&job.dst, job.meta.permissions())?;
-        set_file_mtime_compat(&job.dst, mtime)?;
-        return Ok(bytes.len() as u64);
+        if is_venv_pth_file(&job.rel_in_target) {
+            let bytes = std::fs::read(&job.src)?;
+            let rewritten = rewrite_python_pth_bytes(&bytes, ctx.repo_root);
+            return write_independent_warm_file(
+                &job.src,
+                &job.dst,
+                &job.meta,
+                rewritten,
+                reflink_supported,
+            );
+        }
     }
 
     if reflink_supported && reflink_copy::reflink(&job.src, &job.dst).is_ok() {
@@ -482,7 +556,7 @@ fn process_warm_file_job(
         return Ok(job.meta.len());
     }
 
-    if is_immutable_cache_artifact(&job.rel_in_target, &job.meta, ecosystem)
+    if is_immutable_cache_artifact(&job.rel_in_target, &job.meta, ctx.ecosystem)
         && std::fs::hard_link(&job.src, &job.dst).is_ok()
     {
         return Ok(job.meta.len());
@@ -501,7 +575,7 @@ fn is_transient_lock_file(rel: &Path, is_dir: bool) -> bool {
     let Some(name) = rel.file_name().and_then(|s| s.to_str()) else {
         return false;
     };
-    if name == ".cargo-lock" || name == ".oz-lock" || name.ends_with(".flock") {
+    if is_cargo_lock_filename(name) || name == ".oz-lock" || name.ends_with(".flock") {
         return true;
     }
     let in_incremental = rel
@@ -532,8 +606,13 @@ fn is_immutable_cache_artifact(
         // compiled artifacts (`deps/`, `.fingerprint/`, `build/`, `doc/`, binaries) are replaced atomically.
         EcosystemKind::RustCargo => !comps.contains(&"incremental"),
         EcosystemKind::NodeJs => true,
-        EcosystemKind::Python => !comps.contains(&"bin")
-            && rel_in_target.file_name().and_then(|s| s.to_str()) != Some("pyvenv.cfg"),
+        EcosystemKind::Python => {
+            let fname = rel_in_target.file_name().and_then(|s| s.to_str());
+            !comps.contains(&"bin")
+                && fname != Some("pyvenv.cfg")
+                && !is_venv_pth_file(rel_in_target)
+                && !fname.is_some_and(|n| n.starts_with("activate"))
+        }
         EcosystemKind::Custom(_) => false,
     }
 }
@@ -558,7 +637,8 @@ pub fn touch_baseline_lru(ozone_dir: &Path, commit_oid: &str) -> Result<()> {
         return Ok(());
     }
     let now = Utc::now();
-    let nanos = i128::from(now.timestamp()) * 1_000_000_000 + i128::from(now.timestamp_subsec_nanos());
+    let nanos =
+        i128::from(now.timestamp()) * 1_000_000_000 + i128::from(now.timestamp_subsec_nanos());
     std::fs::write(dir.join(".last_used"), format!("{nanos}\n"))?;
     Ok(())
 }
@@ -574,7 +654,9 @@ pub fn gc_baselines(ozone_dir: &Path, max_baseline_gb: f64) -> Result<GcReport> 
     let budget_bytes = if !max_baseline_gb.is_finite() || max_baseline_gb <= 0.0 {
         0u64
     } else {
-        (max_baseline_gb * 1024.0 * 1024.0 * 1024.0).floor().max(0.0) as u64
+        (max_baseline_gb * 1024.0 * 1024.0 * 1024.0)
+            .floor()
+            .max(0.0) as u64
     };
 
     struct BaselineEntry {
@@ -745,23 +827,64 @@ fn write_symlink_bytes(dst: &Path, target_bytes: &[u8]) -> Result<()> {
 
 fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
     let target = std::fs::read_link(src)?;
+    write_symlink_target(src, dst, &target)
+}
+
+fn copy_symlink_portable(src: &Path, dst: &Path, repo_root: &Path) -> Result<()> {
+    let target = std::fs::read_link(src)?;
+    if target.is_absolute() {
+        let repo_canon =
+            std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        if let Some(rel_from_repo) = target
+            .strip_prefix(repo_root)
+            .ok()
+            .or_else(|| target.strip_prefix(&repo_canon).ok())
+            && let Some(src_parent) = src.parent()
+            && let Some(src_parent_rel) = src_parent
+                .strip_prefix(repo_root)
+                .ok()
+                .or_else(|| src_parent.strip_prefix(&repo_canon).ok())
+        {
+            let depth = src_parent_rel
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count();
+            let mut rel_target = PathBuf::new();
+            for _ in 0..depth {
+                rel_target.push("..");
+            }
+            if rel_from_repo.as_os_str().is_empty() {
+                if depth == 0 {
+                    rel_target.push(".");
+                }
+            } else {
+                rel_target.push(rel_from_repo);
+            }
+            return write_symlink_target(src, dst, &rel_target);
+        }
+    }
+    write_symlink_target(src, dst, &target)
+}
+
+fn write_symlink_target(src: &Path, dst: &Path, target: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&target, dst)?;
+        let _ = src;
+        std::os::unix::fs::symlink(target, dst)?;
     }
     #[cfg(windows)]
     {
         if src.is_dir() {
-            std::os::windows::fs::symlink_dir(&target, dst)?;
+            std::os::windows::fs::symlink_dir(target, dst)?;
         } else {
-            std::os::windows::fs::symlink_file(&target, dst)?;
+            std::os::windows::fs::symlink_file(target, dst)?;
         }
     }
     Ok(())
 }
 
-fn set_symlink_mtime_secs(path: &Path, secs: i64) -> Result<()> {
-    let ft = FileTime::from_unix_time(secs, 0);
+fn set_symlink_mtime_secs_nanos(path: &Path, secs: i64, nanos: u32) -> Result<()> {
+    let ft = FileTime::from_unix_time(secs, nanos);
     set_symlink_times_compat(path, ft)?;
     Ok(())
 }

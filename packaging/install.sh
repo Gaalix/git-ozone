@@ -235,7 +235,7 @@ case ":${PATH}:" in
   *)
     warn "${BIN_DIR} is not currently in your PATH."
     printf '  Add it to your shell profile:\n'
-    printf '    export PATH="%s:$PATH"\n' "$BIN_DIR"
+    printf '    export PATH="%s:%s"\n' "$BIN_DIR" "\$PATH"
     ;;
 esac
 

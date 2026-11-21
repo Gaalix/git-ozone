@@ -4,12 +4,15 @@
 //! Quiescence locking checks (`fs4`) and prior-baseline fallback resolution.
 
 use crate::baseline::{capture_baseline, touch_baseline_lru};
-use crate::{BaselineMetadata, WarmCacheTarget, detect_warm_targets};
+use crate::{
+    BaselineMetadata, EcosystemKind, WarmCacheTarget, detect_warm_targets, is_cargo_lock_filename,
+};
 use fs4::{FileExt, TryLockError};
 use oz_core::{OzError, OzoneConfig, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 /// A validated baseline snapshot loaded from `.git/ozone/baselines/<commit_oid>/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,22 +39,50 @@ pub struct BaselineResolution {
 
 /// Checks whether all build/package lock indicators in `repo_root` are idle via non-blocking `fs4` locks.
 ///
-/// Returns `Ok(false)` if any lock indicator (e.g., `target/.cargo-lock`) is currently locked.
+/// Returns `Ok(false)` if any lock indicator (e.g., `target/.cargo-lock`,
+/// `target/debug/.cargo-build-lock`, `target/debug/.cargo-artifact-lock`) is currently locked.
 pub fn is_repo_quiescent(repo_root: &Path, targets: &[WarmCacheTarget]) -> Result<bool> {
     let mut lock_paths = BTreeSet::new();
+    let mut cargo_roots = BTreeSet::new();
     for target in targets {
         for indicator in &target.lock_indicators {
             lock_paths.insert(repo_root.join(indicator));
         }
+        if matches!(target.ecosystem, EcosystemKind::RustCargo) {
+            cargo_roots.insert(repo_root.join(&target.relative_path));
+        }
     }
 
     if repo_root.join("Cargo.toml").is_file() || repo_root.join("target").is_dir() {
-        for rel in [
-            "target/.cargo-lock",
-            "target/debug/.cargo-lock",
-            "target/release/.cargo-lock",
-        ] {
-            lock_paths.insert(repo_root.join(rel));
+        cargo_roots.insert(repo_root.join("target"));
+    }
+
+    for target_dir in cargo_roots {
+        for sub in ["", "debug", "release"] {
+            let base = if sub.is_empty() {
+                target_dir.clone()
+            } else {
+                target_dir.join(sub)
+            };
+            for lock_name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+                lock_paths.insert(base.join(lock_name));
+            }
+        }
+        if target_dir.is_dir() {
+            // Catch custom profiles and target triples (e.g. target/x86_64-.../release/.cargo-build-lock).
+            for entry in WalkDir::new(&target_dir)
+                .max_depth(3)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+            {
+                if entry.file_type().is_file()
+                    && let Some(name) = entry.file_name().to_str()
+                    && is_cargo_lock_filename(name)
+                {
+                    lock_paths.insert(entry.into_path());
+                }
+            }
         }
     }
 

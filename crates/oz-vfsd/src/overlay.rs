@@ -608,6 +608,65 @@ pub fn scan_dirty_paths(cfg: &OverlayMountConfig) -> std::io::Result<Vec<DirtyPa
     Ok(dirty.into_values().collect())
 }
 
+/// Unescapes `/proc/self/mountinfo` octal sequences (`\040`, `\011`, `\012`, `\134`, etc.).
+#[cfg(unix)]
+pub(crate) fn unescape_mountinfo_field(raw: &str) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let val =
+                ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    OsString::from_vec(out)
+}
+
+/// Extracts active FUSE mountpoint paths from `/proc/self/mountinfo` text.
+#[cfg(unix)]
+pub(crate) fn parse_fuse_mountpoints_from_mountinfo(raw: &str) -> Vec<PathBuf> {
+    let mut mounts = Vec::new();
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(mp_escaped) = fields.nth(4) else {
+            continue;
+        };
+        let Some((_, after_sep)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fs_type = after_sep.split_whitespace().next().unwrap_or("");
+        if fs_type == "fuse" || fs_type.starts_with("fuse.") {
+            mounts.push(PathBuf::from(unescape_mountinfo_field(mp_escaped)));
+        }
+    }
+    mounts
+}
+
+/// Returns `true` when `mount_point` appears as an active FUSE mount in `/proc/self/mountinfo`.
+#[cfg(unix)]
+#[must_use]
+pub fn is_fuse_mount_in_proc_mountinfo(mount_point: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let canon_target = std::fs::canonicalize(mount_point).ok();
+    parse_fuse_mountpoints_from_mountinfo(&raw)
+        .into_iter()
+        .any(|mp| mp == mount_point || canon_target.as_ref().is_some_and(|c| &mp == c))
+}
+
 /// Invokes `fusermount3 -u -z` (or `fusermount -u -z`) on `mount_point`.
 /// Best-effort cleanup helper used for `ENOTCONN` recovery and forced unmounts.
 pub fn lazy_unmount_fuse(mount_point: &Path) -> Result<()> {
@@ -615,6 +674,7 @@ pub fn lazy_unmount_fuse(mount_point: &Path) -> Result<()> {
     {
         use std::process::{Command, Stdio};
 
+        let mut last_err: Option<String> = None;
         for bin in ["fusermount3", "fusermount"] {
             match Command::new(bin)
                 .arg("-u")
@@ -642,20 +702,28 @@ pub fn lazy_unmount_fuse(mount_point: &Path) -> Result<()> {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     if stderr.contains("not found in /etc/mtab")
                         || stderr.contains("not mounted")
+                        || stderr.contains("is not a mount point")
+                        || stderr.contains("No such file or directory")
                         || stderr.contains("Invalid argument")
                     {
                         return Ok(());
                     }
-                    if bin == "fusermount" {
-                        return Err(OzError::Other(format!(
-                            "fusermount unmount failed for {}: {}",
-                            mount_point.display(),
-                            stderr.trim()
-                        )));
-                    }
+                    last_err = Some(stderr.trim().to_string());
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(OzError::Io(e)),
+            }
+        }
+        if let Some(err_msg) = last_err {
+            let still_attached = std::fs::symlink_metadata(mount_point)
+                .err()
+                .is_some_and(|e| oz_core::is_enotconn(&e))
+                || is_fuse_mount_in_proc_mountinfo(mount_point);
+            if still_attached {
+                return Err(OzError::Other(format!(
+                    "fusermount unmount failed for {}: {err_msg}",
+                    mount_point.display()
+                )));
             }
         }
         Ok(())
@@ -724,9 +792,10 @@ impl MountedOverlay {
 #[cfg(target_os = "linux")]
 pub fn mount_overlay(spec: &MountSpec) -> Result<MountedOverlay> {
     let cfg = OverlayMountConfig::from_spec(spec);
-    if let Err(err) = std::fs::symlink_metadata(&cfg.mount_point)
-        && oz_core::is_enotconn(&err)
-    {
+    let stale_enotconn = std::fs::symlink_metadata(&cfg.mount_point)
+        .err()
+        .is_some_and(|err| oz_core::is_enotconn(&err));
+    if stale_enotconn || is_fuse_mount_in_proc_mountinfo(&cfg.mount_point) {
         lazy_unmount_fuse(&cfg.mount_point)?;
     }
     cfg.ensure_directories()?;
@@ -985,6 +1054,16 @@ mod linux_impl {
             }
         }
 
+        #[cfg(test)]
+        pub(super) fn test_copy_up_entry(
+            &self,
+            rel: &Path,
+            truncate_to_zero: bool,
+        ) -> std::result::Result<(), Errno> {
+            let mut inner = self.state.lock().map_err(|_| Errno::EIO)?;
+            self.copy_up_entry(&mut inner, rel, truncate_to_zero)
+        }
+
         fn upper_path(&self, rel: &Path) -> PathBuf {
             if rel.as_os_str().is_empty() {
                 self.cfg.upper_dir.clone()
@@ -1044,7 +1123,8 @@ mod linux_impl {
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let resolved = resolve_rel_path(&self.cfg, &cur_rel).ok_or(Errno::ENOENT)?;
+                        let resolved =
+                            resolve_rel_path(&self.cfg, &cur_rel).ok_or(Errno::ENOENT)?;
                         let lower_meta = std::fs::symlink_metadata(&resolved.host_path)
                             .map_err(|err| errno_from_io(&err))?;
                         if !lower_meta.file_type().is_dir() {
@@ -1116,8 +1196,7 @@ mod linux_impl {
                     .open(&tmp_path)
                     .map_err(|e| errno_from_io(&e))?;
                 if !truncate_to_zero {
-                    let mut src =
-                        File::open(&resolved.host_path).map_err(|e| errno_from_io(&e))?;
+                    let mut src = File::open(&resolved.host_path).map_err(|e| errno_from_io(&e))?;
                     std::io::copy(&mut src, &mut dst).map_err(|e| {
                         let _ = std::fs::remove_file(&tmp_path);
                         errno_from_io(&e)
@@ -1160,7 +1239,8 @@ mod linux_impl {
             removed_lower_files: &mut Vec<PathBuf>,
         ) -> std::result::Result<(), Errno> {
             self.ensure_upper_dir(rel_dir)?;
-            let entries = list_merged_dir_entries(&self.cfg, rel_dir).map_err(|e| errno_from_io(&e))?;
+            let entries =
+                list_merged_dir_entries(&self.cfg, rel_dir).map_err(|e| errno_from_io(&e))?;
             for entry in entries {
                 let child_rel = if rel_dir.as_os_str().is_empty() {
                     PathBuf::from(&entry.name)
@@ -1346,7 +1426,11 @@ mod linux_impl {
         )
     }
 
-    fn lchown_path(path: &Path, uid: Option<u32>, gid: Option<u32>) -> std::result::Result<(), Errno> {
+    fn lchown_path(
+        path: &Path,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> std::result::Result<(), Errno> {
         if uid.is_none() && gid.is_none() {
             return Ok(());
         }
@@ -1489,15 +1573,15 @@ mod linux_impl {
             let rel_res = inner.inodes.resolve_ino_path(ino);
 
             if let Err(err) = rel_res {
-                let open_match = fh
-                    .and_then(|handle| inner.open_files.get(&handle))
-                    .or_else(|| {
-                        inner
-                            .open_files
-                            .values()
-                            .find(|o| o.ino == ino && o.writable)
-                            .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
-                    });
+                let open_match =
+                    fh.and_then(|handle| inner.open_files.get(&handle))
+                        .or_else(|| {
+                            inner
+                                .open_files
+                                .values()
+                                .find(|o| o.ino == ino && o.writable)
+                                .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
+                        });
                 if let Some(open) = open_match {
                     let file = Arc::clone(&open.file);
                     let writable = open.writable;
@@ -1667,8 +1751,7 @@ mod linux_impl {
                 .open(&upper_path)
             {
                 Ok(_) => {
-                    let _ =
-                        std::fs::set_permissions(&upper_path, Permissions::from_mode(eff_mode));
+                    let _ = std::fs::set_permissions(&upper_path, Permissions::from_mode(eff_mode));
                     match self.stat_resolved(&mut inner, &rel, true) {
                         Ok(attr) => reply.entry(&ZERO_TTL, &attr, Generation(0)),
                         Err(e) => reply.error(e),
@@ -1995,6 +2078,18 @@ mod linux_impl {
             }
 
             if !src_is_dir {
+                let upper_src = self.upper_path(&src_rel);
+                let upper_dst = self.upper_path(&dst_rel);
+                if let (Ok(u_src_meta), Ok(u_dst_meta)) = (
+                    std::fs::symlink_metadata(&upper_src),
+                    std::fs::symlink_metadata(&upper_dst),
+                ) && u_src_meta.dev() == u_dst_meta.dev()
+                    && u_src_meta.ino() == u_dst_meta.ino()
+                {
+                    // POSIX: renaming two hardlinks pointing to the same inode is a no-op.
+                    reply.ok();
+                    return;
+                }
                 if let Err(e) = self.copy_up_entry(&mut inner, &src_rel, false) {
                     reply.error(e);
                     return;
@@ -2004,8 +2099,6 @@ mod linux_impl {
                     &dst_rel,
                     WHITEOUT_SUFFIX,
                 ));
-                let upper_src = self.upper_path(&src_rel);
-                let upper_dst = self.upper_path(&dst_rel);
                 if let Err(e) = std::fs::rename(&upper_src, &upper_dst) {
                     reply.error(errno_from_io(&e));
                     return;
@@ -2013,8 +2106,7 @@ mod linux_impl {
                 if resolve_in_lower_layers(&self.cfg, &src_rel).is_some()
                     && !lower_layers_blocked_at_dir(&self.cfg, &src_parent)
                 {
-                    let wh_path =
-                        marker_path(&self.cfg.whiteouts_dir(), &src_rel, WHITEOUT_SUFFIX);
+                    let wh_path = marker_path(&self.cfg.whiteouts_dir(), &src_rel, WHITEOUT_SUFFIX);
                     if let Err(e) = Self::write_marker(&wh_path) {
                         reply.error(e);
                         return;
@@ -2176,7 +2268,9 @@ mod linux_impl {
                 return;
             }
             match std::fs::symlink_metadata(&upper_new) {
-                Ok(meta) => reply.entry(&ZERO_TTL, &metadata_to_file_attr(ino, &meta), Generation(0)),
+                Ok(meta) => {
+                    reply.entry(&ZERO_TTL, &metadata_to_file_attr(ino, &meta), Generation(0))
+                }
                 Err(e) => reply.error(errno_from_io(&e)),
             }
         }
@@ -2415,9 +2509,8 @@ mod linux_impl {
                 return;
             }
             if !excl
-                && !trunc
                 && existed
-                && let Err(e) = self.copy_up_entry(&mut inner, &rel, false)
+                && let Err(e) = self.copy_up_entry(&mut inner, &rel, trunc)
             {
                 reply.error(e);
                 return;
@@ -2432,6 +2525,7 @@ mod linux_impl {
 
             let eff_mode = (mode & !umask) & 0o7777;
             let upper_path = self.upper_path(&rel);
+            let acc_mode = flags & libc::O_ACCMODE;
 
             let file = match OpenOptions::new()
                 .create(true)
@@ -2443,6 +2537,23 @@ mod linux_impl {
                 .open(&upper_path)
             {
                 Ok(f) => f,
+                Err(e)
+                    if existed
+                        && e.kind() == std::io::ErrorKind::PermissionDenied
+                        && acc_mode == libc::O_WRONLY =>
+                {
+                    match OpenOptions::new()
+                        .write(true)
+                        .truncate(trunc)
+                        .open(&upper_path)
+                    {
+                        Ok(f) => f,
+                        Err(err) => {
+                            reply.error(errno_from_io(&err));
+                            return;
+                        }
+                    }
+                }
                 Err(e) => {
                     reply.error(errno_from_io(&e));
                     return;
@@ -2580,7 +2691,8 @@ mod linux_impl {
             };
             drop(inner);
 
-            for (idx, (entry_ino, kind, name)) in snapshot.iter().enumerate().skip(offset as usize) {
+            for (idx, (entry_ino, kind, name)) in snapshot.iter().enumerate().skip(offset as usize)
+            {
                 let next_offset = (idx + 1) as u64;
                 if reply.add(*entry_ino, next_offset, *kind, name) {
                     break;
@@ -2599,6 +2711,44 @@ mod linux_impl {
         ) {
             let mut inner = self.state.lock().expect("vfsd lock poisoned");
             inner.open_dirs.remove(&fh);
+            reply.ok();
+        }
+
+        fn fsyncdir(
+            &self,
+            _req: &Request,
+            ino: INodeNo,
+            _fh: FileHandle,
+            datasync: bool,
+            reply: ReplyEmpty,
+        ) {
+            let upper_dir_path = {
+                let inner = self.state.lock().expect("vfsd lock poisoned");
+                let Ok(rel_dir) = inner.inodes.resolve_ino_path(ino) else {
+                    reply.error(Errno::ENOENT);
+                    return;
+                };
+                if resolve_rel_path(&self.cfg, &rel_dir).is_none() {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                self.upper_path(&rel_dir)
+            };
+            if let Ok(meta) = std::fs::symlink_metadata(&upper_dir_path)
+                && meta.file_type().is_dir()
+                && let Ok(dir_file) = File::open(&upper_dir_path)
+            {
+                let res = if datasync {
+                    dir_file.sync_data()
+                } else {
+                    dir_file.sync_all()
+                };
+                match res {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(errno_from_io(&e)),
+                }
+                return;
+            }
             reply.ok();
         }
 
@@ -2785,7 +2935,11 @@ mod tests {
         std::fs::write(cfg.upper_dir.join("tracked.txt"), b"edited").expect("write");
         std::fs::write(cfg.upper_dir.join("brand_new.txt"), b"hi").expect("write");
         std::fs::write(
-            marker_path(&cfg.whiteouts_dir(), Path::new("removed.txt"), WHITEOUT_SUFFIX),
+            marker_path(
+                &cfg.whiteouts_dir(),
+                Path::new("removed.txt"),
+                WHITEOUT_SUFFIX,
+            ),
             b"",
         )
         .expect("wh");
@@ -2875,5 +3029,57 @@ mod tests {
             .find(|e| e.name == "item_0001.txt")
             .expect("item_0001");
         assert_eq!(overridden.layer, LayerKind::Seed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mountinfo_parser_unescapes_spaces_tabs_and_filters_fuse_types() {
+        let sample = "\
+275 30 0:50 / /proc/sys/fs/binfmt_misc rw,relatime - binfmt_misc binfmt_misc rw\n\
+307 815 0:71 / /home/user/My\\040Repo.oz/ws\\011tab rw,nosuid - fuse.ozone ozone:ws rw\n\
+308 815 0:72 / /mnt/plain\\134dir rw - ext4 /dev/nvme0n1p1 rw\n\
+309 815 0:73 / /tmp/raw-fuse rw - fuse portal rw\n";
+
+        let parsed = parse_fuse_mountpoints_from_mountinfo(sample);
+        assert_eq!(
+            parsed,
+            vec![
+                PathBuf::from("/home/user/My Repo.oz/ws\ttab"),
+                PathBuf::from("/tmp/raw-fuse"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_copy_up_inode_table_and_lazy_unmount_non_mount_path_behave_cleanly() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = test_cfg(dir.path());
+        let base = cfg.baseline_dir.as_ref().expect("base");
+        std::fs::write(base.join("exec.sh"), b"#!/bin/sh\necho v1\n").expect("write exec");
+        std::fs::set_permissions(
+            base.join("exec.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        // Ensure copy-up + truncation preserves 0o755 executable permissions without touching baseline.
+        let fs = linux_impl::OzoneOverlayFs::new(cfg.clone());
+        fs.test_copy_up_entry(Path::new("exec.sh"), true)
+            .expect("copy_up truncate");
+        let upper_exec = cfg.upper_dir.join("exec.sh");
+        assert_eq!(std::fs::read(&upper_exec).expect("read upper"), b"");
+        let upper_mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&upper_exec).expect("meta").permissions(),
+        ) & 0o777;
+        assert_eq!(upper_mode, 0o755);
+        assert_eq!(
+            std::fs::read_to_string(base.join("exec.sh")).expect("base intact"),
+            "#!/bin/sh\necho v1\n"
+        );
+
+        // Verify lazy_unmount_fuse does not hang or panic on a non-existent path.
+        let missing = dir.path().join("not-a-mount");
+        lazy_unmount_fuse(&missing).expect("lazy unmount missing path");
     }
 }

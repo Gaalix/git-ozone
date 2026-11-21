@@ -38,6 +38,17 @@ do
   pass "bash -n ${script}"
 done
 
+# 1b. ShellCheck static analysis (if shellcheck is installed)
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck -x \
+    packaging/install.sh \
+    packaging/deb/build-deb.sh \
+    packaging/validate.sh
+  pass "shellcheck packaging/install.sh packaging/deb/build-deb.sh packaging/validate.sh"
+else
+  warn "shellcheck not installed; skipped ShellCheck lint (bash -n passed)"
+fi
+
 # 2. YAML syntax & cross-file consistency checks (workflows + winget manifests)
 python3 - <<'PY'
 import pathlib
@@ -214,6 +225,8 @@ fi
 
 # 4. PowerShell AST syntax check (if pwsh is installed)
 if command -v pwsh >/dev/null 2>&1; then
+  # PowerShell variables ($tokens, $errors) are intentionally single-quoted for pwsh.
+  # shellcheck disable=SC2016
   pwsh -NoLogo -NoProfile -Command '
     $tokens = $null
     $errors = $null

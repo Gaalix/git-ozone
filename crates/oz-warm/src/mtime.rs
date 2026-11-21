@@ -35,31 +35,38 @@ pub fn apply_baseline_mtimes(
     let kept = AtomicUsize::new(0);
     let missing = AtomicUsize::new(0);
 
-    entries.par_iter().try_for_each(|(rel_path, mtime_secs)| -> Result<()> {
-        if modified_or_added_paths.contains(*rel_path) {
-            kept.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-
-        let target_path = workspace_root.join(rel_path.as_str());
-        let meta = match std::fs::symlink_metadata(&target_path) {
-            Ok(m) => m,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                missing.fetch_add(1, Ordering::Relaxed);
+    entries
+        .par_iter()
+        .try_for_each(|(rel_path, mtime_secs)| -> Result<()> {
+            if modified_or_added_paths.contains(*rel_path) {
+                kept.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
-            Err(err) => return Err(OzError::Io(err)),
-        };
 
-        let ft = FileTime::from_unix_time(**mtime_secs, 0);
-        if meta.file_type().is_symlink() {
-            let _ = set_symlink_times_compat(&target_path, ft);
-        } else if meta.is_file() {
-            set_file_mtime_compat(&target_path, ft)?;
-        }
-        restored.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    })?;
+            let target_path = workspace_root.join(rel_path.as_str());
+            let meta = match std::fs::symlink_metadata(&target_path) {
+                Ok(m) => m,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    missing.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(err) => return Err(OzError::Io(err)),
+            };
+
+            let nanos = baseline
+                .file_mtimes_nanos
+                .get(*rel_path)
+                .copied()
+                .unwrap_or(0);
+            let ft = FileTime::from_unix_time(**mtime_secs, nanos);
+            if meta.file_type().is_symlink() {
+                let _ = set_symlink_times_compat(&target_path, ft);
+            } else if meta.is_file() {
+                set_file_mtime_compat(&target_path, ft)?;
+            }
+            restored.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })?;
 
     Ok(MtimeApplyStats {
         restored_files: restored.load(Ordering::Relaxed),
@@ -68,11 +75,9 @@ pub fn apply_baseline_mtimes(
     })
 }
 
-pub(crate) fn system_time_to_unix_secs(st: std::time::SystemTime) -> i64 {
-    match st.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(err) => -(err.duration().as_secs() as i64),
-    }
+pub(crate) fn metadata_modified_secs_nanos(meta: &std::fs::Metadata) -> (i64, u32) {
+    let ft = metadata_modified_filetime(meta);
+    (ft.unix_seconds(), ft.nanoseconds())
 }
 
 pub(crate) fn system_time_to_filetime(st: std::time::SystemTime) -> FileTime {
@@ -83,12 +88,6 @@ pub(crate) fn system_time_to_filetime(st: std::time::SystemTime) -> FileTime {
             FileTime::from_unix_time(-(d.as_secs() as i64), 0)
         }
     }
-}
-
-pub(crate) fn metadata_modified_unix_secs(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .map(system_time_to_unix_secs)
-        .unwrap_or(0)
 }
 
 pub(crate) fn metadata_modified_filetime(meta: &std::fs::Metadata) -> FileTime {

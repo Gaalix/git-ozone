@@ -28,6 +28,8 @@ OZ_BACKEND="auto"
 WORK_DIR=""
 OUTPUT_DIR="${SCRIPT_DIR}/results"
 SKIP_GIT_WARM_COPY=0
+WITH_WARM_BUILDS=0
+QUICK_MODE=0
 ONLY_SUITE=""
 VERIFY_CARGO_GATE=0
 
@@ -49,7 +51,8 @@ Overrides:
   --concurrency-agents N   Concurrent commit agent count (default: ${CONCURRENCY_AGENTS})
   --rounds R               Concurrent commit rounds (default: ${CONCURRENCY_ROUNDS})
   --skip-git-warm-copy     Skip copying warm caches for git worktrees
-  --only SUITE             Run only one suite: worktrees | status | vcbench | concurrency
+  --with-warm-builds       Also run Phase 5A warm incremental builds suite (bench_warm_builds.py)
+  --only SUITE             Run only one suite: worktrees | status | vcbench | concurrency | warm_builds
   --verify-cargo-gate      Also cross-verify VCBench against Rust m3_exit_gates test
   --oz-bin PATH            Explicit path to \`oz\` binary
   --vfsd-bin PATH          Explicit path to \`oz-vfsd\` binary
@@ -63,6 +66,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quick|--smoke)
+      QUICK_MODE=1
       AGENTS=5
       CACHE_MB=50
       SOURCE_FILES=100
@@ -74,6 +78,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --full)
+      QUICK_MODE=0
       AGENTS=20
       CACHE_MB=5000
       SOURCE_FILES=200
@@ -93,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --concurrency-agents) CONCURRENCY_AGENTS="$2"; shift 2 ;;
     --rounds) CONCURRENCY_ROUNDS="$2"; shift 2 ;;
     --skip-git-warm-copy) SKIP_GIT_WARM_COPY=1; shift ;;
+    --with-warm-builds) WITH_WARM_BUILDS=1; shift ;;
     --only) ONLY_SUITE="$2"; shift 2 ;;
     --verify-cargo-gate) VERIFY_CARGO_GATE=1; shift ;;
     --oz-bin) OZ_BIN="$2"; shift 2 ;;
@@ -181,8 +187,32 @@ if should_run "concurrency"; then
   REPORT_ARGS+=(--concurrency "${CC_JSON}")
 fi
 
+WARM_BUILDS_RAN=0
+if [[ "${WITH_WARM_BUILDS}" -eq 1 || "${ONLY_SUITE}" == "warm_builds" ]]; then
+  WARM_BUILDS_JSON="${OUTPUT_DIR}/warm_builds.json"
+  WARM_BUILDS_MD="${OUTPUT_DIR}/WARM_BUILDS.md"
+  WARM_ARGS=(
+    --oz-backend "${OZ_BACKEND}"
+    --output "${WARM_BUILDS_JSON}"
+    --markdown-out "${WARM_BUILDS_MD}"
+  )
+  if [[ "${QUICK_MODE}" -eq 1 ]]; then
+    WARM_ARGS+=(--quick)
+  fi
+  if [[ ${#COMMON_ARGS[@]} -gt 0 ]]; then
+    WARM_ARGS+=("${COMMON_ARGS[@]}")
+  fi
+  echo "==> [opt] Running Phase 5A Warm Builds Benchmark..." >&2
+  "${PYTHON}" "${SCRIPT_DIR}/bench_warm_builds.py" "${WARM_ARGS[@]}"
+  WARM_BUILDS_RAN=1
+fi
+
+if [[ "${ONLY_SUITE}" == "warm_builds" && "${WARM_BUILDS_RAN}" -eq 1 ]]; then
+  exit 0
+fi
+
 if [[ ${#REPORT_ARGS[@]} -eq 0 ]]; then
-  echo "ERROR: Invalid --only value '${ONLY_SUITE}'. Expected: worktrees | status | vcbench | concurrency" >&2
+  echo "ERROR: Invalid --only value '${ONLY_SUITE}'. Expected: worktrees | status | vcbench | concurrency | warm_builds" >&2
   exit 2
 fi
 

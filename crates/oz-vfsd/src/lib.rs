@@ -24,6 +24,8 @@ pub use client::{
     socket_path_for_git_dir, unmount_via_daemon,
 };
 pub use lookup::{OZ_VFSD_BIN_ENV, find_oz_vfsd_bin, resolve_oz_vfsd_bin_with, vfsd_binary_name};
+#[cfg(unix)]
+pub use overlay::is_fuse_mount_in_proc_mountinfo;
 pub use overlay::{
     LayerKind, MergedDirEntry, MountedOverlay, OPAQUE_SUFFIX, OverlayMountConfig, ResolvedEntry,
     WHITEOUT_SUFFIX, lazy_unmount_fuse, list_merged_dir_entries, mount_overlay, resolve_rel_path,

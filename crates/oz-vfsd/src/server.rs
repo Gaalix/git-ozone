@@ -3,17 +3,17 @@
 
 //! Local IPC server (`oz-vfsd`) managing CoW FUSE3 (Linux) and ProjFS (Windows) mounts.
 
-use crate::overlay::{
-    OverlayMountConfig, lazy_unmount_fuse, scan_dirty_paths,
-};
 #[cfg(not(target_os = "windows"))]
 use crate::overlay::{MountedOverlay, mount_overlay};
+use crate::overlay::{OverlayMountConfig, lazy_unmount_fuse, scan_dirty_paths};
 #[cfg(target_os = "windows")]
 use crate::projfs::{MountedProjFs, mount_projfs};
 use crate::protocol::{MountInfo, MountSpec, VfsRequest, VfsResponse, encode_line};
 use chrono::Utc;
 use fs4::{FileExt as Fs4FileExt, TryLockError};
-use oz_core::{BackendKind, MountRecord, OzError, OzoneConfig, OzoneLayout, Result, WorkspaceState};
+use oz_core::{
+    BackendKind, MountRecord, OzError, OzoneConfig, OzoneLayout, Result, WorkspaceState,
+};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -88,6 +88,19 @@ struct ActiveMount {
 }
 
 impl ActiveMount {
+    fn is_healthy(&self) -> bool {
+        if std::fs::symlink_metadata(&self.spec.mount_point).is_err() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if self.backend == BackendKind::LinuxFuse3
+            && !crate::overlay::is_fuse_mount_in_proc_mountinfo(&self.spec.mount_point)
+        {
+            return false;
+        }
+        true
+    }
+
     fn info(&self) -> MountInfo {
         let dirty_count = scan_dirty_paths(self.mounted.config()).map_or(0, |v| v.len());
         MountInfo {
@@ -95,7 +108,7 @@ impl ActiveMount {
             branch: self.spec.branch.clone(),
             mount_point: self.spec.mount_point.clone(),
             upper_dir: self.spec.upper_dir.clone(),
-            mounted: true,
+            mounted: self.is_healthy(),
             dirty_count,
         }
     }
@@ -143,12 +156,7 @@ impl DaemonManager {
         Ok(())
     }
 
-    fn persist_mount_state(
-        &mut self,
-        spec: &MountSpec,
-        backend: BackendKind,
-        mounted_flag: bool,
-    ) {
+    fn persist_mount_state(&mut self, spec: &MountSpec, backend: BackendKind, mounted_flag: bool) {
         let ws_dir = if !spec.git_dir.as_os_str().is_empty() {
             spec.git_dir.join("ozone").join("ws").join(&spec.workspace)
         } else if let Some(parent) = spec.meta_dir.parent() {
@@ -208,11 +216,11 @@ impl DaemonManager {
     }
 
     fn mount_workspace(&mut self, spec: MountSpec) -> Result<MountInfo> {
-        if let Some(existing) = self.mounts.get(&spec.workspace) {
-            let healthy = std::fs::symlink_metadata(&existing.spec.mount_point).is_ok();
-            if healthy && existing.spec == spec {
-                return Ok(existing.info());
-            }
+        if let Some(existing) = self.mounts.get(&spec.workspace)
+            && existing.is_healthy()
+            && existing.spec == spec
+        {
+            return Ok(existing.info());
         }
         if let Some(old) = self.mounts.remove(&spec.workspace) {
             let _ = old.mounted.unmount(true);
@@ -233,7 +241,27 @@ impl DaemonManager {
 
     fn unmount_workspace(&mut self, workspace: &str, force: bool) -> Result<()> {
         if let Some(active) = self.mounts.remove(workspace) {
-            active.mounted.unmount(force)?;
+            let mp = active.spec.mount_point.clone();
+            let backend = active.backend;
+            if let Err(err) = active.mounted.unmount(force) {
+                #[cfg(target_os = "linux")]
+                if !force
+                    && backend == BackendKind::LinuxFuse3
+                    && !crate::overlay::is_fuse_mount_in_proc_mountinfo(&mp)
+                    && std::fs::symlink_metadata(&mp)
+                        .err()
+                        .is_none_or(|e| !oz_core::is_enotconn(&e))
+                {
+                    // Mount was already detached externally; still finalize mount.json state.
+                } else {
+                    return Err(err);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (mp, backend);
+                    return Err(err);
+                }
+            }
         } else {
             let mount_json = self.ws_dir(workspace).join("mount.json");
             if let Ok(raw) = std::fs::read_to_string(&mount_json)
@@ -242,7 +270,17 @@ impl DaemonManager {
                 let needs_lazy = force
                     || std::fs::symlink_metadata(&record.mount_point)
                         .err()
-                        .is_some_and(|e| oz_core::is_enotconn(&e));
+                        .is_some_and(|e| oz_core::is_enotconn(&e))
+                    || {
+                        #[cfg(unix)]
+                        {
+                            crate::overlay::is_fuse_mount_in_proc_mountinfo(&record.mount_point)
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            false
+                        }
+                    };
                 if needs_lazy {
                     lazy_unmount_fuse(&record.mount_point)?;
                 }
@@ -302,9 +340,20 @@ impl DaemonManager {
             }
 
             let spec = load_or_reconstruct_spec(&self.git_dir, &ws_dir, &record);
-            if let Err(err) = std::fs::symlink_metadata(&spec.mount_point)
-                && oz_core::is_enotconn(&err)
-            {
+            let stale_enotconn = std::fs::symlink_metadata(&spec.mount_point)
+                .err()
+                .is_some_and(|err| oz_core::is_enotconn(&err));
+            let in_mountinfo = {
+                #[cfg(unix)]
+                {
+                    crate::overlay::is_fuse_mount_in_proc_mountinfo(&spec.mount_point)
+                }
+                #[cfg(not(unix))]
+                {
+                    false
+                }
+            };
+            if stale_enotconn || in_mountinfo {
                 let _ = lazy_unmount_fuse(&spec.mount_point);
             }
 
@@ -557,7 +606,11 @@ mod unix_signal {
         fn drop(&mut self) {
             SIGNAL_WAKEUP_FD.store(-1, Ordering::SeqCst);
             unsafe {
-                libc::sigaction(libc::SIGTERM, &raw const self.prev_term, std::ptr::null_mut());
+                libc::sigaction(
+                    libc::SIGTERM,
+                    &raw const self.prev_term,
+                    std::ptr::null_mut(),
+                );
                 libc::sigaction(libc::SIGINT, &raw const self.prev_int, std::ptr::null_mut());
             }
         }
@@ -582,7 +635,7 @@ async fn prepare_daemon_runtime(
 
     let lock_file = acquire_daemon_lock(git_dir)?;
 
-    if socket_path.exists() {
+    if std::fs::symlink_metadata(socket_path).is_ok() {
         let _ = std::fs::remove_file(socket_path);
     }
 
@@ -596,7 +649,9 @@ async fn prepare_daemon_runtime(
     {
         let mgr = Arc::clone(&manager);
         tokio::task::spawn_blocking(move || {
-            mgr.lock().expect("daemon lock poisoned").restore_mounts_on_startup();
+            mgr.lock()
+                .expect("daemon lock poisoned")
+                .restore_mounts_on_startup();
         })
         .await
         .map_err(|e| OzError::Other(format!("startup restore panicked: {e}")))?;
@@ -624,16 +679,16 @@ fn handle_request_concurrent(
         let spec = *spec;
         let old_mount = {
             let mut guard = manager.lock().expect("daemon lock poisoned");
-            if let Some(existing) = guard.mounts.get(&spec.workspace) {
-                let healthy = std::fs::symlink_metadata(&existing.spec.mount_point).is_ok();
-                if healthy && existing.spec == spec {
-                    return (
-                        VfsResponse::Mounted {
-                            mount: existing.info(),
-                        },
-                        false,
-                    );
-                }
+            if let Some(existing) = guard.mounts.get(&spec.workspace)
+                && existing.is_healthy()
+                && existing.spec == spec
+            {
+                return (
+                    VfsResponse::Mounted {
+                        mount: existing.info(),
+                    },
+                    false,
+                );
             }
             guard.mounts.remove(&spec.workspace)
         };
@@ -718,10 +773,9 @@ async fn serve_ipc_stream<S>(
                     }
                 };
                 let mgr_call = Arc::clone(&manager);
-                let call_res = tokio::task::spawn_blocking(move || {
-                    handle_request_concurrent(&mgr_call, req)
-                })
-                .await;
+                let call_res =
+                    tokio::task::spawn_blocking(move || handle_request_concurrent(&mgr_call, req))
+                        .await;
 
                 let (resp, should_shutdown) = match call_res {
                     Ok(pair) => pair,
