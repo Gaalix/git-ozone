@@ -111,30 +111,30 @@ oz blame crates/auth/src/token.rs --json`,
     }
   };
 
-  // Real v1.0.0 release benchmark results measured from `benchmarks/results/latest.json`
-  // (commit 3a240f354701, 2026-11-18T22:36:15Z, AMD Ryzen 9 7900X, Ubuntu Linux 7.3.0 ext4,
-  // oz 1.0.0 vs git 2.55.0, --oz-backend cas_hardlink under NoNewPrivs: 1).
+  // Real v1.0.0 full-gate benchmark results measured from `benchmarks/results/latest.json`
+  // (commit 4690cbee08b2, 2026-11-21T21:51:45Z, AMD Ryzen 9 7900X, Ubuntu Linux 7.3.0 ext4,
+  // live linux_fuse3 via fusermount3 3.18.3, oz 1.0.0 vs git 2.55.0, jj 0.47.1, worktrunk 0.83.0).
   const BENCHMARK_DATA = window.OZONE_BENCHMARKS || {
     measured: true,
     environment:
-      "AMD Ryzen 9 7900X (24 logical cores, 61.39 GiB RAM) · Ubuntu Linux 7.3.0 (ext4) · oz 1.0.0 vs git 2.55.0 · --oz-backend cas_hardlink under NoNewPrivs: 1 (reproduce 5 GB FUSE3/CoW on host shell with ./benchmarks/run_all.sh --full).",
+      "AMD Ryzen 9 7900X (24 logical cores, 61.39 GiB RAM) · Ubuntu Linux 7.3.0 (ext4, live linux_fuse3) · oz 1.0.0 vs git 2.55.0, jj 0.47.1 & worktrunk 0.83.0 · 7/7 ROADMAP gates PASS (./benchmarks/run_all.sh --full).",
     suites: [
       {
-        title: "20-Agent Worktree Spawn & Disk (512 MiB Cache)",
-        target: "5.6x faster · 19.7x less disk",
+        title: "20-Agent Worktree Spawn & Disk (5 GB Cache)",
+        target: "51.2x faster · 54,404x less disk",
         metrics: [
-          { label: "oz ws spawn (cas_hardlink, warm)", value: "941.1 ms total · 43.5 ms p50/ws" },
-          { label: "git worktree + warm copy (vs cold raw)", value: "5.28 s (261.8 ms p50) · cold: 245.4 ms" },
-          { label: "Extra disk (oz total / ws-only vs git)", value: "529.11 MiB / 720 KiB vs 10.16 GiB" }
+          { label: "oz ws spawn (linux_fuse3, warm 20/20)", value: "444.5 ms total · 19.8 ms p50/ws" },
+          { label: "git warm copy · jj (cold) · wt (cold)", value: "22.78 s · 2.61 s · 567.8 ms (cold git: 243.9 ms)" },
+          { label: "Extra physical disk (oz vs git warm / cold)", value: "1.84 MiB (97.67 GiB app.) vs 97.96 GiB / 17.03 MiB" }
         ]
       },
       {
         title: "250k-File Monorepo Status (100% Parity)",
-        target: "1.19x–1.22x faster (regular repo)",
+        target: "30.2x faster vs git · 15.8x vs jj",
         metrics: [
-          { label: "oz status --json (regular repo, dirty/clean)", value: "117.0 ms / 112.4 ms p50" },
-          { label: "git status --porcelain (dirty/clean)", value: "139.4 ms / 137.5 ms p50" },
-          { label: "oz ws cas_hardlink (full walk, no FUSE3)", value: "226.5 ms dirty p50 (host FUSE3: O(dirty))" }
+          { label: "oz status --json (oz ws linux_fuse3)", value: "4.4 ms dirty · 3.3 ms clean p50" },
+          { label: "oz status --json (regular repo, dirty/clean)", value: "118.3 ms / 117.4 ms p50" },
+          { label: "git status --porcelain · jj status (dirty)", value: "132.1 ms · 69.6 ms p50" }
         ]
       },
       {
@@ -143,15 +143,15 @@ oz blame crates/auth/src/token.rs --json`,
         metrics: [
           { label: "Total non-interactive commands", value: "16 oz vs 50 git (-68.0%)" },
           { label: "Approx / lexical token overhead", value: "1,163 vs 4,257 (-72.7%) · lex -69.7%" },
-          { label: "Local CLI wall time & tree parity", value: "136.3 ms vs 85.8 ms · 4/4 fsck PASS" }
+          { label: "Local CLI wall time & tree parity", value: "142.1 ms vs 83.6 ms · 4/4 fsck PASS" }
         ]
       },
       {
         title: "10-Agent Concurrent Commits (30 Ops)",
         target: "0% lock errors · git fsck PASS",
         metrics: [
-          { label: "Distinct-branch commits (+ pack-refs)", value: "oz 0% (305–322 c/s) · git 0% (1,052–1,268 c/s)" },
-          { label: "Shared-worktree .git/index.lock contention", value: "oz 0/30 (0.0%) vs git add 20/30 (66.7%)" },
+          { label: "Distinct-branch commits (+ pack-refs)", value: "oz 0% (389–496 c/s) · git 0% (1,043–1,131 c/s)" },
+          { label: "Shared-worktree .git/index.lock contention", value: "oz 0/30 (0.0%) vs git add 22/30 (73.3%)" },
           { label: "Integrity verification", value: "30/30 refs + git fsck --full PASS" }
         ]
       }

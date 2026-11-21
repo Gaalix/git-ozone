@@ -184,19 +184,19 @@ All edits on FUSE3/ProjFS workspaces persist immediately on real host disk in `.
 
 ---
 
-## Measured v1.0.0 Release Benchmarks
+## Measured v1.0.0 Release Benchmarks (7/7 ROADMAP Gates PASS)
 
-Measured on **AMD Ryzen 9 7900X** (24 logical cores, `61.39 GiB` RAM), Ubuntu Linux `7.3.0-10-generic` (`ext4` NVMe), comparing release `oz 1.0.0` vs. `git 2.55.0` (commit `3a240f354701`). Because the release runner executes inside a `NoNewPrivs: 1` sandbox (blocking setuid `/usr/bin/fusermount3`), worktree and workspace-status suites ran on Ozone's zero-privilege `cas_hardlink` tier; reproduce the full 5 GB FUSE3 / native CoW run on a standard host shell (`NoNewPrivs: 0`) with `./benchmarks/run_all.sh --full`.
+Measured via `./benchmarks/run_all.sh --full` on **AMD Ryzen 9 7900X** (24 logical cores, `61.39 GiB` RAM), Ubuntu Linux `7.3.0-10-generic` (`ext4` NVMe, live unprivileged `linux_fuse3` via `fusermount3 3.18.3`), comparing release `oz 1.0.0` vs. `git 2.55.0`, `jj 0.47.1`, and `worktrunk 0.83.0` (commit `4690cbee08b2`).
 
-| Benchmark | C `git 2.55.0` | Ozone `oz 1.0.0` (`cas_hardlink`) | Result |
-| :--- | :---: | :---: | :--- |
-| **20-Agent Warm Worktree Spawn** (`512 MiB` cache) | `5.28 s` (`261.8 ms` p50/ws) | **`941.1 ms` (`43.5 ms` p50/ws)** | **5.6x faster** *(raw cold `git worktree`: `245.4 ms`)* |
-| **20-Agent Extra Disk Footprint** (`512 MiB` cache) | `10.16 GiB` | **`529.11 MiB` total** (`720.0 KiB` ws-only) | **19.7x less disk** *(1x `ext4` baseline copy; `< 50 MiB` on FUSE3/CoW)* |
-| **250k-File Monorepo `status`** (regular repo, dirty p50) | `139.4 ms` *(clean `137.5 ms`)* | **`117.0 ms`** *(clean **`112.4 ms`**)* | **1.19x–1.22x faster** *(`cas_hardlink` ws walk: `226.5 ms`; FUSE3 hits `O(dirty)`)* |
-| **Agent VCBench** (4 canonical tasks, 100% tree parity) | `50` cmds · `4,257` tok~ | **`16` cmds · `1,163` tok~** | **-68.0% commands**, **-72.7% tokens** (`-69.7%` lexical) |
-| **10-Agent Concurrent Commits** (distinct / shared `.git/index`) | `0%` distinct / **`66.7%` (`20/30`)** shared | **`0.0%` lock errors (`0/30`)** | **Zero `.git/index.lock` errors** (`git fsck` PASS) |
+| Benchmark | C `git 2.55.0` | `jj 0.47.1` / `wt 0.83.0` | Ozone `oz 1.0.0` (`linux_fuse3`) | Result |
+| :--- | :---: | :---: | :---: | :--- |
+| **20-Agent Warm Worktree Spawn** (`5,000 MiB` cache) | `22.78 s` (`1.11 s` p50) *(cold: `243.9 ms`)* | `jj` `2.61 s` · `wt` `567.8 ms` *(cold)* | **`444.5 ms` (`19.8 ms` p50/ws)** | **51.2x faster** than warm `git`; faster than cold `jj` & `wt` |
+| **20-Agent Extra Disk Footprint** (`5,000 MiB` cache) | `97.96 GiB` *(cold: `17.03 MiB`)* | `jj` `16.72 MiB` · `wt` `20.79 MiB` *(cold)* | **`1.84 MiB`** (`97.67 GiB` apparent) | **~54,404x less disk** than warm `git` (`9.3x` less than cold `git`) |
+| **250k-File Monorepo `status`** (dirty warm p50) | `132.1 ms` *(clean `136.8 ms`)* | `jj` `69.6 ms` | **`4.4 ms`** (`oz ws`) · `118.3 ms` (regular) | **30.2x faster** than `git`, **15.8x faster** than `jj` |
+| **Agent VCBench** (4 canonical tasks, 100% tree parity) | `50` cmds · `4,257` tok~ | — | **`16` cmds · `1,163` tok~** | **-68.0% commands**, **-72.7% tokens** (`-69.7%` lexical) |
+| **10-Agent Concurrent Commits** (distinct / shared `.git/index`) | `0%` distinct / **`73.3%` (`22/30`)** shared | — | **`0.0%` lock errors (`0/30`)** | **Zero `.git/index.lock` errors** (`git fsck` PASS) |
 
-*Honest trade-offs:* If your repo has no build caches at all, raw cold `git worktree add` (`245.4 ms` / `12.3 ms` per ws) is faster than warm `oz ws spawn` (`941.1 ms` incl. baseline capture), and C `git` has higher raw throughput on tiny distinct-branch commits (`1,051.8 c/s` vs `305.0 c/s` due to MVCC OpLog journaling). See **[docs/benchmarks.md](docs/benchmarks.md)** for full per-suite tables, methodology, and reproduction commands.
+*Honest trade-offs:* If your repo has no build caches at all, raw cold `git worktree add` (`243.9 ms` / `12.2 ms` per ws) is faster than warm `oz ws spawn` (`444.5 ms` incl. `79.7 ms` baseline capture), and C `git` has higher raw throughput on tiny 1-file distinct-branch commits (`1,131.2 c/s` vs `496.0 c/s` due to MVCC OpLog journaling). See **[docs/benchmarks.md](docs/benchmarks.md)** for full per-suite tables, methodology, and reproduction commands.
 
 ---
 
