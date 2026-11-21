@@ -37,6 +37,8 @@ pub fn is_builtin_subcommand(name: &str) -> bool {
             | "blame"
             | "setup"
             | "doctor"
+            | "gc"
+            | "fsck"
             | "version"
             | "git"
             | "log"
@@ -121,6 +123,8 @@ fn should_expand_ci_alias(tail: &[OsString], configured: Option<&str>) -> bool {
                 | "--signing-key"
                 | "--amend"
                 | "--no-edit"
+                | "-n"
+                | "--no-verify"
         ) || s.starts_with("-m")
             || s.starts_with("--message=")
             || s.starts_with("--signing-key=")
@@ -387,6 +391,26 @@ mod tests {
         assert_eq!(
             expand_aliases_with_map(os(&["oz", "br", "--json"]), &map).unwrap(),
             os(&["oz", "branch", "--json"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "ci", "-n", "-m", "feat: skip", "--json"]), &map)
+                .unwrap(),
+            os(&["oz", "commit", "-n", "-m", "feat: skip", "--json"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "ci", "--no-verify"]), &map).unwrap(),
+            os(&["oz", "commit", "--no-verify"])
+        );
+        let mut shadowed = map.clone();
+        shadowed.insert("gc".to_string(), "log".to_string());
+        shadowed.insert("fsck".to_string(), "status".to_string());
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "gc", "--dry-run"]), &shadowed).unwrap(),
+            os(&["oz", "gc", "--dry-run"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "fsck", "--json"]), &shadowed).unwrap(),
+            os(&["oz", "fsck", "--json"])
         );
     }
 }
