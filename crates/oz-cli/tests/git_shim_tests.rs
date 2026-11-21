@@ -1306,3 +1306,397 @@ fn m3_git_commit_agent_provenance_notes() {
     assert_eq!(env_note["model"], "claude-sonnet-4-6");
     assert_eq!(env_note["line_ranges"][0]["path"], "env_agent.rs");
 }
+
+#[test]
+fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let sub_src = tmp.path().join("sub");
+    fs::create_dir_all(&sub_src).unwrap();
+    sys_git(&sub_src, &["init", "-b", "main"]);
+    fs::write(sub_src.join("s.txt"), "sub1\n").unwrap();
+    sys_git(&sub_src, &["add", "."]);
+    sys_git(&sub_src, &["commit", "-m", "s1"]);
+    fs::write(sub_src.join("s.txt"), "sub2\n").unwrap();
+    sys_git(&sub_src, &["add", "."]);
+    sys_git(&sub_src, &["commit", "-m", "s2"]);
+    let sub_v2 = sys_git(&sub_src, &["rev-parse", "HEAD"]).trim().to_string();
+    sys_git(&sub_src, &["checkout", "-q", "HEAD~1"]);
+    let sub_v1 = sys_git(&sub_src, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let repo_dir = tmp.path().join("repo");
+    let head_oid = init_repo(&repo_dir);
+    fs::write(repo_dir.join(".gitignore"), "*.log\n").unwrap();
+    fs::write(repo_dir.join("tracked.txt"), "line1\n").unwrap();
+    sys_git(&repo_dir, &["add", ".gitignore", "tracked.txt"]);
+    sys_git(
+        &repo_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_src.to_str().unwrap(),
+            "deps/sub",
+        ],
+    );
+    sys_git(&repo_dir, &["commit", "-m", "add tracked + submodule"]);
+    let head_oid2 = sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(head_oid, head_oid2);
+
+    // Dirty tracked file, staged file via `oz git add`, untracked file, ignored file, and bumped submodule
+    fs::write(repo_dir.join("tracked.txt"), "line1\nline2\n").unwrap();
+    fs::write(repo_dir.join("staged.txt"), "staged\n").unwrap();
+    assert_eq!(run_oz(&repo_dir, &["git", "add", "staged.txt"], &[]).code, 0);
+    fs::write(repo_dir.join("untracked.txt"), "untracked\n").unwrap();
+    fs::write(repo_dir.join("debug.log"), "ignored\n").unwrap();
+    sys_git(&repo_dir, &["-C", "deps/sub", "checkout", "-q", &sub_v2]);
+
+    // 1. VS Code / JetBrains / lazygit `status --porcelain=v2 --branch -z --no-optional-locks`
+    let st_v2 = run_oz(
+        &repo_dir,
+        &[
+            "git",
+            "--no-optional-locks",
+            "-c",
+            "core.quotepath=false",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+        ],
+        &[],
+    );
+    assert_eq!(st_v2.code, 0, "stderr={}", st_v2.stderr);
+    let recs: Vec<&str> = st_v2.stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    assert!(
+        recs.contains(&format!("# branch.oid {head_oid2}").as_str()),
+        "recs={recs:?}"
+    );
+    assert!(recs.contains(&"# branch.head main"), "recs={recs:?}");
+    assert!(
+        recs.iter()
+            .any(|r| r.starts_with("1 .M N...") && r.ends_with(" tracked.txt")),
+        "recs={recs:?}"
+    );
+    assert!(
+        recs.iter()
+            .any(|r| r.starts_with("1 .M S... 160000 160000 160000") && r.ends_with(" deps/sub")),
+        "recs={recs:?}"
+    );
+    assert!(recs.contains(&"1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 staged.txt"), "recs={recs:?}");
+    assert!(recs.contains(&"? untracked.txt"), "recs={recs:?}");
+    assert!(!recs.iter().any(|r| r.contains("debug.log")), "recs={recs:?}");
+
+    // 2. `--porcelain --null` (v1 NUL-terminated)
+    let st_v1z = run_oz(&repo_dir, &["git", "status", "--porcelain", "--null"], &[]);
+    assert_eq!(st_v1z.code, 0);
+    let v1_recs: Vec<&str> = st_v1z.stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    assert!(v1_recs.contains(&" M tracked.txt"), "{v1_recs:?}");
+    assert!(v1_recs.contains(&"A  staged.txt"), "{v1_recs:?}");
+    assert!(v1_recs.contains(&"?? untracked.txt"), "{v1_recs:?}");
+
+    // 3. `oz git diff --numstat -z`, `--shortstat`, `--quiet`, `--ignore-submodules=all`
+    let diff_num = run_oz(
+        &repo_dir,
+        &["git", "diff", "--numstat", "-z", "--ignore-submodules=all"],
+        &[],
+    );
+    assert_eq!(diff_num.code, 0);
+    let d_recs: Vec<&str> = diff_num.stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    assert!(d_recs.contains(&"1\t0\ttracked.txt"), "{d_recs:?}");
+    assert!(!d_recs.iter().any(|r| r.contains("deps/sub")), "{d_recs:?}");
+
+    let diff_short = run_oz(&repo_dir, &["git", "diff", "--shortstat"], &[]);
+    assert_eq!(diff_short.code, 0);
+    assert!(diff_short.stdout.contains("changed,"), "{}", diff_short.stdout);
+
+    let diff_quiet = run_oz(&repo_dir, &["git", "diff", "--quiet"], &[]);
+    assert_eq!(diff_quiet.code, 1);
+    assert!(diff_quiet.stdout.is_empty());
+
+    // 4. `rev-parse`, `ls-files -z`, `check-ignore` (exit codes + piped `--stdin -z`)
+    let rp_top = run_oz(
+        &repo_dir,
+        &["git", "--no-optional-locks", "rev-parse", "--show-toplevel"],
+        &[],
+    );
+    assert_eq!(rp_top.code, 0);
+    assert_eq!(rp_top.stdout.trim(), repo_dir.to_string_lossy());
+
+    let rp_bad = run_oz(
+        &repo_dir,
+        &["git", "rev-parse", "--verify", "refs/heads/does-not-exist"],
+        &[],
+    );
+    assert_eq!(rp_bad.code, 2);
+
+    let ls_z = run_oz(&repo_dir, &["git", "ls-files", "-z"], &[]);
+    assert_eq!(ls_z.code, 0);
+    let ls_items: Vec<&str> = ls_z.stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    assert!(ls_items.contains(&"tracked.txt"), "{ls_items:?}");
+    assert!(ls_items.contains(&"deps/sub"), "{ls_items:?}");
+
+    let ci_hit = run_oz(&repo_dir, &["git", "check-ignore", "debug.log"], &[]);
+    assert_eq!(ci_hit.code, 0);
+    assert_eq!(ci_hit.stdout.trim(), "debug.log");
+
+    let ci_miss = run_oz(&repo_dir, &["git", "check-ignore", "tracked.txt"], &[]);
+    assert_eq!(ci_miss.code, 1);
+
+    let ci_miss_json = run_oz(
+        &repo_dir,
+        &["git", "--json", "check-ignore", "tracked.txt"],
+        &[],
+    );
+    assert_eq!(ci_miss_json.code, 1);
+    assert_eq!(
+        ci_miss_json.json.unwrap()["error"]["code"],
+        "check_failed"
+    );
+
+    // Piped stdin to `oz git check-ignore -z --stdin` MUST pass stdin cleanly even when non-TTY
+    let mut child = Command::new(oz_bin())
+        .args(["git", "check-ignore", "-z", "--stdin"])
+        .current_dir(&repo_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"debug.log\0tracked.txt\0")
+        .unwrap();
+    let piped_out = child.wait_with_output().unwrap();
+    assert_eq!(piped_out.status.code(), Some(0));
+    assert_eq!(piped_out.stdout, b"debug.log\0");
+
+    let _ = sub_v1;
+}
+
+#[test]
+fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let bare = tmp.path().join("remote.git");
+    fs::create_dir_all(&bare).unwrap();
+    sys_git(&bare, &["init", "--bare", "-b", "main"]);
+
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir);
+    sys_git(&repo_dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    sys_git(&repo_dir, &["push", "-u", "origin", "main"]);
+
+    let husky_dir = repo_dir.join(".husky/_");
+    fs::create_dir_all(&husky_dir).unwrap();
+    sys_git(&repo_dir, &["config", "core.hooksPath", ".husky/_"]);
+
+    let pre_commit = husky_dir.join("pre-commit");
+    fs::write(&pre_commit, "#!/bin/sh\necho 'bad lint' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&pre_commit, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pre_push = husky_dir.join("pre-push");
+    fs::write(&pre_push, "#!/bin/sh\necho 'push gate failed' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&pre_push, fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::write(repo_dir.join("feat.txt"), "hello\n").unwrap();
+
+    // 1. `oz commit --json` fails with exit code 1 + structured `oz.v1` `check_failed`
+    let c_fail = run_oz(&repo_dir, &["commit", "-m", "feat: fail", "--json"], &[]);
+    assert_eq!(c_fail.code, 1, "stdout={}", c_fail.stdout);
+    let c_json = c_fail.json.expect("json envelope");
+    assert_eq!(c_json["schema"], OZ_SCHEMA_V1);
+    assert_eq!(c_json["ok"], false);
+    assert_eq!(c_json["error"]["code"], "check_failed");
+    assert!(
+        c_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bad lint")
+    );
+
+    // 2. `oz commit --no-verify --json` succeeds
+    let c_ok = run_oz(
+        &repo_dir,
+        &["commit", "--no-verify", "-m", "feat: bypass", "--json"],
+        &[],
+    );
+    assert_eq!(c_ok.code, 0, "stdout={} stderr={}", c_ok.stdout, c_ok.stderr);
+
+    // 3. `oz git -nm "..."` honors combined `-n` bypass on shim
+    fs::write(repo_dir.join("feat2.txt"), "two\n").unwrap();
+    let shim_ok = run_oz(&repo_dir, &["git", "commit", "-nm", "feat: shim -n"], &[]);
+    assert_eq!(shim_ok.code, 0, "stderr={}", shim_ok.stderr);
+
+    // 4. `oz push --json` fails with exit code 1 + `check_failed`
+    let p_fail = run_oz(&repo_dir, &["push", "origin", "main", "--json"], &[]);
+    assert_eq!(p_fail.code, 1, "stdout={}", p_fail.stdout);
+    let p_json = p_fail.json.expect("push json envelope");
+    assert_eq!(p_json["schema"], OZ_SCHEMA_V1);
+    assert_eq!(p_json["ok"], false);
+    assert_eq!(p_json["error"]["code"], "check_failed");
+    assert!(
+        p_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("push gate failed")
+    );
+
+    // 5. `oz push --no-verify --json` and `oz git push --no-verify` bypass pre-push cleanly
+    let p_ok = run_oz(
+        &repo_dir,
+        &["push", "origin", "main", "--no-verify", "--json"],
+        &[],
+    );
+    assert_eq!(p_ok.code, 0, "stdout={} stderr={}", p_ok.stdout, p_ok.stderr);
+    let head_local = sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        sys_git(&bare, &["rev-parse", "refs/heads/main"]).trim(),
+        head_local
+    );
+}
+
+#[test]
+fn oz_clone_and_push_enterprise_ssh_config_and_insteadof_e2e() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let fake_home = tmp.path().join("home");
+    let fake_bin = tmp.path().join("bin");
+    let fetch_bare = tmp.path().join("fetch_origin.git");
+    let push_bare = tmp.path().join("push_origin.git");
+    let work_parent = fake_home.join("work");
+    fs::create_dir_all(fake_home.join(".ssh")).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&fetch_bare).unwrap();
+    fs::create_dir_all(&push_bare).unwrap();
+    fs::create_dir_all(&work_parent).unwrap();
+
+    sys_git(&fetch_bare, &["init", "--bare", "-b", "main"]);
+    sys_git(&push_bare, &["init", "--bare", "-b", "main"]);
+    let seed = tmp.path().join("seed");
+    init_repo(&seed);
+    sys_git(&seed, &["push", fetch_bare.to_str().unwrap(), "main"]);
+    sys_git(&seed, &["push", push_bare.to_str().unwrap(), "main"]);
+
+    let ssh_log = tmp.path().join("ssh_invocations.log");
+    let fake_key = fake_home.join(".ssh/id_enterprise");
+    fs::write(&fake_key, "dummy-key\n").unwrap();
+
+    fs::write(
+        fake_home.join(".ssh/config"),
+        "Host corp-fetch\n\
+             HostName 127.0.0.1\n\
+             User fetchuser\n\
+             Port 2222\n\
+             IdentityFile ~/.ssh/id_enterprise\n\
+             IdentitiesOnly yes\n\
+             ProxyJump jumpbox.corp.internal\n\
+         Host corp-push\n\
+             HostName 127.0.0.1\n\
+             User pushuser\n\
+             Port 2223\n\
+             IdentityFile ~/.ssh/id_enterprise\n",
+    )
+    .unwrap();
+
+    let work_inc = fake_home.join("work.gitconfig");
+    fs::write(&work_inc, "[user]\n\temail = corp@enterprise.test\n").unwrap();
+    fs::write(
+        fake_home.join(".gitconfig"),
+        format!(
+            "[user]\n\tname = Enterprise User\n\temail = personal@example.com\n\
+             [url \"ssh://corp-fetch/\"]\n\tinsteadOf = \"gh:\"\n\
+             [url \"ssh://corp-push/\"]\n\tpushInsteadOf = \"gh:\"\n\
+             [includeIf \"gitdir:~/work/\"]\n\tpath = {}\n",
+            work_inc.display()
+        ),
+    )
+    .unwrap();
+
+    // Fake `ssh` wrapper verifying all SSH config CLI flags + agent env and routing to local bare repos
+    let ssh_wrapper = fake_bin.join("ssh");
+    fs::write(
+        &ssh_wrapper,
+        format!(
+            "#!/bin/sh\n\
+             printf 'SOCK=%s ARGS=%s\\n' \"$SSH_AUTH_SOCK\" \"$*\" >> '{}'\n\
+             op=\"\"\n\
+             case \"$*\" in\n\
+               *\"git-upload-pack\"*) op=\"git-upload-pack\" ;;\n\
+               *\"git-receive-pack\"*) op=\"git-receive-pack\" ;;\n\
+               *) echo \"unexpected op: $*\" >&2; exit 1 ;;\n\
+             esac\n\
+             case \"$*\" in\n\
+               *\"corp-fetch\"*) target=\"{}\" ;;\n\
+               *\"corp-push\"*) target=\"{}\" ;;\n\
+               *) echo \"unexpected host args: $*\" >&2; exit 1 ;;\n\
+             esac\n\
+             exec \"$op\" \"$target\"\n",
+            ssh_log.display(),
+            fetch_bare.display(),
+            push_bare.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh_wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let custom_path = format!("{}:{orig_path}", fake_bin.display());
+    let clone_dest = work_parent.join("app");
+
+    let env = [
+        ("HOME", fake_home.to_str().unwrap()),
+        ("PATH", custom_path.as_str()),
+        ("SSH_AUTH_SOCK", "/tmp/fake-enterprise-agent.sock"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ];
+
+    // 1. `oz clone gh:app.git ~/work/app` uses `insteadOf` -> `ssh://corp-fetch/app.git` + `~/.ssh/config`,
+    //    while persisting `"gh:app.git"` in `.git/config`!
+    let cloned = run_oz(
+        &work_parent,
+        &["clone", "gh:app.git", clone_dest.to_str().unwrap()],
+        &env,
+    );
+    let logged_dbg = fs::read_to_string(&ssh_log).unwrap_or_default();
+    assert_eq!(
+        cloned.code, 0,
+        "stdout={} stderr={} ssh_log={logged_dbg}",
+        cloned.stdout, cloned.stderr
+    );
+    assert!(clone_dest.join("README.md").is_file());
+    let cfg_txt = fs::read_to_string(clone_dest.join(".git/config")).unwrap();
+    assert!(cfg_txt.contains("url = gh:app.git"), "{cfg_txt}");
+
+    // 2. Commit inside `~/work/app` inherits `includeIf gitdir:~/work/` user.email!
+    fs::write(clone_dest.join("work.txt"), "enterprise commit\n").unwrap();
+    let comm = run_oz(&clone_dest, &["commit", "-m", "feat: enterprise"], &env);
+    assert_eq!(comm.code, 0, "stdout={} stderr={}", comm.stdout, comm.stderr);
+    let author_email = sys_git(&clone_dest, &["log", "-1", "--pretty=%ae"]);
+    assert_eq!(author_email.trim(), "corp@enterprise.test");
+
+    // 3. `oz push` rewrites `gh:app.git` via `pushInsteadOf` -> `ssh://corp-push/app.git` (`Port=2223`, `User=pushuser`)
+    let pushed = run_oz(&clone_dest, &["push", "origin", "main"], &env);
+    assert_eq!(pushed.code, 0, "stdout={} stderr={}", pushed.stdout, pushed.stderr);
+
+    let pushed_oid = sys_git(&push_bare, &["rev-parse", "refs/heads/main"]).trim().to_string();
+    let local_oid = sys_git(&clone_dest, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(pushed_oid, local_oid);
+
+    let ssh_calls = fs::read_to_string(&ssh_log).unwrap();
+    assert!(ssh_calls.contains("SOCK=/tmp/fake-enterprise-agent.sock"), "{ssh_calls}");
+    assert!(ssh_calls.contains("-F "), "{ssh_calls}");
+    assert!(ssh_calls.contains("HostName=127.0.0.1"), "{ssh_calls}");
+    assert!(ssh_calls.contains("User=fetchuser"), "{ssh_calls}");
+    assert!(ssh_calls.contains("Port=2222"), "{ssh_calls}");
+    assert!(ssh_calls.contains("IdentitiesOnly=yes"), "{ssh_calls}");
+    assert!(ssh_calls.contains("ProxyJump=jumpbox.corp.internal"), "{ssh_calls}");
+    assert!(ssh_calls.contains("User=pushuser"), "{ssh_calls}");
+    assert!(ssh_calls.contains("Port=2223"), "{ssh_calls}");
+}

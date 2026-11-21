@@ -4,8 +4,10 @@
 //! Non-interactive GitHub token discovery, remote URL parsing, and `oz doctor` auth diagnostics.
 
 use crate::GitTransportKind;
+use crate::ssh_config::resolve_ssh_host;
 use gix::bstr::ByteSlice;
-use oz_core::{OzError, OzoneRepo, Result};
+use oz_core::{GitConfig, GitConfigContext, OzError, OzoneRepo, Result};
+use oz_cow::materialize::resolve_git_common_dir;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -393,7 +395,8 @@ pub fn strip_host_port(host: &str) -> &str {
     host
 }
 
-/// Reads the configured URL for `remote_name` (default `"origin"`) from `repo` and parses it.
+/// Reads the configured URL for `remote_name` (default `"origin"`) from `repo`,
+/// resolving `includeIf`, `insteadOf` / `pushInsteadOf`, and SSH `HostName` aliases.
 pub fn resolve_repo_remote(
     repo: &OzoneRepo,
     remote_name: Option<&str>,
@@ -406,27 +409,96 @@ pub fn resolve_repo_remote(
             recovery: vec![format!("git remote add {remote} <url>")],
         }
     })?;
-    parse_git_remote(&raw_url, api_url_override)
+    let mut parsed = parse_git_remote(&raw_url, api_url_override)?;
+    if parsed.scheme == RemoteScheme::Ssh
+        && let Some(ref alias_host) = parsed.host
+    {
+        let resolved_ssh = resolve_ssh_host(alias_host);
+        if let Some(real_host) = resolved_ssh.hostname
+            && !real_host.is_empty()
+        {
+            parsed.host = Some(real_host.clone());
+            if api_url_override.is_none() {
+                let env_api = std::env::var("OZ_GITHUB_API_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
+                parsed.api_base_url = compute_api_base_url(
+                    parsed.scheme,
+                    Some(&real_host),
+                    None,
+                    env_api.as_deref(),
+                );
+            }
+        }
+    }
+    Ok(parsed)
 }
 
-/// Reads `remote.<name>.pushurl` (when `for_push` is `true`) or `remote.<name>.url` from `.git/config`.
+/// Loads layered [`GitConfig`] (`includeIf`, `insteadOf`, etc.) for an open [`gix::Repository`].
+pub fn load_git_config_from_gix_repo(
+    gix_repo: &gix::Repository,
+    overrides: &[(String, String)],
+) -> Result<GitConfig> {
+    let git_dir = gix_repo.git_dir().to_path_buf();
+    let git_common_dir = resolve_git_common_dir(&git_dir)?;
+    let branch = gix_repo
+        .head_name()
+        .ok()
+        .flatten()
+        .map(|n| n.shorten().to_string());
+    let ctx = GitConfigContext {
+        git_dir: Some(git_dir),
+        git_common_dir: Some(git_common_dir),
+        workdir_path: gix_repo.workdir().map(Path::to_path_buf),
+        branch,
+        overrides: overrides.to_vec(),
+        ..Default::default()
+    };
+    GitConfig::load_with_context(&ctx)
+}
+
+/// Reads `remote.<name>.pushurl` (when `for_push` is `true`) or `remote.<name>.url`
+/// from layered Git config, applying `includeIf` and `insteadOf` / `pushInsteadOf`.
 pub fn read_remote_url_from_repo(
     repo: &OzoneRepo,
     remote_name: &str,
     for_push: bool,
 ) -> Result<Option<String>> {
+    let cfg = repo.load_git_config(&[])?;
+    let resolved = cfg.resolve_remote_urls(remote_name);
+    let url = if for_push {
+        resolved.push_url
+    } else {
+        resolved.fetch_url
+    };
+    if url.is_some() {
+        return Ok(url);
+    }
     let gix_repo = gix::open(&repo.git_common_dir)
         .or_else(|_| repo.open_gix())
         .map_err(|err| OzError::Git(err.to_string()))?;
     read_remote_url_from_gix(&gix_repo, remote_name, for_push)
 }
 
-/// Reads `remote.<name>.pushurl` or `remote.<name>.url` directly from a [`gix::Repository`].
+/// Reads `remote.<name>.pushurl` or `remote.<name>.url` using layered Git config
+/// (`includeIf`, `insteadOf`, `pushInsteadOf`) for `gix_repo`.
 pub fn read_remote_url_from_gix(
     gix_repo: &gix::Repository,
     remote_name: &str,
     for_push: bool,
 ) -> Result<Option<String>> {
+    if let Ok(layered) = load_git_config_from_gix_repo(gix_repo, &[]) {
+        let resolved = layered.resolve_remote_urls(remote_name);
+        let url = if for_push {
+            resolved.push_url
+        } else {
+            resolved.fetch_url
+        };
+        if url.is_some() {
+            return Ok(url);
+        }
+    }
+
     let cfg = gix_repo.config_snapshot();
     if for_push {
         let push_key = format!("remote.{remote_name}.pushurl");

@@ -4,8 +4,12 @@
 //! Indexless `O(dirty_files)` working-tree status, `ScopePolicy` (`globset`), and
 //! FUSE3 `upper/` + `meta/{whiteouts,opaque}` fast path.
 
+use crate::attributes::{
+    AttributeResolver, clean_blob_bytes, clean_eol_bytes, is_lfs_pointer,
+};
 use crate::diff::{compute_file_diff, file_id};
 use crate::error::{OzError, Result};
+use crate::git_config::GitConfig;
 use crate::repo::OzoneRepo;
 use crate::types::{ChangeKind, FileChange};
 use gix::bstr::ByteSlice;
@@ -282,7 +286,15 @@ pub(crate) fn resolve_workspace_head(
 
 /// Computes indexless `O(dirty_files)` working-tree status for `repo`.
 pub fn compute_status(repo: &OzoneRepo) -> Result<StatusReport> {
-    let ctx = compute_status_context(repo)?;
+    compute_status_with_overrides(repo, &[])
+}
+
+/// Computes working-tree status with ephemeral `-c key=value` Git config overrides.
+pub fn compute_status_with_overrides(
+    repo: &OzoneRepo,
+    overrides: &[(String, String)],
+) -> Result<StatusReport> {
+    let ctx = compute_status_context_with_overrides(repo, overrides)?;
     Ok(StatusReport {
         workspace: repo.workspace.clone(),
         branch: ctx.head.branch,
@@ -293,16 +305,57 @@ pub fn compute_status(repo: &OzoneRepo) -> Result<StatusReport> {
     })
 }
 
+/// Looks up `(octal_mode, oid_hex)` in `tree_hex` for a batch of repository-relative paths.
+#[must_use]
+pub fn lookup_tree_entries_meta(
+    repo: &OzoneRepo,
+    tree_hex: &str,
+    paths: &[&str],
+) -> BTreeMap<String, (&'static str, String)> {
+    let mut out = BTreeMap::new();
+    let Ok(tree_id) = gix::ObjectId::from_hex(tree_hex.as_bytes()) else {
+        return out;
+    };
+    let Ok(gix_repo) = open_gix_for_workspace(repo) else {
+        return out;
+    };
+    let Ok(tree) = gix_repo.find_tree(tree_id) else {
+        return out;
+    };
+    for &p in paths {
+        if let Ok(Some(entry)) = lookup_tree_entry(&tree, p) {
+            let mode_str = match entry.mode().kind() {
+                EntryKind::BlobExecutable => "100755",
+                EntryKind::Link => "120000",
+                EntryKind::Commit => "160000",
+                EntryKind::Tree => "040000",
+                EntryKind::Blob => "100644",
+            };
+            out.insert(p.to_string(), (mode_str, entry.id().to_hex().to_string()));
+        }
+    }
+    out
+}
+
 pub(crate) fn compute_status_context(repo: &OzoneRepo) -> Result<StatusContext> {
+    compute_status_context_with_overrides(repo, &[])
+}
+
+pub(crate) fn compute_status_context_with_overrides(
+    repo: &OzoneRepo,
+    overrides: &[(String, String)],
+) -> Result<StatusContext> {
     let gix_repo = open_gix_for_workspace(repo)?;
+    let git_cfg = repo.load_git_config(overrides)?;
     let head = resolve_workspace_head(repo, &gix_repo)?;
     let scope_policy = ScopePolicy::from_repo(repo)?;
 
     let (source, mut dirty_items) = if let Some((upper_dir, meta_dir)) = detect_fuse_dirs(repo) {
-        let dirty = scan_fuse_fast_path(repo, &gix_repo, &head, &upper_dir, &meta_dir)?;
+        let dirty =
+            scan_fuse_fast_path(repo, &gix_repo, &git_cfg, &head, &upper_dir, &meta_dir)?;
         (WorktreeSource::FuseOverlay { upper_dir }, dirty)
     } else {
-        let dirty = scan_general_workdir(repo, &gix_repo, &head)?;
+        let dirty = scan_general_workdir(repo, &gix_repo, &git_cfg, &head)?;
         (
             WorktreeSource::Directory {
                 workdir_path: repo.workdir_path.clone(),
@@ -317,6 +370,7 @@ pub(crate) fn compute_status_context(repo: &OzoneRepo) -> Result<StatusContext> 
     for item in &mut dirty_items {
         if !item.known_binary && item.old_bytes.is_empty()
             && let Some(ref he) = item.raw.head_entry
+            && he.kind != EntryKind::Commit
         {
             item.old_bytes = read_blob_bytes(&gix_repo, he.oid)?;
         }
@@ -492,6 +546,7 @@ impl<'repo> HeadTreeCache<'repo> {
 fn scan_fuse_fast_path(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
+    git_cfg: &GitConfig,
     head: &WorkspaceHead,
     upper_dir: &Path,
     meta_dir: &Path,
@@ -507,6 +562,16 @@ fn scan_fuse_fast_path(
 
     let whiteout_paths = collect_whiteout_paths(&whiteouts_dir)?;
     let opaque_dirs = collect_opaque_dirs(&opaque_dir)?;
+
+    let attr_resolver = collect_fuse_attributes(
+        repo,
+        gix_repo,
+        &head_tree,
+        upper_dir,
+        &whiteout_paths,
+        &opaque_dirs,
+        git_cfg,
+    )?;
 
     let mut ignore_eval = FuseIgnoreEvaluator::new(
         repo,
@@ -531,28 +596,37 @@ fn scan_fuse_fast_path(
 
     let mut dirty_map: BTreeMap<String, DirtyWithPayload> = BTreeMap::new();
 
-    // Check if any file in HEAD was replaced by a directory in upper_dir.
+    // Check directories in upper_dir against HEAD (gitlink updates or file->dir replacements).
     for dir_rel in &upper_dirs {
-        if let Some((oid, mode)) = tree_cache.lookup(dir_rel)?
-            && !mode.is_tree()
-        {
-            dirty_map.insert(
-                dir_rel.clone(),
-                DirtyWithPayload {
-                    raw: RawDirtyFile {
-                        path: dir_rel.clone(),
-                        kind: ChangeKind::Deleted,
-                        disk_kind: None,
-                        head_entry: Some(HeadTreeEntry {
-                            oid,
-                            kind: normalize_entry_kind(mode.kind()),
-                        }),
+        if let Some((oid, mode)) = tree_cache.lookup(dir_rel)? {
+            if mode.kind() == EntryKind::Commit {
+                if let Some(item) = inspect_gitlink_dir_state(
+                    dir_rel,
+                    &upper_dir.join(dir_rel),
+                    oid,
+                    whiteout_paths.contains(dir_rel),
+                )? {
+                    dirty_map.insert(dir_rel.clone(), item);
+                }
+            } else if !mode.is_tree() {
+                dirty_map.insert(
+                    dir_rel.clone(),
+                    DirtyWithPayload {
+                        raw: RawDirtyFile {
+                            path: dir_rel.clone(),
+                            kind: ChangeKind::Deleted,
+                            disk_kind: None,
+                            head_entry: Some(HeadTreeEntry {
+                                oid,
+                                kind: normalize_entry_kind(mode.kind()),
+                            }),
+                        },
+                        old_bytes: Vec::new(),
+                        new_bytes: Vec::new(),
+                        known_binary: false,
                     },
-                    old_bytes: Vec::new(),
-                    new_bytes: Vec::new(),
-                    known_binary: false,
-                },
-            );
+                );
+            }
         }
     }
 
@@ -569,7 +643,8 @@ fn scan_fuse_fast_path(
                     .find_tree(oid)
                     .map_err(|err| OzError::Git(err.to_string()))?;
                 collect_deleted_from_subtree(&subtree, rel_path, &upper_files, &mut dirty_map)?;
-                let (new_bytes, known_binary) = read_added_payload(abs_path, *disk_kind)?;
+                let (new_bytes, known_binary) =
+                    read_added_payload(rel_path, abs_path, *disk_kind, &attr_resolver, git_cfg)?;
                 dirty_map.insert(
                     rel_path.clone(),
                     DirtyWithPayload {
@@ -586,9 +661,6 @@ fn scan_fuse_fast_path(
                 );
             }
             Some((oid, mode)) => {
-                if mode.kind() == EntryKind::Commit {
-                    continue;
-                }
                 tracked_checks.push((
                     rel_path.clone(),
                     abs_path.clone(),
@@ -617,6 +689,10 @@ fn scan_fuse_fast_path(
                 disk_kind,
                 Some(head_entry),
                 hash_kind,
+                &attr_resolver,
+                git_cfg,
+                &repo.workdir_path,
+                &repo.git_dir,
             ) {
                 Ok(opt) => opt.map(Ok),
                 Err(err) => Some(Err(err)),
@@ -631,7 +707,8 @@ fn scan_fuse_fast_path(
     let added_dirty: Vec<DirtyWithPayload> = added_checks
         .into_par_iter()
         .map(|(rel_path, abs_path, disk_kind)| {
-            let (new_bytes, known_binary) = read_added_payload(&abs_path, disk_kind)?;
+            let (new_bytes, known_binary) =
+                read_added_payload(&rel_path, &abs_path, disk_kind, &attr_resolver, git_cfg)?;
             Ok(DirtyWithPayload {
                 raw: RawDirtyFile {
                     path: rel_path,
@@ -652,7 +729,7 @@ fn scan_fuse_fast_path(
 
     // Check whiteouts (`meta/whiteouts/<rel_path>.oz_wh`).
     for wh_path in &whiteout_paths {
-        if upper_files.contains_key(wh_path) {
+        if upper_files.contains_key(wh_path) || dirty_map.contains_key(wh_path) {
             continue;
         }
         let Some((oid, mode)) = tree_cache.lookup(wh_path)? else {
@@ -663,7 +740,14 @@ fn scan_fuse_fast_path(
                 .find_tree(oid)
                 .map_err(|err| OzError::Git(err.to_string()))?;
             collect_deleted_from_subtree(&subtree, wh_path, &upper_files, &mut dirty_map)?;
-        } else if mode.kind() != EntryKind::Commit {
+        } else if mode.kind() == EntryKind::Commit {
+            if !upper_dir.join(wh_path).is_dir() {
+                dirty_map.insert(
+                    wh_path.clone(),
+                    make_gitlink_deleted_dirty(wh_path, oid),
+                );
+            }
+        } else {
             dirty_map.insert(
                 wh_path.clone(),
                 DirtyWithPayload {
@@ -715,7 +799,7 @@ fn collect_deleted_from_subtree(
         .files()
         .map_err(|err| OzError::Git(err.to_string()))?;
     for entry in entries {
-        if entry.mode.is_tree() || entry.mode.kind() == EntryKind::Commit {
+        if entry.mode.is_tree() {
             continue;
         }
         let sub_rel = entry.filepath.to_str_lossy();
@@ -725,6 +809,12 @@ fn collect_deleted_from_subtree(
             format!("{prefix}/{sub_rel}")
         };
         if !upper_files.contains_key(&full_rel) {
+            if entry.mode.kind() == EntryKind::Commit {
+                dirty_map
+                    .entry(full_rel.clone())
+                    .or_insert_with(|| make_gitlink_deleted_dirty(&full_rel, entry.oid));
+                continue;
+            }
             dirty_map
                 .entry(full_rel.clone())
                 .or_insert_with(|| DirtyWithPayload {
@@ -774,9 +864,14 @@ fn walk_upper_dir(
         };
 
         if ft.is_dir() {
-            let is_tracked_dir = tree_cache
-                .lookup(&rel_path)?
-                .is_some_and(|(_, mode)| mode.is_tree());
+            let head_entry = tree_cache.lookup(&rel_path)?;
+            let is_gitlink = head_entry.is_some_and(|(_, m)| m.kind() == EntryKind::Commit)
+                || abs_path.join(".git").exists();
+            if is_gitlink {
+                dirs.push(rel_path);
+                continue;
+            }
+            let is_tracked_dir = head_entry.is_some_and(|(_, mode)| mode.is_tree());
             if !is_tracked_dir && ignore_eval.is_ignored(&rel_path, true) {
                 continue;
             }
@@ -1070,8 +1165,11 @@ impl IndexStatCache {
         disk_kind: EntryKind,
         head: &HeadTreeEntry,
     ) -> bool {
-        // Always hash symlinks directly (read_link is tiny and avoids target-length nuances).
-        if disk_kind == EntryKind::Link || head.kind == EntryKind::Link {
+        // Always check symlinks and gitlinks directly.
+        if disk_kind == EntryKind::Link
+            || head.kind == EntryKind::Link
+            || head.kind == EntryKind::Commit
+        {
             return false;
         }
         let eff_disk_kind = effective_disk_kind(disk_kind, Some(head.kind));
@@ -1200,7 +1298,7 @@ fn collect_head_entries_parallel(
                 };
                 if entry.mode.is_tree() {
                     next_frontier.push((full_path, entry.oid.to_owned()));
-                } else if entry.mode.kind() != EntryKind::Commit {
+                } else {
                     files.push((
                         full_path,
                         HeadTreeEntry {
@@ -1244,7 +1342,7 @@ fn collect_head_entries_parallel(
                         full_path.push_str(&name);
                         if entry.mode.is_tree() {
                             stack.push((full_path, entry.oid.to_owned()));
-                        } else if entry.mode.kind() != EntryKind::Commit {
+                        } else {
                             local.push((
                                 full_path,
                                 HeadTreeEntry {
@@ -1271,16 +1369,45 @@ fn collect_head_entries_parallel(
 fn scan_general_workdir(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
+    git_cfg: &GitConfig,
     head: &WorkspaceHead,
 ) -> Result<Vec<DirtyWithPayload>> {
     let hash_kind = gix_repo.object_hash();
-    let index_cache = IndexStatCache::load(repo, hash_kind);
+    let mut index_cache = IndexStatCache::load(repo, hash_kind);
     let cap_hint = index_cache.as_ref().map_or(0, IndexStatCache::entry_count);
+
+    let staged_gitlinks: Vec<(String, gix::ObjectId)> = index_cache
+        .as_ref()
+        .map(|ic| {
+            ic.index
+                .entries()
+                .iter()
+                .filter(|e| e.mode == gix::index::entry::Mode::COMMIT)
+                .map(|e| (e.path(&ic.index).to_str_lossy().into_owned(), e.id))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let attr_resolver =
+        AttributeResolver::for_workdir(&repo.workdir_path, &repo.git_common_dir, git_cfg)?;
+
+    if let Some(ref ic) = index_cache
+        && let Some(attr_mtime) =
+            attr_resolver.max_attributes_mtime(&repo.workdir_path, &repo.git_common_dir)
+        && let Ok(dur) = attr_mtime.duration_since(std::time::UNIX_EPOCH)
+        && dur.as_secs() >= u64::from(ic.index_mtime_secs)
+    {
+        index_cache = None;
+    }
 
     let head_entries = collect_head_entries_parallel(gix_repo, head.tree_id, cap_hint)?;
     let mut head_map: HashMap<&str, usize> = HashMap::with_capacity(head_entries.len());
-    for (idx, (path, _)) in head_entries.iter().enumerate() {
+    let mut gitlink_paths: BTreeSet<String> = BTreeSet::new();
+    for (idx, (path, entry)) in head_entries.iter().enumerate() {
         head_map.insert(path.as_str(), idx);
+        if entry.kind == EntryKind::Commit {
+            gitlink_paths.insert(path.clone());
+        }
     }
     let visited: Vec<AtomicBool> = (0..head_entries.len())
         .map(|_| AtomicBool::new(false))
@@ -1298,6 +1425,8 @@ fn scan_general_workdir(
             None
         };
 
+        let walk_root = repo.workdir_path.clone();
+        let walk_gitlinks = gitlink_paths.clone();
         let mut builder = WalkBuilder::new(&repo.workdir_path);
         builder
             .hidden(false)
@@ -1309,7 +1438,23 @@ fn scan_general_workdir(
             .require_git(false)
             .follow_links(false)
             .threads(rayon::current_num_threads().clamp(1, 16))
-            .filter_entry(|entry| entry.file_name() != ".git");
+            .filter_entry(move |entry| {
+                if entry.file_name() == ".git" {
+                    return false;
+                }
+                if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                    if let Ok(rel) = entry.path().strip_prefix(&walk_root) {
+                        let rel_s = path_to_slash(rel);
+                        if walk_gitlinks.contains(&rel_s) {
+                            return false;
+                        }
+                    }
+                    if entry.path().join(".git").exists() {
+                        return false;
+                    }
+                }
+                true
+            });
 
         let workdir_root = &repo.workdir_path;
         let head_entries_ref = &head_entries;
@@ -1318,6 +1463,9 @@ fn scan_general_workdir(
         let index_cache_ref = &index_cache;
         let exclude_gi_ref = &exclude_gi;
         let shared_ref = &shared_results;
+        let attrs_ref = &attr_resolver;
+        let cfg_ref = git_cfg;
+        let git_dir_ref = &repo.git_dir;
 
         struct WorkerFlush<'a> {
             local_dirty: Vec<DirtyWithPayload>,
@@ -1422,6 +1570,10 @@ fn scan_general_workdir(
                         disk_kind,
                         Some(head_entry.clone()),
                         hash_kind,
+                        attrs_ref,
+                        cfg_ref,
+                        workdir_root,
+                        git_dir_ref,
                     ) {
                         Ok(Some(item)) => collector.local_dirty.push(item),
                         Ok(None) => {}
@@ -1436,7 +1588,17 @@ fn scan_general_workdir(
                     {
                         return ignore::WalkState::Continue;
                     }
-                    match compare_disk_with_head_hash(rel_str, path, disk_kind, None, hash_kind) {
+                    match compare_disk_with_head_hash(
+                        rel_str,
+                        path,
+                        disk_kind,
+                        None,
+                        hash_kind,
+                        attrs_ref,
+                        cfg_ref,
+                        workdir_root,
+                        git_dir_ref,
+                    ) {
                         Ok(Some(item)) => collector.local_dirty.push(item),
                         Ok(None) => {}
                         Err(err) => {
@@ -1458,7 +1620,7 @@ fn scan_general_workdir(
     }
 
     // Check any tracked HEAD entries not yielded by WalkBuilder
-    // (either genuinely deleted on disk, or still present while matching `.gitignore`).
+    // (gitlink directories, deleted files, or still present while matching `.gitignore`).
     let unvisited_dirty: Vec<DirtyWithPayload> = visited
         .par_iter()
         .enumerate()
@@ -1468,72 +1630,363 @@ fn scan_general_workdir(
             }
             let (ref rel_path, ref head_entry) = head_entries[idx];
             let abs_path = repo.workdir_path.join(rel_path);
-            match fs::symlink_metadata(&abs_path) {
-                Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
-                    let disk_kind = disk_entry_kind(&meta);
-                    if let Some(ref cache) = index_cache
-                        && cache.is_provably_clean(rel_path, &meta, disk_kind, head_entry)
-                    {
-                        return None;
+            if head_entry.kind == EntryKind::Commit {
+                match fs::symlink_metadata(&abs_path) {
+                    Ok(meta) if meta.file_type().is_dir() => {
+                        match inspect_gitlink_dir_state(rel_path, &abs_path, head_entry.oid, false) {
+                            Ok(opt) => opt.map(Ok),
+                            Err(err) => Some(Err(err)),
+                        }
                     }
-                    match compare_disk_with_head_hash(
-                        rel_path,
-                        &abs_path,
-                        disk_kind,
-                        Some(head_entry.clone()),
-                        hash_kind,
-                    ) {
-                        Ok(opt) => opt.map(Ok),
-                        Err(err) => Some(Err(err)),
+                    Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                        let disk_kind = disk_entry_kind(&meta);
+                        match compare_disk_with_head_hash(
+                            rel_path,
+                            &abs_path,
+                            disk_kind,
+                            Some(head_entry.clone()),
+                            hash_kind,
+                            &attr_resolver,
+                            git_cfg,
+                            &repo.workdir_path,
+                            &repo.git_dir,
+                        ) {
+                            Ok(opt) => opt.map(Ok),
+                            Err(err) => Some(Err(err)),
+                        }
                     }
+                    _ => Some(Ok(make_gitlink_deleted_dirty(rel_path, head_entry.oid))),
                 }
-                _ => Some(Ok(DirtyWithPayload {
-                    raw: RawDirtyFile {
-                        path: rel_path.clone(),
-                        kind: ChangeKind::Deleted,
-                        disk_kind: None,
-                        head_entry: Some(head_entry.clone()),
-                    },
-                    old_bytes: Vec::new(),
-                    new_bytes: Vec::new(),
-                    known_binary: false,
-                })),
+            } else {
+                match fs::symlink_metadata(&abs_path) {
+                    Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                        let disk_kind = disk_entry_kind(&meta);
+                        if let Some(ref cache) = index_cache
+                            && cache.is_provably_clean(rel_path, &meta, disk_kind, head_entry)
+                        {
+                            return None;
+                        }
+                        match compare_disk_with_head_hash(
+                            rel_path,
+                            &abs_path,
+                            disk_kind,
+                            Some(head_entry.clone()),
+                            hash_kind,
+                            &attr_resolver,
+                            git_cfg,
+                            &repo.workdir_path,
+                            &repo.git_dir,
+                        ) {
+                            Ok(opt) => opt.map(Ok),
+                            Err(err) => Some(Err(err)),
+                        }
+                    }
+                    _ => Some(Ok(DirtyWithPayload {
+                        raw: RawDirtyFile {
+                            path: rel_path.clone(),
+                            kind: ChangeKind::Deleted,
+                            disk_kind: None,
+                            head_entry: Some(head_entry.clone()),
+                        },
+                        old_bytes: Vec::new(),
+                        new_bytes: Vec::new(),
+                        known_binary: false,
+                    })),
+                }
             }
         })
         .collect::<Result<Vec<_>>>()?;
 
     dirty.extend(unvisited_dirty);
+
+    // Pick up newly staged gitlinks (`160000` in `.git/index`, not yet in HEAD).
+    for (sub_rel, idx_oid) in staged_gitlinks {
+        if head_map.contains_key(sub_rel.as_str()) {
+            continue;
+        }
+        let abs_path = repo.workdir_path.join(&sub_rel);
+        if abs_path.is_dir() {
+            let sub_oid = read_submodule_head_oid(&abs_path).unwrap_or(idx_oid);
+            dirty.push(DirtyWithPayload {
+                raw: RawDirtyFile {
+                    path: sub_rel,
+                    kind: ChangeKind::Added,
+                    disk_kind: Some(EntryKind::Commit),
+                    head_entry: None,
+                },
+                old_bytes: Vec::new(),
+                new_bytes: format!("Subproject commit {}\n", sub_oid.to_hex()).into_bytes(),
+                known_binary: false,
+            });
+        }
+    }
+
     Ok(dirty)
 }
 
-fn read_added_payload(abs_path: &Path, disk_kind: EntryKind) -> Result<(Vec<u8>, bool)> {
+pub(crate) fn build_repo_attribute_resolver(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+    git_cfg: &GitConfig,
+) -> Result<AttributeResolver> {
+    if let Some((upper_dir, meta_dir)) = detect_fuse_dirs(repo) {
+        let head_tree = gix_repo
+            .find_tree(tree_id)
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        let whiteout_paths = collect_whiteout_paths(&meta_dir.join("whiteouts"))?;
+        let opaque_dirs = collect_opaque_dirs(&meta_dir.join("opaque"))?;
+        collect_fuse_attributes(
+            repo,
+            gix_repo,
+            &head_tree,
+            &upper_dir,
+            &whiteout_paths,
+            &opaque_dirs,
+            git_cfg,
+        )
+    } else {
+        AttributeResolver::for_workdir(&repo.workdir_path, &repo.git_common_dir, git_cfg)
+    }
+}
+
+fn collect_fuse_attributes(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    head_tree: &gix::Tree<'_>,
+    upper_dir: &Path,
+    whiteouts: &BTreeSet<String>,
+    opaque_dirs: &BTreeSet<String>,
+    git_cfg: &GitConfig,
+) -> Result<AttributeResolver> {
+    let mut per_dir: HashMap<String, String> = HashMap::new();
+    let entries = head_tree
+        .traverse()
+        .breadthfirst
+        .files()
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    for entry in entries {
+        if !entry.mode.is_blob() {
+            continue;
+        }
+        let rel = entry.filepath.to_str_lossy();
+        if rel == ".gitattributes" || rel.ends_with("/.gitattributes") {
+            if whiteouts.contains(rel.as_ref()) || opaque_dirs.contains("") {
+                continue;
+            }
+            let dir = rel.strip_suffix("/.gitattributes").unwrap_or("").to_string();
+            if !dir.is_empty() && opaque_dirs.contains(&dir) {
+                continue;
+            }
+            let blob = gix_repo
+                .find_blob(entry.oid)
+                .map_err(|err| OzError::Git(err.to_string()))?;
+            per_dir.insert(dir, String::from_utf8_lossy(&blob.data).into_owned());
+        }
+    }
+
+    if upper_dir.is_dir() {
+        collect_upper_gitattributes(upper_dir, "", &mut per_dir)?;
+    }
+
+    AttributeResolver::from_preloaded_files(per_dir, &repo.git_common_dir, git_cfg)
+}
+
+fn collect_upper_gitattributes(
+    dir_abs: &Path,
+    rel_prefix: &str,
+    per_dir: &mut HashMap<String, String>,
+) -> Result<()> {
+    for item in fs::read_dir(dir_abs)? {
+        let entry = item?;
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if name == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_dir() {
+            if path.join(".git").exists() {
+                continue;
+            }
+            let sub = if rel_prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{rel_prefix}/{name}")
+            };
+            collect_upper_gitattributes(&path, &sub, per_dir)?;
+        } else if name == ".gitattributes" && meta.file_type().is_file() {
+            per_dir.insert(rel_prefix.to_string(), fs::read_to_string(&path)?);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn read_submodule_head_oid(sub_dir: &Path) -> Option<gix::ObjectId> {
+    if !sub_dir.join(".git").exists() {
+        return None;
+    }
+    let sub_repo = gix::open(sub_dir).ok()?;
+    let head = sub_repo.head().ok()?;
+    if head.is_unborn() {
+        return None;
+    }
+    head.into_peeled_id().ok().map(|id| id.detach())
+}
+
+fn format_subproject_commit(oid: gix::ObjectId) -> Vec<u8> {
+    format!("Subproject commit {}\n", oid.to_hex()).into_bytes()
+}
+
+fn make_gitlink_deleted_dirty(rel_path: &str, head_oid: gix::ObjectId) -> DirtyWithPayload {
+    DirtyWithPayload {
+        raw: RawDirtyFile {
+            path: rel_path.to_string(),
+            kind: ChangeKind::Deleted,
+            disk_kind: None,
+            head_entry: Some(HeadTreeEntry {
+                oid: head_oid,
+                kind: EntryKind::Commit,
+            }),
+        },
+        old_bytes: format_subproject_commit(head_oid),
+        new_bytes: Vec::new(),
+        known_binary: false,
+    }
+}
+
+fn inspect_gitlink_dir_state(
+    rel_path: &str,
+    abs_dir: &Path,
+    head_oid: gix::ObjectId,
+    had_whiteout: bool,
+) -> Result<Option<DirtyWithPayload>> {
+    if !abs_dir.exists() {
+        if had_whiteout {
+            return Ok(Some(make_gitlink_deleted_dirty(rel_path, head_oid)));
+        }
+        return Ok(None);
+    }
+    if !abs_dir.join(".git").exists() {
+        // Empty / uninitialized submodule mount dir is clean in Git worktrees.
+        return Ok(None);
+    }
+    let Some(sub_oid) = read_submodule_head_oid(abs_dir) else {
+        return Ok(None);
+    };
+    if sub_oid == head_oid {
+        return Ok(None);
+    }
+    Ok(Some(DirtyWithPayload {
+        raw: RawDirtyFile {
+            path: rel_path.to_string(),
+            kind: ChangeKind::Modified,
+            disk_kind: Some(EntryKind::Commit),
+            head_entry: Some(HeadTreeEntry {
+                oid: head_oid,
+                kind: EntryKind::Commit,
+            }),
+        },
+        old_bytes: format_subproject_commit(head_oid),
+        new_bytes: format_subproject_commit(sub_oid),
+        known_binary: false,
+    }))
+}
+
+fn read_added_payload(
+    rel_path: &str,
+    abs_path: &Path,
+    disk_kind: EntryKind,
+    attrs: &AttributeResolver,
+    cfg: &GitConfig,
+) -> Result<(Vec<u8>, bool)> {
+    let resolved = attrs.resolve(rel_path);
+    if resolved.is_diff_disabled() {
+        return Ok((Vec::new(), true));
+    }
     if disk_kind != EntryKind::Link && is_file_binary_prefix(abs_path)? {
         return Ok((Vec::new(), true));
     }
-    Ok((read_disk_bytes(abs_path, Some(disk_kind))?, false))
+    let raw = read_disk_bytes(abs_path, Some(disk_kind))?;
+    if resolved.filter_driver() == Some("lfs") && !is_lfs_pointer(&raw) {
+        // Do not run mutating `git-lfs clean` or dump multi-MB binary diffs on untracked files.
+        return Ok((Vec::new(), true));
+    }
+    let cleaned = clean_eol_bytes(&raw, &resolved, cfg);
+    Ok((cleaned.into_owned(), false))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_disk_with_head_hash(
     rel_path: &str,
     abs_path: &Path,
     disk_kind: EntryKind,
     head_entry: Option<HeadTreeEntry>,
     hash_kind: gix::hash::Kind,
+    attrs: &AttributeResolver,
+    cfg: &GitConfig,
+    workdir: &Path,
+    git_dir: &Path,
 ) -> Result<Option<DirtyWithPayload>> {
+    let resolved = attrs.resolve(rel_path);
     match head_entry {
         Some(head) => {
+            if head.kind == EntryKind::Commit {
+                let head_oid = head.oid;
+                let raw = read_disk_bytes(abs_path, Some(disk_kind))?;
+                let known_binary = resolved.is_diff_disabled()
+                    || (disk_kind != EntryKind::Link && crate::diff::is_binary_bytes(&raw));
+                return Ok(Some(DirtyWithPayload {
+                    raw: RawDirtyFile {
+                        path: rel_path.to_string(),
+                        kind: ChangeKind::TypeChanged,
+                        disk_kind: Some(disk_kind),
+                        head_entry: Some(head),
+                    },
+                    old_bytes: format_subproject_commit(head_oid),
+                    new_bytes: if known_binary { Vec::new() } else { raw },
+                    known_binary,
+                }));
+            }
             let eff_disk_kind = effective_disk_kind(disk_kind, Some(head.kind));
-            let disk_bytes = read_disk_bytes(abs_path, Some(disk_kind))?;
-            let disk_oid =
-                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &disk_bytes)
+            let raw_disk_bytes = read_disk_bytes(abs_path, Some(disk_kind))?;
+            let raw_oid =
+                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &raw_disk_bytes)
                     .map_err(|err| OzError::Git(err.to_string()))?;
-            if disk_oid == head.oid && eff_disk_kind == head.kind {
+            if raw_oid == head.oid && eff_disk_kind == head.kind {
                 return Ok(None);
             }
+
+            let cleaned_cow = clean_blob_bytes(
+                rel_path,
+                &raw_disk_bytes,
+                &resolved,
+                cfg,
+                workdir,
+                git_dir,
+                false,
+            )?;
+            let cleaned_oid =
+                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &cleaned_cow)
+                    .map_err(|err| OzError::Git(err.to_string()))?;
+            if cleaned_oid == head.oid && eff_disk_kind == head.kind {
+                return Ok(None);
+            }
+
             let kind = if (eff_disk_kind == EntryKind::Link) != (head.kind == EntryKind::Link) {
                 ChangeKind::TypeChanged
             } else {
                 ChangeKind::Modified
+            };
+            let known_binary = resolved.is_diff_disabled()
+                || (eff_disk_kind != EntryKind::Link && crate::diff::is_binary_bytes(&cleaned_cow));
+            let new_bytes = if known_binary {
+                Vec::new()
+            } else {
+                cleaned_cow.into_owned()
             };
             Ok(Some(DirtyWithPayload {
                 raw: RawDirtyFile {
@@ -1543,12 +1996,13 @@ fn compare_disk_with_head_hash(
                     head_entry: Some(head),
                 },
                 old_bytes: Vec::new(),
-                new_bytes: disk_bytes,
-                known_binary: false,
+                new_bytes,
+                known_binary,
             }))
         }
         None => {
-            let (new_bytes, known_binary) = read_added_payload(abs_path, disk_kind)?;
+            let (new_bytes, known_binary) =
+                read_added_payload(rel_path, abs_path, disk_kind, attrs, cfg)?;
             Ok(Some(DirtyWithPayload {
                 raw: RawDirtyFile {
                     path: rel_path.to_string(),
@@ -1629,6 +2083,7 @@ fn normalize_entry_kind(kind: EntryKind) -> EntryKind {
     match kind {
         EntryKind::BlobExecutable => EntryKind::BlobExecutable,
         EntryKind::Link => EntryKind::Link,
+        EntryKind::Commit => EntryKind::Commit,
         _ => EntryKind::Blob,
     }
 }

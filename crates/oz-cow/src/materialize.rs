@@ -6,9 +6,13 @@
 
 use crate::SpawnRequest;
 use filetime::FileTime;
+use gix::bstr::ByteSlice;
 use gix::object::tree::EntryMode;
 use gix::object::tree::diff::Change;
-use oz_core::{OzError, OzoneConfig, Result, normalize_lexical};
+use oz_core::{
+    AttributeResolver, AutoCrlf, GitConfig, GitConfigContext, OzError, OzoneConfig, Result,
+    is_lfs_pointer, normalize_lexical, smudge_blob_bytes,
+};
 use oz_warm::detect_warm_targets;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -89,7 +93,6 @@ pub fn compute_tree_delta(
                     ..
                 } => {
                     if !entry_mode.is_tree()
-                        && !entry_mode.is_commit()
                         && let Ok(rel) = std::str::from_utf8(location.as_ref())
                     {
                         delta.upserts.push((rel.to_string(), id.detach(), entry_mode));
@@ -101,7 +104,6 @@ pub fn compute_tree_delta(
                     ..
                 } => {
                     if !entry_mode.is_tree()
-                        && !entry_mode.is_commit()
                         && let Ok(rel) = std::str::from_utf8(location.as_ref())
                     {
                         delta.deletions.push(rel.to_string());
@@ -123,7 +125,6 @@ pub fn compute_tree_delta(
                         delta.deletions.push(src_rel.to_string());
                     }
                     if !entry_mode.is_tree()
-                        && !entry_mode.is_commit()
                         && let Ok(dst_rel) = std::str::from_utf8(location.as_ref())
                     {
                         delta
@@ -139,12 +140,18 @@ pub fn compute_tree_delta(
     Ok(delta)
 }
 
-/// Materializes all files/symlinks from `tree_id` into `dst_root` in parallel using `rayon`.
+/// Materializes all files/symlinks/gitlink dirs from `tree_id` into `dst_root` in parallel using `rayon`,
+/// applying `.gitattributes` EOL/clean-smudge rules (`filter=lfs`, `eol=*`, etc.).
 pub fn materialize_tree_from_odb(
     repo: &gix::Repository,
     tree_id: gix::ObjectId,
     dst_root: &Path,
 ) -> Result<()> {
+    let git_common_dir = resolve_git_common_dir(repo.git_dir())?;
+    let git_cfg = load_git_config_for_cow(repo, &git_common_dir)?;
+    let attr_resolver =
+        AttributeResolver::for_tree(repo, Some(tree_id), &git_common_dir, &git_cfg)?;
+
     let tree = repo
         .find_tree(tree_id)
         .map_err(|e| OzError::Git(e.to_string()))?;
@@ -156,22 +163,30 @@ pub fn materialize_tree_from_odb(
 
     let mut files = Vec::new();
     let mut dirs = HashSet::new();
+    let mut gitlink_dirs = Vec::new();
     for entry in entries {
-        if entry.mode.is_tree() || entry.mode.is_commit() {
+        if entry.mode.is_tree() {
             continue;
         }
         let Ok(rel) = std::str::from_utf8(entry.filepath.as_ref()) else {
             continue;
         };
         let dst = dst_root.join(rel);
+        if entry.mode.is_commit() {
+            gitlink_dirs.push(dst);
+            continue;
+        }
         if let Some(parent) = dst.parent() {
             dirs.insert(parent.to_path_buf());
         }
-        files.push((dst, entry.oid, entry.mode));
+        files.push((rel.to_string(), dst, entry.oid, entry.mode));
     }
 
     for dir in dirs {
         std::fs::create_dir_all(dir)?;
+    }
+    for gdir in gitlink_dirs {
+        std::fs::create_dir_all(gdir)?;
     }
 
     let git_dir = repo.git_dir().to_path_buf();
@@ -179,11 +194,21 @@ pub fn materialize_tree_from_odb(
         .par_iter()
         .map_init(
             || gix::open(&git_dir).map_err(|e| OzError::Git(e.to_string())),
-            |thread_repo_res, (dst, oid, mode)| {
+            |thread_repo_res, (rel, dst, oid, mode)| {
                 let thread_repo = thread_repo_res
                     .as_ref()
                     .map_err(|e| OzError::Git(e.to_string()))?;
-                write_git_entry(thread_repo, dst, *oid, *mode)
+                write_git_entry(
+                    thread_repo,
+                    rel,
+                    dst,
+                    *oid,
+                    *mode,
+                    &attr_resolver,
+                    &git_cfg,
+                    dst_root,
+                    &git_common_dir,
+                )
             },
         )
         .collect::<Result<Vec<()>>>()?;
@@ -191,7 +216,8 @@ pub fn materialize_tree_from_odb(
     Ok(())
 }
 
-/// Applies `delta` (deletions and upserts) to `dst_root`.
+/// Applies `delta` (deletions and upserts) to `dst_root`, handling gitlinks (`160000`) and
+/// `.gitattributes` smudge filters / EOL conversion.
 pub fn apply_tree_delta_to_dir(
     repo: &gix::Repository,
     delta: &TreeDelta,
@@ -199,36 +225,64 @@ pub fn apply_tree_delta_to_dir(
 ) -> Result<()> {
     for rel in &delta.deletions {
         let p = dst_root.join(rel);
-        if p.exists() || std::fs::symlink_metadata(&p).is_ok() {
-            let _ = std::fs::remove_file(&p);
+        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+            if meta.file_type().is_dir() {
+                let _ = std::fs::remove_dir_all(&p);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
 
+    let git_common_dir = resolve_git_common_dir(repo.git_dir())?;
+    let git_cfg = load_git_config_for_cow(repo, &git_common_dir)?;
+    let attr_resolver =
+        build_delta_attribute_resolver(repo, &delta.upserts, dst_root, &git_common_dir, &git_cfg)?;
+
     let mut dirs = HashSet::new();
-    for (rel, _, _) in &delta.upserts {
-        if let Some(parent) = dst_root.join(rel).parent() {
+    let mut file_upserts = Vec::new();
+    for (rel, oid, mode) in &delta.upserts {
+        let dst = dst_root.join(rel);
+        if mode.is_commit() {
+            dirs.insert(dst);
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
             dirs.insert(parent.to_path_buf());
         }
+        file_upserts.push((rel.clone(), dst, *oid, *mode));
     }
     for dir in dirs {
         std::fs::create_dir_all(dir)?;
     }
 
     let git_dir = repo.git_dir().to_path_buf();
-    delta
-        .upserts
+    file_upserts
         .par_iter()
         .map_init(
             || gix::open(&git_dir).map_err(|e| OzError::Git(e.to_string())),
-            |thread_repo_res, (rel, oid, mode)| {
+            |thread_repo_res, (rel, dst, oid, mode)| {
                 let thread_repo = thread_repo_res
                     .as_ref()
                     .map_err(|e| OzError::Git(e.to_string()))?;
-                let dst = dst_root.join(rel);
-                if std::fs::symlink_metadata(&dst).is_ok() {
-                    let _ = std::fs::remove_file(&dst);
+                if let Ok(meta) = std::fs::symlink_metadata(dst) {
+                    if meta.file_type().is_dir() {
+                        let _ = std::fs::remove_dir_all(dst);
+                    } else {
+                        let _ = std::fs::remove_file(dst);
+                    }
                 }
-                write_git_entry(thread_repo, &dst, *oid, *mode)
+                write_git_entry(
+                    thread_repo,
+                    rel,
+                    dst,
+                    *oid,
+                    *mode,
+                    &attr_resolver,
+                    &git_cfg,
+                    dst_root,
+                    &git_common_dir,
+                )
             },
         )
         .collect::<Result<Vec<()>>>()?;
@@ -236,12 +290,176 @@ pub fn apply_tree_delta_to_dir(
     Ok(())
 }
 
+/// Ensures any gitlink directories (`160000`) and attribute-filtered (`filter=*`, `eol=crlf`,
+/// `core.autocrlf=true`) entries in `tree_id` are cleanly created/smudged inside `dst_root`,
+/// even when files were inherited directly from a raw `oz-warm` baseline copy.
+pub(crate) fn reconcile_attributes_and_gitlinks_in_dir(
+    repo: &gix::Repository,
+    git_common_dir: &Path,
+    tree_id: gix::ObjectId,
+    dst_root: &Path,
+) -> Result<()> {
+    let git_cfg = load_git_config_for_cow(repo, git_common_dir)?;
+    let attr_resolver =
+        AttributeResolver::for_tree(repo, Some(tree_id), git_common_dir, &git_cfg)?;
+
+    let tree = repo
+        .find_tree(tree_id)
+        .map_err(|e| OzError::Git(e.to_string()))?;
+    let entries = tree
+        .traverse()
+        .breadthfirst
+        .files()
+        .map_err(|e| OzError::Git(e.to_string()))?;
+
+    let needs_file_checks =
+        attr_resolver.may_have_rules() || git_cfg.autocrlf() == AutoCrlf::True;
+    let mut jobs = Vec::new();
+
+    for entry in entries {
+        if entry.mode.is_tree() {
+            continue;
+        }
+        let Ok(rel) = std::str::from_utf8(entry.filepath.as_ref()) else {
+            continue;
+        };
+        let dst = dst_root.join(rel);
+        if entry.mode.is_commit() {
+            std::fs::create_dir_all(&dst)?;
+            continue;
+        }
+        if !needs_file_checks || entry.mode.is_link() {
+            continue;
+        }
+        let resolved = attr_resolver.resolve(rel);
+        if resolved.filter_driver().is_some()
+            || resolved.eol().is_some()
+            || resolved.is_text_set()
+            || resolved.is_text_auto()
+            || git_cfg.autocrlf() == AutoCrlf::True
+        {
+            jobs.push((rel.to_string(), dst, entry.oid, entry.mode, resolved));
+        }
+    }
+
+    for (rel, dst, oid, mode, resolved) in jobs {
+        let blob = repo
+            .find_blob(oid)
+            .map_err(|e| OzError::Git(e.to_string()))?;
+        let needs_rewrite = resolved.filter_driver().is_some()
+            || is_lfs_pointer(&blob.data)
+            || match oz_core::smudge_eol_bytes(&blob.data, &resolved, &git_cfg) {
+                std::borrow::Cow::Owned(_) => true,
+                std::borrow::Cow::Borrowed(_) => false,
+            };
+        if !needs_rewrite {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::symlink_metadata(&dst).is_ok() {
+            let _ = std::fs::remove_file(&dst);
+        }
+        let smudged =
+            smudge_blob_bytes(&rel, &blob.data, &resolved, &git_cfg, dst_root, git_common_dir)?;
+        std::fs::write(&dst, &smudged)?;
+        apply_git_mode(&dst, mode.is_executable())?;
+    }
+
+    Ok(())
+}
+
+fn load_git_config_for_cow(repo: &gix::Repository, git_common_dir: &Path) -> Result<GitConfig> {
+    let branch = repo
+        .head_name()
+        .ok()
+        .flatten()
+        .map(|n| n.shorten().to_string());
+    let ctx = GitConfigContext {
+        git_dir: Some(repo.git_dir().to_path_buf()),
+        git_common_dir: Some(git_common_dir.to_path_buf()),
+        workdir_path: repo.workdir().map(Path::to_path_buf),
+        branch,
+        ..Default::default()
+    };
+    GitConfig::load_with_context(&ctx)
+}
+
+fn build_delta_attribute_resolver(
+    repo: &gix::Repository,
+    upserts: &[(String, gix::ObjectId, EntryMode)],
+    dst_root: &Path,
+    git_common_dir: &Path,
+    git_cfg: &GitConfig,
+) -> Result<AttributeResolver> {
+    let mut per_dir: HashMap<String, String> = HashMap::new();
+    if let Ok(head_tree) = repo.head_tree_id()
+        && let Ok(tree) = repo.find_tree(head_tree)
+        && let Ok(entries) = tree.traverse().breadthfirst.files()
+    {
+        for entry in entries {
+            if !entry.mode.is_blob() {
+                continue;
+            }
+            let rel = entry.filepath.to_str_lossy();
+            if rel == ".gitattributes" || rel.ends_with("/.gitattributes") {
+                let dir = rel.strip_suffix("/.gitattributes").unwrap_or("").to_string();
+                if let Ok(blob) = repo.find_blob(entry.oid) {
+                    per_dir.insert(dir, String::from_utf8_lossy(&blob.data).into_owned());
+                }
+            }
+        }
+    }
+
+    // Overlay `.gitattributes` files already present in `dst_root`.
+    if dst_root.is_dir() {
+        for entry in WalkDir::new(dst_root).follow_links(false).into_iter().flatten() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_name() == ".gitattributes"
+                && entry.file_type().is_file()
+                && let Ok(rel) = entry.path().strip_prefix(dst_root)
+                && let Ok(raw) = std::fs::read_to_string(entry.path())
+            {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                let dir = rel_s.strip_suffix("/.gitattributes").unwrap_or("").to_string();
+                per_dir.insert(dir, raw);
+            }
+        }
+    }
+
+    // Highest-priority target-tree `.gitattributes` from this delta's upserts.
+    for (rel, oid, mode) in upserts {
+        if !mode.is_commit() && !mode.is_tree() && (rel == ".gitattributes" || rel.ends_with("/.gitattributes")) {
+            let dir = rel.strip_suffix("/.gitattributes").unwrap_or("").to_string();
+            let blob = repo
+                .find_blob(*oid)
+                .map_err(|e| OzError::Git(e.to_string()))?;
+            per_dir.insert(dir, String::from_utf8_lossy(&blob.data).into_owned());
+        }
+    }
+
+    AttributeResolver::from_preloaded_files(per_dir, git_common_dir, git_cfg)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_git_entry(
     repo: &gix::Repository,
+    rel_path: &str,
     dst: &Path,
     oid: gix::ObjectId,
     mode: EntryMode,
+    attrs: &AttributeResolver,
+    cfg: &GitConfig,
+    workdir: &Path,
+    git_common_dir: &Path,
 ) -> Result<()> {
+    if mode.is_commit() {
+        std::fs::create_dir_all(dst)?;
+        return Ok(());
+    }
     let blob = repo
         .find_blob(oid)
         .map_err(|e| OzError::Git(e.to_string()))?;
@@ -249,7 +467,16 @@ fn write_git_entry(
         write_symlink_bytes(dst, &blob.data)?;
         return Ok(());
     }
-    std::fs::write(dst, &blob.data)?;
+    let resolved = attrs.resolve(rel_path);
+    let smudged = smudge_blob_bytes(
+        rel_path,
+        &blob.data,
+        &resolved,
+        cfg,
+        workdir,
+        git_common_dir,
+    )?;
+    std::fs::write(dst, &smudged)?;
     apply_git_mode(dst, mode.is_executable())?;
     Ok(())
 }

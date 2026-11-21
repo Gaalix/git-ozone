@@ -24,7 +24,7 @@ use oz_github::{
     CiQueryOptions, CiReport, CloneOptions, CloneOutcome, DEFAULT_MAX_EXCERPT_LINES, FetchOptions,
     FetchOutcome, ForceLeaseSpec, HttpAuthScheme, PrCreateOptions, PrCreateOutcome, PrStackOptions,
     PrStackOutcome, PushOptions, PushOutcome, SyncOptions, SyncOutcome, clone_repo, fetch_remote,
-    pr_create, pr_stack, push_refs, query_ci_status, sync_repo,
+    pr_create, pr_stack, push_refs_with_options, query_ci_status, sync_repo,
 };
 use oz_integrate::{
     AbortOutcome, CollisionSeverity, ContinueOutcome, IntegrateOptions, IntegrateOutcome,
@@ -143,6 +143,9 @@ pub struct CommitArgs {
     /// Reuse `HEAD`'s existing commit message without modification when amending.
     #[arg(long = "no-edit")]
     pub no_edit: bool,
+    /// Bypass `pre-commit` and `commit-msg` hooks.
+    #[arg(short = 'n', long = "no-verify")]
+    pub no_verify: bool,
 }
 
 #[derive(Debug, Args)]
@@ -340,6 +343,9 @@ pub struct PushArgs {
     /// Delete the specified remote references.
     #[arg(short = 'd', long = "delete")]
     pub delete: bool,
+    /// Bypass `pre-push` verification hooks.
+    #[arg(long = "no-verify")]
+    pub no_verify: bool,
 }
 
 /// Pull request subcommands (`oz pr ...`).
@@ -1095,6 +1101,8 @@ pub(crate) fn handle_commit(
             sign,
             signing_key: args.signing_key.clone(),
             amend: args.amend,
+            no_verify: args.no_verify,
+            config_overrides: Vec::new(),
         };
         let outcome = oz_core::commit_changes(&repo, &opts)?;
 
@@ -2004,7 +2012,7 @@ pub(crate) fn handle_push(
             auth_scheme: HttpAuthScheme::BasicToken,
         };
 
-        let outcome = push_refs(&repo, &opts, actor)?;
+        let outcome = push_refs_with_options(&repo, &opts, args.no_verify, &[], actor)?;
         let op_id = outcome.op_id.clone();
 
         let mut env = Envelope::success(outcome)
