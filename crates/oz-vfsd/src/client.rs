@@ -108,9 +108,9 @@ pub fn send_request(_socket_path: &Path, _req: &VfsRequest) -> Result<VfsRespons
 pub fn ping_daemon(socket_path: &Path) -> Result<DaemonPong> {
     match send_request(socket_path, &VfsRequest::Ping)? {
         VfsResponse::Pong { version, pid } => Ok(DaemonPong { version, pid }),
-        VfsResponse::Error { code, message } => {
-            Err(OzError::Other(format!("oz-vfsd ping error ({code}): {message}")))
-        }
+        VfsResponse::Error { code, message } => Err(OzError::Other(format!(
+            "oz-vfsd ping error ({code}): {message}"
+        ))),
         other => Err(OzError::Other(format!(
             "unexpected oz-vfsd response to Ping: {other:?}"
         ))),
@@ -161,7 +161,7 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
         }
     }
 
-    if sock.exists() {
+    if std::fs::symlink_metadata(&sock).is_ok() {
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -409,7 +409,9 @@ fn verify_or_repair_live_mounts(
     let current = list_mounts_via_socket(sock)?;
     let mut repaired = false;
     for record in records {
-        let is_listed = current.iter().any(|m| m.workspace == record.workspace && m.mounted);
+        let is_listed = current
+            .iter()
+            .any(|m| m.workspace == record.workspace && m.mounted);
         let is_healthy = std::fs::symlink_metadata(&record.mount_point).is_ok();
         if !is_listed || !is_healthy {
             if needs_stale_unmount(&record.mount_point) {
@@ -492,34 +494,13 @@ fn load_expected_daemon_mounts(layout: &OzoneLayout) -> Vec<MountRecord> {
 fn needs_stale_unmount(mount_point: &Path) -> bool {
     match std::fs::symlink_metadata(mount_point) {
         Err(err) if oz_core::is_enotconn(&err) => true,
-        _ => is_fuse_mount_in_proc_mountinfo(mount_point),
+        _ => crate::overlay::is_fuse_mount_in_proc_mountinfo(mount_point),
     }
 }
 
 #[cfg(not(unix))]
 fn needs_stale_unmount(_mount_point: &Path) -> bool {
     false
-}
-
-#[cfg(unix)]
-fn is_fuse_mount_in_proc_mountinfo(mount_point: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return false;
-    };
-    let target = mount_point.to_string_lossy();
-    raw.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        let Some(mp) = fields.nth(4) else {
-            return false;
-        };
-        if mp != target {
-            return false;
-        }
-        let Some((_, after_sep)) = line.split_once(" - ") else {
-            return false;
-        };
-        after_sep.starts_with("fuse")
-    })
 }
 
 #[cfg(any(unix, windows))]

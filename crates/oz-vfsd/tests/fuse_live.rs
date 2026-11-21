@@ -79,7 +79,10 @@ impl Drop for DaemonGuard {
             let _ = shutdown_daemon(git_dir);
         }
         for mp in &self.mount_points {
-            if std::fs::symlink_metadata(mp).err().is_some_and(|e| is_enotconn(&e)) {
+            if std::fs::symlink_metadata(mp)
+                .err()
+                .is_some_and(|e| is_enotconn(&e))
+            {
                 let _ = lazy_unmount_fuse(mp);
             }
             // Also check /proc/self/mountinfo in case a fuse mount is still attached.
@@ -317,13 +320,19 @@ fn live_fuse_unlink_rmdir_opaque_rename_link_readdir_and_open_unlinked() {
     assert_eq!(pkg_names, vec!["a.txt", "b.txt", "c.txt"]);
 
     // Many-entry readdir pagination.
-    let many_count = std::fs::read_dir(mnt.join("many")).expect("readdir many").count();
+    let many_count = std::fs::read_dir(mnt.join("many"))
+        .expect("readdir many")
+        .count();
     assert_eq!(many_count, 220);
 
     // Unlink creates immediate whiteout without modifying baseline.
     std::fs::remove_file(mnt.join("to_unlink.txt")).expect("unlink");
     assert!(!mnt.join("to_unlink.txt").exists());
-    assert!(spec.meta_dir.join("whiteouts/to_unlink.txt.oz_wh").is_file());
+    assert!(
+        spec.meta_dir
+            .join("whiteouts/to_unlink.txt.oz_wh")
+            .is_file()
+    );
     assert!(base.join("to_unlink.txt").is_file());
 
     // Unlink file then mkdir same name creates opaque directory.
@@ -645,8 +654,8 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
         is_enotconn(&stat_err),
         "expected ENOTCONN after SIGKILL, got {stat_err:?}"
     );
-    let discovered =
-        OzoneRepo::discover(Some(&spec1.mount_point.join("sub"))).expect("discover across ENOTCONN");
+    let discovered = OzoneRepo::discover(Some(&spec1.mount_point.join("sub")))
+        .expect("discover across ENOTCONN");
     assert_eq!(discovered.mount_health, MountHealth::DisconnectedEnotconn);
     assert_eq!(discovered.workspace.as_deref(), Some("ws1"));
 
@@ -715,4 +724,428 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
     let _ = unsafe { libc::waitpid(third_pong.pid as libc::pid_t, &mut status2, 0) };
     // Verify ws1 mountpoint is cleanly unmounted (not ENOTCONN).
     assert!(std::fs::symlink_metadata(&spec1.mount_point).is_ok());
+}
+
+fn run_cmd_bounded(mut cmd: Command, timeout: Duration) -> std::process::Output {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn bounded command");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            return child.wait_with_output().expect("wait_with_output");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("command timed out (hung) after {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn live_fuse_advisory_locks_flock_and_fcntl_soak() {
+    use fs4::{FileExt as Fs4FileExt, TryLockError};
+    use std::os::fd::AsRawFd;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let dir = TempDir::new().expect("tempdir");
+    let spec = make_spec(dir.path(), "ws-locks", false, true);
+    let base = spec.baseline_dir.as_ref().expect("base");
+    std::fs::create_dir_all(base.join("target")).expect("mkdir base target");
+    std::fs::write(base.join("target/.cargo-lock"), b"").expect("write base cargo-lock");
+
+    let _guard = OverlayGuard::new(&spec);
+    let mnt = &spec.mount_point;
+    let lock_path = mnt.join("target/.cargo-lock");
+
+    // 1. Multi-thread flock mutual exclusion across copied-up baseline lock file.
+    let active = Arc::new(AtomicUsize::new(0));
+    let threads = 6usize;
+    let barrier = Arc::new(Barrier::new(threads));
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            let b = Arc::clone(&barrier);
+            let lp = &lock_path;
+            let act = Arc::clone(&active);
+            s.spawn(move || {
+                b.wait();
+                for _ in 0..25 {
+                    let f = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(lp)
+                        .expect("open lock");
+                    Fs4FileExt::lock(&f).expect("flock");
+                    assert_eq!(act.fetch_add(1, Ordering::SeqCst), 0);
+                    std::thread::yield_now();
+                    act.fetch_sub(1, Ordering::SeqCst);
+                    Fs4FileExt::unlock(&f).expect("funlock");
+                }
+            });
+        }
+    });
+
+    // 2. Non-blocking flock + cross-process fcntl (F_SETLK / F_GETLK) inside FUSE3.
+    let holder = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open holder");
+    Fs4FileExt::lock(&holder).expect("lock holder");
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open contender");
+    assert!(matches!(
+        Fs4FileExt::try_lock(&contender),
+        Err(TryLockError::WouldBlock)
+    ));
+    Fs4FileExt::unlock(&holder).expect("unlock holder");
+
+    let fcntl_path = mnt.join("target/.cargo-build-lock");
+    let f = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&fcntl_path)
+        .expect("open fcntl lock");
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = libc::F_WRLCK as libc::c_short;
+    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    fl.l_start = 0;
+    fl.l_len = 64;
+    assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
+
+    if Command::new("python3")
+        .arg("--version")
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let mut child_cmd = Command::new("python3");
+        child_cmd.args([
+            "-c",
+            "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR); fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+            fcntl_path.to_str().expect("utf8"),
+        ]);
+        let denied = run_cmd_bounded(child_cmd, Duration::from_secs(5));
+        assert!(
+            !denied.status.success(),
+            "child fcntl must conflict while parent holds F_WRLCK"
+        );
+    }
+
+    fl.l_type = libc::F_UNLCK as libc::c_short;
+    assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
+}
+
+#[test]
+fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
+    use std::os::fd::AsRawFd;
+    use std::sync::{Arc, Barrier};
+
+    let dir = TempDir::new().expect("tempdir");
+    let spec = make_spec(dir.path(), "ws-posix", false, true);
+    let base = spec.baseline_dir.as_ref().expect("base");
+    std::fs::write(base.join("tool.sh"), b"#!/bin/sh\necho old\n").expect("write tool");
+    std::fs::set_permissions(base.join("tool.sh"), Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(base.join("ro_map.bin"), b"BASELINE_MMAP_PAYLOAD").expect("write ro_map");
+
+    let _guard = OverlayGuard::new(&spec);
+    let mnt = &spec.mount_point;
+
+    // 1. O_CREAT | O_WRONLY | O_TRUNC on baseline 0755 file must preserve 0755 mode.
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(mnt.join("tool.sh"))
+            .expect("open O_CREAT|O_TRUNC on baseline exec");
+        f.write_all(b"#!/bin/sh\necho new\n").expect("write");
+        f.sync_all().expect("fsync");
+    }
+    let tool_mode = std::fs::symlink_metadata(mnt.join("tool.sh"))
+        .expect("stat tool")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(tool_mode, 0o755, "O_CREAT|O_TRUNC must preserve 0755 mode");
+    assert_eq!(
+        std::fs::read_to_string(base.join("tool.sh")).expect("base intact"),
+        "#!/bin/sh\necho old\n"
+    );
+
+    // 2. Hardlink same-inode rename is a POSIX no-op (both links remain intact).
+    std::fs::write(mnt.join("hl_a.txt"), b"hardlink-body").expect("write hl_a");
+    std::fs::hard_link(mnt.join("hl_a.txt"), mnt.join("hl_b.txt")).expect("hard_link");
+    std::fs::rename(mnt.join("hl_a.txt"), mnt.join("hl_b.txt")).expect("same-inode rename");
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("hl_a.txt")).expect("hl_a remains"),
+        "hardlink-body"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("hl_b.txt")).expect("hl_b remains"),
+        "hardlink-body"
+    );
+
+    // 3. MAP_PRIVATE on baseline file + MAP_SHARED PROT_READ|PROT_WRITE + msync + fsync + fsyncdir.
+    let ro_f = std::fs::File::open(mnt.join("ro_map.bin")).expect("open ro_map");
+    let ro_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            21,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            ro_f.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(ro_ptr, libc::MAP_FAILED);
+    let ro_slice = unsafe { std::slice::from_raw_parts(ro_ptr.cast::<u8>(), 21) };
+    assert_eq!(ro_slice, b"BASELINE_MMAP_PAYLOAD");
+    unsafe { assert_eq!(libc::munmap(ro_ptr, 21), 0) };
+    drop(ro_f);
+
+    let rw_path = mnt.join("rw_map.bin");
+    let rw_f = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&rw_path)
+        .expect("open rw_map");
+    rw_f.set_len(4096).expect("set_len");
+    let rw_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            rw_f.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(rw_ptr, libc::MAP_FAILED);
+    unsafe {
+        let s = std::slice::from_raw_parts_mut(rw_ptr.cast::<u8>(), 4096);
+        s[..10].copy_from_slice(b"FUSE_MMAP!");
+        assert_eq!(libc::msync(rw_ptr, 4096, libc::MS_SYNC), 0);
+        assert_eq!(libc::munmap(rw_ptr, 4096), 0);
+    }
+    rw_f.sync_all().expect("fsync rw_map");
+    drop(rw_f);
+
+    let dir_f = std::fs::File::open(mnt).expect("open mount dir");
+    assert_eq!(unsafe { libc::fsync(dir_f.as_raw_fd()) }, 0);
+    drop(dir_f);
+    assert_eq!(
+        &std::fs::read(&rw_path).expect("read rw_map")[..10],
+        b"FUSE_MMAP!"
+    );
+
+    // 4. Multi-thread atomic write-fsync-rename soak inside live FUSE3.
+    let workers = 4usize;
+    let iters = 25usize;
+    let barrier = Arc::new(Barrier::new(workers));
+    std::thread::scope(|s| {
+        for wid in 0..workers {
+            let b = Arc::clone(&barrier);
+            s.spawn(move || {
+                b.wait();
+                let dst = mnt.join(format!("atomic_{wid}.txt"));
+                for it in 0..iters {
+                    let tmp = mnt.join(format!(".atomic_tmp_{wid}_{it}"));
+                    let mut tf = OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&tmp)
+                        .expect("create tmp");
+                    tf.write_all(format!("w={wid}:i={it}\n").as_bytes())
+                        .expect("write tmp");
+                    tf.sync_data().expect("fsync tmp");
+                    drop(tf);
+                    std::fs::rename(&tmp, &dst).expect("atomic rename");
+                }
+            });
+        }
+    });
+    for wid in 0..workers {
+        assert_eq!(
+            std::fs::read_to_string(mnt.join(format!("atomic_{wid}.txt"))).expect("read final"),
+            format!("w={wid}:i={}\n", iters - 1)
+        );
+    }
+}
+
+#[test]
+fn live_fuse_concurrent_cargo_build_soak() {
+    let dir = TempDir::new().expect("tempdir");
+    let spec = make_spec(dir.path(), "ws-cargo", false, true);
+    let base = spec.baseline_dir.as_ref().expect("base");
+
+    std::fs::create_dir_all(base.join("src")).expect("mkdir src");
+    std::fs::write(
+        base.join("Cargo.toml"),
+        "[package]\nname = \"fuse_soak_crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("Cargo.toml");
+    std::fs::write(
+        base.join("src/lib.rs"),
+        "pub fn val() -> u32 { 41 }\n#[test] fn it_works() { assert_eq!(val(), 41); }\n",
+    )
+    .expect("lib.rs");
+
+    // Pre-warm target/ inside baseline_dir before mounting FUSE3.
+    let mut pre_cmd = Command::new("cargo");
+    pre_cmd.args(["test", "--offline"]).current_dir(base);
+    let pre = run_cmd_bounded(pre_cmd, Duration::from_secs(60));
+    assert!(
+        pre.status.success(),
+        "prewarm cargo test failed: {}",
+        String::from_utf8_lossy(&pre.stderr)
+    );
+
+    let _guard = OverlayGuard::new(&spec);
+    let mnt = &spec.mount_point;
+
+    // Modify source inside FUSE3 mount and launch two concurrent `cargo test --offline` builds
+    // exercising Cargo `.cargo-lock` / `.cargo-build-lock` coordination, mmap, atomic rename, and fsync.
+    std::fs::write(
+        mnt.join("src/lib.rs"),
+        "pub fn val() -> u32 { 42 }\n#[test] fn it_works() { assert_eq!(val(), 42); }\n",
+    )
+    .expect("edit lib.rs inside fuse");
+
+    let (tx1, rx1) = std::sync::mpsc::channel();
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    let m1 = mnt.clone();
+    let m2 = mnt.clone();
+
+    let h1 = std::thread::spawn(move || {
+        let mut c = Command::new("cargo");
+        c.args(["test", "--offline"]).current_dir(&m1);
+        let _ = tx1.send(run_cmd_bounded(c, Duration::from_secs(60)));
+    });
+    let h2 = std::thread::spawn(move || {
+        let mut c = Command::new("cargo");
+        c.args(["build", "--offline"]).current_dir(&m2);
+        let _ = tx2.send(run_cmd_bounded(c, Duration::from_secs(60)));
+    });
+
+    h1.join().expect("join cargo 1");
+    h2.join().expect("join cargo 2");
+    let out1 = rx1.recv().expect("rx1");
+    let out2 = rx2.recv().expect("rx2");
+    assert!(
+        out1.status.success(),
+        "concurrent cargo test inside FUSE failed: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        out2.status.success(),
+        "concurrent cargo build inside FUSE failed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(base.join("src/lib.rs"))
+            .expect("base lib intact")
+            .contains("41")
+    );
+}
+
+#[test]
+fn live_fuse_stale_endpoint_recovery_without_hanging_ls_or_df() {
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("repo");
+    let head_oid = init_real_git_repo(&repo_root);
+    let git_dir = repo_root.join(".git");
+    OzoneLayout::from_git_common_dir(&git_dir)
+        .ensure_initialized()
+        .expect("init layout");
+
+    let mut spec = make_spec(dir.path(), "ws-stale", false, true);
+    spec.base_commit = Some(head_oid);
+    let base = spec.baseline_dir.as_ref().expect("base");
+    std::fs::write(base.join("probe.txt"), b"ok\n").expect("write probe");
+
+    let mut guard = DaemonGuard::new();
+    guard.track(git_dir.clone(), vec![spec.mount_point.clone()]);
+    mount_via_daemon(&git_dir, &spec).expect("mount ws-stale");
+    let sock = socket_path_for_git_dir(&git_dir);
+    let pong1 = ping_daemon(&sock).expect("ping1");
+    guard.track_pid(pong1.pid);
+
+    // 1. SIGKILL daemon -> verify `ls` and `df` return quickly (never hang on dead FUSE).
+    assert_eq!(
+        unsafe { libc::kill(pong1.pid as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    let mut st: libc::c_int = 0;
+    let _ = unsafe { libc::waitpid(pong1.pid as libc::pid_t, &mut st, 0) };
+
+    let mut ls_dead = Command::new("ls");
+    ls_dead.arg(&spec.mount_point);
+    let ls_dead_out = run_cmd_bounded(ls_dead, Duration::from_secs(3));
+    assert!(!ls_dead_out.status.success());
+
+    let mut df_dead = Command::new("df");
+    df_dead.arg(&spec.mount_point);
+    let _ = run_cmd_bounded(df_dead, Duration::from_secs(3));
+
+    // Recover cleanly via ensure_daemon_and_mounts.
+    let recovered = ensure_daemon_and_mounts(&git_dir).expect("recover after SIGKILL");
+    assert_eq!(recovered.len(), 1);
+    let pong2 = ping_daemon(&sock).expect("ping2");
+    guard.track_pid(pong2.pid);
+
+    // 2. Externally unmount via `fusermount3 -u` while daemon is still running.
+    let mut umount_cmd = Command::new("fusermount3");
+    umount_cmd.args(["-u", "--"]).arg(&spec.mount_point);
+    let umount_out = run_cmd_bounded(umount_cmd, Duration::from_secs(5));
+    assert!(
+        umount_out.status.success(),
+        "external fusermount3 -u failed: {}",
+        String::from_utf8_lossy(&umount_out.stderr)
+    );
+
+    // Daemon Status must accurately report mounted: false, and ensure_daemon_and_mounts repairs it.
+    match send_request(&sock, &VfsRequest::Status).expect("status") {
+        VfsResponse::DaemonStatus { active_mounts, .. } => {
+            assert!(
+                active_mounts
+                    .iter()
+                    .any(|m| m.workspace == "ws-stale" && !m.mounted),
+                "expected mounted=false after external unmount: {active_mounts:?}"
+            );
+        }
+        other => panic!("unexpected Status: {other:?}"),
+    }
+
+    let repaired = ensure_daemon_and_mounts(&git_dir).expect("repair external unmount");
+    assert!(
+        repaired
+            .iter()
+            .any(|m| m.workspace == "ws-stale" && m.mounted)
+    );
+
+    // Verify `ls` and `df` succeed promptly on the recovered mountpoint.
+    let mut ls_ok = Command::new("ls");
+    ls_ok.arg(&spec.mount_point);
+    let ls_ok_out = run_cmd_bounded(ls_ok, Duration::from_secs(3));
+    assert!(ls_ok_out.status.success());
+    assert!(String::from_utf8_lossy(&ls_ok_out.stdout).contains("probe.txt"));
+
+    let mut df_ok = Command::new("df");
+    df_ok.arg(&spec.mount_point);
+    let df_ok_out = run_cmd_bounded(df_ok, Duration::from_secs(3));
+    assert!(df_ok_out.status.success());
 }
