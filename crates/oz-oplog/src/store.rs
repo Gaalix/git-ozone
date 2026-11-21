@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 static IN_PROCESS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
-fn process_oplog_mutex(oplog_dir: &Path) -> Arc<Mutex<()>> {
+pub(crate) fn process_oplog_mutex(oplog_dir: &Path) -> Arc<Mutex<()>> {
     let key = fs::canonicalize(oplog_dir).unwrap_or_else(|_| oplog_dir.to_path_buf());
     let map_mutex = IN_PROCESS_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = map_mutex
@@ -122,7 +122,7 @@ pub(crate) fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct HeadLockGuard<'a> {
+pub(crate) struct HeadLockGuard<'a> {
     _proc_guard: std::sync::MutexGuard<'a, ()>,
     lock_file: File,
 }
@@ -133,7 +133,7 @@ impl Drop for HeadLockGuard<'_> {
     }
 }
 
-fn lock_head<'a>(
+pub(crate) fn lock_head<'a>(
     layout: &OzoneLayout,
     proc_mutex: &'a Mutex<()>,
 ) -> Result<HeadLockGuard<'a>> {
@@ -177,6 +177,24 @@ pub fn read_head_op_id(layout: &OzoneLayout) -> Result<Option<String>> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(OzError::Io(err)),
+    }
+}
+
+/// Atomically updates or clears `.git/ozone/oplog/HEAD` (caller must hold `lock_head`).
+pub(crate) fn write_head_op_id(layout: &OzoneLayout, op_id: Option<&str>) -> Result<()> {
+    let p = head_path(layout);
+    match op_id {
+        Some(id) => {
+            validate_op_id(id)?;
+            let mut bytes = id.as_bytes().to_vec();
+            bytes.push(b'\n');
+            atomic_write_bytes(&p, &bytes)
+        }
+        None => match fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(OzError::Io(err)),
+        },
     }
 }
 

@@ -215,3 +215,132 @@ pub struct RedoOutcome {
     pub ref_deltas: BTreeMap<String, RefDelta>,
     pub entry: OpLogEntry,
 }
+
+/// Default retention window (in days) for OpLog compaction (`oz gc --oplog-days`).
+pub const DEFAULT_OPLOG_RETENTION_DAYS: u64 = 30;
+
+/// Options controlling OpLog compaction and garbage collection (`oz gc`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpLogGcOptions {
+    /// Retain OpLog entries newer than this many days (default `30`).
+    pub oplog_days: u64,
+    /// Optional cap on retained non-protected OpLog entries (oldest evicted first).
+    pub max_entries: Option<usize>,
+    /// Preview compaction and GC without mutating `.git/ozone/oplog/` or refs.
+    pub dry_run: bool,
+    /// Optional reference timestamp for age computation (defaults to `Utc::now()`).
+    pub now: Option<DateTime<Utc>>,
+}
+
+impl Default for OpLogGcOptions {
+    fn default() -> Self {
+        Self {
+            oplog_days: DEFAULT_OPLOG_RETENTION_DAYS,
+            max_entries: None,
+            dry_run: false,
+            now: None,
+        }
+    }
+}
+
+/// Summary returned by [`crate::compact_oplog`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpLogGcOutcome {
+    pub dry_run: bool,
+    pub oplog_days: u64,
+    pub cutoff_timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_op_id: Option<String>,
+    pub total_entries_before: usize,
+    pub removed_entries: Vec<String>,
+    pub retained_entries: usize,
+    pub protected_entries: usize,
+    pub relinked_entries: usize,
+    pub pruned_checkpoint_refs: Vec<String>,
+    pub removed_temp_files: Vec<String>,
+    pub preserved_object_count: usize,
+    pub reclaimed_bytes: u64,
+    pub remaining_bytes: u64,
+}
+
+/// Options controlling [`crate::fsck_repo`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FsckOptions {
+    /// Safely recover/clean interrupted transactions, broken OpLog pointers, and orphaned
+    /// metadata records without deleting user working-tree files.
+    pub repair: bool,
+}
+
+/// Severity of an integrity finding reported by `oz fsck`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsckSeverity {
+    Warning,
+    Error,
+}
+
+/// Subsystem checked by `oz fsck`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsckCategory {
+    Git,
+    Oplog,
+    Snapshot,
+    Mount,
+    Baseline,
+    Transaction,
+}
+
+/// Status of a summary check section in `oz fsck`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsckCheckStatus {
+    Ok,
+    Repaired,
+    Warn,
+    Fail,
+}
+
+/// Individual integrity finding emitted by `oz fsck`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsckIssue {
+    pub code: String,
+    pub category: FsckCategory,
+    pub severity: FsckSeverity,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
+    pub repairable: bool,
+    pub repaired: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// High-level summary check emitted by `oz fsck`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsckCheckSummary {
+    pub id: String,
+    pub category: FsckCategory,
+    pub status: FsckCheckStatus,
+    pub summary: String,
+}
+
+/// Complete integrity verification and repair report returned by [`crate::fsck_repo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsckReport {
+    pub healthy: bool,
+    pub repair_mode: bool,
+    pub git_fsck_passed: bool,
+    pub oplog_entries_checked: usize,
+    pub snapshot_objects_checked: usize,
+    pub mounts_checked: usize,
+    pub baselines_checked: usize,
+    pub issue_count: usize,
+    pub unresolved_issue_count: usize,
+    pub repaired_count: usize,
+    pub checks: Vec<FsckCheckSummary>,
+    pub issues: Vec<FsckIssue>,
+    pub repaired_actions: Vec<String>,
+}
