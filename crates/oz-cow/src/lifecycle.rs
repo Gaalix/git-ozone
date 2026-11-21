@@ -10,6 +10,7 @@ use crate::backends::Fuse3VfsBackend;
 #[cfg(target_os = "windows")]
 use crate::backends::ProjFsVfsBackend;
 use crate::detect::select_backend_fast;
+use crate::materialize::reconcile_attributes_and_gitlinks_in_dir;
 use crate::{SpawnRequest, SpawnedWorkspace};
 use chrono::Utc;
 use globset::Glob;
@@ -277,9 +278,35 @@ pub fn spawn_workspace(
             materialize_files: true,
         };
 
+        if backend_kind.requires_daemon()
+            && let Some(ref tree_hex) = base_tree
+            && let Ok(tree_id) = gix::ObjectId::from_hex(tree_hex.as_bytes())
+        {
+            let seed_dir = repo.layout.ws_meta_dir(&opts.name).join("seed");
+            reconcile_attributes_and_gitlinks_in_dir(
+                &gix_repo,
+                &repo.git_common_dir,
+                tree_id,
+                &seed_dir,
+            )?;
+        }
+
         let spawned = spawn_with_backend(repo, backend_kind, &spawn_req)?;
 
         if !backend_kind.requires_daemon() {
+            if baseline_dir.is_some()
+                && !matches!(backend_kind, BackendKind::CasHardlink)
+                && let Some(ref tree_hex) = base_tree
+                && let Ok(tree_id) = gix::ObjectId::from_hex(tree_hex.as_bytes())
+            {
+                reconcile_attributes_and_gitlinks_in_dir(
+                    &gix_repo,
+                    &repo.git_common_dir,
+                    tree_id,
+                    &target_path,
+                )?;
+            }
+
             std::fs::write(
                 target_path.join(".git"),
                 format!("gitdir: {}\n", wt_git_dir.display()),

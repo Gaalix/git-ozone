@@ -6,9 +6,10 @@
 //! SSH, and HTTP/HTTPS (`reqwest` + `rustls`).
 
 use crate::auth::{
-    RemoteScheme, TokenDiscoveryOptions, discover_github_token_with_options, parse_git_remote,
-    read_remote_url_from_gix,
+    RemoteScheme, TokenDiscoveryOptions, discover_github_token_with_options,
+    load_git_config_from_gix_repo, parse_git_remote, read_remote_url_from_gix,
 };
+use crate::ssh_config::build_gix_ssh_options;
 use chrono::Utc;
 use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
@@ -21,7 +22,10 @@ use gix_packetline::PacketLineRef;
 use gix_transport::client::blocking_io::{Transport, TransportV2Ext, connect};
 use gix_transport::client::{Capabilities, MessageKind, TransportWithoutIO, WriteMode};
 use gix_transport::{Protocol, Service};
-use oz_core::{ConflictEntry, OzError, OzoneLayout, OzoneRepo, Result, normalize_lexical};
+use oz_core::{
+    ConflictEntry, GitConfig, OzError, OzoneLayout, OzoneRepo, PrePushRefLine, Result,
+    normalize_lexical, run_pre_push,
+};
 use oz_cow::materialize::materialize_tree_from_odb;
 use oz_oplog::{
     ActorInfo, DEFAULT_WORKSPACE_KEY, MutationTransaction, OpKind, OpLogEntry, RefDelta,
@@ -379,12 +383,21 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
         .to_thread_local();
 
         let git_dir = init_repo.git_dir().to_path_buf();
-        let (gix_url, persisted_url, token_opt, auth_scheme) = resolve_transport_url_and_auth(
-            &opts.url,
+        let global_cfg = GitConfig::load_global(&[])?;
+        let connect_url = global_cfg.rewrite_url(&opts.url, false, false);
+        let (gix_url, resolved_persisted, token_opt, auth_scheme) = resolve_transport_url_and_auth(
+            &connect_url,
             &cwd,
             opts.auth_token.as_deref(),
             opts.auth_scheme,
         )?;
+        let persisted_url = if connect_url != opts.url {
+            parse_git_remote(&opts.url, None)
+                .map(|p| p.sanitized_url)
+                .unwrap_or_else(|_| opts.url.clone())
+        } else {
+            resolved_persisted
+        };
 
         let mut warnings = Vec::new();
         let (protocol, adv_refs, pack_written, filter_negotiated) = fetch_pack_session(
@@ -396,6 +409,7 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
             true,
             None,
             &[],
+            Some(&global_cfg),
             &mut warnings,
         )?;
         let _ = pack_written;
@@ -650,12 +664,18 @@ fn fetch_remote_blocking(
         .filter(|s| !s.is_empty())
         .unwrap_or("origin");
 
-    let configured_url = read_remote_url_from_gix(&gix_repo, remote_arg, false)?;
+    let git_cfg = repo.load_git_config(&[])?;
+    let remote_urls = git_cfg.resolve_remote_urls(remote_arg);
+    let configured_url = remote_urls
+        .fetch_url
+        .or_else(|| read_remote_url_from_gix(&gix_repo, remote_arg, false).ok().flatten());
     let (remote_label, raw_url, is_named_remote) = match configured_url {
         Some(url) => (remote_arg.to_string(), url, true),
-        None if looks_like_url_or_path(remote_arg) => {
-            (remote_arg.to_string(), remote_arg.to_string(), false)
-        }
+        None if looks_like_url_or_path(remote_arg) => (
+            remote_arg.to_string(),
+            git_cfg.rewrite_url(remote_arg, false, false),
+            false,
+        ),
         None => {
             return Err(OzError::InvalidUsage {
                 message: format!("remote '{remote_arg}' is not configured"),
@@ -731,6 +751,7 @@ fn fetch_remote_blocking(
         opts.tags,
         Some(&parsed_specs),
         &local_have_oids,
+        Some(&git_cfg),
         &mut warnings,
     )?;
 
@@ -870,9 +891,24 @@ fn fetch_remote_blocking(
 /// HTTP/HTTPS), supporting `--atomic`, `--force-with-lease[=<ref>:<oid>]`, `--delete`, and
 /// `--set-upstream`, plus updating `refs/remotes/<remote>/*` and recording an OpLog transaction.
 pub fn push_refs(repo: &OzoneRepo, opts: &PushOptions, actor: ActorInfo) -> Result<PushOutcome> {
+    push_refs_with_options(repo, opts, false, &[], actor)
+}
+
+/// Pushes local branches/refs over pure-Rust smart `git-receive-pack` with explicit `--no-verify`
+/// hook bypass and optional `-c key=value` Git config overrides.
+pub fn push_refs_with_options(
+    repo: &OzoneRepo,
+    opts: &PushOptions,
+    no_verify: bool,
+    config_overrides: &[(String, String)],
+    actor: ActorInfo,
+) -> Result<PushOutcome> {
     let repo_cloned = repo.clone();
     let opts_cloned = opts.clone();
-    run_blocking_safe(move || push_refs_blocking(&repo_cloned, &opts_cloned, actor))
+    let overrides_owned = config_overrides.to_vec();
+    run_blocking_safe(move || {
+        push_refs_blocking(&repo_cloned, &opts_cloned, no_verify, &overrides_owned, actor)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -888,10 +924,13 @@ struct ResolvedPushSpec {
 fn push_refs_blocking(
     repo: &OzoneRepo,
     opts: &PushOptions,
+    no_verify: bool,
+    config_overrides: &[(String, String)],
     actor: ActorInfo,
 ) -> Result<PushOutcome> {
     repo.layout.ensure_initialized()?;
     let gix_repo = open_gix_unrestricted(&repo.repo_root)?;
+    let git_cfg = repo.load_git_config(config_overrides)?;
 
     let remote_arg = opts
         .remote
@@ -900,12 +939,17 @@ fn push_refs_blocking(
         .filter(|s| !s.is_empty())
         .unwrap_or("origin");
 
-    let configured_url = read_remote_url_from_gix(&gix_repo, remote_arg, true)?;
+    let remote_urls = git_cfg.resolve_remote_urls(remote_arg);
+    let configured_url = remote_urls
+        .push_url
+        .or_else(|| read_remote_url_from_gix(&gix_repo, remote_arg, true).ok().flatten());
     let (remote_label, raw_url, is_named_remote) = match configured_url {
         Some(url) => (remote_arg.to_string(), url, true),
-        None if looks_like_url_or_path(remote_arg) => {
-            (remote_arg.to_string(), remote_arg.to_string(), false)
-        }
+        None if looks_like_url_or_path(remote_arg) => (
+            remote_arg.to_string(),
+            git_cfg.rewrite_url(remote_arg, true, false),
+            false,
+        ),
         None => {
             return Err(OzError::InvalidUsage {
                 message: format!("remote '{remote_arg}' is not configured"),
@@ -936,6 +980,7 @@ fn push_refs_blocking(
         token_opt.as_deref(),
         auth_scheme,
         &gix_repo,
+        Some(&git_cfg),
     )?;
 
     let mut advertised_tips: BTreeMap<String, ObjectId> = BTreeMap::new();
@@ -1033,6 +1078,45 @@ fn push_refs_blocking(
                     ],
                 });
             }
+        }
+    }
+
+    // 3b. Run `pre-push` hook BEFORE generating packfile or mutating remote refs (unless --no-verify).
+    if !no_verify {
+        let pre_push_lines: Vec<PrePushRefLine> = push_specs
+            .iter()
+            .map(|spec| {
+                let local_ref = spec.local_ref.clone().unwrap_or_else(|| {
+                    if spec.is_delete {
+                        "(delete)".to_string()
+                    } else {
+                        spec.new_oid.to_hex().to_string()
+                    }
+                });
+                let remote_oid = advertised_tips
+                    .get(&spec.remote_ref)
+                    .copied()
+                    .unwrap_or(null_oid)
+                    .to_hex()
+                    .to_string();
+                PrePushRefLine {
+                    local_ref,
+                    local_oid: spec.new_oid.to_hex().to_string(),
+                    remote_ref: spec.remote_ref.clone(),
+                    remote_oid,
+                }
+            })
+            .collect();
+        if let Err(err) = run_pre_push(
+            repo,
+            &git_cfg,
+            &remote_label,
+            &persisted_url,
+            &pre_push_lines,
+            no_verify,
+        ) {
+            send_graceful_flush(&mut transport);
+            return Err(err);
         }
     }
 
@@ -1869,6 +1953,7 @@ fn fetch_pack_session(
     include_tags: bool,
     fetch_specs: Option<&[ParsedFetchSpec]>,
     local_have_oids: &[ObjectId],
+    git_cfg: Option<&GitConfig>,
     warnings: &mut Vec<String>,
 ) -> Result<(Protocol, Vec<AdvertisedRef>, bool, bool)> {
     let mut transport = connect_transport(
@@ -1877,6 +1962,7 @@ fn fetch_pack_session(
         auth_token,
         auth_scheme,
         gix_repo,
+        git_cfg,
     )?;
 
     let (protocol, capabilities, v1_refs) = {
@@ -1987,6 +2073,7 @@ fn fetch_specific_objects(
         auth_token,
         auth_scheme,
         gix_repo,
+        None,
     )?;
     let (protocol, capabilities) = {
         let mut hs = transport
@@ -2465,16 +2552,31 @@ fn connect_transport(
     auth_token: Option<&str>,
     auth_scheme: HttpAuthScheme,
     gix_repo: &gix::Repository,
+    git_cfg: Option<&GitConfig>,
 ) -> Result<Box<dyn Transport + Send>> {
     let is_http = matches!(
         gix_url.scheme,
         gix::url::Scheme::Http | gix::url::Scheme::Https
     );
+    let ssh_opts = if gix_url.scheme == gix::url::Scheme::Ssh {
+        let loaded_cfg;
+        let effective_cfg = match git_cfg {
+            Some(c) => Some(c),
+            None => {
+                loaded_cfg = load_git_config_from_gix_repo(gix_repo, &[]).ok();
+                loaded_cfg.as_ref()
+            }
+        };
+        build_gix_ssh_options(&gix_url, effective_cfg.and_then(GitConfig::ssh_command))
+    } else {
+        Default::default()
+    };
+
     let mut transport = connect::connect(
         gix_url,
         connect::Options {
             version: desired_version,
-            ssh: Default::default(),
+            ssh: ssh_opts,
             trace: false,
         },
     )

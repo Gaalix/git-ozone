@@ -283,6 +283,15 @@ impl OzoneRepo {
         gix::open(&self.repo_root).map_err(|err| OzError::Git(err.to_string()))
     }
 
+    /// Loads layered Git configuration (`system`, `global`, `local`, `worktree`,
+    /// `include` / `includeIf`, env vars, and CLI `-c` overrides) for this repository.
+    pub fn load_git_config(
+        &self,
+        overrides: &[(String, String)],
+    ) -> Result<crate::git_config::GitConfig> {
+        crate::git_config::GitConfig::load_for_repo(self, overrides)
+    }
+
     /// Deterministic discovery core allowing unit tests to simulate `current_dir()` `ENOTCONN`
     /// failures, `PWD` fallbacks, and mount probes without changing global process state.
     pub fn discover_with_env<F>(

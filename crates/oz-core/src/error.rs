@@ -48,6 +48,15 @@ pub enum OzError {
         recovery: Vec<String>,
     },
 
+    /// A Git hook failed with a non-zero exit status.
+    #[error("{message}")]
+    HookFailed {
+        hook: String,
+        hook_exit_code: Option<i32>,
+        message: String,
+        recovery: Vec<String>,
+    },
+
     /// VFS workspace mount is unavailable or disconnected (e.g., `ENOTCONN`).
     #[error("workspace '{workspace}' mount unavailable at {path}: {message}")]
     MountUnavailable {
@@ -89,7 +98,9 @@ impl OzError {
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::Conflict { .. } | Self::CheckFailed { .. } => ExitCode::ConflictOrCheckFail,
+            Self::Conflict { .. } | Self::CheckFailed { .. } | Self::HookFailed { .. } => {
+                ExitCode::ConflictOrCheckFail
+            }
             Self::NotARepository { .. }
             | Self::InvalidConfig { .. }
             | Self::InvalidUsage { .. }
@@ -114,6 +125,7 @@ impl OzError {
             Self::GuardrailViolation { .. } => "guardrail_violation",
             Self::Conflict { .. } => "conflict",
             Self::CheckFailed { .. } => "check_failed",
+            Self::HookFailed { .. } => "hook_failed",
             Self::MountUnavailable { .. } => "mount_unavailable",
             Self::WorkspaceNotFound { .. } => "workspace_not_found",
             Self::BinaryNotFound { .. } => "binary_not_found",
@@ -131,7 +143,8 @@ impl OzError {
             Self::InvalidUsage { recovery, .. }
             | Self::GuardrailViolation { recovery, .. }
             | Self::Conflict { recovery, .. }
-            | Self::CheckFailed { recovery, .. } => recovery.clone(),
+            | Self::CheckFailed { recovery, .. }
+            | Self::HookFailed { recovery, .. } => recovery.clone(),
             Self::NotARepository { .. } => vec!["git init -b main".to_string()],
             Self::MountUnavailable { workspace, .. } => {
                 vec![

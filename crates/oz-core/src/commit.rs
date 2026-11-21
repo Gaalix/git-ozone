@@ -5,16 +5,23 @@
 //! commit synthesis using `gix` in-memory ODB & `tree::Editor`, atomic CAS ref edits,
 //! and deterministic `Change-Id: I<40-hex>` trailers.
 
+use crate::attributes::{AttributeResolver, clean_blob_bytes};
 use crate::diff::{apply_selected_hunks, target_matches_file};
 use crate::error::{OzError, Result};
+use crate::git_config::GitConfig;
 use crate::guardrails::{GuardrailOptions, GuardrailTarget, check_guardrails};
+use crate::hooks::{
+    CommitHookEnv, run_commit_msg, run_post_commit, run_pre_commit, run_prepare_commit_msg,
+};
 use crate::repo::OzoneRepo;
 use crate::ssh_sign::{
     CommitSignatureVerification, GIT_SSHSIG_NAMESPACE, expand_tilde_path,
     match_allowed_signers_file, resolve_signing_private_key, verify_sshsig,
 };
 use crate::status::{
-    StatusContext, compute_status_context, open_gix_for_workspace, read_blob_bytes, read_disk_bytes,
+    RawDirtyFile, StatusContext, build_repo_attribute_resolver,
+    compute_status_context_with_overrides, open_gix_for_workspace, read_blob_bytes,
+    read_disk_bytes, read_submodule_head_oid,
 };
 use crate::types::{ChangeKind, WorkspaceState};
 use gix::bstr::ByteSlice;
@@ -58,6 +65,10 @@ pub struct CommitOptions {
     /// Amend the current `HEAD` commit (`HEAD`'s parent(s) become parent(s), preserving
     /// `HEAD`'s `Change-Id:` trailer unless another is explicitly present).
     pub amend: bool,
+    /// Bypass `pre-commit` and `commit-msg` verification hooks (`--no-verify` / `-n`).
+    pub no_verify: bool,
+    /// Ephemeral Git config overrides (from `-c key=value`) applied over layered Git config.
+    pub config_overrides: Vec<(String, String)>,
 }
 
 impl CommitOptions {
@@ -112,6 +123,20 @@ impl CommitOptions {
         self.amend = amend;
         self
     }
+
+    /// Enables or disables `--no-verify` hook bypass.
+    #[must_use]
+    pub const fn with_no_verify(mut self, no_verify: bool) -> Self {
+        self.no_verify = no_verify;
+        self
+    }
+
+    /// Appends `-c key=value` Git configuration overrides.
+    #[must_use]
+    pub fn with_config_overrides(mut self, overrides: Vec<(String, String)>) -> Self {
+        self.config_overrides = overrides;
+        self
+    }
 }
 
 /// Summary returned by [`commit_changes`].
@@ -156,6 +181,13 @@ enum PreparedEdit {
         bytes: Vec<u8>,
         reported_size_bytes: Option<u64>,
         is_full_file: bool,
+        out_of_scope: bool,
+        scope_reason: Option<String>,
+    },
+    UpsertCommit {
+        path: String,
+        kind: ChangeKind,
+        commit_oid: gix::ObjectId,
         out_of_scope: bool,
         scope_reason: Option<String>,
     },
@@ -212,8 +244,9 @@ fn commit_changes_inner(
         });
     }
 
-    let ctx = compute_status_context(repo)?;
+    let ctx = compute_status_context_with_overrides(repo, &opts.config_overrides)?;
     let mut gix_repo = open_gix_for_commit(repo)?;
+    let git_cfg = repo.load_git_config(&opts.config_overrides)?;
 
     let amended_head = if opts.amend {
         let Some(head_oid) = ctx.head.commit_oid else {
@@ -269,6 +302,26 @@ fn commit_changes_inner(
         });
     }
 
+    let (mut author_sig, committer_sig) = resolve_signatures(&mut gix_repo, opts, &git_cfg)?;
+    if let Some(ref head_info) = amended_head
+        && opts.author_name.is_none()
+        && opts.author_email.is_none()
+        && let Some(ref orig_author) = head_info.author
+    {
+        author_sig = orig_author.clone();
+    }
+
+    let hook_env = CommitHookEnv {
+        author_name: Some(author_sig.name.to_str_lossy().into_owned()),
+        author_email: Some(author_sig.email.to_str_lossy().into_owned()),
+        author_date: Some(format_git_author_date(author_sig.time)),
+    };
+
+    run_pre_commit(repo, &git_cfg, &hook_env, opts.no_verify)?;
+
+    let attr_resolver =
+        build_repo_attribute_resolver(repo, &gix_repo, ctx.head.tree_id, &git_cfg)?;
+
     let mut prepared_edits = Vec::with_capacity(selection.len());
     let mut partial_hunk_paths = Vec::new();
     let max_blob_bytes = repo.config.max_blob_mb.saturating_mul(1024 * 1024);
@@ -288,57 +341,39 @@ fn commit_changes_inner(
                         scope_reason,
                     });
                 } else {
-                    let disk_path = ctx.source.disk_path(&raw.path);
-                    let meta = fs::symlink_metadata(&disk_path)?;
-                    let file_len = meta.len();
-                    let entry_kind = raw.disk_kind.unwrap_or(EntryKind::Blob);
-                    let bytes = if !opts.force
-                        && file_len > max_blob_bytes
-                        && entry_kind != EntryKind::Link
-                    {
-                        Vec::new()
-                    } else {
-                        read_disk_bytes(&disk_path, Some(entry_kind))?
-                    };
-                    prepared_edits.push(PreparedEdit::Upsert {
-                        path: raw.path.clone(),
-                        kind: raw.kind,
-                        entry_kind,
-                        bytes,
-                        reported_size_bytes: Some(file_len),
-                        is_full_file: true,
+                    prepared_edits.push(prepare_full_entry_edit(
+                        repo,
+                        &gix_repo,
+                        &ctx,
+                        raw,
+                        &attr_resolver,
+                        &git_cfg,
+                        max_blob_bytes,
+                        opts.force,
                         out_of_scope,
                         scope_reason,
-                    });
+                    )?);
                 }
             }
             FileSelection::Hunks(selected_hunk_indices) => {
                 let all_selected = selected_hunk_indices.len() == change.hunks.len()
                     && !change.hunks.is_empty();
 
-                if all_selected && raw.kind != ChangeKind::Deleted {
-                    let disk_path = ctx.source.disk_path(&raw.path);
-                    let meta = fs::symlink_metadata(&disk_path)?;
-                    let file_len = meta.len();
-                    let entry_kind = raw.disk_kind.unwrap_or(EntryKind::Blob);
-                    let bytes = if !opts.force
-                        && file_len > max_blob_bytes
-                        && entry_kind != EntryKind::Link
-                    {
-                        Vec::new()
-                    } else {
-                        read_disk_bytes(&disk_path, Some(entry_kind))?
-                    };
-                    prepared_edits.push(PreparedEdit::Upsert {
-                        path: raw.path.clone(),
-                        kind: raw.kind,
-                        entry_kind,
-                        bytes,
-                        reported_size_bytes: Some(file_len),
-                        is_full_file: true,
+                if raw.disk_kind == Some(EntryKind::Commit)
+                    || (all_selected && raw.kind != ChangeKind::Deleted)
+                {
+                    prepared_edits.push(prepare_full_entry_edit(
+                        repo,
+                        &gix_repo,
+                        &ctx,
+                        raw,
+                        &attr_resolver,
+                        &git_cfg,
+                        max_blob_bytes,
+                        opts.force,
                         out_of_scope,
                         scope_reason,
-                    });
+                    )?);
                 } else if raw.kind == ChangeKind::Deleted {
                     prepared_edits.push(PreparedEdit::Remove {
                         path: raw.path.clone(),
@@ -347,11 +382,24 @@ fn commit_changes_inner(
                     });
                 } else {
                     let before_bytes = match raw.head_entry {
-                        Some(ref he) => read_blob_bytes(&gix_repo, he.oid)?,
-                        None => Vec::new(),
+                        Some(ref he) if he.kind != EntryKind::Commit => {
+                            read_blob_bytes(&gix_repo, he.oid)?
+                        }
+                        _ => Vec::new(),
                     };
                     let disk_path = ctx.source.disk_path(&raw.path);
-                    let after_bytes = read_disk_bytes(&disk_path, raw.disk_kind)?;
+                    let raw_after = read_disk_bytes(&disk_path, raw.disk_kind)?;
+                    let resolved_attrs = attr_resolver.resolve(&raw.path);
+                    let after_bytes = clean_blob_bytes(
+                        &raw.path,
+                        &raw_after,
+                        &resolved_attrs,
+                        &git_cfg,
+                        &repo.workdir_path,
+                        &repo.git_dir,
+                        true,
+                    )?
+                    .into_owned();
                     let partial_bytes = apply_selected_hunks(
                         &raw.path,
                         &before_bytes,
@@ -413,6 +461,20 @@ fn commit_changes_inner(
                 out_of_scope: *out_of_scope,
                 scope_reason: scope_reason.clone(),
             },
+            PreparedEdit::UpsertCommit {
+                path,
+                kind,
+                out_of_scope,
+                scope_reason,
+                ..
+            } => GuardrailTarget {
+                path,
+                kind: *kind,
+                content: &[],
+                reported_size_bytes: Some(0),
+                out_of_scope: *out_of_scope,
+                scope_reason: scope_reason.clone(),
+            },
         })
         .collect();
 
@@ -426,9 +488,10 @@ fn commit_changes_inner(
     )?;
 
     // Resolve and validate SSH signing key BEFORE mutating any objects or refs.
-    let should_sign = resolve_should_sign(repo, &gix_repo, opts.sign);
+    let should_sign = resolve_should_sign(repo, &git_cfg, &gix_repo, opts.sign);
     let active_signing_key = if should_sign {
-        let key_spec = resolve_signing_key_spec(repo, &gix_repo, opts.signing_key.as_deref());
+        let key_spec =
+            resolve_signing_key_spec(repo, &git_cfg, &gix_repo, opts.signing_key.as_deref());
         let (priv_key, _) = resolve_signing_private_key(&key_spec, Some(&repo.repo_root))?;
         Some(priv_key)
     } else {
@@ -455,28 +518,44 @@ fn commit_changes_inner(
     }
 
     for edit in &prepared_edits {
-        if let PreparedEdit::Upsert {
-            path,
-            entry_kind,
-            bytes,
-            is_full_file,
-            ..
-        } = edit
-        {
-            let blob_id = gix_repo
-                .write_blob(bytes)
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach();
-            editor
-                .upsert(path.as_str(), *entry_kind, blob_id)
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            committed_paths.push(path.clone());
-            index_deltas.push(IndexDelta::Upsert {
-                path: path.clone(),
-                blob_id,
-                entry_kind: *entry_kind,
-                is_full_file: *is_full_file,
-            });
+        match edit {
+            PreparedEdit::Upsert {
+                path,
+                entry_kind,
+                bytes,
+                is_full_file,
+                ..
+            } => {
+                let blob_id = gix_repo
+                    .write_blob(bytes)
+                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .detach();
+                editor
+                    .upsert(path.as_str(), *entry_kind, blob_id)
+                    .map_err(|err| OzError::Git(err.to_string()))?;
+                committed_paths.push(path.clone());
+                index_deltas.push(IndexDelta::Upsert {
+                    path: path.clone(),
+                    blob_id,
+                    entry_kind: *entry_kind,
+                    is_full_file: *is_full_file,
+                });
+            }
+            PreparedEdit::UpsertCommit {
+                path, commit_oid, ..
+            } => {
+                editor
+                    .upsert(path.as_str(), EntryKind::Commit, *commit_oid)
+                    .map_err(|err| OzError::Git(err.to_string()))?;
+                committed_paths.push(path.clone());
+                index_deltas.push(IndexDelta::Upsert {
+                    path: path.clone(),
+                    blob_id: *commit_oid,
+                    entry_kind: EntryKind::Commit,
+                    is_full_file: false,
+                });
+            }
+            PreparedEdit::Remove { .. } => {}
         }
     }
 
@@ -487,21 +566,12 @@ fn commit_changes_inner(
         .map_err(|err| OzError::Git(err.to_string()))?
         .detach();
 
-    let (mut author_sig, committer_sig) = resolve_signatures(&mut gix_repo, opts)?;
-    if let Some(ref head_info) = amended_head
-        && opts.author_name.is_none()
-        && opts.author_email.is_none()
-        && let Some(ref orig_author) = head_info.author
-    {
-        author_sig = orig_author.clone();
-    }
-
     let parents: Vec<gix::ObjectId> = match amended_head {
         Some(ref head_info) => head_info.parents.clone(),
         None => ctx.head.commit_oid.into_iter().collect(),
     };
 
-    let raw_message = if opts.amend && opts.message.trim().is_empty() {
+    let initial_message = if opts.amend && opts.message.trim().is_empty() {
         amended_head
             .as_ref()
             .map(|h| h.message.clone())
@@ -509,6 +579,17 @@ fn commit_changes_inner(
     } else {
         opts.message.clone()
     };
+
+    let editmsg_path = repo.git_dir.join("COMMIT_EDITMSG");
+    fs::write(&editmsg_path, &initial_message)?;
+    let (msg_source, msg_sha) = if opts.amend {
+        ("commit", Some("HEAD"))
+    } else {
+        ("message", None)
+    };
+    run_prepare_commit_msg(repo, &git_cfg, &hook_env, &editmsg_path, msg_source, msg_sha)?;
+    run_commit_msg(repo, &git_cfg, &hook_env, &editmsg_path, opts.no_verify)?;
+    let raw_message = fs::read_to_string(&editmsg_path)?;
 
     if raw_message.trim().is_empty() {
         return Err(OzError::InvalidUsage {
@@ -623,6 +704,8 @@ fn commit_changes_inner(
     // Clear virtual `pinned_paths` (`.git/ozone/state/<ws>.json` or `.git/ozone/pinned_main.json`).
     let clear_all_pinned = (opts.pick.is_empty() && opts.exclude.is_empty()) || ignore_pinned;
     clear_pinned_paths_if_present(repo, &committed_paths, &partial_hunk_paths, clear_all_pinned)?;
+
+    let _ = run_post_commit(repo, &git_cfg, &hook_env);
 
     let remaining_dirty_count =
         (ctx.changes.len() - selection.len()) + partial_hunk_paths.len();
@@ -765,9 +848,111 @@ fn resolve_selection(
     Ok(selected)
 }
 
+fn format_git_author_date(time: gix::date::Time) -> String {
+    let sign = if time.offset < 0 { '-' } else { '+' };
+    let abs = time.offset.unsigned_abs();
+    let hours = abs / 3600;
+    let mins = (abs % 3600) / 60;
+    format!("@{} {sign}{hours:02}{mins:02}", time.seconds)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_full_entry_edit(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    ctx: &StatusContext,
+    raw: &RawDirtyFile,
+    attr_resolver: &AttributeResolver,
+    git_cfg: &GitConfig,
+    max_blob_bytes: u64,
+    force: bool,
+    out_of_scope: bool,
+    scope_reason: Option<String>,
+) -> Result<PreparedEdit> {
+    let disk_path = ctx.source.disk_path(&raw.path);
+    if raw.disk_kind == Some(EntryKind::Commit) {
+        let commit_oid = read_submodule_head_oid(&disk_path)
+            .or_else(|| {
+                gix_repo.open_index().ok().and_then(|idx| {
+                    idx.entry_by_path(raw.path.as_bytes().as_bstr())
+                        .filter(|e| e.mode == gix::index::entry::Mode::COMMIT)
+                        .map(|e| e.id)
+                })
+            })
+            .ok_or_else(|| {
+                OzError::Git(format!(
+                    "submodule '{}' does not have a valid HEAD commit OID",
+                    raw.path
+                ))
+            })?;
+        return Ok(PreparedEdit::UpsertCommit {
+            path: raw.path.clone(),
+            kind: raw.kind,
+            commit_oid,
+            out_of_scope,
+            scope_reason,
+        });
+    }
+
+    let meta = fs::symlink_metadata(&disk_path)?;
+    let file_len = meta.len();
+    let entry_kind = raw.disk_kind.unwrap_or(EntryKind::Blob);
+    let resolved_attrs = attr_resolver.resolve(&raw.path);
+
+    let (bytes, reported_size_bytes) = if entry_kind == EntryKind::Link {
+        (read_disk_bytes(&disk_path, Some(EntryKind::Link))?, file_len)
+    } else if resolved_attrs.filter_driver().is_some() {
+        let raw_bytes = read_disk_bytes(&disk_path, Some(entry_kind))?;
+        let cleaned = clean_blob_bytes(
+            &raw.path,
+            &raw_bytes,
+            &resolved_attrs,
+            git_cfg,
+            &repo.workdir_path,
+            &repo.git_dir,
+            true,
+        )?
+        .into_owned();
+        let cleaned_len = cleaned.len() as u64;
+        if !force && cleaned_len > max_blob_bytes {
+            (Vec::new(), cleaned_len)
+        } else {
+            (cleaned, cleaned_len)
+        }
+    } else if !force && file_len > max_blob_bytes {
+        (Vec::new(), file_len)
+    } else {
+        let raw_bytes = read_disk_bytes(&disk_path, Some(entry_kind))?;
+        let cleaned = clean_blob_bytes(
+            &raw.path,
+            &raw_bytes,
+            &resolved_attrs,
+            git_cfg,
+            &repo.workdir_path,
+            &repo.git_dir,
+            true,
+        )?
+        .into_owned();
+        let cleaned_len = cleaned.len() as u64;
+        (cleaned, cleaned_len)
+    };
+
+    Ok(PreparedEdit::Upsert {
+        path: raw.path.clone(),
+        kind: raw.kind,
+        entry_kind,
+        bytes,
+        reported_size_bytes: Some(reported_size_bytes),
+        is_full_file: true,
+        out_of_scope,
+        scope_reason,
+    })
+}
+
 fn resolve_signatures(
     gix_repo: &mut gix::Repository,
     opts: &CommitOptions,
+    git_cfg: &GitConfig,
 ) -> Result<(gix::actor::Signature, gix::actor::Signature)> {
     let now = gix::date::Time::now_local_or_utc();
 
@@ -780,7 +965,7 @@ fn resolve_signatures(
         return Ok((sig.clone(), sig));
     }
 
-    let committer = match gix_repo.committer() {
+    let mut committer = match gix_repo.committer() {
         Some(res) => res
             .map_err(|err| OzError::Git(err.to_string()))?
             .to_owned()
@@ -799,6 +984,27 @@ fn resolve_signatures(
             .map_err(|err| OzError::Git(err.to_string()))?,
         None => committer.clone(),
     };
+
+    if std::env::var_os("GIT_COMMITTER_NAME").is_none()
+        && let Some(cfg_name) = git_cfg.user_name()
+    {
+        committer.name = cfg_name.into();
+    }
+    if std::env::var_os("GIT_COMMITTER_EMAIL").is_none()
+        && let Some(cfg_email) = git_cfg.user_email()
+    {
+        committer.email = cfg_email.into();
+    }
+    if std::env::var_os("GIT_AUTHOR_NAME").is_none()
+        && let Some(cfg_name) = git_cfg.user_name()
+    {
+        author.name = cfg_name.into();
+    }
+    if std::env::var_os("GIT_AUTHOR_EMAIL").is_none()
+        && let Some(cfg_email) = git_cfg.user_email()
+    {
+        author.email = cfg_email.into();
+    }
 
     if let Some(ref name) = opts.author_name {
         author.name = name.as_str().into();
@@ -872,6 +1078,7 @@ fn format_message_with_change_id(message: &str, change_id: &str) -> String {
 
 fn resolve_should_sign(
     repo: &OzoneRepo,
+    git_cfg: &GitConfig,
     gix_repo: &gix::Repository,
     explicit_sign: Option<bool>,
 ) -> bool {
@@ -882,16 +1089,23 @@ fn resolve_should_sign(
         return enabled;
     }
     let snap = gix_repo.config_snapshot();
-    let gpgsign = snap.boolean("commit.gpgsign").unwrap_or(false);
-    let gpg_format = snap.string("gpg.format");
-    gpgsign
-        && gpg_format
+    let gpgsign = git_cfg
+        .commit_gpgsign()
+        .or_else(|| snap.boolean("commit.gpgsign"))
+        .unwrap_or(false);
+    let gpg_format_matches = git_cfg
+        .gpg_format()
+        .is_some_and(|f| f.trim().eq_ignore_ascii_case("ssh"))
+        || snap
+            .string("gpg.format")
             .as_deref()
-            .is_some_and(|f| f.to_str_lossy().trim().eq_ignore_ascii_case("ssh"))
+            .is_some_and(|f| f.to_str_lossy().trim().eq_ignore_ascii_case("ssh"));
+    gpgsign && gpg_format_matches
 }
 
 fn resolve_signing_key_spec(
     repo: &OzoneRepo,
+    git_cfg: &GitConfig,
     gix_repo: &gix::Repository,
     explicit_key: Option<&str>,
 ) -> String {
@@ -906,6 +1120,9 @@ fn resolve_signing_key_spec(
         .map(str::trim)
         .filter(|k| !k.is_empty())
     {
+        return k.to_string();
+    }
+    if let Some(k) = git_cfg.signing_key().map(str::trim).filter(|k| !k.is_empty()) {
         return k.to_string();
     }
     if let Some(k) = gix_repo

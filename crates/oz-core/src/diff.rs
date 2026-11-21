@@ -6,7 +6,7 @@
 
 use crate::error::{OzError, Result};
 use crate::repo::OzoneRepo;
-use crate::status::compute_status;
+use crate::status::{compute_status, compute_status_with_overrides};
 use crate::types::{ChangeKind, DiffHunk, DiffLine, DiffLineKind, FileChange};
 use imara_diff::{Algorithm, Diff, InternedInput, sources};
 use serde::{Deserialize, Serialize};
@@ -319,6 +319,20 @@ pub(crate) fn apply_selected_hunks(
 /// before applying `targets` filters.
 pub fn compute_diff(repo: &OzoneRepo, targets: &[String]) -> Result<DiffReport> {
     let status = compute_status(repo)?;
+    build_diff_report(status, targets)
+}
+
+/// Computes working-tree diffs with ephemeral `-c key=value` Git config overrides.
+pub fn compute_diff_with_overrides(
+    repo: &OzoneRepo,
+    targets: &[String],
+    overrides: &[(String, String)],
+) -> Result<DiffReport> {
+    let status = compute_status_with_overrides(repo, overrides)?;
+    build_diff_report(status, targets)
+}
+
+fn build_diff_report(status: crate::status::StatusReport, targets: &[String]) -> Result<DiffReport> {
     let files = if targets.is_empty() {
         status.changes
     } else {

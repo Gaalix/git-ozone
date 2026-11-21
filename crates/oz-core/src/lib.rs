@@ -7,18 +7,25 @@
 //! configuration parsing, canonical `oz.v1` JSON envelope formatting, non-interactive
 //! detection, exit codes, and shared domain types.
 
+pub mod attributes;
 pub mod checkout;
 pub mod commit;
 pub mod config;
 pub mod diff;
 pub mod envelope;
 pub mod error;
+pub mod git_config;
 pub mod guardrails;
+pub mod hooks;
 pub mod repo;
 pub mod ssh_sign;
 pub mod status;
 pub mod types;
 
+pub use attributes::{
+    AttrState, AttributeResolver, ResolvedAttrs, clean_blob_bytes, clean_eol_bytes,
+    is_lfs_pointer, smudge_blob_bytes, smudge_eol_bytes,
+};
 pub use checkout::{
     CheckoutPathsOptions, CheckoutPathsOutcome, PathspecMatcher, SwitchOptions, SwitchOutcome,
     checkout_paths, create_or_reset_local_branch, is_local_branch, list_git_worktree_entries,
@@ -37,19 +44,27 @@ pub use config::{
     validate_workspace_name,
 };
 pub use diff::{
-    BINARY_SNIFF_BYTES, DEFAULT_CONTEXT_LINES, DiffReport, compute_diff, file_id, hunk_id,
-    hunk_suffix, is_binary_bytes, render_file_unified_diff, render_hunk_unified_diff,
-    render_unified_diff,
+    BINARY_SNIFF_BYTES, DEFAULT_CONTEXT_LINES, DiffReport, compute_diff,
+    compute_diff_with_overrides, file_id, hunk_id, hunk_suffix, is_binary_bytes,
+    render_file_unified_diff, render_hunk_unified_diff, render_unified_diff,
 };
 pub use envelope::{
     ConflictEntry, Envelope, EnvelopeError, ExitCode, InteractionInput, InteractionMode,
     OZ_SCHEMA_V1, WarningEntry,
 };
 pub use error::{OzError, Result};
+pub use git_config::{
+    AutoCrlf, EolSetting, FilterDriverConfig, GitConfig, GitConfigContext, RemoteConfig,
+    ResolvedRemoteUrls,
+};
 pub use guardrails::{
     GuardrailFinding, GuardrailKind, GuardrailOptions, GuardrailTarget, check_guardrails,
     check_workspace_guardrails, detect_secret_in_line, inspect_guardrails,
     is_conflict_marker_line, is_unignored_env_filename,
+};
+pub use hooks::{
+    CommitHookEnv, HookRunOutcome, PrePushRefLine, find_executable_hook, resolve_hooks_dir,
+    run_commit_msg, run_post_commit, run_pre_commit, run_pre_push, run_prepare_commit_msg,
 };
 pub use repo::{
     CliInvocation, MountHealth, OzoneLayout, OzoneRepo, SiblingOzPath, find_git_ozone_on_path,
@@ -63,7 +78,10 @@ pub use ssh_sign::{
     match_allowed_signers_file, resolve_signing_private_key, sha256, sha512, sign_sshsig,
     verify_sshsig,
 };
-pub use status::{ScopePolicy, StatusReport, compute_status};
+pub use status::{
+    ScopePolicy, StatusReport, compute_status, compute_status_with_overrides,
+    lookup_tree_entries_meta,
+};
 pub use types::{
     BackendKind, ChangeKind, DiffHunk, DiffLine, DiffLineKind, DirtyEntry, FileChange,
     FilesystemKind, MountRecord, WorkspaceState,

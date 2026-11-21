@@ -20,13 +20,14 @@ use oz_agent::{
     AiProvenanceNote, ProvenanceOptions, detect_agent_session, record_commit_provenance,
 };
 use oz_core::{
-    CheckoutPathsOptions, CommitOptions, DiffReport, Envelope, ExitCode, FileChange,
+    CheckoutPathsOptions, CommitOptions, DiffReport, Envelope, ExitCode, FileChange, GitConfig,
     InteractionMode, OzError, OzoneRepo, PathspecMatcher, Result, SwitchOptions,
     add_pinned_paths, checkout_paths, clear_pinned_paths, commit_changes,
-    commit_changes_ignoring_pinned, compute_diff, compute_status, create_or_reset_local_branch,
-    is_local_branch, list_git_worktree_entries, list_tracked_paths_in_head, normalize_lexical,
-    read_pinned_paths, remove_pinned_paths, render_unified_diff, resolves_as_revision,
-    switch_branch, validate_workspace_name,
+    commit_changes_ignoring_pinned, compute_diff_with_overrides, compute_status,
+    compute_status_with_overrides, create_or_reset_local_branch, is_local_branch,
+    list_git_worktree_entries, list_tracked_paths_in_head, lookup_tree_entries_meta,
+    normalize_lexical, read_pinned_paths, remove_pinned_paths, render_unified_diff,
+    resolves_as_revision, switch_branch, validate_workspace_name,
 };
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, gc_workspaces,
@@ -34,7 +35,8 @@ use oz_cow::{
 };
 use oz_github::{
     CloneOptions, FetchOptions, FetchOutcome, ForceLeaseSpec, HttpAuthScheme, PushOptions,
-    PushOutcome, RemoteScheme, clone_repo, fetch_remote, parse_git_remote, push_refs,
+    PushOutcome, RemoteScheme, clone_repo, fetch_remote, parse_git_remote,
+    push_refs_with_options,
 };
 use oz_integrate::{
     IntegrateOptions, IntegrationMode, StackRebaseOptions, StackRebaseOutcome, abort_integration,
@@ -236,8 +238,8 @@ fn parse_leading_git_globals(
         if s == "-c" {
             if let Some(kv_os) = raw_args.get(i + 1) {
                 let kv = kv_os.to_string_lossy();
-                if let Some((k, v)) = kv.split_once('=') {
-                    config_overrides.push((k.trim().to_string(), v.to_string()));
+                if let Ok((k, v)) = GitConfig::parse_cli_override(kv.trim()) {
+                    config_overrides.push((k, v));
                 }
                 delegated_globals.push(arg.clone());
                 delegated_globals.push(kv_os.clone());
@@ -251,8 +253,8 @@ fn parse_leading_git_globals(
         if let Some(rest) = s.strip_prefix("-c")
             && !rest.is_empty()
         {
-            if let Some((k, v)) = rest.split_once('=') {
-                config_overrides.push((k.trim().to_string(), v.to_string()));
+            if let Ok((k, v)) = GitConfig::parse_cli_override(rest.trim()) {
+                config_overrides.push((k, v));
             }
             delegated_globals.push(arg.clone());
             i += 1;
@@ -692,12 +694,26 @@ fn build_real_git_command(
         cmd.env("GIT_PAGER", "cat");
         cmd.env("PAGER", "cat");
     }
-    if parsed.mode.non_interactive {
+    let needs_piped_stdin = subcmd.is_some_and(|s| {
+        matches!(
+            s,
+            "check-ignore" | "check-attr" | "hash-object" | "cat-file" | "rev-parse" | "update-index"
+        )
+    }) && args.iter().any(|a| {
+        matches!(
+            a.to_string_lossy().as_ref(),
+            "--stdin" | "--batch" | "--batch-check"
+        )
+    });
+    if parsed.mode.non_interactive && !needs_piped_stdin {
         cmd.stdin(Stdio::null());
         if suppress_editor {
             cmd.env("GIT_EDITOR", "true");
             cmd.env("EDITOR", "true");
         }
+    } else if parsed.mode.non_interactive && suppress_editor {
+        cmd.env("GIT_EDITOR", "true");
+        cmd.env("EDITOR", "true");
     }
     Ok(cmd)
 }
@@ -744,12 +760,22 @@ fn delegate_readonly(
                     ExitCode::Success
                 } else {
                     let stderr_str = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    let err = OzError::Git(if stderr_str.is_empty() {
+                    let msg = if stderr_str.is_empty() {
                         format!("{cmd_label} exited with status {code}")
                     } else {
                         stderr_str
-                    });
-                    emit_error(parsed.mode, &err)
+                    };
+                    if code == 1 {
+                        emit_error(
+                            parsed.mode,
+                            &OzError::CheckFailed {
+                                message: msg,
+                                recovery: Vec::new(),
+                            },
+                        )
+                    } else {
+                        emit_error(parsed.mode, &OzError::Git(msg))
+                    }
                 }
             }
             Err(err) => emit_error(parsed.mode, &OzError::Io(err)),
@@ -1406,6 +1432,7 @@ enum StatusOutputFormat {
     Human,
     Short,
     Porcelain,
+    PorcelainV2,
 }
 
 fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
@@ -1414,6 +1441,8 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
     let mut format = StatusOutputFormat::Human;
     let mut show_branch = false;
     let mut show_untracked = true;
+    let mut explicit_untracked = false;
+    let mut nul_terminated = false;
     let mut pathspecs = Vec::new();
     let mut after_sep = false;
 
@@ -1423,11 +1452,22 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
             continue;
         }
         if !after_sep {
-            if raw == "--ignored" || raw == "--porcelain=v2" || raw == "--porcelain=2" {
+            if raw == "--ignored" || raw.starts_with("--ignored=") {
                 return delegate_readonly(parsed, &["status"], &parsed.subcommand_args);
+            }
+            if raw == "--porcelain=v2" || raw == "--porcelain=2" {
+                format = StatusOutputFormat::PorcelainV2;
+                continue;
             }
             if raw == "--porcelain" || raw == "--porcelain=v1" || raw == "--porcelain=1" {
                 format = StatusOutputFormat::Porcelain;
+                continue;
+            }
+            if raw == "-z" || raw == "--null" {
+                nul_terminated = true;
+                if format == StatusOutputFormat::Human {
+                    format = StatusOutputFormat::Porcelain;
+                }
                 continue;
             }
             if raw == "-s" || raw == "--short" {
@@ -1440,6 +1480,7 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
             }
             if raw == "-uno" || raw == "--untracked-files=no" {
                 show_untracked = false;
+                explicit_untracked = true;
                 continue;
             }
             if raw == "-u"
@@ -1448,6 +1489,15 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
                 || raw.starts_with("--untracked-files")
             {
                 show_untracked = true;
+                explicit_untracked = true;
+                continue;
+            }
+            if raw == "--no-renames"
+                || raw == "--renames"
+                || raw == "--ahead-behind"
+                || raw == "--no-ahead-behind"
+                || raw.starts_with("--ignore-submodules")
+            {
                 continue;
             }
             if raw.starts_with('-') {
@@ -1466,11 +1516,15 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
         }
         pathspecs.push(raw.clone());
     }
+    if nul_terminated && !explicit_untracked {
+        show_untracked = true;
+    }
 
     let inv_dir = invocation_dir(parsed);
+    let mut repo_ctx: Option<OzoneRepo> = None;
     let res = (|| -> Result<Envelope<oz_core::StatusReport>> {
         let repo = discover_and_recover_repo(parsed.effective_dir.as_deref(), false)?;
-        let mut report = compute_status(&repo)?;
+        let mut report = compute_status_with_overrides(&repo, &parsed.config_overrides)?;
 
         if !pathspecs.is_empty() {
             let resolved_specs: Vec<PathspecMatcher> = pathspecs
@@ -1495,6 +1549,7 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
             });
         }
 
+        repo_ctx = Some(repo.clone());
         let workspace = report.workspace.clone();
         let branch = report.branch.clone();
         let head_oid = report.head_oid.clone();
@@ -1507,6 +1562,7 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
 
     emit_json_or_human(mode, res, |env| {
         let report = &env.data;
+        let delim = if nul_terminated { '\0' } else { '\n' };
         match format {
             StatusOutputFormat::Porcelain | StatusOutputFormat::Short => {
                 if show_branch {
@@ -1515,12 +1571,23 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
                         (Some(br), Some(_)) => format!("## {br}"),
                         (None, _) => "## HEAD (no branch)".to_string(),
                     };
-                    println!("{header}");
+                    print!("{header}{delim}");
                 }
                 for change in &report.changes {
                     let (x, y) = status_xy_codes(change);
-                    println!("{x}{y} {}", change.path);
+                    print!("{x}{y} {}{delim}", change.path);
                 }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            StatusOutputFormat::PorcelainV2 => {
+                render_porcelain_v2_status(
+                    repo_ctx.as_ref(),
+                    report,
+                    show_branch,
+                    delim,
+                    &parsed.config_overrides,
+                );
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             StatusOutputFormat::Human => {
                 match (&report.branch, &report.head_oid) {
@@ -1628,6 +1695,100 @@ fn status_xy_codes(change: &FileChange) -> (char, char) {
     }
 }
 
+fn render_porcelain_v2_status(
+    repo_opt: Option<&OzoneRepo>,
+    report: &oz_core::StatusReport,
+    show_branch: bool,
+    delim: char,
+    config_overrides: &[(String, String)],
+) {
+    if show_branch {
+        let oid = report.head_oid.as_deref().unwrap_or("(initial)");
+        let head = report.branch.as_deref().unwrap_or("(detached)");
+        print!("# branch.oid {oid}{delim}");
+        print!("# branch.head {head}{delim}");
+        if let Some(repo) = repo_opt
+            && let Some(br) = report.branch.as_deref()
+            && let Ok(cfg) = repo.load_git_config(config_overrides)
+            && let Some(remote) = cfg.get_str("branch", Some(br), "remote")
+            && let Some(merge_ref) = cfg.get_str("branch", Some(br), "merge")
+        {
+            let short_merge = merge_ref.strip_prefix("refs/heads/").unwrap_or(merge_ref);
+            print!("# branch.upstream {remote}/{short_merge}{delim}");
+        }
+    }
+
+    let head_entries = if let Some(repo) = repo_opt
+        && let Some(ref tree_hex) = report.base_tree
+    {
+        let paths: Vec<&str> = report.changes.iter().map(|c| c.path.as_str()).collect();
+        lookup_tree_entries_meta(repo, tree_hex, &paths)
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+
+    for change in &report.changes {
+        if !change.pinned
+            && matches!(
+                change.kind,
+                oz_core::ChangeKind::Added | oz_core::ChangeKind::Untracked
+            )
+        {
+            print!("? {}{delim}", change.path);
+            continue;
+        }
+
+        let (x_raw, y_raw) = status_xy_codes(change);
+        let x = if x_raw == ' ' { '.' } else { x_raw };
+        let y = if y_raw == ' ' { '.' } else { y_raw };
+
+        let (head_mode, head_oid) = head_entries
+            .get(&change.path)
+            .map(|(m, oid)| (*m, oid.as_str()))
+            .unwrap_or(("000000", ZERO_OID));
+
+        let work_mode = repo_opt
+            .and_then(|r| std::fs::symlink_metadata(r.workdir_path.join(&change.path)).ok())
+            .map(|m| disk_meta_octal(&m))
+            .unwrap_or_else(|| "000000".to_string());
+
+        let idx_mode = if change.pinned {
+            work_mode.as_str()
+        } else {
+            head_mode
+        };
+        let sub = if head_mode == "160000" || work_mode == "160000" {
+            "S..."
+        } else {
+            "N..."
+        };
+
+        print!(
+            "1 {x}{y} {sub} {head_mode} {idx_mode} {work_mode} {head_oid} {head_oid} {}{delim}",
+            change.path
+        );
+    }
+}
+
+fn disk_meta_octal(meta: &std::fs::Metadata) -> String {
+    if meta.file_type().is_symlink() {
+        return "120000".to_string();
+    }
+    if meta.file_type().is_dir() {
+        return "160000".to_string();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (meta.permissions().mode() & 0o111) != 0 {
+            return "100755".to_string();
+        }
+    }
+    "100644".to_string()
+}
+
 // ============================================================================
 // Native: `oz git diff`
 // ============================================================================
@@ -1637,6 +1798,8 @@ enum DiffFormat {
     Unified,
     NameOnly,
     NameStatus,
+    NumStat,
+    ShortStat,
     Stat,
 }
 
@@ -1646,6 +1809,9 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
     let mut cached = false;
     let mut format = DiffFormat::Unified;
     let mut exit_code_flag = false;
+    let mut quiet = false;
+    let mut nul_terminated = false;
+    let mut ignore_all_submodules = false;
     let mut before_sep = Vec::new();
     let mut after_sep_paths = Vec::new();
     let mut after_sep = false;
@@ -1671,17 +1837,46 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
             format = DiffFormat::NameStatus;
             continue;
         }
+        if raw == "--numstat" {
+            format = DiffFormat::NumStat;
+            continue;
+        }
+        if raw == "--shortstat" {
+            format = DiffFormat::ShortStat;
+            continue;
+        }
         if raw == "--stat" {
             format = DiffFormat::Stat;
+            continue;
+        }
+        if raw == "-z" || raw == "--null" {
+            nul_terminated = true;
             continue;
         }
         if raw == "--exit-code" {
             exit_code_flag = true;
             continue;
         }
+        if raw == "--quiet" {
+            quiet = true;
+            exit_code_flag = true;
+            continue;
+        }
+        if raw == "--ignore-submodules" || raw == "--ignore-submodules=all" {
+            ignore_all_submodules = true;
+            continue;
+        }
+        if raw.starts_with("--ignore-submodules=") {
+            continue;
+        }
         if raw == "-p"
             || raw == "--patch"
             || raw == "--no-color"
+            || raw == "--no-ext-diff"
+            || raw == "--no-renames"
+            || raw == "--no-textconv"
+            || raw == "--histogram"
+            || raw == "--patience"
             || raw.starts_with("--color")
             || raw.starts_with("-U")
             || raw.starts_with("--unified")
@@ -1725,9 +1920,23 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
     }
 
     let res = (|| -> Result<Envelope<DiffData>> {
-        let mut report = compute_diff(&repo, &path_targets)?;
+        let mut report =
+            compute_diff_with_overrides(&repo, &path_targets, &parsed.config_overrides)?;
         if cached {
             report.files.retain(|f| f.pinned);
+        }
+        if ignore_all_submodules {
+            let paths: Vec<&str> = report.files.iter().map(|f| f.path.as_str()).collect();
+            let head_meta = if let Some(ref tree_hex) = compute_status(&repo).ok().and_then(|s| s.base_tree) {
+                lookup_tree_entries_meta(&repo, tree_hex, &paths)
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            report
+                .files
+                .retain(|f| head_meta.get(&f.path).is_none_or(|(m, _)| *m != "160000"));
+        }
+        if cached || ignore_all_submodules {
             report.total_additions = report.files.iter().map(|f| f.additions).sum();
             report.total_deletions = report.files.iter().map(|f| f.deletions).sum();
         }
@@ -1747,7 +1956,11 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
     let has_diff = res.as_ref().is_ok_and(|env| !env.data.report.files.is_empty());
 
     let code = emit_json_or_human(mode, res, |env| {
+        if quiet {
+            return;
+        }
         let report = &env.data.report;
+        let delim = if nul_terminated { '\0' } else { '\n' };
         match format {
             DiffFormat::Unified => {
                 if !env.data.unified_diff.is_empty() {
@@ -1756,13 +1969,51 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
             }
             DiffFormat::NameOnly => {
                 for f in &report.files {
-                    println!("{}", f.path);
+                    print!("{}{delim}", f.path);
                 }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             DiffFormat::NameStatus => {
                 for f in &report.files {
-                    println!("{}\t{}", f.kind.short_code(), f.path);
+                    print!("{}\t{}{delim}", f.kind.short_code(), f.path);
                 }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            DiffFormat::NumStat => {
+                for f in &report.files {
+                    if f.is_binary {
+                        print!("-\t-\t{}{delim}", f.path);
+                    } else {
+                        print!("{}\t{}\t{}{delim}", f.additions, f.deletions, f.path);
+                    }
+                }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            DiffFormat::ShortStat => {
+                if report.files.is_empty() {
+                    return;
+                }
+                let file_word = if report.files.len() == 1 {
+                    "file"
+                } else {
+                    "files"
+                };
+                let ins_word = if report.total_additions == 1 {
+                    "insertion"
+                } else {
+                    "insertions"
+                };
+                let del_word = if report.total_deletions == 1 {
+                    "deletion"
+                } else {
+                    "deletions"
+                };
+                println!(
+                    " {} {file_word} changed, {} {ins_word}(+), {} {del_word}(-)",
+                    report.files.len(),
+                    report.total_additions,
+                    report.total_deletions
+                );
             }
             DiffFormat::Stat => {
                 if report.files.is_empty() {
@@ -2105,6 +2356,7 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
         }
     }
 
+    let mut no_verify = false;
     let mut i = 0usize;
     let mut after_sep = false;
     while i < args.len() {
@@ -2240,7 +2492,12 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             i += 1;
             continue;
         }
-        if arg == "-n" || arg == "--no-verify" || arg == "-v" || arg == "--verbose" {
+        if arg == "-n" || arg == "--no-verify" {
+            no_verify = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-v" || arg == "--verbose" {
             i += 1;
             continue;
         }
@@ -2259,7 +2516,8 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             for (byte_idx, ch) in short.char_indices() {
                 match ch {
                     'a' => all_flag = true,
-                    'n' | 'v' => {}
+                    'n' => no_verify = true,
+                    'v' => {}
                     'q' => quiet = true,
                     'f' => force = true,
                     'S' => {
@@ -2425,6 +2683,8 @@ fn handle_git_commit(parsed: &ParsedGitGlobals) -> ExitCode {
             sign,
             signing_key,
             amend,
+            no_verify,
+            config_overrides: parsed.config_overrides.clone(),
         };
         let outcome = if all_flag {
             commit_changes_ignoring_pinned(&repo, &opts)?
@@ -3297,17 +3557,22 @@ pub fn handle_git_rebase(parsed: &ParsedGitGlobals) -> ExitCode {
 // Native Wrappers: `clone`, `fetch`, `push`
 // ============================================================================
 
+fn has_non_config_exotic_globals(parsed: &ParsedGitGlobals) -> bool {
+    parsed.delegated_globals.iter().any(|g| {
+        let s = g.to_string_lossy();
+        !s.starts_with("-c")
+            && !matches!(
+                s.as_ref(),
+                "--no-pager" | "-p" | "--paginate" | "--no-optional-locks"
+            )
+    })
+}
+
 fn has_exotic_git_globals(parsed: &ParsedGitGlobals) -> bool {
     if !parsed.config_overrides.is_empty() {
         return true;
     }
-    parsed.delegated_globals.iter().any(|g| {
-        let s = g.to_string_lossy();
-        !matches!(
-            s.as_ref(),
-            "--no-pager" | "-p" | "--paginate" | "--no-optional-locks"
-        )
-    })
+    has_non_config_exotic_globals(parsed)
 }
 
 enum GitCloneAction {
@@ -3961,6 +4226,7 @@ enum GitPushAction {
         lease_specs: Vec<ForceLeaseSpec>,
         set_upstream: bool,
         quiet: bool,
+        no_verify: bool,
     },
     Fallback,
 }
@@ -3976,6 +4242,7 @@ fn parse_git_push_action(args: &[String], has_exotic_globals: bool) -> GitPushAc
     let mut lease_specs: Vec<ForceLeaseSpec> = Vec::new();
     let mut set_upstream = false;
     let mut quiet = false;
+    let mut no_verify = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut after_sep = false;
     let mut i = 0usize;
@@ -4025,7 +4292,12 @@ fn parse_git_push_action(args: &[String], has_exotic_globals: bool) -> GitPushAc
                     i += 1;
                     continue;
                 }
-                "-v" | "--verbose" | "--progress" | "--no-progress" | "--no-verify" => {
+                "--no-verify" => {
+                    no_verify = true;
+                    i += 1;
+                    continue;
+                }
+                "-v" | "--verbose" | "--progress" | "--no-progress" => {
                     i += 1;
                     continue;
                 }
@@ -4076,6 +4348,7 @@ fn parse_git_push_action(args: &[String], has_exotic_globals: bool) -> GitPushAc
         lease_specs,
         set_upstream,
         quiet,
+        no_verify,
     }
 }
 
@@ -4120,7 +4393,7 @@ fn handle_git_push(parsed: &ParsedGitGlobals) -> ExitCode {
         return delegate_readonly(&adjusted, &["push"], &os_args);
     }
 
-    match parse_git_push_action(&clean_args, has_exotic_git_globals(parsed)) {
+    match parse_git_push_action(&clean_args, has_non_config_exotic_globals(parsed)) {
         GitPushAction::Fallback => {
             adjusted.mode.non_interactive = true;
             delegate_mutating(&adjusted, "push", &os_args, true, false)
@@ -4134,12 +4407,13 @@ fn handle_git_push(parsed: &ParsedGitGlobals) -> ExitCode {
             lease_specs,
             set_upstream,
             quiet,
+            no_verify,
         } => {
             let res = (|| -> Result<Envelope<PushOutcome>> {
                 let repo = discover_and_recover_repo(parsed.effective_dir.as_deref(), false)?;
                 let effective_remote = remote.or_else(|| read_configured_branch_remote(&repo));
                 let actor = actor_from_mode(mode, &repo);
-                let outcome = push_refs(
+                let outcome = push_refs_with_options(
                     &repo,
                     &PushOptions {
                         remote: effective_remote,
@@ -4153,6 +4427,8 @@ fn handle_git_push(parsed: &ParsedGitGlobals) -> ExitCode {
                         auth_token: None,
                         auth_scheme: HttpAuthScheme::BasicToken,
                     },
+                    no_verify,
+                    &parsed.config_overrides,
                     actor,
                 )?;
 
@@ -4327,7 +4603,14 @@ fn is_read_only_git_command(subcmd: &str, args: &[OsString]) -> bool {
         "config" => str_args.iter().any(|a| {
             matches!(
                 a.as_str(),
-                "--get" | "--get-all" | "--get-regexp" | "--list" | "-l" | "--show-origin"
+                "--get"
+                    | "--get-all"
+                    | "--get-regexp"
+                    | "--get-urlmatch"
+                    | "--list"
+                    | "-l"
+                    | "--show-origin"
+                    | "--show-scope"
             )
         }),
         "symbolic-ref" => !str_args.iter().any(|a| a == "-d" || a == "--delete")
