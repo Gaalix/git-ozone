@@ -9,7 +9,8 @@ use fs4::FileExt;
 use oz_core::OzoneConfig;
 use oz_warm::{
     BaselineMetadata, BaselineSource, apply_baseline_mtimes, capture_baseline,
-    compute_changed_paths_between_commits, detect_warm_targets, find_baseline, gc_baselines,
+    check_cargo_fingerprint_portability, compute_changed_paths_between_commits,
+    detect_warm_targets, detect_warm_targets_with_cargo_target_dir, find_baseline, gc_baselines,
     is_repo_quiescent, resolve_or_capture_baseline, touch_baseline_lru,
 };
 use std::fs::OpenOptions;
@@ -157,7 +158,10 @@ fn venv_trampoline_rewrites_and_executes_from_cloned_workspace_path() {
     let meta = capture_baseline(&repo_root, &ozone_dir, &commit_oid, &cfg).expect("capture");
     assert!(meta.targets.iter().any(|t| t.relative_path == ".venv"));
 
-    let baseline_venv = ozone_dir.join("baselines").join(&commit_oid).join("root/.venv");
+    let baseline_venv = ozone_dir
+        .join("baselines")
+        .join(&commit_oid)
+        .join("root/.venv");
     let cloned_ws = dir.path().join("elsewhere/cloned-ws");
     std::fs::create_dir_all(cloned_ws.join(".venv/bin")).expect("mkdir cloned venv");
     std::fs::copy(
@@ -306,13 +310,18 @@ fn baseline_capture_excludes_locks_and_never_hardlinks_editable_sources() {
             .join("target/debug/incremental/crate_a/s-123/sess.lock")
             .exists()
     );
-    assert!(baseline_root.join("target/debug/deps/libdep.rlib").is_file());
+    assert!(
+        baseline_root
+            .join("target/debug/deps/libdep.rlib")
+            .is_file()
+    );
 
     // Editable source file MUST NOT be hardlinked!
     let src_ino = std::fs::metadata(repo_root.join("src/main.rs"))
         .expect("src meta")
         .ino();
-    let base_src_meta = std::fs::metadata(baseline_root.join("src/main.rs")).expect("base src meta");
+    let base_src_meta =
+        std::fs::metadata(baseline_root.join("src/main.rs")).expect("base src meta");
     assert_ne!(src_ino, base_src_meta.ino());
     assert_eq!(base_src_meta.nlink(), 1);
 }
@@ -329,8 +338,11 @@ fn mtime_preservation_restores_untouched_and_keeps_modified_at_now() {
     )
     .expect("write Cargo.toml");
     std::fs::write(repo_root.join("src/unchanged.rs"), "pub fn a() {}\n").expect("write unchanged");
-    std::fs::write(repo_root.join("src/modified.rs"), "pub fn b() -> u32 { 1 }\n")
-        .expect("write modified");
+    std::fs::write(
+        repo_root.join("src/modified.rs"),
+        "pub fn b() -> u32 { 1 }\n",
+    )
+    .expect("write modified");
 
     let c1 = init_repo(&repo_root);
     std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
@@ -350,8 +362,11 @@ fn mtime_preservation_restores_untouched_and_keeps_modified_at_now() {
     let baseline_meta = capture_baseline(&repo_root, &ozone_dir, &c1, &cfg).expect("capture c1");
 
     // Advance branch to c2 modifying src/modified.rs and adding src/added.rs.
-    std::fs::write(repo_root.join("src/modified.rs"), "pub fn b() -> u32 { 2 }\n")
-        .expect("modify");
+    std::fs::write(
+        repo_root.join("src/modified.rs"),
+        "pub fn b() -> u32 { 2 }\n",
+    )
+    .expect("modify");
     std::fs::write(repo_root.join("src/added.rs"), "pub fn c() {}\n").expect("add");
     let c2 = commit_all(&repo_root, "modify and add");
 
@@ -363,7 +378,11 @@ fn mtime_preservation_restores_untouched_and_keeps_modified_at_now() {
     // Simulate freshly checked out workspace where all files initially have mtime = NOW.
     let ws_root = dir.path().join("ws-1");
     std::fs::create_dir_all(ws_root.join("src")).expect("mkdir ws src");
-    std::fs::write(ws_root.join("Cargo.toml"), "[package]\nname = \"mtime-repo\"\n").expect("w");
+    std::fs::write(
+        ws_root.join("Cargo.toml"),
+        "[package]\nname = \"mtime-repo\"\n",
+    )
+    .expect("w");
     std::fs::write(ws_root.join("src/unchanged.rs"), "pub fn a() {}\n").expect("w");
     std::fs::write(ws_root.join("src/modified.rs"), "pub fn b() -> u32 { 2 }\n").expect("w");
     std::fs::write(ws_root.join("src/added.rs"), "pub fn c() {}\n").expect("w");
@@ -403,6 +422,7 @@ fn lru_gc_evicts_least_recently_used_baselines_within_budget() {
             targets: Vec::new(),
             total_bytes: 4096,
             file_mtimes_secs: Default::default(),
+            file_mtimes_nanos: Default::default(),
         };
         std::fs::write(
             bdir.join("metadata.json"),
@@ -506,8 +526,12 @@ fn concurrent_baseline_capture_serializes_cleanly_and_hardlinks_non_incremental_
     let base_root = ozone_dir.join("baselines").join(&oid).join("root");
     // Editable source MUST NOT be hardlinked!
     assert_ne!(
-        std::fs::metadata(repo_root.join("src/lib.rs")).expect("src").ino(),
-        std::fs::metadata(base_root.join("src/lib.rs")).expect("base src").ino()
+        std::fs::metadata(repo_root.join("src/lib.rs"))
+            .expect("src")
+            .ino(),
+        std::fs::metadata(base_root.join("src/lib.rs"))
+            .expect("base src")
+            .ino()
     );
     // Incremental cache uses in-place mmap/SQLite writes -> MUST NOT be hardlinked!
     assert_ne!(
@@ -519,6 +543,311 @@ fn concurrent_baseline_capture_serializes_cleanly_and_hardlinks_non_incremental_
     // Compiled deps and top-level binary in `target/debug/` ARE hardlinked on non-reflink ext4/tmpfs
     // (or reflinked on APFS/Btrfs/XFS, in which case content and mode still match).
     let base_bin = base_root.join("target/debug/concurrent-rust");
-    assert_eq!(std::fs::metadata(&base_bin).expect("base bin").len(), 64 * 1024);
+    assert_eq!(
+        std::fs::metadata(&base_bin).expect("base bin").len(),
+        64 * 1024
+    );
     assert!(base_root.join("target/debug/deps/libdep.rlib").is_file());
+}
+
+#[test]
+fn excludes_and_detects_cargo_build_and_artifact_locks_across_profiles() {
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("cargo-locks");
+    let ozone_dir = repo_root.join(".git/ozone");
+    std::fs::create_dir_all(repo_root.join("src")).expect("mkdir src");
+    std::fs::write(
+        repo_root.join("Cargo.toml"),
+        "[package]\nname = \"cargo-locks\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(repo_root.join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib");
+
+    let oid = init_repo(&repo_root);
+    std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
+
+    let triple_debug = repo_root.join("target/x86_64-unknown-linux-gnu/debug");
+    std::fs::create_dir_all(triple_debug.join("deps")).expect("mkdir triple deps");
+    std::fs::write(triple_debug.join("deps/libx.rlib"), b"rlib").expect("write rlib");
+    let build_lock = triple_debug.join(".cargo-build-lock");
+    let artifact_lock = repo_root.join("target/debug/.cargo-artifact-lock");
+    std::fs::create_dir_all(artifact_lock.parent().expect("parent")).expect("mkdir debug");
+    std::fs::write(&build_lock, b"").expect("write build lock");
+    std::fs::write(&artifact_lock, b"").expect("write artifact lock");
+
+    let cfg = OzoneConfig::default();
+    let targets = detect_warm_targets(&repo_root, &cfg);
+    assert!(is_repo_quiescent(&repo_root, &targets).expect("quiescent before lock"));
+
+    // Holding `.cargo-build-lock` in target triple dir blocks quiescence.
+    let holder = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&build_lock)
+        .expect("open build_lock");
+    FileExt::lock(&holder).expect("lock build_lock");
+    assert!(!is_repo_quiescent(&repo_root, &targets).expect("non-quiescent on build_lock"));
+    FileExt::unlock(&holder).expect("unlock build_lock");
+    drop(holder);
+
+    // Holding `.cargo-artifact-lock` also blocks quiescence.
+    let holder2 = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&artifact_lock)
+        .expect("open artifact_lock");
+    FileExt::lock(&holder2).expect("lock artifact_lock");
+    assert!(!is_repo_quiescent(&repo_root, &targets).expect("non-quiescent on artifact_lock"));
+    FileExt::unlock(&holder2).expect("unlock artifact_lock");
+    drop(holder2);
+
+    capture_baseline(&repo_root, &ozone_dir, &oid, &cfg).expect("capture baseline");
+    let base_root = ozone_dir.join("baselines").join(&oid).join("root");
+    assert!(
+        !base_root
+            .join("target/x86_64-unknown-linux-gnu/debug/.cargo-build-lock")
+            .exists()
+    );
+    assert!(!base_root.join("target/debug/.cargo-artifact-lock").exists());
+    assert!(
+        base_root
+            .join("target/x86_64-unknown-linux-gnu/debug/deps/libx.rlib")
+            .is_file()
+    );
+}
+
+#[test]
+fn detects_custom_cargo_target_dir_and_subsecond_mtime_preservation() {
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("custom-target");
+    let ozone_dir = repo_root.join(".git/ozone");
+    std::fs::create_dir_all(repo_root.join(".cargo")).expect("mkdir .cargo");
+    std::fs::create_dir_all(repo_root.join("src")).expect("mkdir src");
+    std::fs::write(
+        repo_root.join("Cargo.toml"),
+        "[package]\nname = \"custom-target\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("Cargo.toml");
+    std::fs::write(
+        repo_root.join(".cargo/config.toml"),
+        "[build]\ntarget-dir = \"build/cargo-target\"\n",
+    )
+    .expect("config.toml");
+    let src_file = repo_root.join("src/lib.rs");
+    std::fs::write(&src_file, "pub fn x() -> u32 { 1 }\n").expect("write lib");
+
+    let c1 = init_repo(&repo_root);
+    std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
+
+    let precise_ft = FileTime::from_unix_time(1_700_000_123, 456_789_000);
+    #[allow(deprecated)]
+    filetime::set_file_mtime(&src_file, precise_ft).expect("set subsecond mtime");
+
+    let cfg = OzoneConfig::default();
+    let targets = detect_warm_targets_with_cargo_target_dir(&repo_root, &cfg, None);
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.relative_path == "build/cargo-target")
+    );
+
+    let env_targets = detect_warm_targets_with_cargo_target_dir(
+        &repo_root,
+        &cfg,
+        Some(std::ffi::OsStr::new("env-target")),
+    );
+    assert!(env_targets.iter().any(|t| t.relative_path == "env-target"));
+
+    let meta = capture_baseline(&repo_root, &ozone_dir, &c1, &cfg).expect("capture");
+    assert_eq!(
+        meta.file_mtimes_secs.get("src/lib.rs").copied(),
+        Some(1_700_000_123)
+    );
+    assert_eq!(
+        meta.file_mtimes_nanos.get("src/lib.rs").copied(),
+        Some(456_789_000)
+    );
+
+    let ws_root = dir.path().join("ws-subsec");
+    std::fs::create_dir_all(ws_root.join("src")).expect("mkdir ws src");
+    std::fs::write(ws_root.join("src/lib.rs"), "pub fn x() -> u32 { 1 }\n").expect("write ws");
+    apply_baseline_mtimes(&ws_root, &meta, &Default::default()).expect("apply mtime");
+
+    let restored_meta = std::fs::metadata(ws_root.join("src/lib.rs")).expect("stat ws lib");
+    let restored_mod = restored_meta.modified().expect("modified");
+    let dur = restored_mod.duration_since(UNIX_EPOCH).expect("epoch");
+    assert_eq!(dur.as_secs(), 1_700_000_123);
+    assert_eq!(dur.subsec_nanos(), 456_789_000);
+}
+
+#[test]
+fn cargo_fingerprint_portability_check_detects_absolute_paths_and_remap_flags() {
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("fp-check");
+    let fp_dir = repo_root.join("target/debug/.fingerprint/mycrate-abc");
+    std::fs::create_dir_all(&fp_dir).expect("mkdir fp");
+
+    std::fs::write(
+        fp_dir.join("lib-mycrate.json"),
+        serde_json::json!({
+            "rustflags": ["--remap-path-prefix", "src=/src"],
+            "local": [{"CheckDepInfo": {"dep_info": "debug/.fingerprint/mycrate-abc/dep-lib-mycrate", "checksum": false}}]
+        })
+        .to_string(),
+    )
+    .expect("write clean fp");
+    let ok_report =
+        check_cargo_fingerprint_portability(&repo_root, Path::new("target")).expect("scan");
+    assert!(ok_report.portable);
+    assert_eq!(ok_report.fingerprints_scanned, 1);
+
+    std::fs::write(
+        fp_dir.join("run-build-script.json"),
+        serde_json::json!({
+            "rustflags": [format!("--remap-path-prefix={}=/ws", repo_root.display())],
+            "local": [{"RerunIfChanged": {"output": "out", "paths": [repo_root.join("src/lib.rs")]}}]
+        })
+        .to_string(),
+    )
+    .expect("write non-portable fp");
+    let bad_report =
+        check_cargo_fingerprint_portability(&repo_root, Path::new("target")).expect("scan2");
+    assert!(!bad_report.portable);
+    assert_eq!(bad_report.non_portable_remap_rustflags.len(), 1);
+    assert_eq!(bad_report.non_portable_rerun_paths.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn python_venv_normalizes_pyvenv_cfg_activate_long_trampolines_and_editable_pth() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let Some(sys_python) = find_system_python3() else {
+        return;
+    };
+
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("py-full");
+    let ozone_dir = repo_root.join(".git/ozone");
+    std::fs::create_dir_all(repo_root.join("pkg")).expect("mkdir pkg");
+    std::fs::write(
+        repo_root.join("pyproject.toml"),
+        "[project]\nname = \"py-full\"\n",
+    )
+    .expect("pyproject");
+    std::fs::write(repo_root.join("pkg/__init__.py"), "MARKER = 'from_repo'\n").expect("init");
+    let oid = init_repo(&repo_root);
+    std::fs::create_dir_all(&ozone_dir).expect("ozone");
+
+    let venv_root = repo_root.join(".venv");
+    let venv_bin = venv_root.join("bin");
+    let sp_dir = venv_root.join("lib/python3.14/site-packages");
+    std::fs::create_dir_all(&venv_bin).expect("mkdir bin");
+    std::fs::create_dir_all(&sp_dir).expect("mkdir sp");
+
+    std::fs::write(
+        venv_root.join("pyvenv.cfg"),
+        format!(
+            "home = /usr/bin\ninclude-system-site-packages = false\ncommand = /usr/bin/python3 -m venv {}\n",
+            venv_root.display()
+        ),
+    )
+    .expect("pyvenv.cfg");
+    symlink(&sys_python, venv_bin.join("python3")).expect("symlink python3");
+    symlink("python3", venv_bin.join("python")).expect("symlink python");
+    symlink(venv_bin.join("python3"), venv_bin.join("py_alias")).expect("symlink abs internal");
+
+    std::fs::write(
+        venv_bin.join("activate"),
+        format!(
+            "deactivate nondestructive\nexport VIRTUAL_ENV={}\nPATH=\"$VIRTUAL_ENV/bin:$PATH\"\n",
+            venv_root.display()
+        ),
+    )
+    .expect("activate");
+
+    let long_tool = venv_bin.join("long-tool");
+    std::fs::write(
+        &long_tool,
+        format!(
+            "#!/bin/sh\n'''exec' {}/python3 \"$0\" \"$@\"\n' '''\nimport sys, pkg\nprint('LONG:' + sys.prefix + ':' + pkg.MARKER)\n",
+            venv_bin.display()
+        ),
+    )
+    .expect("long-tool");
+    std::fs::set_permissions(&long_tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    std::fs::write(
+        sp_dir.join("editable.pth"),
+        format!("{}\n", repo_root.display()),
+    )
+    .expect("pth");
+
+    let cfg = OzoneConfig::default();
+    capture_baseline(&repo_root, &ozone_dir, &oid, &cfg).expect("capture");
+    let base_root = ozone_dir.join("baselines").join(&oid).join("root");
+
+    // Copy baseline root into a relocated workspace and override pkg/__init__.py to prove isolation!
+    let ws_root = dir.path().join("relocated/ws-py");
+    std::fs::create_dir_all(ws_root.join("pkg")).expect("mkdir ws pkg");
+    std::fs::write(ws_root.join("pkg/__init__.py"), "MARKER = 'from_ws'\n").expect("ws init");
+    for entry in walkdir::WalkDir::new(base_root.join(".venv")).follow_links(false) {
+        let entry = entry.expect("walk");
+        let rel = entry.path().strip_prefix(&base_root).expect("strip");
+        let dst = ws_root.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&dst).expect("mkdir");
+        } else if entry.path_is_symlink() {
+            let tgt = std::fs::read_link(entry.path()).expect("readlink");
+            symlink(tgt, &dst).expect("symlink");
+        } else {
+            std::fs::copy(entry.path(), &dst).expect("copy");
+            std::fs::set_permissions(&dst, entry.metadata().expect("meta").permissions())
+                .expect("perms");
+        }
+    }
+
+    let cfg_text = std::fs::read_to_string(ws_root.join(".venv/pyvenv.cfg")).expect("read cfg");
+    assert!(!cfg_text.contains(repo_root.to_string_lossy().as_ref()));
+    assert!(cfg_text.contains("command = /usr/bin/python3 -m venv .venv"));
+
+    let alias_target =
+        std::fs::read_link(ws_root.join(".venv/bin/py_alias")).expect("readlink alias");
+    assert!(
+        !alias_target.is_absolute(),
+        "expected relative symlink, got {alias_target:?}"
+    );
+
+    // Source `.venv/bin/activate` in bash and check VIRTUAL_ENV resolves to `ws_root/.venv`.
+    let act_out = Command::new("bash")
+        .args([
+            "-c",
+            "source .venv/bin/activate && printf '%s' \"$VIRTUAL_ENV\"",
+        ])
+        .current_dir(&ws_root)
+        .output()
+        .expect("bash activate");
+    assert!(
+        act_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&act_out.stderr)
+    );
+    let expected_venv = std::fs::canonicalize(ws_root.join(".venv")).expect("canon");
+    assert_eq!(
+        String::from_utf8_lossy(&act_out.stdout),
+        expected_venv.to_string_lossy().as_ref()
+    );
+
+    // Execute rewritten long-path trampoline script and verify sys.prefix and editable pkg come from ws_root!
+    let tool_out = run_script_retry_etxtbsy(&ws_root.join(".venv/bin/long-tool"));
+    assert!(
+        tool_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tool_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&tool_out.stdout);
+    assert!(
+        stdout.contains(&format!("LONG:{}:from_ws", expected_venv.display())),
+        "unexpected long-tool output: {stdout}"
+    );
 }
