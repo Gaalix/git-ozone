@@ -31,6 +31,7 @@ path = "src/bin/git_ozone.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 oz-agent.workspace = true
 oz-cloud-api.workspace = true
 oz-core.workspace = true

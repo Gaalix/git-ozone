@@ -3,11 +3,14 @@
 
 //! Ozone CLI (`oz` and `git-ozone`) argument parsing, `oz.v1` JSON rendering, and subcommands.
 
+pub mod aliases;
 pub mod commands;
+pub mod daily;
 pub mod git_shim;
+pub mod pager;
 pub mod recovery;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 pub use commands::build_mcp_server;
 use commands::{
     AgentCommand, BlameArgs, CheckpointArgs, CiArgs, CloneArgs, CommitArgs, DiffArgs, FetchArgs,
@@ -16,6 +19,11 @@ use commands::{
     handle_clone, handle_commit, handle_diff, handle_fetch, handle_integrate, handle_mcp,
     handle_pr, handle_push, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
     handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope,
+};
+use daily::{
+    BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RevertArgs, ShowArgs, StashArgs, TagArgs,
+    handle_branch, handle_cherry_pick, handle_completions, handle_diff_paged, handle_log,
+    handle_revert, handle_show, handle_stash, handle_tag,
 };
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, FilesystemKind, InteractionMode, MountHealth,
@@ -105,6 +113,22 @@ pub enum Commands {
     Mcp(McpArgs),
     /// Show line-level human vs. AI (`refs/notes/ai`) authorship attribution for a file.
     Blame(BlameArgs),
+    /// Show commit history graph with filtering (`--oneline`, `-n`, `--author`, `--grep`, `-S`, `-G`, `--since`).
+    Log(LogArgs),
+    /// Show commit metadata, `Change-Id`, `refs/notes/ai` provenance, and diff (`--stat`, `--json`).
+    Show(ShowArgs),
+    /// Save and restore dirty working-tree snapshots (`push`, `pop`, `list`, `drop`) backed by OpLog.
+    Stash(StashArgs),
+    /// Apply the changes introduced by an existing commit onto `HEAD` (recorded in OpLog).
+    CherryPick(CherryPickArgs),
+    /// Create a new commit reverting the changes introduced by an existing commit (recorded in OpLog).
+    Revert(RevertArgs),
+    /// Create, list, delete, and SSH-sign tags (recorded in OpLog).
+    Tag(TagArgs),
+    /// List, create, rename, and delete local branches (recorded in OpLog).
+    Branch(BranchArgs),
+    /// Generate shell completion scripts (`bash`, `zsh`, `fish`, `powershell`).
+    Completions(CompletionsArgs),
     /// Initialize colocated `.git/ozone/` metadata, `systemd --user`, or Windows ProjFS.
     Setup(SetupArgs),
     /// Inspect OS, filesystem (`statfs`), FUSE3/reflink readiness, and colocated repo status.
@@ -266,6 +290,23 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
     let raw_json_hint = args.iter().any(|a| a == "--json");
     let raw_agent_hint = args.iter().any(|a| a == "--agent");
 
+    let args = match aliases::expand_aliases(args) {
+        Ok(expanded) => expanded,
+        Err(err) => {
+            if raw_json_hint {
+                let env = Envelope::from_error(&err);
+                println!(
+                    "{}",
+                    env.to_json_pretty()
+                        .unwrap_or_else(|_| "{\"schema\":\"oz.v1\",\"ok\":false}".into())
+                );
+            } else {
+                eprintln!("error: {err}");
+            }
+            return err.exit_code();
+        }
+    };
+
     let (parse_slice, trailing_git_args) = match find_git_subcommand_index(&args) {
         Some(idx) => (&args[..=idx], Some(args[idx + 1..].to_vec())),
         None => (args.as_slice(), None),
@@ -334,7 +375,13 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
     match cli.command {
         Some(Commands::Ws(ws_cmd)) => handle_ws(ws_cmd, cli.directory.as_deref(), mode),
         Some(Commands::Status) => handle_status(cli.directory.as_deref(), mode),
-        Some(Commands::Diff(args)) => handle_diff(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Diff(args)) => {
+            if pager::pager_allowed_for_mode(mode) {
+                handle_diff_paged(&args.targets, cli.directory.as_deref(), mode)
+            } else {
+                handle_diff(&args, cli.directory.as_deref(), mode)
+            }
+        }
         Some(Commands::Commit(args)) => handle_commit(&args, cli.directory.as_deref(), mode),
         Some(Commands::Checkpoint(args)) => {
             handle_checkpoint(&args, cli.directory.as_deref(), mode)
@@ -356,6 +403,14 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Agent(agent_cmd)) => handle_agent(agent_cmd, cli.directory.as_deref(), mode),
         Some(Commands::Mcp(args)) => handle_mcp(&args, cli.directory.as_deref(), mode),
         Some(Commands::Blame(args)) => handle_blame(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Log(args)) => handle_log(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Show(args)) => handle_show(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Stash(args)) => handle_stash(&args, cli.directory.as_deref(), mode),
+        Some(Commands::CherryPick(args)) => handle_cherry_pick(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Revert(args)) => handle_revert(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Tag(args)) => handle_tag(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Branch(args)) => handle_branch(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Completions(args)) => handle_completions(&args, Cli::command(), mode),
         Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),
         Some(Commands::Version) => handle_version(invocation, mode),
