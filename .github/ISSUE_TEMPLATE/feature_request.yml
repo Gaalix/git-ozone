@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an improvement, new Git compatibility feature, or agent workflow enhancement
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow gap
+      description: Describe what workflow is missing or harder than it should be with `oz`.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed CLI / API / MCP design
+      description: Describe the flags, JSON fields, or behavior you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or existing git behavior
+      description: How does canonical `git`, `jj`, or your current workaround handle this?

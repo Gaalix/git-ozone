@@ -2,9 +2,11 @@
 
 **A pure-Rust, GitHub-compatible Git client and Copy-on-Write workspace engine built for solo developers and parallel AI coding agents.**
 
+[![CI](https://github.com/Gaalix/git-ozone/actions/workflows/ci.yml/badge.svg)](https://github.com/Gaalix/git-ozone/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Gaalix/git-ozone)](https://github.com/Gaalix/git-ozone/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Pure Rust](https://img.shields.io/badge/pure--rust-zero%20C%20bindings-orange.svg)](#tiered-cross-platform-cow-architecture)
-[![Version: v1.0.0](https://img.shields.io/badge/version-v1.0.0-brightgreen.svg)](#installation)
+[![Website](https://img.shields.io/badge/site-gaalix.github.io%2Fgit--ozone-brightgreen.svg)](https://gaalix.github.io/git-ozone/)
 
 Ozone operates **100% colocated inside standard `.git/` repositories** — no repository conversion, no lock-in, and full compatibility with `git`, GitHub, IDEs, `gh`, and CI. It eliminates the four failure modes of canonical C `git` under heavy parallel agent workloads:
 
@@ -17,55 +19,58 @@ Ozone operates **100% colocated inside standard `.git/` repositories** — no re
 
 ## Installation
 
-Release archives (`oz`, `git-ozone`, and `oz-vfsd`) are published as static pure-Rust binaries (zero `libgit2`, `OpenSSL`, or `libfuse` C dependencies) on [GitHub Releases](https://github.com/ozone-vcs/ozone/releases).
-
-### macOS & Linux (Homebrew)
-
-```bash
-brew install ozone-vcs/tap/oz
-```
+Release archives (`oz`, `git-ozone`, and `oz-vfsd`) are published as static pure-Rust binaries (zero `libgit2`, `OpenSSL`, or `libfuse` C dependencies) on [GitHub Releases](https://github.com/Gaalix/git-ozone/releases), or you can install straight from source with Cargo.
 
 ### Linux & macOS (Shell Installer)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash
 ```
 
 Supports `--version v1.0.0`, `--prefix ~/.local`, and `--dry-run`.
+
+### Windows (PowerShell Installer)
+
+```powershell
+irm https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.ps1 | iex
+```
+
+Supports `-Version v1.0.0`, `-Prefix "$env:LOCALAPPDATA\Ozone"`, and `-DryRun`. To enable Windows `NTFS` virtualization (`Client-ProjFS`) without rebooting, run `oz setup --enable-projfs`.
+
+### Cargo (From GitHub, `cargo-binstall`, or Local Checkout)
+
+```bash
+# Install directly from GitHub source (works immediately with Rust 1.85+ / edition 2024)
+cargo install --git https://github.com/Gaalix/git-ozone --locked oz-cli oz-vfsd
+
+# Or download pre-built GitHub Release binaries via cargo-binstall
+cargo binstall --git https://github.com/Gaalix/git-ozone oz-cli
+
+# Or build from a local clone
+cargo install --path crates/oz-cli --locked
+cargo install --path crates/oz-vfsd --locked
+```
 
 ### Debian / Ubuntu (`.deb` / APT)
 
 ```bash
 # Download the latest release .deb (amd64 or arm64) and install with Recommends: fuse3
-curl -fsSLO https://github.com/ozone-vcs/ozone/releases/download/v1.0.0/ozone_1.0.0_amd64.deb
+curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.0.0/ozone_1.0.0_amd64.deb
 sudo apt install ./ozone_1.0.0_amd64.deb
 ```
 
 For self-hosted APT repository instructions, see [`packaging/deb/apt-repo-setup.md`](packaging/deb/apt-repo-setup.md).
 
+### macOS & Linux (Homebrew Formula)
+
+```bash
+brew install --formula https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/homebrew/oz.rb
+```
+
 ### Windows (`winget`)
 
 ```powershell
 winget install OzoneVCS.Ozone
-```
-
-### Windows (PowerShell Installer)
-
-```powershell
-irm https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.ps1 | iex
-```
-
-Supports `-Version v1.0.0`, `-Prefix "$env:LOCALAPPDATA\Ozone"`, and `-DryRun`. To enable Windows `NTFS` virtualization (`Client-ProjFS`) without rebooting, run `oz setup --enable-projfs`.
-
-### Cargo (`cargo-binstall` or Source)
-
-```bash
-# Pre-built release binaries via cargo-binstall
-cargo binstall oz-cli
-
-# Or build from source
-cargo install --path crates/oz-cli --locked
-cargo install --path crates/oz-vfsd --locked
 ```
 
 ### Verify Your Environment
@@ -149,21 +154,29 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz ws <spawn\|list\|rm\|gc>` | Manage isolated CoW/VFS workspaces (`../<repo>.oz/<ws>`) and warm cache LRU GC. |
 | `oz status` | Indexless `O(dirty_files)` status emitting deterministic `[f1]` file and `h1a` hunk IDs. |
 | `oz diff [TARGETS...]` | Histogram unified diffs filtered by file IDs (`f1`), hunk IDs (`h1a`), or paths. |
-| `oz commit -m "..."` | Stage-free commit (`--pick`, `--exclude`, `--amend`, `--no-edit`, `-S/--sign`, guardrails, `Change-Id:`). |
+| `oz commit -m "..."` | Stage-free commit (`--pick`, `--exclude`, `--amend`, `--no-edit`, `-S/--sign`, `--no-verify`, hooks, guardrails, `Change-Id:`). |
+| `oz log` / `oz show` | Colored commit graph (`--oneline`, `--author`, `--grep`, `-S`/`-G`, `--since`) and commit details (`refs/notes/ai`, `--stat`). |
+| `oz stash` | `push` / `pop` / `list` / `drop` backed by MVCC OpLog snapshots so `oz undo` reverses stash operations too. |
+| `oz cherry-pick` / `oz revert` | In-memory cherry-pick & revert with `--no-commit`, `--json`, and OpLog undo support. |
+| `oz branch` / `oz tag` | Branch list/create/rename/delete and tag list/create/delete/SSH-signed/verify. |
 | `oz checkpoint` | Capture `< 10 ms` MVCC working-tree checkpoint (`-q/--quiet` for agent hooks). |
 | `oz undo [OP_ID \| --steps N]` / `oz redo` | Sub-10 ms OpLog rewind & re-apply for refs and working-tree edits. |
 | `oz radar` | Detect overlapping hunks, shared-file edits, and out-of-scope edits across workspaces. |
 | `oz integrate <SOURCES...>` | In-memory 3-way merge into `--into <branch>` with `--verify "<cmd>"` and `_integrate/` sandbox. |
 | `oz resolve <ID \| --all> --take <ours\|theirs\|base>` | Resolve structured conflict IDs (`c1`, `c2`) with optional `--continue`. |
 | `oz stack <status\|rebase>` | Inspect and in-memory rebase stacked branches while preserving `Change-Id:` trailers. |
-| `oz clone` / `oz fetch` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--atomic`, `--force-with-lease`). |
+| `oz clone` / `oz fetch` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--atomic`, `--force-with-lease`, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
 | `oz pr <create\|stack>` | Create/update single or cross-linked stacked GitHub Pull Requests. |
 | `oz sync` | Fetch, fast-forward base, retarget stacked PRs, rebase downstream, GC merged workspaces, refresh warm baseline. |
 | `oz ci` | Inspect GitHub Check Runs & compact failing Actions job log excerpts (`--json` for agent self-healing). |
 | `oz agent setup` | Install idempotent skills/rules and `oz checkpoint --quiet` hooks for 5 agent harnesses. |
 | `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (8 tools). |
 | `oz blame <PATH>` | Line-level human vs. AI (`refs/notes/ai`) authorship attribution. |
+| `oz gc` / `oz fsck` | Bounded `.git/ozone/oplog/` compaction (`--oplog-days`), integrity checks, and safe `--repair` for interrupted transactions. |
+| `oz completions <SHELL>` | Generate `bash`, `zsh`, `fish`, or `powershell` completions (`clap_complete`). |
 | `oz setup` / `oz doctor` | Initialize `.git/ozone/` (`--systemd-user`, `--enable-projfs`) and run system diagnostics. |
+
+Ozone also ships full **Day-3 Git compatibility** (`pre-commit`/`commit-msg`/`post-commit`/`pre-push` hooks & `core.hooksPath`, `.gitattributes` `text`/`eol`/`binary` & `git-lfs` filter safety, `160000` gitlink submodules, `includeIf` + `insteadOf` + `~/.ssh/config`), automatic TTY paging (`$OZ_PAGER` / `$GIT_PAGER` / `delta` / `less -FRX`, strictly disabled under `--json`, `--agent`, or non-TTY pipes), and configurable short command aliases (`st`, `ci`, `co`, `lg`, `br`) via `.ozone.toml`.
 
 ---
 
@@ -202,13 +215,14 @@ Measured via `./benchmarks/run_all.sh --full` on **AMD Ryzen 9 7900X** (24 logic
 
 ## Documentation & Resources
 
+* **[Website & Interactive Demo](https://gaalix.github.io/git-ozone/)** — Interactive install commands, `git` vs `oz` comparisons, and live v1.0.0 benchmarks (`site/index.html`).
 * **[Quickstart Guide](docs/quickstart.md)** — Solo developer workflow, `.ozone.toml` configuration, parallel AI agent setups (`oz agent setup`, `oz mcp`), and provenance (`refs/notes/ai`).
-* **[Migrating from `git worktree`](docs/migration-from-git-worktree.md)** — Command mapping table, colocated `.git/` safety, `oz git` compatibility shim, and zero-lock-in uninstall steps.
+* **[Migrating from `git worktree`](docs/migration-from-git-worktree.md)** — Command mapping table, colocated `.git/` safety, `oz git` shim, and zero-lock-in uninstall steps.
 * **[JSON Schema Reference (`oz.v1`)](docs/json-schema-reference.md)** & **[JSON Schema File](docs/schemas/oz.v1.envelope.schema.json)** — Canonical envelope contract, exit codes (`0`/`1`/`2`), deterministic IDs (`f1`, `h1a`, `c1`), command payload schemas, and `oz mcp` tool definitions.
-* **[Benchmarks & Methodology](docs/benchmarks.md)** & **[Benchmark Suite](benchmarks/README.md)** — Reproducible scripts comparing `git` vs `oz` (and `jj` / `worktrunk` / `simgit` when installed) on 20-agent spawn time/disk, 250k-file `status` latency, VCBench agent token reduction, and concurrent commit lock contention.
+* **[Benchmarks & Methodology](docs/benchmarks.md)** & **[Benchmark Suite](benchmarks/README.md)** — Reproducible scripts comparing `git` vs `oz` (and `jj` / `worktrunk` / `simgit` when installed) on 20-agent spawn time/disk, 250k-file `status` latency, VCBench agent token reduction, warm incremental builds, and concurrent commit lock contention.
 * **[Architecture Specification](ARCHITECTURE.md)** — Deep dive into crate boundaries, MVCC OpLog, warm cache `mtime` preservation, and `oz-cloud-api` open-core seams.
-* **[Implementation Roadmap](ROADMAP.md)** — Milestones 0–5 from scaffolding to v1.0 launch and Ozone Cloud.
-* **[Launch Site](site/index.html)** — Zero-dependency static site with interactive installer tabs and `git` vs `oz` workflow comparisons.
+* **[Implementation Roadmap](ROADMAP.md)** & **[Changelog](CHANGELOG.md)** — Milestones 0–5 and release history.
+* **[Contributing](CONTRIBUTING.md)** · **[Security Policy](SECURITY.md)** · **[Code of Conduct](CODE_OF_CONDUCT.md)** — How to contribute, verify pure-Rust supply chain guarantees, and report security issues.
 
 ---
 

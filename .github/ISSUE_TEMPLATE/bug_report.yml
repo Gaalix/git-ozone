@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a bug, regression, or compatibility issue in oz, git-ozone, or oz-vfsd
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug in Ozone! Please include `oz doctor --json` output so we can see your OS, filesystem, and backend selection.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands, flags, or repository setup needed to reproduce the issue.
+      placeholder: |
+        1. oz ws spawn test --from main
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`oz doctor --json` and `oz --version --json` output"
+      description: Paste the JSON output (redact any sensitive paths if needed).
+      render: json
+    validations:
+      required: false
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System & Filesystem
+      options:
+        - Linux (ext4 + FUSE3)
+        - Linux (Btrfs / XFS / bcachefs)
+        - Linux (Container / cas_hardlink)
+        - macOS (APFS)
+        - Windows 11 (NTFS / ProjFS)
+        - Windows 11 (Dev Drive / ReFS)
+        - Other
+    validations:
+      required: true

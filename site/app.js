@@ -2,29 +2,29 @@
   "use strict";
 
   const INSTALL_SNIPPETS = {
-    homebrew: {
-      command: "brew install ozone-vcs/tap/oz",
-      note: "Installs <code>oz</code>, <code>git-ozone</code>, and <code>oz-vfsd</code> on macOS &amp; Linux. Verify with <code>oz doctor</code>."
-    },
     shell: {
-      command: "curl -fsSL https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.sh | bash",
+      command: "curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash",
       note: "Detects OS/arch, verifies <code>SHA256SUMS.txt</code>, and installs static binaries. Supports <code>--version</code>, <code>--prefix</code>, and <code>--dry-run</code>."
     },
+    homebrew: {
+      command: "brew install --formula https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/homebrew/oz.rb",
+      note: "Installs <code>oz</code>, <code>git-ozone</code>, and <code>oz-vfsd</code> on macOS &amp; Linux. Verify with <code>oz doctor</code>."
+    },
     deb: {
-      command: "curl -fsSLO https://github.com/ozone-vcs/ozone/releases/download/v1.0.0/ozone_1.0.0_amd64.deb\nsudo apt install ./ozone_1.0.0_amd64.deb",
+      command: "curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.0.0/ozone_1.0.0_amd64.deb\nsudo apt install ./ozone_1.0.0_amd64.deb",
       note: "Debian/Ubuntu <code>.deb</code> (<code>amd64</code> / <code>arm64</code>) with <code>Recommends: fuse3</code>. Installs to <code>/usr/bin/</code>."
     },
     winget: {
       command: "winget install OzoneVCS.Ozone",
-      note: "Installs <code>oz.exe</code>, <code>git-ozone.exe</code>, and <code>oz-vfsd.exe</code>. Run <code>oz setup --enable-projfs</code> on NTFS (no reboot)."
+      note: "Installs <code>oz.exe</code>, <code>git-ozone.exe</code>, and <code>oz-vfsd.exe</code> (or use PowerShell installer before winget community PR merge). Run <code>oz setup --enable-projfs</code> on NTFS."
     },
     powershell: {
-      command: "irm https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.ps1 | iex",
+      command: "irm https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.ps1 | iex",
       note: "Verifies SHA256 checksum, installs binaries, and updates user <code>PATH</code>. Supports <code>-Version</code>, <code>-Prefix</code>, and <code>-DryRun</code>."
     },
     cargo: {
-      command: "cargo binstall oz-cli",
-      note: "Downloads pre-built GitHub Release binaries via <code>[package.metadata.binstall]</code>, or build from source with <code>cargo install --path crates/oz-cli --locked</code>."
+      command: "cargo install --git https://github.com/Gaalix/git-ozone --locked oz-cli oz-vfsd",
+      note: "Builds from source directly from GitHub, or install pre-built release binaries with <code>cargo binstall --git https://github.com/Gaalix/git-ozone oz-cli</code>."
     }
   };
 
@@ -222,7 +222,7 @@ oz blame crates/auth/src/token.rs --json`,
       });
     }
 
-    selectTab("homebrew");
+    selectTab("shell");
   }
 
   function initComparisonTabs() {

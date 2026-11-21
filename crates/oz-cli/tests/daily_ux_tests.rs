@@ -21,6 +21,31 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
+fn find_delta_binary() -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "delta.exe" } else { "delta" };
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(exe_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        let candidate = PathBuf::from(cargo_home).join("bin").join(exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".cargo").join("bin").join(exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn oz_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oz"))
 }
@@ -792,9 +817,10 @@ fn pager_selection_and_strict_non_tty_json_agent_suppression() {
     assert_eq!(piped.code, 0);
     assert!(!marker.exists(), "pager must NOT run when stdout is piped non-TTY");
 
-    // 2. Unit-check delta binary at `/home/gal-borinc/.cargo/bin/delta` (when present) and fallback
-    let delta_bin_dir = Path::new("/home/gal-borinc/.cargo/bin");
-    if delta_bin_dir.join("delta").is_file() {
+    // 2. Unit-check delta binary resolution (when installed) and fallback
+    if let Some(delta_bin) = find_delta_binary()
+        && let Some(delta_bin_dir) = delta_bin.parent()
+    {
         let choice = resolve_pager_spec(PagerSelectionInput {
             json_flag: false,
             agent_flag: false,
@@ -808,7 +834,7 @@ fn pager_selection_and_strict_non_tty_json_agent_suppression() {
         assert_eq!(
             choice,
             PagerChoice::Command {
-                program: delta_bin_dir.join("delta").to_string_lossy().into_owned(),
+                program: delta_bin.to_string_lossy().into_owned(),
                 args: Vec::new(),
             }
         );
@@ -1102,13 +1128,16 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
     assert!(cmd_diff.status().expect("oz diff tty").success());
     assert!(marker.exists(), "oz diff on interactive TTY must invoke pager");
 
-    // If `/home/gal-borinc/.cargo/bin/delta` is installed, run `oz show` with default delta on TTY
-    if Path::new("/home/gal-borinc/.cargo/bin/delta").is_file() {
+    // If `delta` is installed, run `oz show` with default delta on TTY
+    if let Some(delta_bin) = find_delta_binary()
+        && let Some(delta_bin_dir) = delta_bin.parent()
+    {
+        let path_with_delta = format!("{}:/usr/bin:/bin", delta_bin_dir.display());
         let mut cmd_delta = Command::new(oz_bin());
         cmd_delta
             .args(["show"])
             .current_dir(repo)
-            .env("PATH", "/home/gal-borinc/.cargo/bin:/usr/bin:/bin")
+            .env("PATH", path_with_delta)
             .env("DELTA_PAGER", "cat")
             .env_remove("OZ_PAGER")
             .env_remove("GIT_PAGER")

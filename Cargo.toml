@@ -17,8 +17,8 @@ members = [
 version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ozone-vcs/ozone"
-homepage = "https://github.com/ozone-vcs/ozone"
+repository = "https://github.com/Gaalix/git-ozone"
+homepage = "https://gaalix.github.io/git-ozone/"
 
 [workspace.dependencies]
 # Internal workspace crates

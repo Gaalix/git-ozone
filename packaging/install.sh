@@ -5,13 +5,13 @@
 # Single-command installer for Ozone (oz, git-ozone, oz-vfsd) on Linux and macOS.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash
 #   ./packaging/install.sh --version 1.0.0 --prefix "$HOME/.local" --dry-run
 
 set -euo pipefail
 
 DEFAULT_VERSION="1.0.0"
-REPO="${OZ_REPO:-ozone-vcs/ozone}"
+REPO="${OZ_REPO:-Gaalix/git-ozone}"
 VERSION="${OZ_VERSION:-${DEFAULT_VERSION}}"
 PREFIX="${OZ_INSTALL_PREFIX:-${HOME}/.local}"
 DRY_RUN=0
@@ -29,7 +29,7 @@ Usage:
 Options:
   --version <VER>   Version to install (e.g. 1.0.0, v1.0.0, or latest; default: 1.0.0)
   --prefix <DIR>    Installation prefix; binaries go into <DIR>/bin (default: ~/.local)
-  --repo <O/R>      GitHub repository slug (default: ozone-vcs/ozone)
+  --repo <O/R>      GitHub repository slug (default: Gaalix/git-ozone)
   --dry-run         Print resolved target, URLs, and install paths without downloading or writing
   --no-doctor       Skip running `oz doctor` after installation
   -h, --help        Show this help message

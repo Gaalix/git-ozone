@@ -4,14 +4,14 @@
 # Single-command installer for Ozone (oz.exe, git-ozone.exe, oz-vfsd.exe) on Windows.
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/ozone-vcs/ozone/main/packaging/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.ps1 | iex
 #   .\packaging\install.ps1 -Version 1.0.0 -Prefix "$env:LOCALAPPDATA\Ozone" -DryRun
 
 [CmdletBinding()]
 param(
     [string]$Version = $(if ($env:OZ_VERSION) { $env:OZ_VERSION } else { "1.0.0" }),
     [string]$Prefix = $(if ($env:OZ_INSTALL_PREFIX) { $env:OZ_INSTALL_PREFIX } else { Join-Path $env:LOCALAPPDATA "Ozone" }),
-    [string]$Repo = $(if ($env:OZ_REPO) { $env:OZ_REPO } else { "ozone-vcs/ozone" }),
+    [string]$Repo = $(if ($env:OZ_REPO) { $env:OZ_REPO } else { "Gaalix/git-ozone" }),
     [switch]$DryRun,
     [switch]$NoPathUpdate,
     [switch]$NoDoctor

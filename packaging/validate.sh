@@ -145,7 +145,7 @@ for name, doc, mtype in (
     assert doc.get("ManifestVersion") == "1.6.0", f"winget {name} ManifestVersion mismatch"
 
 inst_entry = wg_inst["Installers"][0]
-expected_win_url = "https://github.com/ozone-vcs/ozone/releases/download/v1.0.0/oz-v1.0.0-x86_64-pc-windows-msvc.zip"
+expected_win_url = "https://github.com/Gaalix/git-ozone/releases/download/v1.0.0/oz-v1.0.0-x86_64-pc-windows-msvc.zip"
 assert inst_entry["InstallerUrl"] == expected_win_url, f"winget InstallerUrl mismatch: {inst_entry['InstallerUrl']}"
 assert re.fullmatch(r"[A-F0-9]{64}", inst_entry["InstallerSha256"]), "winget InstallerSha256 must be 64 uppercase hex chars"
 

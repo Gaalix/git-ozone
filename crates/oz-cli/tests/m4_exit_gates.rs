@@ -413,7 +413,7 @@ fn gate1_v1_0_0_version_consistency_and_binstall_contract() {
         "root Cargo.toml must declare version = \"1.0.0\""
     );
     assert!(
-        root_toml.contains("repository = \"https://github.com/ozone-vcs/ozone\""),
+        root_toml.contains("repository = \"https://github.com/Gaalix/git-ozone\""),
         "root Cargo.toml must declare canonical GitHub repository"
     );
 

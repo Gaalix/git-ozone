@@ -6,14 +6,14 @@ Ozone ships architecture-specific `.deb` packages (`amd64` and `arm64`) on every
 
 ## 1. Direct `.deb` Installation (No APT Repo Required)
 
-Download the matching `.deb` and `SHA256SUMS.txt` from the [GitHub Releases](https://github.com/ozone-vcs/ozone/releases) page:
+Download the matching `.deb` and `SHA256SUMS.txt` from the [GitHub Releases](https://github.com/Gaalix/git-ozone/releases) page:
 
 ```bash
 VERSION=1.0.0
 ARCH="$(dpkg --print-architecture)" # amd64 or arm64
 
-curl -fsSLO "https://github.com/ozone-vcs/ozone/releases/download/v${VERSION}/ozone_${VERSION}_${ARCH}.deb"
-curl -fsSLO "https://github.com/ozone-vcs/ozone/releases/download/v${VERSION}/SHA256SUMS.txt"
+curl -fsSLO "https://github.com/Gaalix/git-ozone/releases/download/v${VERSION}/ozone_${VERSION}_${ARCH}.deb"
+curl -fsSLO "https://github.com/Gaalix/git-ozone/releases/download/v${VERSION}/SHA256SUMS.txt"
 
 grep "ozone_${VERSION}_${ARCH}.deb" SHA256SUMS.txt | sha256sum -c -
 sudo apt-get install -y "./ozone_${VERSION}_${ARCH}.deb"

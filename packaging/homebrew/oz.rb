@@ -2,32 +2,32 @@
 # frozen_string_literal: true
 
 # Homebrew formula for Ozone (oz / git-ozone / oz-vfsd)
-# Tap usage: brew install ozone-vcs/tap/oz
+# Formula usage: brew install --formula https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/homebrew/oz.rb
 class Oz < Formula
   desc "Pure-Rust CoW Git client and multi-agent workspace engine"
-  homepage "https://github.com/ozone-vcs/ozone"
+  homepage "https://github.com/Gaalix/git-ozone"
   version "1.0.0"
   license any_of: ["MIT", "Apache-2.0"]
 
   # Release checksums are populated from SHA256SUMS.txt on tag publish.
   on_macos do
     on_arm do
-      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/Gaalix/git-ozone/releases/download/v#{version}/oz-v#{version}-aarch64-apple-darwin.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
-      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/Gaalix/git-ozone/releases/download/v#{version}/oz-v#{version}-x86_64-apple-darwin.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/Gaalix/git-ozone/releases/download/v#{version}/oz-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
-      url "https://github.com/ozone-vcs/ozone/releases/download/v#{version}/oz-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/Gaalix/git-ozone/releases/download/v#{version}/oz-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end

@@ -3,12 +3,12 @@ PackageIdentifier: OzoneVCS.Ozone
 PackageVersion: 1.0.0
 PackageLocale: en-US
 Publisher: Ozone Contributors
-PublisherUrl: https://github.com/ozone-vcs
-PublisherSupportUrl: https://github.com/ozone-vcs/ozone/issues
+PublisherUrl: https://github.com/Gaalix
+PublisherSupportUrl: https://github.com/Gaalix/git-ozone/issues
 PackageName: Ozone
-PackageUrl: https://github.com/ozone-vcs/ozone
+PackageUrl: https://github.com/Gaalix/git-ozone
 License: MIT OR Apache-2.0
-LicenseUrl: https://github.com/ozone-vcs/ozone/blob/main/LICENSE-MIT
+LicenseUrl: https://github.com/Gaalix/git-ozone/blob/main/LICENSE-MIT
 Copyright: Copyright (c) 2026 Ozone Contributors
 ShortDescription: Pure-Rust CoW Git client and multi-agent workspace engine
 Description: |-
@@ -28,6 +28,6 @@ Tags:
   - rust
   - ai-agents
   - mcp
-ReleaseNotesUrl: https://github.com/ozone-vcs/ozone/releases/tag/v1.0.0
+ReleaseNotesUrl: https://github.com/Gaalix/git-ozone/releases/tag/v1.0.0
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0

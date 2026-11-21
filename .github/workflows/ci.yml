@@ -38,10 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure Python PyYAML is available
+      - name: Ensure Python PyYAML and shellcheck are available
         run: |
           set -euo pipefail
           python3 -c "import yaml" >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-yaml)
+          command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck)
 
       - name: Run packaging validation suite
         run: ./packaging/validate.sh
@@ -62,17 +63,28 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Prepare Ubuntu FUSE3 runtime (without libfuse3-dev)
+      - name: Prepare Ubuntu FUSE3 and git-lfs runtime (without libfuse3-dev)
         if: matrix.os == 'ubuntu-latest'
         run: |
           set -euo pipefail
-          if ! command -v fusermount3 >/dev/null 2>&1; then
+          pkgs=()
+          command -v fusermount3 >/dev/null 2>&1 || pkgs+=(fuse3)
+          command -v git-lfs >/dev/null 2>&1 || pkgs+=(git-lfs)
+          if (( ${#pkgs[@]} > 0 )); then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends fuse3
+            sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
           fi
           ls -la /dev/fuse
           which fusermount3
           fusermount3 --version
+          git lfs version
+
+      - name: Ensure git-lfs is available on macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          command -v git-lfs >/dev/null 2>&1 || brew install git-lfs
+          git lfs version
 
       - name: Enable Windows ProjFS (Client-ProjFS)
         if: matrix.os == 'windows-latest'
@@ -88,6 +100,10 @@ jobs:
             throw "ProjectedFSLib.dll not found at $dll after enabling Client-ProjFS"
           }
           Get-Item $dll | Select-Object FullName, Length
+
+      - name: Run Clippy lints (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build workspace
         run: cargo build --workspace --locked

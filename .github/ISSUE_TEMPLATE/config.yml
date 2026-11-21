@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/Gaalix/git-ozone/discussions
+    about: Ask questions, share dogfooding feedback, or discuss multi-agent workflows
+  - name: 60-Second Quickstart & Docs
+    url: https://github.com/Gaalix/git-ozone/blob/main/docs/quickstart.md
+    about: Setup guide for solo developers, coding agents, and oz mcp

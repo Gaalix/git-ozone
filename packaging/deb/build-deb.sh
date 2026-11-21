@@ -151,7 +151,7 @@ cat > "${PKG_ROOT}/usr/share/doc/ozone/copyright" <<'EOF'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: ozone
 Upstream-Contact: Ozone Contributors <maintainers@ozone-vcs.dev>
-Source: https://github.com/ozone-vcs/ozone
+Source: https://github.com/Gaalix/git-ozone
 
 Files: *
 Copyright: 2026 Ozone Contributors
@@ -210,7 +210,7 @@ Maintainer: Ozone Contributors <maintainers@ozone-vcs.dev>
 Installed-Size: ${INSTALLED_SIZE}
 Section: vcs
 Priority: optional
-Homepage: https://github.com/ozone-vcs/ozone
+Homepage: https://github.com/Gaalix/git-ozone
 Recommends: fuse3
 Suggests: git
 Description: Pure-Rust CoW Git client and multi-agent workspace engine
