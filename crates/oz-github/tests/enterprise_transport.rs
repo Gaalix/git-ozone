@@ -12,6 +12,7 @@ use oz_github::{
 };
 use oz_oplog::{ActorInfo, ActorKind};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -47,6 +48,7 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[cfg(unix)]
 fn write_exec(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -182,6 +184,7 @@ fn include_if_and_instead_of_push_instead_of_control_fetch_and_push_targets() {
     assert!(!absent_on_fetch.status.success());
 }
 
+#[cfg(unix)]
 #[test]
 fn pre_push_hook_receives_remote_args_and_stdin_and_respects_no_verify() {
     let tmp = TempDir::new().unwrap();

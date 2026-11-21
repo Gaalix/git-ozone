@@ -1227,10 +1227,7 @@ impl IndexStatCache {
                     return false;
                 }
             }
-            if stat.ino != 0 && (meta.ino() as u32) != stat.ino {
-                return false;
-            }
-            true
+            stat.ino == 0 || (meta.ino() as u32) == stat.ino
         }
         #[cfg(not(unix))]
         {

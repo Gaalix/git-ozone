@@ -16,6 +16,7 @@ use oz_cli::pager::{PagerChoice, PagerSelectionInput, resolve_pager_spec};
 use oz_core::OZ_SCHEMA_V1;
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -350,8 +351,10 @@ fn stash_push_pop_list_drop_are_reversed_by_oz_undo_and_redo() {
     fs::write(repo.join("tracked.txt"), "stashed edit\n").unwrap();
     fs::write(repo.join("new_file.txt"), "untracked payload\n").unwrap();
     fs::write(repo.join("run.sh"), "#!/bin/sh\necho ok\n").unwrap();
+    #[cfg(unix)]
     fs::set_permissions(repo.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
     fs::remove_file(repo.join("to_delete.txt")).unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink("tracked.txt", repo.join("link_to_tracked")).unwrap();
 
     // Capture pre-stash `oz status --json` and `git status --short` for exact parity after pop.
@@ -404,11 +407,14 @@ fn stash_push_pop_list_drop_are_reversed_by_oz_undo_and_redo() {
     assert_eq!(fs::read_to_string(repo.join("tracked.txt")).unwrap(), "stashed edit\n");
     assert_eq!(fs::read_to_string(repo.join("new_file.txt")).unwrap(), "untracked payload\n");
     assert!(!repo.join("to_delete.txt").exists());
-    assert!(fs::symlink_metadata(repo.join("link_to_tracked")).unwrap().file_type().is_symlink());
-    assert_eq!(
-        fs::metadata(repo.join("run.sh")).unwrap().permissions().mode() & 0o111,
-        0o111
-    );
+    #[cfg(unix)]
+    {
+        assert!(fs::symlink_metadata(repo.join("link_to_tracked")).unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::metadata(repo.join("run.sh")).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+    }
     let list_after_undo = run_oz(&repo, &["stash", "list", "--json"], &[]);
     assert_eq!(list_after_undo.unwrap_json()["data"]["count"], 0);
 
@@ -806,6 +812,7 @@ fn pager_selection_and_strict_non_tty_json_agent_suppression() {
         format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
     )
     .unwrap();
+    #[cfg(unix)]
     fs::set_permissions(&spy_pager, fs::Permissions::from_mode(0o755)).unwrap();
 
     // 1. Non-TTY piped stdout MUST NEVER invoke `$OZ_PAGER`
@@ -840,7 +847,8 @@ fn pager_selection_and_strict_non_tty_json_agent_suppression() {
         );
     }
 
-    // 3. Real PTY test: spawn `oz log` with stdout attached to a real Linux PTY!
+    // 3. Real PTY test: spawn `oz log` with stdout attached to a real Unix PTY!
+    #[cfg(unix)]
     run_pty_pager_verification(&repo, &spy_pager, &marker);
 }
 
@@ -856,8 +864,8 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut() as _,
+            std::ptr::null_mut() as _,
         )
     };
     assert_eq!(rc, 0, "openpty failed");
@@ -1062,6 +1070,7 @@ fn edge_cases_multi_stash_conflicts_no_commit_unborn_and_pty_diff_delta() {
 
     // 4. PTY test for `oz diff` pager dispatch and live `delta` execution when available
     fs::write(repo.join("shared.txt"), "main1\nline2-edited\nline3\n").unwrap();
+    #[cfg(unix)]
     run_pty_diff_and_delta_check(&repo, tmp.path());
 
     assert_git_fsck_clean(&repo);
@@ -1088,8 +1097,8 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut() as _,
+            std::ptr::null_mut() as _,
         )
     };
     assert_eq!(rc, 0, "openpty failed");

@@ -47,6 +47,20 @@ jobs:
       - name: Run packaging validation suite
         run: ./packaging/validate.sh
 
+  clippy:
+    name: Clippy (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run Clippy lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   test:
     name: Build & Test (${{ matrix.os }})
     strategy:
@@ -100,10 +114,6 @@ jobs:
             throw "ProjectedFSLib.dll not found at $dll after enabling Client-ProjFS"
           }
           Get-Item $dll | Select-Object FullName, Length
-
-      - name: Run Clippy lints (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build workspace
         run: cargo build --workspace --locked

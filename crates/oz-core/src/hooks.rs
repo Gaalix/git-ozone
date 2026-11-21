@@ -324,7 +324,7 @@ fn expand_tilde_env(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::git_config::GitConfigContext;

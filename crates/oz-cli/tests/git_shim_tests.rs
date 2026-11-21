@@ -1478,6 +1478,7 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
     let _ = sub_v1;
 }
 
+#[cfg(unix)]
 #[test]
 fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
     use std::os::unix::fs::PermissionsExt;
@@ -1561,6 +1562,7 @@ fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn oz_clone_and_push_enterprise_ssh_config_and_insteadof_e2e() {
     use std::os::unix::fs::PermissionsExt;

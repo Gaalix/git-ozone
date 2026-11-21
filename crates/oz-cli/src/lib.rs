@@ -19,7 +19,7 @@ use commands::{
     SyncArgs, UndoArgs, WsCommand, handle_agent, handle_blame, handle_checkpoint, handle_ci,
     handle_clone, handle_commit, handle_diff, handle_fetch, handle_integrate, handle_mcp,
     handle_pr, handle_push, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
-    handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope,
+    handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope, write_stdout_line,
 };
 use daily::{
     BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RevertArgs, ShowArgs, StashArgs, TagArgs,
@@ -300,10 +300,9 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Err(err) => {
             if raw_json_hint {
                 let env = Envelope::from_error(&err);
-                println!(
-                    "{}",
-                    env.to_json_pretty()
-                        .unwrap_or_else(|_| "{\"schema\":\"oz.v1\",\"ok\":false}".into())
+                write_stdout_line(
+                    &env.to_json_pretty()
+                        .unwrap_or_else(|_| "{\"schema\":\"oz.v1\",\"ok\":false}".into()),
                 );
             } else {
                 eprintln!("error: {err}");
@@ -336,10 +335,9 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
                             err.to_string().trim().to_string(),
                         )
                         .with_recovery_command("oz --help");
-                        println!(
-                            "{}",
-                            env.to_json_pretty()
-                                .unwrap_or_else(|_| "{\"schema\":\"oz.v1\",\"ok\":false}".into())
+                        write_stdout_line(
+                            &env.to_json_pretty()
+                                .unwrap_or_else(|_| "{\"schema\":\"oz.v1\",\"ok\":false}".into()),
                         );
                     } else {
                         let _ = err.print();
@@ -486,7 +484,7 @@ fn handle_version(invocation: CliInvocation, mode: InteractionMode) -> ExitCode 
         let env = Envelope::success(data);
         print_json_envelope(&env);
     } else {
-        println!("{} {}", invocation.binary_name(), env!("CARGO_PKG_VERSION"));
+        write_stdout_line(&format!("{} {}", invocation.binary_name(), env!("CARGO_PKG_VERSION")));
     }
     ExitCode::Success
 }

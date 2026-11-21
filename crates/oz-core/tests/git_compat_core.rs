@@ -6,6 +6,7 @@ use oz_core::{
     render_unified_diff,
 };
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -34,6 +35,7 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[cfg(unix)]
 fn write_exec(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -44,6 +46,7 @@ fn write_exec(path: &Path, body: &str) {
     fs::set_permissions(path, perms).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_husky_lefthook_pre_commit_style_and_no_verify() {
     let tmp = TempDir::new().unwrap();

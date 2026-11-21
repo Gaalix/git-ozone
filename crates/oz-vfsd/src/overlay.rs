@@ -144,6 +144,7 @@ fn rel_to_slash_string(rel: &Path) -> String {
         .join("/")
 }
 
+#[cfg(target_os = "linux")]
 fn is_valid_child_name(name: &OsStr) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return false;

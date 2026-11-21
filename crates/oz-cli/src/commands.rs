@@ -606,9 +606,19 @@ fn baseline_source_label(source: BaselineSource) -> &'static str {
     }
 }
 
+pub(crate) fn write_stdout_line(line: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    if let Err(err) = out.write_all(line.as_bytes()).and_then(|()| out.write_all(b"\n")).and_then(|()| out.flush())
+        && err.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        eprintln!("error: failed writing stdout: {err}");
+    }
+}
+
 pub(crate) fn print_json_envelope<T: Serialize>(env: &Envelope<T>) {
     match env.to_json_pretty() {
-        Ok(s) => println!("{s}"),
+        Ok(s) => write_stdout_line(&s),
         Err(err) => eprintln!("error: failed to serialize oz.v1 envelope: {err}"),
     }
 }
