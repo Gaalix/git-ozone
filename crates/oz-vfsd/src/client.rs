@@ -199,7 +199,12 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
         cmd.creation_flags(0x0800_0008);
     }
 
-    let mut child = cmd.spawn().map_err(|err| {
+    #[cfg(windows)]
+    let no_inherit_guard = win_no_inherit::StdioNoInheritGuard::acquire();
+    let spawn_res = cmd.spawn();
+    #[cfg(windows)]
+    drop(no_inherit_guard);
+    let mut child = spawn_res.map_err(|err| {
         OzError::Other(format!(
             "failed to spawn oz-vfsd ({}): {err}",
             vfsd_bin.display()
@@ -501,6 +506,64 @@ fn needs_stale_unmount(mount_point: &Path) -> bool {
 #[cfg(not(unix))]
 fn needs_stale_unmount(_mount_point: &Path) -> bool {
     false
+}
+
+#[cfg(windows)]
+mod win_no_inherit {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const INVALID_HANDLE_VALUE: *mut c_void = (-1isize) as *mut c_void;
+
+    unsafe extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut c_void;
+        fn GetHandleInformation(hObject: *mut c_void, lpdwFlags: *mut u32) -> i32;
+        fn SetHandleInformation(hObject: *mut c_void, dwMask: u32, dwFlags: u32) -> i32;
+    }
+
+    static GUARD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Temporarily clears `HANDLE_FLAG_INHERIT` on the process standard handles so a detached
+    /// `oz-vfsd.exe` child does not keep parent `Command::output()` stdout/stderr pipes open.
+    pub(super) struct StdioNoInheritGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(*mut c_void, u32)>,
+    }
+
+    impl StdioNoInheritGuard {
+        pub(super) fn acquire() -> Self {
+            let lock = GUARD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut saved = Vec::with_capacity(3);
+            for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let handle = unsafe { GetStdHandle(std_id) };
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                let mut flags = 0u32;
+                if unsafe { GetHandleInformation(handle, &mut flags) } != 0
+                    && (flags & HANDLE_FLAG_INHERIT) != 0
+                {
+                    let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+                    saved.push((handle, flags));
+                }
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for StdioNoInheritGuard {
+        fn drop(&mut self) {
+            for (handle, orig_flags) in self.saved.drain(..) {
+                let _ = unsafe {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, orig_flags & HANDLE_FLAG_INHERIT)
+                };
+            }
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
