@@ -1322,9 +1322,9 @@ mod tests {
              [includeIf \"gitdir:~/work/\"]\n\tpath = {}\n\
              [includeIf \"gitdir/i:~/work/\"]\n\tpath = {}\n\
              [includeIf \"onbranch:release/\"]\n\tpath = {}\n",
-            inc_work.display(),
-            inc_ci.display(),
-            inc_main.display(),
+            inc_work.to_string_lossy().replace('\\', "/"),
+            inc_ci.to_string_lossy().replace('\\', "/"),
+            inc_main.to_string_lossy().replace('\\', "/"),
         );
         let global_cfg = tmp.path().join(".gitconfig");
         fs::write(&global_cfg, main_cfg).unwrap();

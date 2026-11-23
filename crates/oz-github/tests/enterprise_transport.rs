@@ -138,10 +138,10 @@ fn include_if_and_instead_of_push_instead_of_control_fetch_and_push_targets() {
         test_actor(),
     )
     .expect("fetch via insteadOf");
+    let fetch_remote_norm = fetch_out.remote_url.replace('\\', "/");
+    let bare_fetch_norm = bare_fetch.to_string_lossy().replace('\\', "/");
     assert!(
-        fetch_out
-            .remote_url
-            .contains(&bare_fetch.to_string_lossy().into_owned()),
+        fetch_remote_norm.contains(&bare_fetch_norm),
         "got {}",
         fetch_out.remote_url
     );
@@ -170,10 +170,10 @@ fn include_if_and_instead_of_push_instead_of_control_fetch_and_push_targets() {
         test_actor(),
     )
     .expect("push via onbranch pushInsteadOf");
+    let push_remote_norm = push_out.remote_url.replace('\\', "/");
+    let bare_push_norm = bare_push.to_string_lossy().replace('\\', "/");
     assert!(
-        push_out
-            .remote_url
-            .contains(&bare_push.to_string_lossy().into_owned()),
+        push_remote_norm.contains(&bare_push_norm),
         "got {}",
         push_out.remote_url
     );

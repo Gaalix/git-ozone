@@ -278,13 +278,21 @@ fn execute_hook_script(
         cmd
     };
 
-    let mut child = match run_with_program(hook_path, None).spawn() {
-        Ok(child) => child,
-        #[cfg(unix)]
-        Err(err) if err.raw_os_error() == Some(libc::ENOEXEC) => {
-            run_with_program(Path::new("/bin/sh"), Some(hook_path)).spawn()?
+    let mut attempt = 0u32;
+    let mut child = loop {
+        match run_with_program(hook_path, None).spawn() {
+            Ok(child) => break child,
+            #[cfg(unix)]
+            Err(err) if err.raw_os_error() == Some(libc::ENOEXEC) => {
+                break run_with_program(Path::new("/bin/sh"), Some(hook_path)).spawn()?;
+            }
+            #[cfg(unix)]
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(err) => return Err(OzError::Io(err)),
         }
-        Err(err) => return Err(OzError::Io(err)),
     };
 
     if let Some(input) = stdin_bytes

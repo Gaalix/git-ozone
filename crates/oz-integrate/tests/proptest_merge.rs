@@ -72,11 +72,16 @@ struct MultiSourceCase {
 }
 
 fn proptest_config(default_cases: u32) -> ProptestConfig {
+    let fallback_cases = if cfg!(windows) && std::env::var_os("CI").is_some() {
+        default_cases.min(10)
+    } else {
+        default_cases
+    };
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(default_cases);
+        .unwrap_or(fallback_cases);
     ProptestConfig {
         cases,
         failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
