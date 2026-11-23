@@ -986,7 +986,15 @@ proptest! {
         write_entry(&oz_dir, "local_notes/scratch-π.bin", &dirty_file_entry);
         write_entry(&oz_dir, "local_notes/sym_note", &dirty_sym_entry);
         expected_snapshot.insert("local_notes/scratch-π.bin".to_string(), dirty_file_entry);
-        expected_snapshot.insert("local_notes/sym_note".to_string(), dirty_sym_entry);
+        let expected_sym_entry = if cfg!(unix) {
+            dirty_sym_entry
+        } else {
+            TreeEntry::File {
+                bytes: case.dirty_symlink_target.clone().into_bytes(),
+                executable: false,
+            }
+        };
+        expected_snapshot.insert("local_notes/sym_note".to_string(), expected_sym_entry);
 
         let repo = OzoneRepo::discover(Some(&oz_dir)).expect("discover multi");
         let outcome = integrate(

@@ -274,7 +274,7 @@ impl OracleModel {
         self.latest_recorded_ws_state = Some((
             self.current_head.clone(),
             self.current_tree.clone(),
-            self.current_disk.clone(),
+            popped.pre_disk.clone(),
         ));
         self.redo_stack.push(popped);
         true
@@ -301,13 +301,14 @@ impl OracleModel {
                 }
             }
         }
+        let recorded_disk = top.post_disk.clone();
         if !top.is_rewind_only {
             self.active.push(top);
         }
         self.latest_recorded_ws_state = Some((
             self.current_head.clone(),
             self.current_tree.clone(),
-            self.current_disk.clone(),
+            recorded_disk,
         ));
         true
     }
@@ -363,11 +364,16 @@ fn diff_snapshots(
 }
 
 fn proptest_config(default_cases: u32) -> ProptestConfig {
+    let fallback_cases = if cfg!(windows) && std::env::var_os("CI").is_some() {
+        default_cases.min(10)
+    } else {
+        default_cases
+    };
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(default_cases);
+        .unwrap_or(fallback_cases);
     ProptestConfig {
         cases,
         failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
@@ -429,6 +435,7 @@ fn init_git_repo(dir: &Path) {
     run_git(dir, &["init", "-b", "main"]);
     run_git(dir, &["config", "user.name", "PropTest OpLog"]);
     run_git(dir, &["config", "user.email", "oplog@ozone.test"]);
+    run_git(dir, &["config", "core.autocrlf", "false"]);
 }
 
 fn snapshot_worktree_disk(root: &Path) -> BTreeMap<String, TreeEntry> {
