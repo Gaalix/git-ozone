@@ -112,13 +112,13 @@ fn include_if_and_instead_of_push_instead_of_control_fetch_and_push_targets() {
 
     let cfg_path = work.join(".git/config");
     let mut cfg_txt = fs::read_to_string(&cfg_path).unwrap();
+    let work_cfg = work.to_string_lossy().replace('\\', "/").to_ascii_uppercase();
+    let corp_inc_cfg = corp_inc.to_string_lossy().replace('\\', "/");
+    let release_inc_cfg = release_inc.to_string_lossy().replace('\\', "/");
     cfg_txt.push_str(&format!(
         "\n[remote \"corp-origin\"]\n\turl = \"corp:app.git\"\n\tfetch = +refs/heads/*:refs/remotes/corp-origin/*\n\
-         [includeIf \"gitdir/i:{}/\"]\n\tpath = {}\n\
-         [includeIf \"onbranch:release/\"]\n\tpath = {}\n",
-        work.display().to_string().to_ascii_uppercase(),
-        corp_inc.display(),
-        release_inc.display()
+         [includeIf \"gitdir/i:{work_cfg}/\"]\n\tpath = {corp_inc_cfg}\n\
+         [includeIf \"onbranch:release/\"]\n\tpath = {release_inc_cfg}\n"
     ));
     fs::write(&cfg_path, cfg_txt).unwrap();
 

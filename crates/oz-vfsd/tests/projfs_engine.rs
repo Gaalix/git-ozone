@@ -135,16 +135,19 @@ fn projfs_enumerate_dir_sorts_case_insensitively_and_matches_dos_wildcards() {
     let spec = make_spec(dir.path(), false, true);
     let base = spec.baseline_dir.as_ref().expect("base");
 
-    for name in [
+    let mut names = vec![
         "_meta.txt",
         "B.txt",
         "a.txt",
         "alpha.b.txt",
         "foo",
-        "foo.",
         "foo.txt",
         "foobar",
-    ] {
+    ];
+    if !cfg!(windows) {
+        names.push("foo.");
+    }
+    for name in names {
         std::fs::write(base.join(name), name.as_bytes()).expect("write");
     }
     std::fs::create_dir_all(base.join("sub/nested")).expect("mkdir sub");
@@ -157,8 +160,18 @@ fn projfs_enumerate_dir_sorts_case_insensitively_and_matches_dos_wildcards() {
         .into_iter()
         .map(|e| e.name)
         .collect();
-    assert_eq!(
-        all,
+    let expected_all = if cfg!(windows) {
+        vec![
+            "a.txt",
+            "alpha.b.txt",
+            "B.txt",
+            "foo",
+            "foo.txt",
+            "foobar",
+            "sub",
+            "_meta.txt",
+        ]
+    } else {
         vec![
             "a.txt",
             "alpha.b.txt",
@@ -170,7 +183,8 @@ fn projfs_enumerate_dir_sorts_case_insensitively_and_matches_dos_wildcards() {
             "sub",
             "_meta.txt",
         ]
-    );
+    };
+    assert_eq!(all, expected_all);
 
     let txt_dos_star: Vec<String> = engine
         .enumerate_dir("", Some("<.TXT"))
@@ -189,7 +203,12 @@ fn projfs_enumerate_dir_sorts_case_insensitively_and_matches_dos_wildcards() {
         .into_iter()
         .map(|e| e.name)
         .collect();
-    assert_eq!(foo_dos_dot, vec!["foo", "foo.", "foo.txt"]);
+    let expected_foo_dot = if cfg!(windows) {
+        vec!["foo", "foo.txt"]
+    } else {
+        vec!["foo", "foo.", "foo.txt"]
+    };
+    assert_eq!(foo_dos_dot, expected_foo_dot);
 
     // Windows backslash relative directory paths work cross-platform.
     let nested = engine

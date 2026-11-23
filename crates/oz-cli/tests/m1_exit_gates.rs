@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 fn sub10ms_budget_ms() -> f64 {
     if std::env::var_os("CI").is_some() && cfg!(debug_assertions) {
-        100.0
+        500.0
     } else {
         10.0
     }

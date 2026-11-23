@@ -680,6 +680,11 @@ fn fsck_detects_corrupt_git_object_via_git_fsck() {
         perms.set_mode(0o644);
         fs::set_permissions(&obj_path, perms).unwrap();
     }
+    #[cfg(not(unix))]
+    {
+        perms.set_readonly(false);
+        fs::set_permissions(&obj_path, perms).unwrap();
+    }
     fs::write(&obj_path, b"corrupted-zlib-payload").unwrap();
 
     let out = run_oz(&repo_dir, &["fsck", "--json"]);

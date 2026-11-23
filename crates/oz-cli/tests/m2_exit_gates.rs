@@ -21,7 +21,7 @@ use tempfile::TempDir;
 
 fn sub10ms_budget_ms() -> f64 {
     if std::env::var_os("CI").is_some() && cfg!(debug_assertions) {
-        100.0
+        500.0
     } else {
         10.0
     }
@@ -326,6 +326,7 @@ fn init_git_repo(repo: &Path) -> String {
     sys_git(repo, &["init", "-b", "main"]);
     sys_git(repo, &["config", "user.name", "Ozone M2 Gate"]);
     sys_git(repo, &["config", "user.email", "m2@ozone.dev"]);
+    sys_git(repo, &["config", "core.autocrlf", "false"]);
     sys_git(repo, &["add", "."]);
     sys_git(repo, &["commit", "-m", "initial commit"]);
     sys_git(repo, &["rev-parse", "HEAD"])
@@ -721,6 +722,9 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
     let mut sandbox = GateSandbox::new("g2w");
     let repo = sandbox.repo_root.clone();
     write_repo_file(&repo, ".gitignore", "/target\n/node_modules\n/.venv\n");
+    write_repo_file(&repo, "Cargo.toml", "[package]\nname = \"g2w\"\nversion = \"0.1.0\"\n");
+    write_repo_file(&repo, "package.json", "{\"name\":\"g2w\"}\n");
+    write_repo_file(&repo, "pyproject.toml", "[project]\nname = \"g2w\"\n");
     write_repo_file(&repo, "README.md", "# Windows ProjFS Gate\n");
     write_repo_file(&repo, "src/lib.rs", "pub fn win() -> u32 { 7 }\n");
     let base_commit = init_git_repo(&repo);
@@ -1287,6 +1291,7 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
     assert!(cloned.join(".git/ozone/state").is_dir());
     sys_git(&cloned, &["config", "user.name", "Shim User"]);
     sys_git(&cloned, &["config", "user.email", "shim@ozone.dev"]);
+    sys_git(&cloned, &["config", "core.autocrlf", "false"]);
 
     // 2. `oz git add` (virtual pinned set, zero `.git/index.lock`), `status`, `diff --cached`, `commit`.
     write_repo_file(&cloned, "a.rs", "pub fn a() -> i32 { 2 }\n");

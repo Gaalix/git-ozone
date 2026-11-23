@@ -612,6 +612,43 @@ fn missing_filter_recovery(driver: &str) -> Vec<String> {
     }
 }
 
+#[cfg(windows)]
+fn find_windows_sh() -> Option<std::path::PathBuf> {
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let sh = dir.join("sh.exe");
+            if sh.is_file() {
+                return Some(sh);
+            }
+        }
+        for dir in std::env::split_paths(&path_env) {
+            if dir.join("git.exe").is_file() {
+                for root in [Some(dir.as_path()), dir.parent()]
+                    .into_iter()
+                    .flatten()
+                {
+                    for rel in ["usr\\bin\\sh.exe", "bin\\sh.exe"] {
+                        let cand = root.join(rel);
+                        if cand.is_file() {
+                            return Some(cand);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for fallback in [
+        r"C:\Program Files\Git\usr\bin\sh.exe",
+        r"C:\Program Files\Git\bin\sh.exe",
+    ] {
+        let p = Path::new(fallback);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    None
+}
+
 fn run_filter_command(
     cmd_template: &str,
     rel_path: &str,
@@ -621,8 +658,28 @@ fn run_filter_command(
 ) -> std::result::Result<Vec<u8>, String> {
     let quoted_path = shell_quote_single(rel_path);
     let expanded = cmd_template.replace("%f", &quoted_path);
-    let mut cmd = Command::new("/bin/sh");
-    cmd.args(["-c", &expanded]);
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", &expanded]);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        if let Some(sh_exe) = find_windows_sh() {
+            let mut c = Command::new(sh_exe);
+            c.args(["-c", &expanded]);
+            c
+        } else {
+            use std::os::windows::process::CommandExt as _;
+            let win_quoted = format!("\"{}\"", rel_path.replace('"', "\\\""));
+            let win_expanded = cmd_template.replace("%f", &win_quoted);
+            let mut c = Command::new("cmd.exe");
+            c.raw_arg("/C");
+            c.raw_arg(format!("\"{win_expanded}\""));
+            c
+        }
+    };
     if workdir.is_dir() {
         cmd.current_dir(workdir);
     }

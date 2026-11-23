@@ -892,10 +892,14 @@ mod tests {
         assert!(wt_out.status.success());
 
         let found = OzoneRepo::discover(Some(&wt_path)).expect("discover linked worktree");
+        let found_root =
+            std::fs::canonicalize(&found.repo_root).unwrap_or_else(|_| found.repo_root.clone());
+        let found_common = std::fs::canonicalize(&found.git_common_dir)
+            .unwrap_or_else(|_| found.git_common_dir.clone());
         let canon_root = std::fs::canonicalize(&repo_root).expect("canon repo_root");
         let canon_common = std::fs::canonicalize(repo_root.join(".git")).expect("canon git_common_dir");
-        assert_eq!(found.repo_root, canon_root);
-        assert_eq!(found.git_common_dir, canon_common);
+        assert_eq!(found_root, canon_root);
+        assert_eq!(found_common, canon_common);
         assert!(found.is_linked_worktree);
         assert_eq!(found.workspace.as_deref(), Some("app-wt-auth"));
         assert_eq!(found.branch.as_deref(), Some("feat/auth"));

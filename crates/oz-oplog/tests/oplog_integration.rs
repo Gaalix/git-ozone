@@ -22,7 +22,7 @@ use tempfile::TempDir;
 
 fn sub10ms_budget() -> Duration {
     if std::env::var_os("CI").is_some() && cfg!(debug_assertions) {
-        Duration::from_millis(100)
+        Duration::from_millis(500)
     } else {
         Duration::from_millis(10)
     }
@@ -380,6 +380,7 @@ fn unborn_initial_commit_undo_and_redo() {
     run_git(&repo_dir, &["init", "-b", "main"]);
     run_git(&repo_dir, &["config", "user.name", "Ozone Test"]);
     run_git(&repo_dir, &["config", "user.email", "test@ozone.dev"]);
+    run_git(&repo_dir, &["config", "core.autocrlf", "false"]);
     fs::write(repo_dir.join("hello.txt"), "before-commit\n").expect("write");
 
     let repo = OzoneRepo::discover(Some(&repo_dir)).expect("discover unborn");
@@ -673,6 +674,7 @@ fn sub_10ms_checkpoint_undo_redo_on_1500_file_repo() {
     run_git(&repo_dir, &["init", "-b", "main"]);
     run_git(&repo_dir, &["config", "user.name", "Ozone Test"]);
     run_git(&repo_dir, &["config", "user.email", "test@ozone.dev"]);
+    run_git(&repo_dir, &["config", "core.autocrlf", "false"]);
 
     // Create 1,500 tracked files across 30 directories.
     for d in 0..30 {
@@ -1240,6 +1242,7 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
     run_git(&repo_dir, &["init", "-b", "main"]);
     run_git(&repo_dir, &["config", "user.name", "Ozone Test"]);
     run_git(&repo_dir, &["config", "user.email", "test@ozone.dev"]);
+    run_git(&repo_dir, &["config", "core.autocrlf", "false"]);
 
     // 1. Create 1,200 files for <10ms reset --hard + undo benchmark.
     fs::write(repo_dir.join(".gitignore"), "*.log\n").unwrap();

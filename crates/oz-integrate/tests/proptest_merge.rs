@@ -151,6 +151,7 @@ fn init_git_repo(dir: &Path) {
     run_git(dir, &["init", "-b", "main"]);
     run_git(dir, &["config", "user.name", "PropTest Merge"]);
     run_git(dir, &["config", "user.email", "merge@ozone.test"]);
+    run_git(dir, &["config", "core.autocrlf", "false"]);
 }
 
 fn snapshot_worktree_disk(root: &Path) -> BTreeMap<String, TreeEntry> {

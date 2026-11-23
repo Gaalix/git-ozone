@@ -200,6 +200,7 @@ fn init_git_repo(repo_dir: &Path) -> String {
     sys_git(repo_dir, &["init", "-b", "main"]);
     sys_git(repo_dir, &["config", "user.name", "Ozone M4 Gate"]);
     sys_git(repo_dir, &["config", "user.email", "m4@ozone.test"]);
+    sys_git(repo_dir, &["config", "core.autocrlf", "false"]);
     fs::write(
         repo_dir.join("README.md"),
         "# Ozone v1.0.0 Exit Gate Repo\n",
@@ -452,7 +453,9 @@ fn gate1_v1_0_0_version_consistency_and_binstall_contract() {
     );
 
     // 3. Cargo.lock synced to 1.0.0 across all 10 workspace crates.
-    let cargo_lock = fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+    let cargo_lock = fs::read_to_string(root.join("Cargo.lock"))
+        .expect("read Cargo.lock")
+        .replace("\r\n", "\n");
     for crate_name in [
         "oz-cli",
         "oz-core",

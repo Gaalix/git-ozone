@@ -1532,8 +1532,10 @@ pub(crate) fn run_verify_command(sandbox_dir: &Path, verify_cmd: &str) -> Result
     };
     #[cfg(windows)]
     let mut cmd = {
+        use std::os::windows::process::CommandExt as _;
         let mut c = Command::new("cmd.exe");
-        c.args(["/C", verify_cmd]);
+        c.raw_arg("/C");
+        c.raw_arg(format!("\"{verify_cmd}\""));
         c
     };
 

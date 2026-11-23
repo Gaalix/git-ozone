@@ -494,12 +494,17 @@ fn integrate_verify_gate_uses_warm_cache_and_cleans_sandbox_on_failure() {
     let sandbox_dir = tmp.path().join("demo.oz/_integrate");
 
     // 1. Failing --verify leaves `main` untouched and removes `_integrate`.
+    let fail_cmd = if cfg!(windows) {
+        "if exist target\\warm_marker.txt exit /b 1"
+    } else {
+        "test -f target/warm_marker.txt && exit 1"
+    };
     let fail_err = integrate(
         &repo,
         &IntegrateOptions {
             sources: vec!["ws-verify".to_string()],
             into: Some("main".to_string()),
-            verify_cmd: Some("test -f target/warm_marker.txt && exit 1".to_string()),
+            verify_cmd: Some(fail_cmd.to_string()),
             ..Default::default()
         },
         agent_actor(None),
@@ -511,15 +516,17 @@ fn integrate_verify_gate_uses_warm_cache_and_cleans_sandbox_on_failure() {
     assert!(!sandbox_dir.exists(), "_integrate sandbox must be cleaned on verify failure");
 
     // 2. Passing --verify sees warm baseline + candidate code and advances `main`.
+    let pass_cmd = if cfg!(windows) {
+        "findstr /C:\"warm-cache-ok\" target\\warm_marker.txt >NUL && findstr /C:\"val() -> i32 { 2 }\" lib.rs >NUL"
+    } else {
+        "grep -q 'warm-cache-ok' target/warm_marker.txt && grep -q 'val() -> i32 { 2 }' lib.rs"
+    };
     let ok = integrate(
         &repo,
         &IntegrateOptions {
             sources: vec!["ws-verify".to_string()],
             into: Some("main".to_string()),
-            verify_cmd: Some(
-                "grep -q 'warm-cache-ok' target/warm_marker.txt && grep -q 'val() -> i32 { 2 }' lib.rs"
-                    .to_string(),
-            ),
+            verify_cmd: Some(pass_cmd.to_string()),
             ..Default::default()
         },
         agent_actor(None),

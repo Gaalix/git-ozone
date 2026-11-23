@@ -408,7 +408,9 @@ fn gate1_pure_rust_cargo_lock_and_v0_3_0_release_candidate() {
         "root Cargo.toml must declare workspace version {expected_version}"
     );
 
-    let cargo_lock = fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+    let cargo_lock = fs::read_to_string(root.join("Cargo.lock"))
+        .expect("read Cargo.lock")
+        .replace("\r\n", "\n");
     let forbidden_c_bindings = [
         "name = \"openssl-sys\"",
         "name = \"libgit2-sys\"",

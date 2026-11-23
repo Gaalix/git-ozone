@@ -1141,7 +1141,11 @@ fn match_gitdir_condition(
                 patterns.push(format!("{}/{}", canon_norm.trim_end_matches('/'), rest));
             }
         }
-    } else if !raw_pat.starts_with('/') {
+    } else if !raw_pat.starts_with('/')
+        && !(raw_pat.len() >= 2
+            && raw_pat.as_bytes()[0].is_ascii_alphabetic()
+            && raw_pat.as_bytes()[1] == b':')
+    {
         patterns.push(format!("**/{raw_pat}"));
     } else {
         patterns.push(raw_pat.clone());
@@ -1220,7 +1224,8 @@ fn match_onbranch_condition(pattern: &str, branch: Option<&str>) -> bool {
 }
 
 fn normalize_slashes(s: &str) -> String {
-    s.replace('\\', "/")
+    let norm = s.replace('\\', "/");
+    norm.strip_prefix("//?/").unwrap_or(&norm).to_string()
 }
 
 fn parse_git_config_parameters(raw: &str) -> Vec<String> {
