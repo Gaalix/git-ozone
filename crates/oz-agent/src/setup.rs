@@ -430,15 +430,16 @@ pub fn render_ozone_workflow_body() -> &'static str {
 
 Use `oz` instead of multi-step `git add` / `git stash` / `git reset` commands to avoid `.git/index.lock` contention and cut token/command overhead:
 
+- **Target Any Repository (`-C` / `--directory`):** Pass global `oz -C <dir> <cmd>` (or `--directory <dir>`) to run against another repo without `cd <dir> && ...`. For quick one-shot `status` / `diff` / `commit` / `log` / `switch` / `pull` calls, invoking the `oz` CLI directly avoids lazy MCP schema-loading overhead.
 - **Status & Hunk IDs:** Run `oz status --json` (or `oz diff --json`, `oz diff <base>..<head>`) for `O(dirty)` status and diffs with deterministic file IDs (`f1`, `f2`) and hunk IDs (`h1a`, `h1b`).
-- **Compact History, Branches & Reverts:** Run `oz log --oneline -n 10`, `oz show <rev>`, `oz switch <branch>` (or `-c`), `oz pull`, and `oz restore <path|f1>` to discard edits to specific files cleanly (all mutations reversible via `oz undo`).
+- **Compact History, Branches & Reverts:** Run `oz log --oneline -n 10`, `oz show <rev>`, `oz switch <branch>` (or `-c` / `--force-create` / `-d` / `-f`), `oz pull`, and `oz restore <path|f1>` to discard edits to specific files cleanly (all mutations reversible via `oz undo`).
 - **One-Shot Surgical Commits:** Commit whole working trees with `oz commit -m \"feat: ...\"` or commit exact files/hunks without staging via `oz commit -m \"feat: ...\" --pick f1 h2a` (or `--exclude h1b`). Never run interactive `git add -p`.
-- **Isolated CoW Workspaces:** Spawn instant warm workspaces with `oz ws spawn <name> --from main --scope \"crates/foo/**\" --deny \"Cargo.lock\"`.
+- **Isolated CoW Workspaces with Warm Caches:** Spawn instant isolated workspaces with `oz ws spawn <name> --from main --scope \"crates/foo/**\" --deny \"Cargo.lock\"`. Warm `target/`, `node_modules/`, and `.venv/` caches with preserved `mtime`s are seeded automatically (including via content-addressed hardlinks under `--backend cas_hardlink`).
 - **Live Collision Radar:** Check overlapping edits across parallel workspaces before conflicts happen with `oz radar --json`.
 - **Atomic In-Memory Integration:** Merge workspaces safely with test verification via `oz integrate <ws1> <ws2> --into main --verify \"cargo test\"` (and resolve indexed conflicts with `oz resolve c1 --take ours|theirs`).
 - **Instant Rewind & Checkpoints:** Snapshot dirty state with `oz checkpoint --quiet` and reverse any mutation or checkpoint in `< 10 ms` via `oz undo [op_id | --steps N]`.
 - **CI Self-Healing:** Inspect compact failing GitHub Actions logs with `oz ci --json`.
-- **MCP Tools:** When `oz mcp` is connected, prefer structured tools (`oz_status`, `oz_diff`, `oz_show`, `oz_commit`, `oz_log`, `oz_restore`, `oz_ws_spawn`, `oz_radar`, `oz_checkpoint`, `oz_undo`, `oz_ci_logs`).
+- **MCP Tools:** When `oz mcp` is connected and structured tool calls are preferred (or in shell-less harnesses), use `oz_status`, `oz_diff`, `oz_show`, `oz_commit`, `oz_log`, `oz_restore`, `oz_ws_spawn`, `oz_radar`, `oz_checkpoint`, `oz_undo`, and `oz_ci_logs` (always passing `\"directory\": \"<repo-root>\"`).
 "
 }
 
@@ -825,10 +826,13 @@ mod tests {
         // Verify key workflow instructions are present.
         let claude_skill =
             fs::read_to_string(dir.path().join(".claude/skills/oz/SKILL.md")).expect("read skill");
+        assert!(claude_skill.contains("oz -C <dir>"));
+        assert!(claude_skill.contains("--directory <dir>"));
         assert!(claude_skill.contains("oz status --json"));
         assert!(claude_skill.contains("oz diff --json"));
         assert!(claude_skill.contains("--pick"));
         assert!(claude_skill.contains("oz ws spawn"));
+        assert!(claude_skill.contains("cas_hardlink"));
         assert!(claude_skill.contains("oz radar --json"));
         assert!(claude_skill.contains("oz integrate"));
         assert!(claude_skill.contains("oz undo"));

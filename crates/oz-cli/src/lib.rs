@@ -58,7 +58,7 @@ pub struct Cli {
     pub agent: bool,
 
     /// Run as if `oz` was started in `<DIR>` instead of the current working directory.
-    #[arg(short = 'C', value_name = "DIR", global = true)]
+    #[arg(short = 'C', long = "directory", value_name = "DIR", global = true)]
     pub directory: Option<PathBuf>,
 
     /// Print version information (supports `--json`).
@@ -372,7 +372,9 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
     {
         let err = OzError::InvalidUsage {
             message: format!("cannot change to '{}': no such directory", dir.display()),
-            recovery: vec!["Pass an existing directory path to `-C <DIR>`.".to_string()],
+            recovery: vec![
+                "Pass an existing directory path to `-C <DIR>` or `--directory <DIR>`.".to_string(),
+            ],
         };
         if mode.json {
             let env = Envelope::from_error(&err);
@@ -464,7 +466,7 @@ fn find_git_subcommand_index(args: &[OsString]) -> Option<usize> {
             i += 1;
             continue;
         }
-        if s == "-C" {
+        if s == "-C" || s == "--directory" {
             i += 2;
             continue;
         }
@@ -1918,5 +1920,33 @@ mod tests {
             .find(|c| c.id == "macos_apfs_clonefile")
             .unwrap();
         assert_eq!(mac_chk.status, DoctorCheckStatus::Ok);
+    }
+
+    #[test]
+    fn parses_short_and_long_directory_flags_and_locates_git_subcommand() {
+        for argv in [
+            vec!["oz", "-C", "/tmp/repo", "status"],
+            vec!["oz", "--directory", "/tmp/repo", "status"],
+            vec!["oz", "--directory=/tmp/repo", "status"],
+            vec!["oz", "status", "--directory", "/tmp/repo"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parse directory flag");
+            assert_eq!(cli.directory.as_deref(), Some(Path::new("/tmp/repo")));
+            assert!(matches!(cli.command, Some(Commands::Status)));
+        }
+
+        let to_os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            find_git_subcommand_index(&to_os(&["oz", "-C", "/tmp/repo", "git", "status"])),
+            Some(3)
+        );
+        assert_eq!(
+            find_git_subcommand_index(&to_os(&["oz", "--directory", "/tmp/repo", "git", "status"])),
+            Some(3)
+        );
+        assert_eq!(
+            find_git_subcommand_index(&to_os(&["oz", "--directory=/tmp/repo", "git", "status"])),
+            Some(2)
+        );
     }
 }

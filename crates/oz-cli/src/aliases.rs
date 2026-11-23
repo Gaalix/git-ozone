@@ -57,7 +57,7 @@ pub fn is_builtin_subcommand(name: &str) -> bool {
 }
 
 /// Expands configured aliases in `args` before clap parses them, preserving leading/trailing
-/// global flags (`--json`, `--agent`, `-C <DIR>`).
+/// global flags (`--json`, `--agent`, `-C`/`--directory <DIR>`).
 pub fn expand_aliases(args: Vec<OsString>) -> Result<Vec<OsString>> {
     let Some((subcmd_idx, dir_opt)) = locate_subcommand_and_dir(&args) else {
         return Ok(args);
@@ -202,7 +202,7 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
             i += 1;
             continue;
         }
-        if s == "-C" {
+        if s == "-C" || s == "--directory" {
             if let Some(val) = args.get(i + 1) {
                 dir_before = Some(PathBuf::from(val));
             }
@@ -210,6 +210,13 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
             continue;
         }
         if let Some(rest) = s.strip_prefix("-C")
+            && !rest.is_empty()
+        {
+            dir_before = Some(PathBuf::from(rest));
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("--directory=")
             && !rest.is_empty()
         {
             dir_before = Some(PathBuf::from(rest));
@@ -228,7 +235,7 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
         return Some((idx, dir_before));
     }
 
-    // Also inspect trailing `-C <DIR>` (since `-C` is a clap `global = true` flag).
+    // Also inspect trailing `-C <DIR>` / `--directory <DIR>` (global clap flag).
     let mut trailing_dir: Option<PathBuf> = None;
     let mut j = idx + 1;
     while j < args.len() {
@@ -236,7 +243,7 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
         if s == "--" {
             break;
         }
-        if s == "-C" {
+        if s == "-C" || s == "--directory" {
             if let Some(val) = args.get(j + 1) {
                 let cand = PathBuf::from(val);
                 if cand.exists() {
@@ -247,6 +254,13 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
             continue;
         }
         if let Some(rest) = s.strip_prefix("-C")
+            && !rest.is_empty()
+        {
+            let cand = PathBuf::from(rest);
+            if cand.exists() {
+                trailing_dir = Some(cand);
+            }
+        } else if let Some(rest) = s.strip_prefix("--directory=")
             && !rest.is_empty()
         {
             let cand = PathBuf::from(rest);
@@ -377,6 +391,18 @@ mod tests {
             )
             .unwrap(),
             os(&["oz", "-C", "/tmp/repo", "git", "checkout", "main", "--json"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(
+                os(&["oz", "--directory", "/tmp/repo", "st", "--json"]),
+                &map
+            )
+            .unwrap(),
+            os(&["oz", "--directory", "/tmp/repo", "status", "--json"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "--directory=/tmp/repo", "st"]), &map).unwrap(),
+            os(&["oz", "--directory=/tmp/repo", "status"])
         );
         assert_eq!(
             expand_aliases_with_map(os(&["oz", "recent", "--json"]), &map).unwrap(),

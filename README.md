@@ -13,7 +13,7 @@ Ozone operates **100% colocated inside standard `.git/` repositories** — no re
 1. **Zero-Byte CoW Workspaces with Warm Caches** — Spawn 20 isolated branch workspaces in `../<repo>.oz/<ws>` on macOS (`APFS clonefile`), Linux (`Btrfs`/`XFS`/`bcachefs` `FICLONE` or unprivileged `ext4` FUSE3 via `oz-vfsd`), and Windows (`Dev Drive / ReFS` or `NTFS ProjFS`) with warm `target/`, `node_modules/`, and `.venv/` caches and deterministic `mtime` preservation.
 2. **Lock-Free MVCC OpLog & `< 10 ms` Undo** — Concurrent commits across parallel workspaces never collide on `.git/index.lock` or `.git/packed-refs.lock`. Every mutating command and `oz checkpoint` is recorded in an append-only OpLog so `oz undo` / `oz redo` rewind refs and working-tree edits in milliseconds.
 3. **Stage-Free Working-Tree-First Commits** — Commit directly from the working directory with built-in secret, conflict-marker, `> 50 MB` binary, and `--scope`/`--deny` guardrails, automatic `Change-Id:` trailers, pure-Rust Ed25519 SSH signing, and one-shot `--pick f1 h2a` / `--exclude` partial commits using deterministic file (`f1`) and hunk (`h1a`) IDs.
-4. **Multi-Agent Integration, GitHub Stacks & MCP** — Detect cross-workspace overlaps before merge with `oz radar`, merge atomically in memory with `oz integrate --verify`, manage GitHub stacked PRs with `oz pr stack` / `oz sync` / `oz ci --json`, wire 5 coding agent harnesses with `oz agent setup`, expose 10 structured tools via `oz mcp`, and audit AI vs. human line authorship with `refs/notes/ai` and `oz blame`.
+4. **Multi-Agent Integration, GitHub Stacks & MCP** — Detect cross-workspace overlaps before merge with `oz radar`, merge atomically in memory with `oz integrate --verify`, manage GitHub stacked PRs with `oz pr stack` / `oz sync` / `oz ci --json`, wire 5 coding agent harnesses with `oz agent setup`, expose 11 structured tools via `oz mcp`, and audit AI vs. human line authorship with `refs/notes/ai` and `oz blame`.
 
 ---
 
@@ -143,7 +143,7 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 
 | Invocation | Purpose |
 | :--- | :--- |
-| `oz <cmd>` | Primary CLI — supports global `--json`, `--agent`, `-C <DIR>`, `-V/--version`. |
+| `oz <cmd>` | Primary CLI — supports global `--json`, `--agent`, `-C`/`--directory <DIR>`, `-V/--version`. |
 | `git ozone <cmd>` | Native Git subcommand alias provided by the `git-ozone` binary. |
 | `oz git <cmd>` | Optional compatibility shim (`alias git="oz git"`). Intercepts `worktree`, `status`, `diff`, `add`, `reset`, `commit`, `switch`, `checkout`, `merge`, `rebase`, `clone`, `fetch`, `push` natively on Ozone and wraps delegated mutating `git` commands in OpLog transactions so even `git reset --hard` is reversible via `oz undo`. |
 
