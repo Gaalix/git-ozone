@@ -1085,6 +1085,27 @@ fn resolve_include_path(raw: &str, base_dir: Option<&Path>, home_dir: Option<&Pa
     }
 }
 
+fn canonicalize_with_tail(path: &Path) -> Option<PathBuf> {
+    let mut cur = Some(path);
+    let mut tail_parts: Vec<&std::ffi::OsStr> = Vec::new();
+    while let Some(p) = cur {
+        if p.exists() {
+            let mut canon = fs::canonicalize(p).ok()?;
+            for part in tail_parts.iter().rev() {
+                canon.push(part);
+            }
+            return Some(canon);
+        }
+        if let Some(name) = p.file_name() {
+            tail_parts.push(name);
+            cur = p.parent();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 fn match_gitdir_condition(
     pattern: &str,
     base_dir: Option<&Path>,
@@ -1092,37 +1113,70 @@ fn match_gitdir_condition(
     home_dir: Option<&Path>,
     case_insensitive: bool,
 ) -> bool {
-    let mut pat = normalize_slashes(pattern);
-    if pat == "~" {
+    let raw_pat = normalize_slashes(pattern);
+    let mut patterns = Vec::new();
+
+    if raw_pat == "~" {
         if let Some(home) = home_dir {
-            pat = normalize_slashes(&home.to_string_lossy());
+            patterns.push(normalize_slashes(&home.to_string_lossy()));
+            if let Ok(canon) = fs::canonicalize(home) {
+                patterns.push(normalize_slashes(&canon.to_string_lossy()));
+            }
         }
-    } else if let Some(rest) = pat.strip_prefix("~/") {
+    } else if let Some(rest) = raw_pat.strip_prefix("~/") {
         if let Some(home) = home_dir {
             let home_norm = normalize_slashes(&home.to_string_lossy());
-            pat = format!("{}/{}", home_norm.trim_end_matches('/'), rest);
+            patterns.push(format!("{}/{}", home_norm.trim_end_matches('/'), rest));
+            if let Ok(canon) = fs::canonicalize(home) {
+                let canon_norm = normalize_slashes(&canon.to_string_lossy());
+                patterns.push(format!("{}/{}", canon_norm.trim_end_matches('/'), rest));
+            }
         }
-    } else if let Some(rest) = pat.strip_prefix("./") {
+    } else if let Some(rest) = raw_pat.strip_prefix("./") {
         if let Some(base) = base_dir {
             let base_norm = normalize_slashes(&base.to_string_lossy());
-            pat = format!("{}/{}", base_norm.trim_end_matches('/'), rest);
+            patterns.push(format!("{}/{}", base_norm.trim_end_matches('/'), rest));
+            if let Ok(canon) = fs::canonicalize(base) {
+                let canon_norm = normalize_slashes(&canon.to_string_lossy());
+                patterns.push(format!("{}/{}", canon_norm.trim_end_matches('/'), rest));
+            }
         }
-    } else if !pat.starts_with('/') {
-        pat = format!("**/{pat}");
+    } else if !raw_pat.starts_with('/') {
+        patterns.push(format!("**/{raw_pat}"));
+    } else {
+        patterns.push(raw_pat.clone());
+        if !raw_pat.contains(['*', '?', '['])
+            && let Some(canon) = canonicalize_with_tail(Path::new(raw_pat.trim_end_matches('/')))
+        {
+            let mut c = normalize_slashes(&canon.to_string_lossy());
+            if raw_pat.ends_with('/') && !c.ends_with('/') {
+                c.push('/');
+            }
+            patterns.push(c);
+        }
     }
 
-    if pat.ends_with('/') {
-        pat.push_str("**");
+    if patterns.is_empty() {
+        patterns.push(raw_pat);
     }
 
-    let Ok(glob) = GlobBuilder::new(&pat)
-        .literal_separator(true)
-        .case_insensitive(case_insensitive)
-        .build()
-    else {
+    let matchers: Vec<globset::GlobMatcher> = patterns
+        .into_iter()
+        .filter_map(|mut pat| {
+            if pat.ends_with('/') {
+                pat.push_str("**");
+            }
+            GlobBuilder::new(&pat)
+                .literal_separator(true)
+                .case_insensitive(case_insensitive)
+                .build()
+                .ok()
+                .map(|g| g.compile_matcher())
+        })
+        .collect();
+    if matchers.is_empty() {
         return false;
-    };
-    let matcher = glob.compile_matcher();
+    }
 
     let mut candidates = Vec::new();
     for maybe_dir in [
@@ -1145,7 +1199,9 @@ fn match_gitdir_condition(
         }
     }
 
-    candidates.iter().any(|c| matcher.is_match(c))
+    candidates
+        .iter()
+        .any(|c| matchers.iter().any(|m| m.is_match(c)))
 }
 
 fn match_onbranch_condition(pattern: &str, branch: Option<&str>) -> bool {

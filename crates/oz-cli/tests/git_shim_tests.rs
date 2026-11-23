@@ -1432,7 +1432,10 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
         &[],
     );
     assert_eq!(rp_top.code, 0);
-    assert_eq!(rp_top.stdout.trim(), repo_dir.to_string_lossy());
+    assert_eq!(
+        fs::canonicalize(Path::new(rp_top.stdout.trim())).unwrap(),
+        fs::canonicalize(&repo_dir).unwrap()
+    );
 
     let rp_bad = run_oz(
         &repo_dir,

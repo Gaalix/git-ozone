@@ -121,7 +121,7 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       - name: Run Milestone 3 VCBench & exit gates
         run: cargo test --locked -p oz-cli --test m3_exit_gates -- --nocapture
