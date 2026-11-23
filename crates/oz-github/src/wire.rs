@@ -2804,7 +2804,10 @@ fn write_clone_git_config(
     }
 
     existing.push_str(&format!("[remote \"{remote_name}\"]\n"));
-    existing.push_str(&format!("\turl = {remote_url}\n"));
+    existing.push_str(&format!(
+        "\turl = {}\n",
+        escape_git_config_value(remote_url)
+    ));
     if !bare {
         existing.push_str(&format!(
             "\tfetch = +refs/heads/*:refs/remotes/{remote_name}/*\n"
@@ -2823,6 +2826,10 @@ fn write_clone_git_config(
 
     std::fs::write(&config_path, existing)?;
     Ok(())
+}
+
+fn escape_git_config_value(val: &str) -> String {
+    val.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn replace_repository_format_version(config: &str, version: u8) -> String {

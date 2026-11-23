@@ -87,22 +87,26 @@ fn include_if_and_instead_of_push_instead_of_control_fetch_and_push_targets() {
     .expect("clone initial repo");
 
     // Configure includeIf (gitdir/i + onbranch) and url insteadOf / pushInsteadOf in local repo config
+    let mirror_fetch_url = tmp
+        .path()
+        .join("mirror_fetch")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mirror_push_url = tmp
+        .path()
+        .join("mirror_push")
+        .to_string_lossy()
+        .replace('\\', "/");
     let corp_inc = tmp.path().join("corp.gitconfig");
     fs::write(
         &corp_inc,
-        format!(
-            "[url \"{}/\"]\n\tinsteadOf = \"corp:\"\n",
-            tmp.path().join("mirror_fetch").display()
-        ),
+        format!("[url \"{mirror_fetch_url}/\"]\n\tinsteadOf = \"corp:\"\n"),
     )
     .unwrap();
     let release_inc = tmp.path().join("release.gitconfig");
     fs::write(
         &release_inc,
-        format!(
-            "[url \"{}/\"]\n\tpushInsteadOf = \"corp:\"\n",
-            tmp.path().join("mirror_push").display()
-        ),
+        format!("[url \"{mirror_push_url}/\"]\n\tpushInsteadOf = \"corp:\"\n"),
     )
     .unwrap();
 

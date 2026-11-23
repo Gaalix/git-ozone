@@ -19,11 +19,11 @@ use oz_core::{
     CherryPickOptions, CherryPickOutcome, Envelope, ExitCode, InteractionMode, LogCommitEntry,
     LogOptions, OZ_STASH_REF, OzError, OzoneRepo, Result, RestoreOptions, RestoreOutcome,
     RevertOptions, RevertOutcome, ShowOptions, ShowReport, StashDropOutcome, StashListReport,
-    StashPopOutcome, StashPushOutcome, TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport,
-    TagVerifyOutcome, apply_stash_pop, branch_create, branch_delete, branch_list, branch_rename,
-    cherry_pick_commit, compute_status, log_commits, prepare_stash_pop, restore_paths,
-    revert_commit, show_commit, stash_drop, stash_list, stash_push, tag_create, tag_delete,
-    tag_list, tag_verify,
+    StashPopOutcome, StashPushOutcome, SwitchOptions, SwitchOutcome, TagCreateOptions,
+    TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome, apply_stash_pop, branch_create,
+    branch_delete, branch_list, branch_rename, cherry_pick_commit, compute_status, log_commits,
+    prepare_stash_pop, restore_paths, revert_commit, show_commit, stash_drop, stash_list,
+    stash_push, switch_branch, tag_create, tag_delete, tag_list, tag_verify,
 };
 use oz_oplog::{ActorInfo, ActorKind, MutationTransaction};
 use serde::Serialize;
@@ -382,15 +382,19 @@ pub(crate) fn handle_show(
 
 /// Paged `oz diff` dispatch used when stdout is an interactive TTY (`!json && !agent`).
 pub(crate) fn handle_diff_paged(
-    targets: &[String],
+    args: &crate::commands::DiffArgs,
     directory: Option<&Path>,
     mode: InteractionMode,
 ) -> ExitCode {
     let res = (|| -> Result<Envelope<String>> {
         let repo = discover_and_recover_repo(directory, false)?;
-        let report = oz_core::compute_diff(&repo, targets)?;
-        let unified_diff = oz_core::render_unified_diff(&report);
-        Ok(Envelope::success(unified_diff)
+        let report = crate::commands::resolve_diff_report(&repo, args)?;
+        let rendered = if args.stat {
+            crate::commands::format_diff_stat(&report)
+        } else {
+            oz_core::render_unified_diff(&report)
+        };
+        Ok(Envelope::success(rendered)
             .with_workspace(report.workspace)
             .with_branch(report.branch)
             .with_head_oid(report.head_oid))
@@ -1450,6 +1454,90 @@ pub(crate) fn handle_restore(
         }
         if !d.removed_paths.is_empty() {
             println!("Removed {} untracked path(s)", d.removed_paths.len());
+        }
+        Ok(())
+    })
+}
+
+// ============================================================================
+// 9. `oz switch` (native branch switch with OpLog undo)
+// ============================================================================
+
+#[derive(Debug, Args)]
+pub struct SwitchArgs {
+    /// Target branch, tag, or commit revision to switch to.
+    pub target: Option<String>,
+    /// Create a new branch starting at `<TARGET>` (or HEAD) and switch to it.
+    #[arg(short = 'c', long = "create", value_name = "BRANCH", conflicts_with = "force_create")]
+    pub create: Option<String>,
+    /// Create or reset `<BRANCH>` starting at `<TARGET>` (or HEAD) and switch to it.
+    #[arg(long = "force-create", value_name = "BRANCH", conflicts_with = "create")]
+    pub force_create: Option<String>,
+    /// Detach `HEAD` at the resolved commit revision.
+    #[arg(short = 'd', long = "detach")]
+    pub detach: bool,
+    /// Overwrite conflicting dirty working-tree files.
+    #[arg(short = 'f', long = "force", alias = "discard-changes")]
+    pub force: bool,
+}
+
+pub(crate) fn handle_switch(
+    args: &SwitchArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<SwitchOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let pre_status = compute_status(&repo)?;
+        let actor = actor_from_mode(mode, &repo);
+        let (create_branch, reset_existing_branch) = if let Some(ref c) = args.create {
+            (Some(c.clone()), false)
+        } else if let Some(ref fc) = args.force_create {
+            (Some(fc.clone()), true)
+        } else {
+            (None, false)
+        };
+
+        let tx = MutationTransaction::begin_watching_all_branches(
+            &repo,
+            "oz switch".to_string(),
+            actor,
+            Some(&pre_status.changes),
+        )?;
+
+        let outcome = switch_branch(
+            &repo,
+            &SwitchOptions {
+                target: args.target.clone(),
+                create_branch,
+                reset_existing_branch,
+                detach: args.detach,
+                allow_detached_commit: args.detach,
+                force: args.force,
+            },
+        )?;
+
+        let post_repo = OzoneRepo::discover(directory).unwrap_or(repo);
+        let entry = tx.finish(&post_repo, None)?;
+        let op_id = entry.op_id;
+        Ok(Envelope::success(outcome.clone())
+            .with_op_id(op_id.clone())
+            .with_workspace(post_repo.workspace)
+            .with_branch(outcome.branch)
+            .with_head_oid(outcome.head_oid)
+            .with_recovery_command(format!("oz undo {op_id}")))
+    })();
+
+    render_daily_result(mode, res, |env| {
+        let d = &env.data;
+        if let Some(ref br) = d.branch {
+            if d.created_branch {
+                println!("Switched to a new branch '{br}'");
+            } else {
+                println!("Switched to branch '{br}'");
+            }
+        } else if let Some(ref oid) = d.head_oid {
+            println!("HEAD is now at {}", &oid[..oid.len().min(7)]);
         }
         Ok(())
     })

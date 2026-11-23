@@ -11,7 +11,8 @@ use crate::sandbox::{
     conflicting_dirty_paths, extract_unresolved_conflicts, find_merge_base_commit,
     integrate_sandbox_path, is_ancestor, load_session, materialize_integrate_sandbox, merge_labels,
     normalize_branch_short, open_gix_with_fallback, parse_oid, preserve_or_add_change_id,
-    resolve_local_branch, resolve_main_repo, resolve_signatures, save_session,
+    resolve_branch_or_revision, resolve_local_branch, resolve_main_repo, resolve_signatures,
+    save_session,
     sync_git_index_for_delta, verify_and_build_resolved_tree, write_commit_in_odb,
     write_workspace_state_atomic,
 };
@@ -215,7 +216,7 @@ pub fn stack_rebase(
 
     let gix_repo = open_gix_with_fallback(&main_repo.repo_root)?;
     let onto_branch = normalize_branch_short(opts.onto.as_deref().unwrap_or("main")).to_string();
-    let Some((_, onto_commit_id)) = resolve_local_branch(&gix_repo, &onto_branch)? else {
+    let Some((_, onto_commit_id)) = resolve_branch_or_revision(&gix_repo, &onto_branch)? else {
         return Err(OzError::InvalidUsage {
             message: format!("target base branch '{onto_branch}' does not exist"),
             recovery: vec![format!("Create '{onto_branch}' or pass --onto <existing-branch>.")],

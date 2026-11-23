@@ -14,8 +14,8 @@ use crate::sandbox::{
     apply_tree_delta_with_cleanup, cleanup_session_and_sandbox, commit_tree_id,
     conflicting_dirty_paths, extract_unresolved_conflicts, integrate_sandbox_path, is_ancestor,
     load_session, materialize_integrate_sandbox, merge_labels, normalize_branch_short,
-    open_gix_with_fallback, parse_oid, preserve_or_add_change_id, resolve_local_branch,
-    resolve_main_repo, resolve_signatures, run_verify_command, save_session,
+    open_gix_with_fallback, parse_oid, preserve_or_add_change_id, resolve_branch_or_revision,
+    resolve_local_branch, resolve_main_repo, resolve_signatures, run_verify_command, save_session,
     sync_git_index_for_delta, verify_and_build_resolved_tree, write_commit_in_odb,
     write_workspace_state_atomic,
 };
@@ -692,7 +692,7 @@ fn resolve_and_validate_sources(
             continue;
         }
 
-        let Some((_, commit_id)) = resolve_local_branch(gix_repo, short_src)? else {
+        let Some((_, commit_id)) = resolve_branch_or_revision(gix_repo, raw_src)? else {
             return Err(OzError::WorkspaceNotFound {
                 name: raw_src.clone(),
             });

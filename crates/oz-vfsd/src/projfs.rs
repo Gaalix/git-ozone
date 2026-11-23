@@ -934,24 +934,23 @@ impl ProjFsLayerEngine {
 
 static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn is_real_non_placeholder_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
-        let attrs = meta.file_attributes();
-        if (attrs & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)) != 0 {
-            return false;
-        }
-    }
+#[cfg(windows)]
+fn is_non_placeholder_attrs(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+    (meta.file_attributes() & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)) == 0
+}
+
+#[cfg(not(windows))]
+fn is_non_placeholder_attrs(_meta: &std::fs::Metadata) -> bool {
     true
+}
+
+fn is_real_non_placeholder_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.is_file() && is_non_placeholder_attrs(&meta))
+        .unwrap_or(false)
 }
 
 fn extract_file_times_and_attrs(meta: &std::fs::Metadata) -> (bool, u64, i64, i64, i64, u32) {

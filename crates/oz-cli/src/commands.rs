@@ -13,8 +13,9 @@ use oz_agent::{
 };
 use oz_core::{
     BackendKind, CommitOptions, CommitOutcome, DiffReport, Envelope, EnvelopeError, ExitCode,
-    FileChange, InteractionMode, OzError, OzoneRepo, Result, ScopePolicy, StatusReport,
-    WarningEntry, compute_diff, compute_status, normalize_lexical, render_unified_diff,
+    FileChange, InteractionMode, OzError, OzoneRepo, Result, RevisionDiffOptions, ScopePolicy,
+    StatusReport, WarningEntry, compute_diff, compute_revision_diff, compute_status,
+    normalize_lexical, render_unified_diff,
 };
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, detect_filesystem,
@@ -23,8 +24,9 @@ use oz_cow::{
 use oz_github::{
     CiQueryOptions, CiReport, CloneOptions, CloneOutcome, DEFAULT_MAX_EXCERPT_LINES, FetchOptions,
     FetchOutcome, ForceLeaseSpec, HttpAuthScheme, PrCreateOptions, PrCreateOutcome, PrStackOptions,
-    PrStackOutcome, PushOptions, PushOutcome, SyncOptions, SyncOutcome, clone_repo, fetch_remote,
-    pr_create, pr_stack, push_refs_with_options, query_ci_status, sync_repo,
+    PrStackOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, SyncOptions,
+    SyncOutcome, clone_repo, fetch_remote, pr_create, pr_stack, pull_current_branch,
+    push_refs_with_options, query_ci_status, sync_repo,
 };
 use oz_integrate::{
     AbortOutcome, CollisionSeverity, ContinueOutcome, IntegrateOptions, IntegrateOutcome,
@@ -104,7 +106,16 @@ pub struct WsGcArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffArgs {
-    /// Optional file paths, directory prefixes, file IDs (`f1`), or hunk IDs (`h1a`).
+    /// Base revision (`--base <REV>`) to compare against `HEAD` or `--rev`.
+    #[arg(long = "base", value_name = "REV")]
+    pub base: Option<String>,
+    /// Target revision (`--rev <REV>`) when comparing revisions (defaults to `HEAD` when `--base` is set).
+    #[arg(long = "rev", value_name = "REV")]
+    pub rev: Option<String>,
+    /// Display diffstat summary instead of the full unified diff.
+    #[arg(long = "stat")]
+    pub stat: bool,
+    /// Revision range (`A..B` / `A...B`), file paths, directory prefixes, file IDs (`f1`), or hunk IDs (`h1a`).
     pub targets: Vec<String>,
 }
 
@@ -283,7 +294,8 @@ pub struct CloneArgs {
     /// Remote repository URL or local path.
     pub url: String,
     /// Optional target directory (defaults to repository name derived from `<url>`).
-    pub directory: Option<PathBuf>,
+    #[arg(value_name = "DIRECTORY")]
+    pub dest: Option<PathBuf>,
     /// Check out `<BRANCH>` instead of the remote's default branch.
     #[arg(short = 'b', long = "branch", value_name = "BRANCH")]
     pub branch: Option<String>,
@@ -310,6 +322,26 @@ pub struct FetchArgs {
     /// Partial-clone object filter specification (e.g., `blob:none`).
     #[arg(long = "filter", value_name = "SPEC")]
     pub filter: Option<String>,
+    /// Fetch remote tags (`refs/tags/*`).
+    #[arg(short = 't', long = "tags")]
+    pub tags: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PullArgs {
+    /// Remote name (defaults to branch upstream remote or `origin`).
+    pub remote: Option<String>,
+    /// Upstream branch name to pull from (defaults to branch upstream or current branch).
+    pub branch: Option<String>,
+    /// Rebase current branch commits onto the fetched upstream commit when diverged.
+    #[arg(short = 'r', long = "rebase", conflicts_with = "ff_only")]
+    pub rebase: bool,
+    /// Refuse to merge or rebase when local and upstream branches have diverged.
+    #[arg(long = "ff-only", conflicts_with = "rebase")]
+    pub ff_only: bool,
+    /// Prune remote-tracking branches that no longer exist on the remote.
+    #[arg(short = 'p', long = "prune")]
+    pub prune: bool,
     /// Fetch remote tags (`refs/tags/*`).
     #[arg(short = 't', long = "tags")]
     pub tags: bool,
@@ -1019,6 +1051,56 @@ fn print_status_change_line(change: &FileChange) {
     );
 }
 
+pub(crate) fn resolve_diff_report(repo: &OzoneRepo, args: &DiffArgs) -> Result<DiffReport> {
+    if args.base.is_some() || args.rev.is_some() {
+        return compute_revision_diff(
+            repo,
+            &RevisionDiffOptions {
+                base: args.base.clone(),
+                rev: args.rev.clone(),
+                range: None,
+                targets: args.targets.clone(),
+            },
+        );
+    }
+
+    if let Some(first) = args.targets.first()
+        && first.contains("..")
+    {
+        return compute_revision_diff(
+            repo,
+            &RevisionDiffOptions {
+                base: None,
+                rev: None,
+                range: Some(first.clone()),
+                targets: args.targets[1..].to_vec(),
+            },
+        );
+    }
+
+    compute_diff(repo, &args.targets)
+}
+
+pub(crate) fn format_diff_stat(report: &DiffReport) -> String {
+    let mut out = String::new();
+    for f in &report.files {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(" {} | +{} -{}\n", f.path, f.additions, f.deletions),
+        );
+    }
+    let _ = std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            " {} file(s) changed, {} insertion(+), {} deletion(-)\n",
+            report.files.len(),
+            report.total_additions,
+            report.total_deletions
+        ),
+    );
+    out
+}
+
 pub(crate) fn handle_diff(
     args: &DiffArgs,
     directory: Option<&Path>,
@@ -1026,8 +1108,12 @@ pub(crate) fn handle_diff(
 ) -> ExitCode {
     let res = (|| -> Result<Envelope<DiffData>> {
         let repo = discover_and_recover_repo(directory, false)?;
-        let report = compute_diff(&repo, &args.targets)?;
-        let unified_diff = render_unified_diff(&report);
+        let report = resolve_diff_report(&repo, args)?;
+        let unified_diff = if args.stat {
+            format_diff_stat(&report)
+        } else {
+            render_unified_diff(&report)
+        };
         let workspace = report.workspace.clone();
         let branch = report.branch.clone();
         let head_oid = report.head_oid.clone();
@@ -1846,7 +1932,7 @@ pub(crate) fn handle_clone(
         };
 
         let raw_dest = args
-            .directory
+            .dest
             .clone()
             .unwrap_or_else(|| derive_clone_destination_name(&args.url, args.bare));
         let destination = if raw_dest.is_absolute() {
@@ -1986,6 +2072,67 @@ pub(crate) fn handle_fetch(
             for p in &d.pruned_refs {
                 println!("  - [pruned] {p}");
             }
+        }
+    })
+}
+
+pub(crate) fn handle_pull(
+    args: &PullArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PullOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let actor = actor_from_mode(mode, &repo);
+        let opts = PullOptions {
+            remote: args.remote.clone(),
+            branch: args.branch.clone(),
+            rebase: args.rebase,
+            ff_only: args.ff_only,
+            prune: args.prune,
+            tags: args.tags,
+            auth_token: None,
+            git_auth_scheme: HttpAuthScheme::BasicToken,
+        };
+
+        let outcome = pull_current_branch(&repo, &opts, actor)?;
+        let op_id = outcome.op_id.clone();
+        let warnings = outcome.warnings.clone();
+        let branch = Some(outcome.branch.clone());
+        let head_oid = Some(outcome.head_oid.clone());
+
+        let mut env = Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(branch)
+            .with_head_oid(head_oid);
+        if let Some(id) = op_id {
+            env = env
+                .with_op_id(id.clone())
+                .with_recovery_command(format!("oz undo {id}"));
+        }
+        for w in warnings {
+            env = env.with_warning(w);
+        }
+        Ok(env)
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        let short_head = &d.head_oid[..d.head_oid.len().min(7)];
+        match d.strategy {
+            PullStrategy::UpToDate => println!("Already up to date."),
+            PullStrategy::FastForward => println!(
+                "Fast-forwarded '{}' to '{}' ({short_head})",
+                d.branch, d.upstream_ref
+            ),
+            PullStrategy::Merge => println!(
+                "Merged '{}' into '{}' ({short_head})",
+                d.upstream_ref, d.branch
+            ),
+            PullStrategy::Rebase => println!(
+                "Rebased '{}' onto '{}' ({short_head})",
+                d.branch, d.upstream_ref
+            ),
         }
     })
 }

@@ -871,6 +871,15 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
     assert_eq!(rc, 0, "openpty failed");
     let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    let mut pty_master = std::fs::File::from(master);
+    let drainer = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = pty_master.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
 
     // A) With `--json` on a real TTY, pager MUST STILL be suppressed!
     let slave_dup1 = slave.try_clone().expect("dup slave");
@@ -885,6 +894,7 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
         .stdout(unsafe { Stdio::from_raw_fd(slave_dup1.into_raw_fd()) })
         .stderr(Stdio::null());
     assert!(cmd_json.status().expect("oz log --json tty").success());
+    drop(cmd_json);
     assert!(!marker.exists(), "--json must strictly suppress pager even on TTY");
 
     // B) With `--agent` or `OZ_AGENT=1` on a real TTY, pager MUST STILL be suppressed!
@@ -899,6 +909,7 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
         .stdout(unsafe { Stdio::from_raw_fd(slave_dup2.into_raw_fd()) })
         .stderr(Stdio::null());
     assert!(cmd_agent.status().expect("oz log --agent tty").success());
+    drop(cmd_agent);
     assert!(!marker.exists(), "--agent must strictly suppress pager even on TTY");
 
     let slave_dup3 = slave.try_clone().expect("dup slave");
@@ -913,6 +924,7 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
         .stdout(unsafe { Stdio::from_raw_fd(slave_dup3.into_raw_fd()) })
         .stderr(Stdio::null());
     assert!(cmd_env_agent.status().expect("oz log OZ_AGENT=1 tty").success());
+    drop(cmd_env_agent);
     assert!(!marker.exists(), "OZ_AGENT=1 must strictly suppress pager even on TTY");
 
     // C) Interactive TTY stdout WITHOUT --json / --agent / OZ_AGENT=1 / CI MUST invoke `$OZ_PAGER`!
@@ -927,13 +939,11 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
         .stdout(unsafe { Stdio::from_raw_fd(slave.into_raw_fd()) })
         .stderr(Stdio::null());
     assert!(cmd_tty.status().expect("oz log tty").success());
+    drop(cmd_tty);
     assert!(marker.exists(), "interactive TTY stdout must invoke configured pager");
 
-    // Drain PTY master cleanly
-    let mut pty_file = std::fs::File::from(master);
-    let mut buf = [0u8; 4096];
-    let _ = pty_file.read(&mut buf);
-    let _ = &mut pty_file;
+    // Wait for PTY drainer thread after all slave fds close so EOF completes cleanly
+    let _ = drainer.join();
 }
 
 #[test]
@@ -1104,6 +1114,15 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
     assert_eq!(rc, 0, "openpty failed");
     let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    let mut pty_master = std::fs::File::from(master);
+    let drainer = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = pty_master.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
 
     // `oz diff --json` on TTY must suppress pager
     let slave_json = slave.try_clone().expect("dup");
@@ -1119,6 +1138,7 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
         .stdout(unsafe { Stdio::from_raw_fd(slave_json.into_raw_fd()) })
         .stderr(Stdio::null());
     assert!(cmd_json.status().expect("oz diff --json").success());
+    drop(cmd_json);
     assert!(!marker.exists(), "oz diff --json must suppress pager on TTY");
 
     // `oz diff` on interactive TTY invokes `$GIT_PAGER`
@@ -1135,6 +1155,7 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
         .stdout(unsafe { Stdio::from_raw_fd(slave_tty.into_raw_fd()) })
         .stderr(Stdio::null());
     assert!(cmd_diff.status().expect("oz diff tty").success());
+    drop(cmd_diff);
     assert!(marker.exists(), "oz diff on interactive TTY must invoke pager");
 
     // If `delta` is installed, run `oz show` with default delta on TTY
@@ -1156,14 +1177,12 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
             .stdout(unsafe { Stdio::from_raw_fd(slave.into_raw_fd()) })
             .stderr(Stdio::null());
         assert!(cmd_delta.status().expect("oz show via delta").success());
+        drop(cmd_delta);
     } else {
         drop(slave);
     }
 
-    let mut pty_file = std::fs::File::from(master);
-    let mut buf = [0u8; 4096];
-    let _ = pty_file.read(&mut buf);
-    let _ = &mut pty_file;
+    let _ = drainer.join();
 }
 
 // ============================================================================
@@ -1268,4 +1287,206 @@ fn restore_paths_ids_sources_untracked_and_oz_undo_preserve_clean_index() {
     );
 
     assert_git_fsck_clean(&repo);
+}
+
+// ============================================================================
+// 9. `oz switch`, revision-range `oz diff`, and `oz pull`
+// ============================================================================
+
+#[test]
+fn switch_branch_dirty_protection_and_oz_undo() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(tmp.path());
+
+    // Create branch `feat/ui` with a modified README.md
+    let sw_c = run_oz(&repo, &["switch", "-c", "feat/ui", "--json"], &[]);
+    assert_eq!(sw_c.code, 0, "switch -c stderr: {}", sw_c.stderr);
+    let cj = sw_c.unwrap_json();
+    assert_eq!(cj["schema"], OZ_SCHEMA_V1);
+    assert_eq!(cj["data"]["branch"], "feat/ui");
+    assert_eq!(cj["data"]["created_branch"], true);
+
+    fs::write(repo.join("README.md"), "# UI branch\n").unwrap();
+    fs::write(repo.join("ui.txt"), "button\n").unwrap();
+    assert_eq!(
+        run_oz(&repo, &["commit", "-m", "feat: ui work", "--json"], &[]).code,
+        0
+    );
+
+    // Dirty README.md conflicts with switching back to `main` unless `--force`
+    fs::write(repo.join("README.md"), "# local dirty edit\n").unwrap();
+    let sw_blocked = run_oz(&repo, &["switch", "main", "--json"], &[]);
+    assert_ne!(sw_blocked.code, 0);
+    assert_eq!(
+        sys_git(&repo, &["branch", "--show-current"]).trim(),
+        "feat/ui"
+    );
+
+    // Non-conflicting untracked file allows clean switch after restoring README.md
+    assert_eq!(run_oz(&repo, &["restore", "README.md", "--json"], &[]).code, 0);
+    let sw_main = run_oz(&repo, &["switch", "main", "--json"], &[]);
+    assert_eq!(sw_main.code, 0, "switch main stderr: {}", sw_main.stderr);
+    assert_eq!(sys_git(&repo, &["branch", "--show-current"]).trim(), "main");
+    assert!(!repo.join("ui.txt").exists());
+    assert_eq!(fs::read_to_string(repo.join("README.md")).unwrap(), "# Daily UX Test\n");
+
+    // `oz undo` restores previous branch `feat/ui`!
+    let undo_sw = run_oz(&repo, &["undo", "--json"], &[]);
+    assert_eq!(undo_sw.code, 0, "undo switch stderr: {}", undo_sw.stderr);
+    assert_eq!(
+        sys_git(&repo, &["branch", "--show-current"]).trim(),
+        "feat/ui"
+    );
+    assert!(repo.join("ui.txt").is_file());
+
+    assert_git_fsck_clean(&repo);
+}
+
+#[test]
+fn diff_supports_revision_ranges_base_rev_paths_and_stat() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(tmp.path());
+
+    fs::write(repo.join("a.txt"), "base-a\n").unwrap();
+    fs::write(repo.join("b.txt"), "base-b\n").unwrap();
+    assert_eq!(
+        run_oz(&repo, &["commit", "-m", "chore: base", "--json"], &[]).code,
+        0
+    );
+
+    // Feature branch diverges from main
+    assert_eq!(
+        run_oz(&repo, &["switch", "-c", "feat/diff-test", "--json"], &[]).code,
+        0
+    );
+    fs::write(repo.join("a.txt"), "feat-a\n").unwrap();
+    assert_eq!(
+        run_oz(&repo, &["commit", "-m", "feat: update a", "--json"], &[]).code,
+        0
+    );
+
+    // Advance main too so `main..feat/diff-test` and `main...feat/diff-test` differ!
+    assert_eq!(run_oz(&repo, &["switch", "main", "--json"], &[]).code, 0);
+    fs::write(repo.join("b.txt"), "main-b\n").unwrap();
+    assert_eq!(
+        run_oz(&repo, &["commit", "-m", "main: update b", "--json"], &[]).code,
+        0
+    );
+
+    // 1. Two-dot `main..feat/diff-test` includes both a.txt and b.txt
+    let two_dot = run_oz(&repo, &["diff", "main..feat/diff-test", "--json"], &[]);
+    assert_eq!(two_dot.code, 0, "diff 2-dot stderr: {}", two_dot.stderr);
+    let dj2 = two_dot.unwrap_json();
+    assert_eq!(dj2["data"]["files"].as_array().unwrap().len(), 2);
+
+    // 2. Three-dot `main...feat/diff-test --stat` only shows changes on feat since merge-base (a.txt)
+    let three_dot = run_oz(
+        &repo,
+        &["diff", "main...feat/diff-test", "--stat", "--json"],
+        &[],
+    );
+    assert_eq!(three_dot.code, 0, "diff 3-dot stderr: {}", three_dot.stderr);
+    let dj3 = three_dot.unwrap_json();
+    assert_eq!(dj3["data"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(dj3["data"]["files"][0]["path"], "a.txt");
+    assert!(dj3["data"]["unified_diff"].as_str().unwrap().contains("a.txt"));
+
+    // 3. `--base` + `--rev` with path filter
+    let explicit = run_oz(
+        &repo,
+        &["diff", "--base", "main", "--rev", "feat/diff-test", "b.txt", "--json"],
+        &[],
+    );
+    assert_eq!(explicit.code, 0, "diff explicit stderr: {}", explicit.stderr);
+    let de = explicit.unwrap_json();
+    assert_eq!(de["data"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(de["data"]["files"][0]["path"], "b.txt");
+}
+
+#[test]
+fn pull_supports_up_to_date_fast_forward_ff_only_rebase_merge_and_undo() {
+    let tmp = TempDir::new().expect("tempdir");
+    let bare = tmp.path().join("origin.git");
+    fs::create_dir_all(&bare).unwrap();
+    sys_git(&bare, &["init", "--bare", "-b", "main"]);
+
+    let seed = init_repo(tmp.path());
+    sys_git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    sys_git(&seed, &["push", "-u", "origin", "main"]);
+
+    // Clone into `work` using `oz clone` so `.git/config` has branch tracking + `.ozone.toml`
+    let clone_out = run_oz(
+        tmp.path(),
+        &["clone", bare.to_str().unwrap(), "work", "--json"],
+        &[],
+    );
+    assert_eq!(clone_out.code, 0, "clone stderr: {}", clone_out.stderr);
+    let work = tmp.path().join("work");
+    sys_git(&work, &["config", "user.name", "Alice Dev"]);
+    sys_git(&work, &["config", "user.email", "alice@ozone.dev"]);
+    sys_git(&work, &["config", "core.autocrlf", "false"]);
+
+    // 1. Already up to date
+    let up_to_date = run_oz(&work, &["pull", "--json"], &[]);
+    assert_eq!(up_to_date.code, 0, "pull up-to-date stderr: {}", up_to_date.stderr);
+    let uj = up_to_date.unwrap_json();
+    assert_eq!(uj["data"]["strategy"], "up_to_date");
+    assert_eq!(uj["data"]["updated"], false);
+
+    // 2. Upstream advances -> Fast-forward pull + `oz undo`
+    fs::write(seed.join("upstream1.txt"), "u1\n").unwrap();
+    sys_git(&seed, &["add", "upstream1.txt"]);
+    sys_git(&seed, &["commit", "-m", "feat: upstream1"]);
+    sys_git(&seed, &["push", "origin", "main"]);
+
+    let ff = run_oz(&work, &["pull", "--ff-only", "--json"], &[]);
+    assert_eq!(ff.code, 0, "pull ff stderr: {}", ff.stderr);
+    let fj = ff.unwrap_json();
+    assert_eq!(fj["data"]["strategy"], "fast_forward");
+    assert_eq!(fj["data"]["updated"], true);
+    assert_eq!(fs::read_to_string(work.join("upstream1.txt")).unwrap(), "u1\n");
+
+    // 3. Diverge locally and on upstream -> `--ff-only` refuses, `--rebase` rebases, `oz undo` restores, default merges
+    fs::write(work.join("local.txt"), "local-commit\n").unwrap();
+    assert_eq!(
+        run_oz(&work, &["commit", "-m", "feat: local commit", "--json"], &[]).code,
+        0
+    );
+    let diverged_local_head = sys_git(&work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    fs::write(seed.join("upstream2.txt"), "u2\n").unwrap();
+    sys_git(&seed, &["add", "upstream2.txt"]);
+    sys_git(&seed, &["commit", "-m", "feat: upstream2"]);
+    sys_git(&seed, &["push", "origin", "main"]);
+
+    let ff_fail = run_oz(&work, &["pull", "--ff-only", "--json"], &[]);
+    assert_eq!(ff_fail.code, 2);
+
+    let rebased = run_oz(&work, &["pull", "--rebase", "--json"], &[]);
+    assert_eq!(rebased.code, 0, "pull --rebase stderr: {}", rebased.stderr);
+    let rj = rebased.unwrap_json();
+    assert_eq!(rj["data"]["strategy"], "rebase");
+    assert!(work.join("local.txt").is_file());
+    assert!(work.join("upstream2.txt").is_file());
+    assert_eq!(
+        sys_git(&work, &["rev-list", "--count", "HEAD"]).trim(),
+        "4"
+    );
+
+    // Undo the rebase back to diverged_local_head, then test default merge pull!
+    let undo_reb = run_oz(&work, &["undo", "--json"], &[]);
+    assert_eq!(undo_reb.code, 0, "undo rebase stderr: {}", undo_reb.stderr);
+    assert_eq!(
+        sys_git(&work, &["rev-parse", "HEAD"]).trim(),
+        diverged_local_head
+    );
+
+    let merged = run_oz(&work, &["pull", "--json"], &[]);
+    assert_eq!(merged.code, 0, "pull merge stderr: {}", merged.stderr);
+    let mj = merged.unwrap_json();
+    assert_eq!(mj["data"]["strategy"], "merge");
+    assert!(work.join("local.txt").is_file());
+    assert!(work.join("upstream2.txt").is_file());
+
+    assert_git_fsck_clean(&work);
 }

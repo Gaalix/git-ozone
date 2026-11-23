@@ -25,6 +25,10 @@ pub struct DiffReport {
     pub workspace: Option<String>,
     pub branch: Option<String>,
     pub head_oid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_oid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_oid: Option<String>,
     pub files: Vec<FileChange>,
     pub total_additions: u32,
     pub total_deletions: u32,
@@ -346,13 +350,18 @@ fn build_diff_report(status: crate::status::StatusReport, targets: &[String]) ->
         workspace: status.workspace,
         branch: status.branch,
         head_oid: status.head_oid,
+        base_oid: None,
+        target_oid: None,
         files,
         total_additions,
         total_deletions,
     })
 }
 
-fn filter_changes_by_targets(changes: &[FileChange], targets: &[String]) -> Vec<FileChange> {
+pub(crate) fn filter_changes_by_targets(
+    changes: &[FileChange],
+    targets: &[String],
+) -> Vec<FileChange> {
     let mut out = Vec::new();
     for file in changes {
         if targets.iter().any(|t| target_matches_file(t, file)) {

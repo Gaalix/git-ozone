@@ -1475,6 +1475,7 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
         "oz_ci_logs",
         "oz_log",
         "oz_restore",
+        "oz_show",
     ] {
         assert!(tool_names.contains(&expected), "missing MCP tool {expected}");
     }

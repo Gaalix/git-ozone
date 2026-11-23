@@ -36,7 +36,10 @@ pub use pr::{
     PrStackOutcome, StackPrItem, infer_title_body_and_change_ids, pr_create, pr_stack,
     render_stack_navigation_block, strip_stack_navigation_block, upsert_stack_navigation_block,
 };
-pub use sync::{RetargetedPrSummary, SyncOptions, SyncOutcome, sync_repo};
+pub use sync::{
+    PullOptions, PullOutcome, PullStrategy, RetargetedPrSummary, SyncOptions, SyncOutcome,
+    pull_current_branch, sync_repo,
+};
 pub use wire::{
     CloneOptions, CloneOutcome, FetchOptions, FetchOutcome, FetchedRefUpdate, ForceLeaseSpec,
     HttpAuthScheme, PushOptions, PushOutcome, PushedRefUpdate, clone_repo, fetch_remote,

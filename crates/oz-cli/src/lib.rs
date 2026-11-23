@@ -15,16 +15,18 @@ use clap::{CommandFactory, Parser, Subcommand};
 pub use commands::build_mcp_server;
 use commands::{
     AgentCommand, BlameArgs, CheckpointArgs, CiArgs, CloneArgs, CommitArgs, DiffArgs, FetchArgs,
-    IntegrateArgs, McpArgs, PrCommand, PushArgs, RadarArgs, ResolveArgs, SetupArgs, StackCommand,
-    SyncArgs, UndoArgs, WsCommand, handle_agent, handle_blame, handle_checkpoint, handle_ci,
-    handle_clone, handle_commit, handle_diff, handle_fetch, handle_integrate, handle_mcp,
-    handle_pr, handle_push, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
-    handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope, write_stdout_line,
+    IntegrateArgs, McpArgs, PrCommand, PullArgs, PushArgs, RadarArgs, ResolveArgs, SetupArgs,
+    StackCommand, SyncArgs, UndoArgs, WsCommand, handle_agent, handle_blame, handle_checkpoint,
+    handle_ci, handle_clone, handle_commit, handle_diff, handle_fetch, handle_integrate,
+    handle_mcp, handle_pr, handle_pull, handle_push, handle_radar, handle_redo, handle_resolve,
+    handle_setup, handle_stack, handle_status, handle_sync, handle_undo, handle_ws,
+    print_json_envelope, write_stdout_line,
 };
 use daily::{
     BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RestoreArgs, RevertArgs, ShowArgs,
-    StashArgs, TagArgs, handle_branch, handle_cherry_pick, handle_completions, handle_diff_paged,
-    handle_log, handle_restore, handle_revert, handle_show, handle_stash, handle_tag,
+    StashArgs, SwitchArgs, TagArgs, handle_branch, handle_cherry_pick, handle_completions,
+    handle_diff_paged, handle_log, handle_restore, handle_revert, handle_show, handle_stash,
+    handle_switch, handle_tag,
 };
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, FilesystemKind, InteractionMode, MountHealth,
@@ -98,6 +100,8 @@ pub enum Commands {
     Clone(CloneArgs),
     /// Fetch remote updates over pure-Rust Git Wire Protocol v2 with OpLog `ref_deltas`.
     Fetch(FetchArgs),
+    /// Fetch and incorporate upstream changes (`--ff-only`, `--rebase`, or merge) with OpLog undo.
+    Pull(PullArgs),
     /// Push refs over pure-Rust smart `git-receive-pack` (`--atomic`, `--force-with-lease`).
     Push(PushArgs),
     /// Create and orchestrate GitHub Pull Requests (`create`, `stack`).
@@ -128,6 +132,8 @@ pub enum Commands {
     Tag(TagArgs),
     /// List, create, rename, and delete local branches (recorded in OpLog).
     Branch(BranchArgs),
+    /// Switch branches or detach `HEAD` via native `gix` tree-delta checkout (recorded in OpLog).
+    Switch(SwitchArgs),
     /// Restore working-tree files from HEAD or `--source <REV>` (recorded in OpLog for `oz undo`).
     Restore(RestoreArgs),
     /// Generate shell completion scripts (`bash`, `zsh`, `fish`, `powershell`).
@@ -382,7 +388,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Status) => handle_status(cli.directory.as_deref(), mode),
         Some(Commands::Diff(args)) => {
             if pager::pager_allowed_for_mode(mode) {
-                handle_diff_paged(&args.targets, cli.directory.as_deref(), mode)
+                handle_diff_paged(&args, cli.directory.as_deref(), mode)
             } else {
                 handle_diff(&args, cli.directory.as_deref(), mode)
             }
@@ -401,6 +407,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         }
         Some(Commands::Clone(args)) => handle_clone(&args, cli.directory.as_deref(), mode),
         Some(Commands::Fetch(args)) => handle_fetch(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Pull(args)) => handle_pull(&args, cli.directory.as_deref(), mode),
         Some(Commands::Push(args)) => handle_push(&args, cli.directory.as_deref(), mode),
         Some(Commands::Pr(pr_cmd)) => handle_pr(pr_cmd, cli.directory.as_deref(), mode),
         Some(Commands::Sync(args)) => handle_sync(&args, cli.directory.as_deref(), mode),
@@ -415,6 +422,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Revert(args)) => handle_revert(&args, cli.directory.as_deref(), mode),
         Some(Commands::Tag(args)) => handle_tag(&args, cli.directory.as_deref(), mode),
         Some(Commands::Branch(args)) => handle_branch(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Switch(args)) => handle_switch(&args, cli.directory.as_deref(), mode),
         Some(Commands::Restore(args)) => handle_restore(&args, cli.directory.as_deref(), mode),
         Some(Commands::Completions(args)) => handle_completions(&args, Cli::command(), mode),
         Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),

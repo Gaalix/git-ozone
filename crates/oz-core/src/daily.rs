@@ -11,7 +11,8 @@
 
 use crate::commit::{compute_change_id, ensure_change_id_trailer, verify_commit_signature};
 use crate::diff::{
-    compute_file_diff, file_id, is_binary_bytes, render_file_unified_diff,
+    DiffReport, compute_file_diff, file_id, filter_changes_by_targets, is_binary_bytes,
+    render_file_unified_diff,
 };
 use crate::error::{OzError, Result};
 use crate::repo::OzoneRepo;
@@ -2069,6 +2070,127 @@ fn diff_commit_trees(
         });
     }
     Ok(out)
+}
+
+/// Options controlling [`compute_revision_diff`].
+#[derive(Debug, Clone, Default)]
+pub struct RevisionDiffOptions {
+    /// Optional base revision (`--base <REV>`).
+    pub base: Option<String>,
+    /// Optional target revision (`--rev <REV>`, defaults to `HEAD` when only `base` is given).
+    pub rev: Option<String>,
+    /// Optional Git range expression (`A..B`, `A...B`, or single `<rev>`).
+    pub range: Option<String>,
+    /// Optional path / directory / file-ID / hunk-ID filters.
+    pub targets: Vec<String>,
+}
+
+/// Computes Histogram diffs between two commits/revisions (`A..B`, `A...B`, or `--base`/`--rev`),
+/// optionally filtered by `targets`.
+pub fn compute_revision_diff(repo: &OzoneRepo, opts: &RevisionDiffOptions) -> Result<DiffReport> {
+    let gix_repo = open_gix_for_workspace(repo)?;
+    let empty_tree_id = ObjectId::empty_tree(gix_repo.object_hash());
+
+    let (lhs_commit_oid, rhs_commit_oid, use_merge_base) = if let Some(ref raw_range) = opts.range
+    {
+        let trimmed = raw_range.trim();
+        if let Some((lhs_raw, rhs_raw)) = trimmed.split_once("...") {
+            let lhs_spec = if lhs_raw.trim().is_empty() {
+                "HEAD"
+            } else {
+                lhs_raw.trim()
+            };
+            let rhs_spec = if rhs_raw.trim().is_empty() {
+                "HEAD"
+            } else {
+                rhs_raw.trim()
+            };
+            (
+                resolve_commit_oid(&gix_repo, lhs_spec)?,
+                resolve_commit_oid(&gix_repo, rhs_spec)?,
+                true,
+            )
+        } else if let Some((lhs_raw, rhs_raw)) = trimmed.split_once("..") {
+            let lhs_spec = if lhs_raw.trim().is_empty() {
+                "HEAD"
+            } else {
+                lhs_raw.trim()
+            };
+            let rhs_spec = if rhs_raw.trim().is_empty() {
+                "HEAD"
+            } else {
+                rhs_raw.trim()
+            };
+            (
+                resolve_commit_oid(&gix_repo, lhs_spec)?,
+                resolve_commit_oid(&gix_repo, rhs_spec)?,
+                false,
+            )
+        } else {
+            let lhs = resolve_commit_oid(&gix_repo, trimmed)?;
+            let head = resolve_commit_oid(&gix_repo, "HEAD")?;
+            (lhs, head, false)
+        }
+    } else {
+        let lhs_spec = opts
+            .base
+            .as_deref()
+            .or(opts.rev.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("HEAD");
+        let rhs_spec = match (opts.base.as_deref(), opts.rev.as_deref()) {
+            (Some(_), Some(r)) if !r.trim().is_empty() => r.trim(),
+            _ => "HEAD",
+        };
+        (
+            resolve_commit_oid(&gix_repo, lhs_spec)?,
+            resolve_commit_oid(&gix_repo, rhs_spec)?,
+            false,
+        )
+    };
+
+    let effective_base_oid = if use_merge_base {
+        gix_repo
+            .merge_base(lhs_commit_oid, rhs_commit_oid)
+            .ok()
+            .flatten()
+            .map(gix::Id::detach)
+    } else {
+        Some(lhs_commit_oid)
+    };
+
+    let lhs_tree = match effective_base_oid {
+        Some(oid) => commit_tree_id(&gix_repo, oid)?,
+        None => empty_tree_id,
+    };
+    let rhs_tree = commit_tree_id(&gix_repo, rhs_commit_oid)?;
+
+    let all_files = diff_commit_trees(&gix_repo, lhs_tree, rhs_tree)?;
+    let files = if opts.targets.is_empty() {
+        all_files
+    } else {
+        filter_changes_by_targets(&all_files, &opts.targets)
+    };
+
+    let total_additions = files.iter().map(|f| f.additions).sum();
+    let total_deletions = files.iter().map(|f| f.deletions).sum();
+
+    Ok(DiffReport {
+        workspace: repo.workspace.clone(),
+        branch: repo.branch.clone(),
+        head_oid: repo.head_oid.clone(),
+        base_oid: Some(
+            effective_base_oid
+                .unwrap_or(empty_tree_id)
+                .to_hex()
+                .to_string(),
+        ),
+        target_oid: Some(rhs_commit_oid.to_hex().to_string()),
+        files,
+        total_additions,
+        total_deletions,
+    })
 }
 
 // ============================================================================

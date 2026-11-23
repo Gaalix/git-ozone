@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pure-Rust JSON-RPC 2.0 Model Context Protocol (`oz mcp`) stdio server supporting both
-//! newline-delimited JSON-RPC lines and LSP-style `Content-Length` framing across all 10
+//! newline-delimited JSON-RPC lines and LSP-style `Content-Length` framing across all 11
 //! Ozone agent tools (`oz_status`, `oz_diff`, `oz_commit`, `oz_ws_spawn`, `oz_radar`,
-//! `oz_checkpoint`, `oz_undo`, `oz_ci_logs`, `oz_log`, `oz_restore`).
+//! `oz_checkpoint`, `oz_undo`, `oz_ci_logs`, `oz_log`, `oz_restore`, `oz_show`).
 
 use crate::AiProvenanceNote;
-use crate::notes::{ProvenanceOptions, record_commit_provenance};
+use crate::notes::{ProvenanceOptions, read_provenance_note, record_commit_provenance};
 use oz_core::{
-    BackendKind, ChangeKind, CommitOptions, CommitOutcome, DiffReport, LogOptions, OzError,
-    OzoneRepo, RestoreOptions, RestoreOutcome, Result, ScopePolicy, StatusReport, WarningEntry,
-    WorkspaceState, compute_diff, compute_status, log_commits, render_unified_diff, restore_paths,
+    BackendKind, ChangeKind, CommitOptions, CommitOutcome, DiffReport, FileChange, LogOptions,
+    OzError, OzoneRepo, RestoreOptions, RestoreOutcome, Result, RevisionDiffOptions, ScopePolicy,
+    ShowOptions, StatusReport, WarningEntry, WorkspaceState, compute_diff, compute_revision_diff,
+    compute_status, log_commits, render_unified_diff, restore_paths, show_commit,
 };
 use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
 use oz_integrate::{RadarOptions, RadarReport, scan_radar};
@@ -486,6 +487,10 @@ impl McpServer {
                 let args: RestoreToolArgs = parse_tool_args(&tool_name, args_val)?;
                 self.exec_oz_restore(args)
             }
+            "oz_show" => {
+                let args: ShowToolArgs = parse_tool_args(&tool_name, args_val)?;
+                self.exec_oz_show(args)
+            }
             _ => {
                 return Err((
                     JSONRPC_INVALID_PARAMS,
@@ -592,36 +597,7 @@ impl McpServer {
         let changes_val = if args.include_lines {
             serde_json::to_value(&report.changes)?
         } else {
-            let compact: Vec<McpStatusFileSummary> = report
-                .changes
-                .iter()
-                .map(|c| McpStatusFileSummary {
-                    id: c.id.clone(),
-                    path: c.path.clone(),
-                    old_path: c.old_path.clone(),
-                    kind: c.kind,
-                    additions: c.additions,
-                    deletions: c.deletions,
-                    is_binary: c.is_binary,
-                    pinned: c.pinned,
-                    out_of_scope: c.out_of_scope,
-                    hunks: c
-                        .hunks
-                        .iter()
-                        .map(|h| McpHunkSummary {
-                            id: h.id.clone(),
-                            file_id: h.file_id.clone(),
-                            path: h.path.clone(),
-                            old_start: h.old_start,
-                            old_lines: h.old_lines,
-                            new_start: h.new_start,
-                            new_lines: h.new_lines,
-                            header: h.header.clone(),
-                        })
-                        .collect(),
-                })
-                .collect();
-            serde_json::to_value(compact)?
+            serde_json::to_value(summarize_files_compact(&report.changes))?
         };
 
         Ok(json!({
@@ -637,11 +613,43 @@ impl McpServer {
     fn exec_oz_diff(&self, args: DiffToolArgs) -> Result<Value> {
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
-        let report: DiffReport = compute_diff(&repo, &args.targets)?;
-        let unified = if args.include_unified.unwrap_or(true) {
+        let is_range = args.range.is_some() || args.base.is_some() || args.rev.is_some();
+        let report: DiffReport = if is_range {
+            compute_revision_diff(
+                &repo,
+                &RevisionDiffOptions {
+                    base: args.base.clone(),
+                    rev: args.rev.clone(),
+                    range: args.range.clone(),
+                    targets: args.targets.clone(),
+                },
+            )?
+        } else if let Some(first) = args.targets.first()
+            && first.contains("..")
+        {
+            compute_revision_diff(
+                &repo,
+                &RevisionDiffOptions {
+                    base: None,
+                    rev: None,
+                    range: Some(first.clone()),
+                    targets: args.targets[1..].to_vec(),
+                },
+            )?
+        } else {
+            compute_diff(&repo, &args.targets)?
+        };
+        let unified = if args.stat_only {
+            None
+        } else if args.include_unified.unwrap_or(true) {
             Some(render_unified_diff(&report))
         } else {
             None
+        };
+        let files_val = if args.stat_only {
+            serde_json::to_value(summarize_files_compact(&report.files))?
+        } else {
+            serde_json::to_value(&report.files)?
         };
 
         Ok(json!({
@@ -649,7 +657,9 @@ impl McpServer {
             "workspace": report.workspace,
             "branch": report.branch,
             "head_oid": report.head_oid,
-            "files": report.files,
+            "base_oid": report.base_oid,
+            "target_oid": report.target_oid,
+            "files": files_val,
             "total_additions": report.total_additions,
             "total_deletions": report.total_deletions,
             "unified_diff": unified,
@@ -954,6 +964,76 @@ impl McpServer {
             outcome,
         })?)
     }
+
+    fn exec_oz_show(&self, args: ShowToolArgs) -> Result<Value> {
+        let repo =
+            self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
+        let report = show_commit(
+            &repo,
+            &ShowOptions {
+                rev: args.rev,
+                stat_only: args.stat_only,
+            },
+        )?;
+        let provenance = read_provenance_note(&repo, &report.commit_oid).unwrap_or(None);
+        Ok(json!({
+            "ok": true,
+            "commit_oid": report.commit_oid,
+            "short_oid": report.short_oid,
+            "tree_oid": report.tree_oid,
+            "parents": report.parents,
+            "tag_name": report.tag_name,
+            "tag_message": report.tag_message,
+            "author_name": report.author_name,
+            "author_email": report.author_email,
+            "author_time": report.author_time,
+            "committer_name": report.committer_name,
+            "committer_email": report.committer_email,
+            "committer_time": report.committer_time,
+            "subject": report.subject,
+            "body": report.body,
+            "message": report.message,
+            "change_id": report.change_id,
+            "signed": report.signed,
+            "signature_valid": report.signature_valid,
+            "signature_fingerprint": report.signature_fingerprint,
+            "provenance": provenance,
+            "stat": report.stat,
+            "files": if args.include_files { Some(report.files) } else { None },
+            "unified_diff": report.unified_diff,
+        }))
+    }
+}
+
+fn summarize_files_compact(changes: &[FileChange]) -> Vec<McpStatusFileSummary> {
+    changes
+        .iter()
+        .map(|c| McpStatusFileSummary {
+            id: c.id.clone(),
+            path: c.path.clone(),
+            old_path: c.old_path.clone(),
+            kind: c.kind,
+            additions: c.additions,
+            deletions: c.deletions,
+            is_binary: c.is_binary,
+            pinned: c.pinned,
+            out_of_scope: c.out_of_scope,
+            hunks: c
+                .hunks
+                .iter()
+                .map(|h| McpHunkSummary {
+                    id: h.id.clone(),
+                    file_id: h.file_id.clone(),
+                    path: h.path.clone(),
+                    old_start: h.old_start,
+                    old_lines: h.old_lines,
+                    new_start: h.new_start,
+                    new_lines: h.new_lines,
+                    header: h.header.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -1031,7 +1111,23 @@ struct RestoreToolArgs {
 struct DiffToolArgs {
     #[serde(default)]
     targets: Vec<String>,
+    base: Option<String>,
+    rev: Option<String>,
+    range: Option<String>,
+    #[serde(default)]
+    stat_only: bool,
     include_unified: Option<bool>,
+    directory: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ShowToolArgs {
+    rev: Option<String>,
+    #[serde(default)]
+    stat_only: bool,
+    #[serde(default)]
+    include_files: bool,
     directory: Option<String>,
     workspace: Option<String>,
 }
@@ -1308,7 +1404,7 @@ where
     Ok(())
 }
 
-/// Returns the canonical MCP `tools/list` schema descriptors for all 10 Ozone MCP tools.
+/// Returns the canonical MCP `tools/list` schema descriptors for all 11 Ozone MCP tools.
 #[must_use]
 pub fn mcp_tool_definitions() -> Vec<Value> {
     vec![
@@ -1326,15 +1422,19 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "oz_diff",
-            "description": "Compute Histogram diffs and addressable hunk IDs (h1a, h1b) for dirty files or specific targets.",
+            "description": "Compute Histogram diffs and addressable hunk IDs (h1a, h1b) for dirty files or revision ranges (A..B, A...B, or base/rev).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "targets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional file IDs (f1), hunk IDs (h1a), or relative file paths."
+                        "description": "Optional revision range (A..B) as first item, or file IDs (f1), hunk IDs (h1a), or relative file paths."
                     },
+                    "base": { "type": "string", "description": "Optional base commit/branch revision (defaults to comparing against HEAD unless rev is set)." },
+                    "rev": { "type": "string", "description": "Optional target commit/branch revision (defaults to HEAD when base is set)." },
+                    "range": { "type": "string", "description": "Optional Git revision range expression (`A..B` or `A...B`)." },
+                    "stat_only": { "type": "boolean", "description": "Omit hunk diff lines and unified diff text, returning compact file/hunk summaries (default: false)." },
                     "include_unified": { "type": "boolean", "description": "Include rendered unified diff text (default: true)." },
                     "workspace": { "type": "string" },
                     "directory": { "type": "string" }
@@ -1468,6 +1568,20 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
                     },
                     "source": { "type": "string", "description": "Optional source revision (defaults to HEAD)." },
                     "remove_untracked": { "type": "boolean", "description": "Delete specified untracked paths not present in source (default: false)." },
+                    "workspace": { "type": "string" },
+                    "directory": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "oz_show",
+            "description": "Inspect a commit or tag: metadata, Change-Id, SSH signature verification, refs/notes/ai provenance, diffstat, and unified diff.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rev": { "type": "string", "description": "Revision, commit OID, branch, or tag to inspect (defaults to HEAD)." },
+                    "stat_only": { "type": "boolean", "description": "Omit unified diff text and return metadata + diffstat only (default: false)." },
+                    "include_files": { "type": "boolean", "description": "Include structured per-file hunk array alongside unified_diff (default: false)." },
                     "workspace": { "type": "string" },
                     "directory": { "type": "string" }
                 }
@@ -1720,11 +1834,11 @@ mod tests {
         assert_eq!(responses[1]["id"], 2);
         assert_eq!(responses[1]["result"], json!({}));
 
-        // 3: tools/list -> all 10 tools
+        // 3: tools/list -> all 11 tools
         let tools = responses[2]["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools
             .iter()
             .map(|t| t["name"].as_str().expect("tool name"))
@@ -1742,6 +1856,7 @@ mod tests {
                 "oz_ci_logs",
                 "oz_log",
                 "oz_restore",
+                "oz_show",
             ]
         );
 
@@ -2031,5 +2146,64 @@ mod tests {
             fs::read_to_string(repo_dir.join("other.txt")).unwrap(),
             "keep dirty\n"
         );
+    }
+
+    #[test]
+    fn mcp_show_and_revision_range_diff_roundtrip() {
+        let (_parent, repo_dir) = setup_mcp_repo();
+        let repo = OzoneRepo::discover(Some(&repo_dir)).expect("discover");
+
+        fs::write(repo_dir.join("calc.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b + 1 }\n")
+            .unwrap();
+        fs::write(repo_dir.join("extra.rs"), "pub const X: u32 = 42;\n").unwrap();
+        let commit_out = commit_changes(&repo, &CommitOptions::new("feat: second commit"))
+            .expect("commit second");
+
+        let mut server = McpServer::new(Some(repo_dir));
+        let reqs = [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oz_show","arguments":{"rev":"HEAD"}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"oz_show","arguments":{"rev":&commit_out.commit_oid,"stat_only":true,"include_files":true}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"oz_diff","arguments":{"range":"HEAD~1..HEAD","targets":["calc.rs"]}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"oz_diff","arguments":{"base":"HEAD~1","stat_only":true}}}),
+        ];
+        let mut input = Vec::new();
+        for req in &reqs {
+            input.extend_from_slice(&encode_msg(MessageFraming::JsonLine, req));
+        }
+        let mut out = Vec::new();
+        server
+            .serve_stdio(Cursor::new(input), &mut out)
+            .expect("serve_stdio");
+        let resps = decode_all_responses(MessageFraming::JsonLine, &out);
+
+        let (err1, show_default) = extract_tool_json(&resps[0]);
+        assert!(!err1, "show default err: {show_default}");
+        assert_eq!(show_default["commit_oid"], commit_out.commit_oid);
+        assert_eq!(show_default["subject"], "feat: second commit");
+        assert!(show_default["unified_diff"].as_str().unwrap().contains("a + b + 1"));
+        assert!(show_default["files"].is_null());
+
+        let (err2, show_stat) = extract_tool_json(&resps[1]);
+        assert!(!err2, "show stat err: {show_stat}");
+        assert!(show_stat["unified_diff"].is_null());
+        assert_eq!(show_stat["stat"]["files_changed"], 2);
+        assert_eq!(show_stat["files"].as_array().unwrap().len(), 2);
+
+        let (err3, diff_range) = extract_tool_json(&resps[2]);
+        assert!(!err3, "diff range err: {diff_range}");
+        assert!(diff_range["base_oid"].is_string());
+        assert_eq!(diff_range["target_oid"], commit_out.commit_oid);
+        assert_eq!(diff_range["files"].as_array().unwrap().len(), 1);
+        assert_eq!(diff_range["files"][0]["path"], "calc.rs");
+
+        let (err4, diff_stat) = extract_tool_json(&resps[3]);
+        assert!(!err4, "diff stat err: {diff_stat}");
+        assert_eq!(diff_stat["files"].as_array().unwrap().len(), 2);
+        assert!(diff_stat["unified_diff"].is_null());
+        for f in diff_stat["files"].as_array().unwrap() {
+            for h in f["hunks"].as_array().unwrap() {
+                assert!(h.get("lines").is_none());
+            }
+        }
     }
 }

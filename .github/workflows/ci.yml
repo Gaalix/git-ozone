@@ -50,6 +50,7 @@ jobs:
   clippy:
     name: Clippy (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -63,6 +64,7 @@ jobs:
 
   test:
     name: Build & Test (${{ matrix.os }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

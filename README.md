@@ -153,12 +153,12 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | :--- | :--- |
 | `oz ws <spawn\|list\|rm\|gc>` | Manage isolated CoW/VFS workspaces (`../<repo>.oz/<ws>`) and warm cache LRU GC. |
 | `oz status` | Indexless `O(dirty_files)` status emitting deterministic `[f1]` file and `h1a` hunk IDs. |
-| `oz diff [TARGETS...]` | Histogram unified diffs filtered by file IDs (`f1`), hunk IDs (`h1a`), or paths. |
+| `oz diff [--base/--rev \| A..B] [TARGETS...]` | Histogram unified diffs (working tree or revision ranges) filtered by file IDs (`f1`), hunk IDs (`h1a`), paths, or `--stat`. |
 | `oz commit -m "..."` | Stage-free commit (`--pick`, `--exclude`, `--amend`, `--no-edit`, `-S/--sign`, `--no-verify`, hooks, guardrails, `Change-Id:`). |
 | `oz log` / `oz show` | Colored commit graph (`--oneline`, `--author`, `--grep`, `-S`/`-G`, `--since`) and commit details (`refs/notes/ai`, `--stat`). |
 | `oz stash` | `push` / `pop` / `list` / `drop` backed by MVCC OpLog snapshots so `oz undo` reverses stash operations too. |
 | `oz cherry-pick` / `oz revert` | In-memory cherry-pick & revert with `--no-commit`, `--json`, and OpLog undo support. |
-| `oz branch` / `oz tag` | Branch list/create/rename/delete and tag list/create/delete/SSH-signed/verify. |
+| `oz branch` / `oz switch` / `oz tag` | Branch list/create/rename/delete, safe branch switching (`-c`/`-d`/`-f`), and tag management with OpLog undo. |
 | `oz restore` | Selectively restore working-tree paths or file IDs (`f1`) from `HEAD` or `--source` (recorded in OpLog for `oz undo`). |
 | `oz checkpoint` | Capture `< 10 ms` MVCC working-tree checkpoint (`-q/--quiet` for agent hooks). |
 | `oz undo [OP_ID \| --steps N]` / `oz redo` | Sub-10 ms OpLog rewind & re-apply for refs and working-tree edits. |
@@ -166,12 +166,12 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz integrate <SOURCES...>` | In-memory 3-way merge into `--into <branch>` with `--verify "<cmd>"` and `_integrate/` sandbox. |
 | `oz resolve <ID \| --all> --take <ours\|theirs\|base>` | Resolve structured conflict IDs (`c1`, `c2`) with optional `--continue`. |
 | `oz stack <status\|rebase>` | Inspect and in-memory rebase stacked branches while preserving `Change-Id:` trailers. |
-| `oz clone` / `oz fetch` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--atomic`, `--force-with-lease`, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
+| `oz clone` / `oz fetch` / `oz pull` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--ff-only`, `--rebase`, `--atomic`, `--force-with-lease`, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
 | `oz pr <create\|stack>` | Create/update single or cross-linked stacked GitHub Pull Requests. |
 | `oz sync` | Fetch, fast-forward base, retarget stacked PRs, rebase downstream, GC merged workspaces, refresh warm baseline. |
 | `oz ci` | Inspect GitHub Check Runs & compact failing Actions job log excerpts (`--json` for agent self-healing). |
 | `oz agent setup` | Install idempotent skills/rules and `oz checkpoint --quiet` hooks for 5 agent harnesses. |
-| `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (10 tools). |
+| `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (11 tools). |
 | `oz blame <PATH>` | Line-level human vs. AI (`refs/notes/ai`) authorship attribution. |
 | `oz gc` / `oz fsck` | Bounded `.git/ozone/oplog/` compaction (`--oplog-days`), integrity checks, and safe `--repair` for interrupted transactions. |
 | `oz completions <SHELL>` | Generate `bash`, `zsh`, `fish`, or `powershell` completions (`clap_complete`). |

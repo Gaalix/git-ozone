@@ -96,6 +96,7 @@ fn init_repo(dir: &Path) -> String {
     sys_git(dir, &["init", "-b", "main"]);
     sys_git(dir, &["config", "user.name", "Ozone Shim Test"]);
     sys_git(dir, &["config", "user.email", "shim@ozone.dev"]);
+    sys_git(dir, &["config", "core.autocrlf", "false"]);
     fs::write(dir.join(".ozone.toml"), "backend = \"cas_hardlink\"\n").expect("write .ozone.toml");
     fs::write(dir.join("README.md"), "# shim test\n").expect("write readme");
     sys_git(dir, &["add", "."]);
@@ -799,7 +800,12 @@ fn m3_git_clone_partial_blob_none_and_exotic_fallbacks() {
 
     // 3. Exotic clone flags (`--depth 1` and `--bare`) fall back cleanly to system `git clone`,
     // initializing `.git/ozone/` only when non-bare.
-    let file_url = format!("file://{}", bare_remote.display());
+    let raw_bare_slash = bare_remote.to_string_lossy().replace('\\', "/");
+    let file_url = if raw_bare_slash.starts_with('/') {
+        format!("file://{raw_bare_slash}")
+    } else {
+        format!("file:///{raw_bare_slash}")
+    };
     let shallow_clone = run_oz(
         tmp.path(),
         &[
@@ -1315,6 +1321,9 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
     let sub_src = tmp.path().join("sub");
     fs::create_dir_all(&sub_src).unwrap();
     sys_git(&sub_src, &["init", "-b", "main"]);
+    sys_git(&sub_src, &["config", "user.name", "Ozone Sub Test"]);
+    sys_git(&sub_src, &["config", "user.email", "sub@ozone.dev"]);
+    sys_git(&sub_src, &["config", "core.autocrlf", "false"]);
     fs::write(sub_src.join("s.txt"), "sub1\n").unwrap();
     sys_git(&sub_src, &["add", "."]);
     sys_git(&sub_src, &["commit", "-m", "s1"]);

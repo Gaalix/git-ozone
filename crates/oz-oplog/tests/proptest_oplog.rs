@@ -286,23 +286,22 @@ impl OracleModel {
         };
         self.current_head = top.post_head.clone();
         self.current_tree = top.post_tree.clone();
-        if top.is_rewind_only {
+        if self.current_disk == top.pre_disk {
             self.current_disk = top.post_disk.clone();
         } else {
-            if self.current_disk == top.pre_disk {
-                self.current_disk = top.post_disk.clone();
-            } else {
-                for path in &top.changed_paths {
-                    match top.post_disk.get(path) {
-                        Some(entry) => {
-                            self.current_disk.insert(path.clone(), entry.clone());
-                        }
-                        None => {
-                            self.current_disk.remove(path);
-                        }
+            // Uncheckpointed edits on paths NOT touched by `top` remain preserved by `restore_working_tree`.
+            for path in &top.changed_paths {
+                match top.post_disk.get(path) {
+                    Some(entry) => {
+                        self.current_disk.insert(path.clone(), entry.clone());
+                    }
+                    None => {
+                        self.current_disk.remove(path);
                     }
                 }
             }
+        }
+        if !top.is_rewind_only {
             self.active.push(top);
         }
         self.latest_recorded_ws_state = Some((

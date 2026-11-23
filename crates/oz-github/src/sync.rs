@@ -23,12 +23,14 @@ use gix::merge::tree::TreatAsUnresolved;
 use gix::objs::Commit;
 use gix::refs::FullName;
 use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
-use oz_core::{MountHealth, OzError, OzoneRepo, Result, WorkspaceState, compute_status};
+use oz_core::{GitConfig, MountHealth, OzError, OzoneRepo, Result, WorkspaceState, compute_status};
 use oz_cow::materialize::{apply_tree_delta_to_dir, compute_tree_delta};
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, gc_workspaces, list_workspaces, remove_workspace,
 };
-use oz_integrate::{StackRebaseOptions, stack_rebase, stack_status};
+use oz_integrate::{
+    IntegrateOptions, StackRebaseOptions, integrate, stack_rebase, stack_status,
+};
 use oz_oplog::{ActorInfo, MutationTransaction, list_entries};
 use oz_warm::{BaselineSource, gc_baselines, resolve_or_capture_baseline};
 use serde::{Deserialize, Serialize};
@@ -188,6 +190,7 @@ pub fn sync_repo(
         if can_ff {
             let refreshed_main = OzoneRepo::discover(Some(&main_repo.repo_root))?;
             match fast_forward_local_base(
+                &refreshed_main,
                 &refreshed_main,
                 &gix_after_fetch,
                 &base_branch,
@@ -553,6 +556,7 @@ enum FastForwardResult {
 
 fn fast_forward_local_base(
     main_repo: &OzoneRepo,
+    active_repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     base_branch: &str,
     old_oid: Option<ObjectId>,
@@ -577,10 +581,19 @@ fn fast_forward_local_base(
 
     let delta = compute_tree_delta(gix_repo, old_tree, new_tree)?;
     let main_checked_out_on_base = main_repo.branch.as_deref() == Some(base_branch);
+    let active_separate_checked_out = active_repo.workdir_path != main_repo.repo_root
+        && active_repo.branch.as_deref() == Some(base_branch);
 
     let mut pre_dirty = None;
-    if main_checked_out_on_base && (!delta.upserts.is_empty() || !delta.deletions.is_empty()) {
-        let status = compute_status(main_repo)?;
+    if (!delta.upserts.is_empty() || !delta.deletions.is_empty())
+        && (main_checked_out_on_base || active_separate_checked_out)
+    {
+        let target_for_status = if active_separate_checked_out {
+            active_repo
+        } else {
+            main_repo
+        };
+        let status = compute_status(target_for_status)?;
         let mut conflicts = Vec::new();
         for ch in &status.changes {
             let collides = delta.deletions.iter().any(|d| paths_overlap(&ch.path, d))
@@ -600,9 +613,14 @@ fn fast_forward_local_base(
         pre_dirty = Some(status.changes);
     }
 
+    let tx_repo = if active_separate_checked_out {
+        active_repo
+    } else {
+        main_repo
+    };
     let full_ref = format!("refs/heads/{base_branch}");
     let tx = MutationTransaction::begin_with_refs(
-        main_repo,
+        tx_repo,
         format!("oz sync (fast-forward {base_branch})"),
         actor,
         &[full_ref.as_str()],
@@ -629,10 +647,296 @@ fn fast_forward_local_base(
         cleanup_empty_dirs_after_deletions(&main_repo.repo_root, &delta.deletions);
         write_repo_index(gix_repo, new_tree)?;
     }
+    if active_separate_checked_out {
+        apply_tree_delta_to_dir(gix_repo, &delta, &active_repo.workdir_path)?;
+        cleanup_empty_dirs_after_deletions(&active_repo.workdir_path, &delta.deletions);
+        if active_repo.is_linked_worktree
+            && let Ok(wt_gix) = open_gix_unrestricted(&active_repo.git_dir)
+        {
+            write_repo_index(&wt_gix, new_tree)?;
+        }
+    }
 
-    let entry = tx.finish(main_repo, pre_dirty.as_deref())?;
+    let entry = tx.finish(tx_repo, pre_dirty.as_deref())?;
     Ok(FastForwardResult::Updated {
         op_id: entry.op_id,
+    })
+}
+
+/// Strategy used by [`pull_current_branch`] to incorporate upstream commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullStrategy {
+    UpToDate,
+    FastForward,
+    Merge,
+    Rebase,
+}
+
+/// Options controlling [`pull_current_branch`].
+#[derive(Debug, Clone, Default)]
+pub struct PullOptions {
+    /// Remote name (defaults to configured `branch.<cur>.remote` or `"origin"`).
+    pub remote: Option<String>,
+    /// Upstream branch name (defaults to configured `branch.<cur>.merge` or `<cur>`).
+    pub branch: Option<String>,
+    /// Rebase local commits onto the fetched upstream branch when diverged (`--rebase`).
+    pub rebase: bool,
+    /// Refuse to merge or rebase when local and upstream branches have diverged (`--ff-only`).
+    pub ff_only: bool,
+    /// Prune deleted remote-tracking refs during fetch (`--prune`).
+    pub prune: bool,
+    /// Fetch tags (`--tags`).
+    pub tags: bool,
+    /// Optional explicit auth token.
+    pub auth_token: Option<String>,
+    /// HTTP authentication scheme.
+    pub git_auth_scheme: HttpAuthScheme,
+}
+
+/// Structured result returned by [`pull_current_branch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullOutcome {
+    pub remote: String,
+    pub branch: String,
+    pub upstream_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_oid: Option<String>,
+    pub head_oid: String,
+    pub strategy: PullStrategy,
+    pub updated: bool,
+    pub fetched: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Fetches updates from remote and fast-forwards, merges, or rebases the current branch,
+/// with full OpLog snapshot capture for `< 10 ms` `oz undo`.
+pub fn pull_current_branch(
+    repo: &OzoneRepo,
+    opts: &PullOptions,
+    actor: ActorInfo,
+) -> Result<PullOutcome> {
+    if opts.rebase && opts.ff_only {
+        return Err(OzError::InvalidUsage {
+            message: "cannot combine `--rebase` and `--ff-only` in `oz pull`".to_string(),
+            recovery: vec!["Pass either `oz pull --rebase` or `oz pull --ff-only`.".to_string()],
+        });
+    }
+
+    let current_branch = repo
+        .branch
+        .as_deref()
+        .map(normalize_short_branch)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| OzError::InvalidUsage {
+            message: "HEAD is detached; cannot pull without a checked-out branch".to_string(),
+            recovery: vec!["Run `oz switch <branch>` first.".to_string()],
+        })?
+        .to_string();
+
+    let main_repo = if repo.is_linked_worktree || repo.workspace.is_some() {
+        OzoneRepo::discover(Some(&repo.repo_root))?
+    } else {
+        repo.clone()
+    };
+    main_repo.layout.ensure_initialized()?;
+
+    let git_cfg = GitConfig::load_for_repo(repo, &[])?;
+    let remote_name = opts
+        .remote
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| git_cfg.get_str("branch", Some(&current_branch), "remote"))
+        .unwrap_or("origin")
+        .to_string();
+    let upstream_branch = opts
+        .branch
+        .as_deref()
+        .map(normalize_short_branch)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            git_cfg
+                .get_str("branch", Some(&current_branch), "merge")
+                .map(normalize_short_branch)
+        })
+        .unwrap_or_else(|| current_branch.clone());
+
+    let mut warnings = Vec::new();
+    let refspecs = if opts.branch.is_some() {
+        vec![format!(
+            "+refs/heads/{upstream_branch}:refs/remotes/{remote_name}/{upstream_branch}"
+        )]
+    } else {
+        Vec::new()
+    };
+
+    let fetch_out = fetch_remote(
+        &main_repo,
+        &FetchOptions {
+            remote: Some(remote_name.clone()),
+            refspecs,
+            prune: opts.prune,
+            filter: None,
+            tags: opts.tags,
+            auth_token: opts.auth_token.clone(),
+            auth_scheme: opts.git_auth_scheme,
+        },
+        actor.clone(),
+    )?;
+    warnings.extend(fetch_out.warnings);
+
+    let gix_after = open_gix_unrestricted(&main_repo.repo_root)?;
+    let local_ref = format!("refs/heads/{current_branch}");
+    let tracking_short = format!("{remote_name}/{upstream_branch}");
+    let tracking_ref = format!("refs/remotes/{tracking_short}");
+
+    let local_oid = read_ref_oid(&gix_after, &local_ref)?;
+    let upstream_oid = read_ref_oid(&gix_after, &tracking_ref)?.ok_or_else(|| {
+        OzError::InvalidUsage {
+            message: format!(
+                "remote-tracking ref '{tracking_short}' was not found on remote '{remote_name}'"
+            ),
+            recovery: vec![format!(
+                "Specify branch explicitly: `oz pull {remote_name} <branch>`"
+            )],
+        }
+    })?;
+    let previous_oid = local_oid.map(|id| id.to_hex().to_string());
+
+    if local_oid == Some(upstream_oid)
+        || local_oid.is_some_and(|l| is_ancestor_commit(&gix_after, upstream_oid, l).unwrap_or(false))
+    {
+        return Ok(PullOutcome {
+            remote: remote_name,
+            branch: current_branch,
+            upstream_ref: tracking_short,
+            previous_oid,
+            head_oid: local_oid
+                .unwrap_or(upstream_oid)
+                .to_hex()
+                .to_string(),
+            strategy: PullStrategy::UpToDate,
+            updated: false,
+            fetched: true,
+            op_id: fetch_out.op_id,
+            warnings,
+        });
+    }
+
+    let can_ff = match local_oid {
+        None => true,
+        Some(l) => is_ancestor_commit(&gix_after, l, upstream_oid)?,
+    };
+
+    if can_ff {
+        let refreshed_main = OzoneRepo::discover(Some(&main_repo.repo_root))?;
+        let active_refreshed = if repo.workdir_path == main_repo.repo_root {
+            refreshed_main.clone()
+        } else {
+            OzoneRepo::discover(Some(&repo.workdir_path)).unwrap_or_else(|_| repo.clone())
+        };
+        return match fast_forward_local_base(
+            &refreshed_main,
+            &active_refreshed,
+            &gix_after,
+            &current_branch,
+            local_oid,
+            upstream_oid,
+            actor,
+        )? {
+            FastForwardResult::Updated { op_id } => Ok(PullOutcome {
+                remote: remote_name,
+                branch: current_branch,
+                upstream_ref: tracking_short,
+                previous_oid,
+                head_oid: upstream_oid.to_hex().to_string(),
+                strategy: PullStrategy::FastForward,
+                updated: true,
+                fetched: true,
+                op_id: Some(op_id),
+                warnings,
+            }),
+            FastForwardResult::SkippedDirty { conflicting_paths } => Err(OzError::InvalidUsage {
+                message: format!(
+                    "your local changes to the following files would be overwritten by pull: {}",
+                    conflicting_paths.join(", ")
+                ),
+                recovery: vec![
+                    "oz stash push".to_string(),
+                    "oz commit -m \"...\"".to_string(),
+                ],
+            }),
+        };
+    }
+
+    if opts.ff_only {
+        return Err(OzError::InvalidUsage {
+            message: format!(
+                "cannot fast-forward '{current_branch}' to '{tracking_short}'; branches have diverged"
+            ),
+            recovery: vec![
+                "oz pull --rebase".to_string(),
+                "oz pull".to_string(),
+            ],
+        });
+    }
+
+    if opts.rebase {
+        let rebase_out = stack_rebase(
+            repo,
+            &StackRebaseOptions {
+                branches: vec![current_branch.clone()],
+                onto: Some(tracking_ref),
+            },
+            actor,
+        )?;
+        let new_head = rebase_out
+            .branches
+            .first()
+            .map(|b| b.new_oid.clone())
+            .unwrap_or_else(|| upstream_oid.to_hex().to_string());
+        return Ok(PullOutcome {
+            remote: remote_name,
+            branch: current_branch,
+            upstream_ref: tracking_short,
+            previous_oid,
+            head_oid: new_head,
+            strategy: PullStrategy::Rebase,
+            updated: true,
+            fetched: true,
+            op_id: rebase_out.op_id,
+            warnings,
+        });
+    }
+
+    let merge_out = integrate(
+        repo,
+        &IntegrateOptions {
+            sources: vec![tracking_ref],
+            into: Some(current_branch.clone()),
+            verify_cmd: None,
+            allow_out_of_scope: true,
+            force: true,
+            message: Some(format!("Merge '{tracking_short}' into {current_branch}")),
+        },
+        actor,
+    )?;
+
+    Ok(PullOutcome {
+        remote: remote_name,
+        branch: current_branch,
+        upstream_ref: tracking_short,
+        previous_oid,
+        head_oid: merge_out.commit_oid,
+        strategy: PullStrategy::Merge,
+        updated: true,
+        fetched: true,
+        op_id: merge_out.op_id,
+        warnings,
     })
 }
 

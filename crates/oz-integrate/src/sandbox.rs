@@ -226,6 +226,53 @@ pub(crate) fn resolve_local_branch(
     }
 }
 
+/// Resolves a local branch, remote-tracking branch (`origin/main`), full ref (`refs/...`),
+/// or commit revision spec to `(display_or_ref_name, commit_oid)`.
+pub(crate) fn resolve_branch_or_revision(
+    gix_repo: &gix::Repository,
+    spec: &str,
+) -> Result<Option<(String, ObjectId)>> {
+    if let Some(local) = resolve_local_branch(gix_repo, spec)? {
+        return Ok(Some(local));
+    }
+
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if trimmed.starts_with("refs/")
+        && let Some(mut r) = gix_repo
+            .try_find_reference(trimmed)
+            .map_err(|err| OzError::Git(err.to_string()))?
+    {
+        let commit = r
+            .peel_to_commit()
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        return Ok(Some((trimmed.to_string(), commit.id)));
+    }
+
+    let remote_ref = format!("refs/remotes/{trimmed}");
+    if let Some(mut r) = gix_repo
+        .try_find_reference(&remote_ref)
+        .map_err(|err| OzError::Git(err.to_string()))?
+    {
+        let commit = r
+            .peel_to_commit()
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        return Ok(Some((remote_ref, commit.id)));
+    }
+
+    if let Ok(id) = gix_repo.rev_parse_single(trimmed)
+        && let Ok(obj) = id.object()
+        && let Ok(commit) = obj.try_into_commit()
+    {
+        return Ok(Some((trimmed.to_string(), commit.id)));
+    }
+
+    Ok(None)
+}
+
 /// Returns `true` if `ancestor` is an ancestor of `descendant` (including `ancestor == descendant`).
 pub(crate) fn is_ancestor(
     gix_repo: &gix::Repository,
