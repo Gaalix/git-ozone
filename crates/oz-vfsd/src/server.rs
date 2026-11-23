@@ -738,10 +738,14 @@ fn handle_request_concurrent(
         .handle_request(req)
 }
 
+async fn wait_for_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = shutdown_rx.wait_for(|&v| v).await;
+}
+
 async fn serve_ipc_stream<S>(
     stream: S,
     manager: Arc<Mutex<DaemonManager>>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -794,7 +798,7 @@ async fn serve_ipc_stream<S>(
                 }
                 let _ = write_half.flush().await;
                 if should_shutdown {
-                    shutdown_notify.notify_waiters();
+                    let _ = shutdown_tx.send(true);
                     break;
                 }
             }
@@ -865,14 +869,14 @@ mod win_signal {
 /// `socket_path`) until `Shutdown` IPC (or console Ctrl-C on Windows).
 pub async fn run_tcp_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
     use tokio::net::TcpListener;
-    use tokio::sync::Notify;
 
     let (_lock_file, manager) = prepare_daemon_runtime(git_dir, socket_path).await?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     write_tcp_endpoint_file(socket_path, &format!("tcp://127.0.0.1:{port}\n"))?;
 
-    let shutdown_notify = Arc::new(Notify::new());
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = Arc::new(shutdown_tx);
     #[cfg(windows)]
     let ctrl_watcher = win_signal::WinCtrlWatcher::install();
     let ctrl_c_fut = async {
@@ -885,7 +889,7 @@ pub async fn run_tcp_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = shutdown_notify.notified() => {
+            () = wait_for_shutdown(&mut shutdown_rx) => {
                 break;
             }
             () = &mut ctrl_c_fut => {
@@ -896,8 +900,8 @@ pub async fn run_tcp_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
                     break;
                 };
                 let mgr = Arc::clone(&manager);
-                let notify = Arc::clone(&shutdown_notify);
-                tokio::spawn(serve_ipc_stream(stream, mgr, notify));
+                let tx = Arc::clone(&shutdown_tx);
+                tokio::spawn(serve_ipc_stream(stream, mgr, tx));
             }
         }
     }
@@ -911,16 +915,16 @@ pub async fn run_tcp_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
 #[cfg(unix)]
 pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
     use tokio::net::UnixListener;
-    use tokio::sync::Notify;
 
     let (_lock_file, manager) = prepare_daemon_runtime(git_dir, socket_path).await?;
     let listener = UnixListener::bind(socket_path)?;
-    let shutdown_notify = Arc::new(Notify::new());
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = Arc::new(shutdown_tx);
     let signal_watcher = unix_signal::SignalWatcher::install()?;
 
     loop {
         tokio::select! {
-            _ = shutdown_notify.notified() => {
+            () = wait_for_shutdown(&mut shutdown_rx) => {
                 break;
             }
             () = signal_watcher.wait_signal() => {
@@ -931,8 +935,8 @@ pub async fn run_daemon(git_dir: &Path, socket_path: &Path) -> Result<()> {
                     break;
                 };
                 let mgr = Arc::clone(&manager);
-                let notify = Arc::clone(&shutdown_notify);
-                tokio::spawn(serve_ipc_stream(stream, mgr, notify));
+                let tx = Arc::clone(&shutdown_tx);
+                tokio::spawn(serve_ipc_stream(stream, mgr, tx));
             }
         }
     }

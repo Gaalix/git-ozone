@@ -197,7 +197,9 @@ pub(crate) fn open_gix_for_workspace(repo: &OzoneRepo) -> Result<gix::Repository
     } else {
         &repo.repo_root
     };
-    gix::open(target).map_err(|err| OzError::Git(err.to_string()))
+    let mut gix_repo = gix::open(target).map_err(|err| OzError::Git(err.to_string()))?;
+    let _ = gix_repo.committer_or_set_fallback("Ozone", "oz@ozone.dev");
+    Ok(gix_repo)
 }
 
 /// Resolves the current commit and root tree for the active workspace branch (handling unborn HEAD).

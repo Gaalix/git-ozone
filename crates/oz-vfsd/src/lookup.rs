@@ -23,7 +23,7 @@ pub const fn vfsd_binary_name() -> &'static str {
 /// Locates the `oz-vfsd` executable using standard Ozone precedence:
 /// 1. `OZ_VFSD_BIN` environment variable
 /// 2. Sibling of `std::env::current_exe()`
-/// 3. Parent of `exe_dir` (handles `cargo test` binaries inside `target/debug/deps`)
+/// 3. Ancestors of `exe_dir` (handles `target/debug/deps` and `target/debug/build/<pkg>/<hash>/out`)
 /// 4. Entries in `PATH`
 pub fn find_oz_vfsd_bin() -> Result<PathBuf> {
     let env_override = std::env::var_os(OZ_VFSD_BIN_ENV);
@@ -64,18 +64,18 @@ pub fn resolve_oz_vfsd_bin_with(
     if let Some(exe) = current_exe
         && let Some(exe_dir) = exe.parent()
     {
-        // 2. Sibling of current_exe().
-        let sibling = exe_dir.join(bin_name);
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-
-        // 3. Parent of exe_dir (for `cargo test` in target/debug/deps).
-        if let Some(parent_dir) = exe_dir.parent() {
-            let parent_cand = parent_dir.join(bin_name);
-            if parent_cand.is_file() {
-                return Ok(parent_cand);
+        // 2 & 3. Sibling or recent ancestor of current_exe() (covers target/debug/deps and
+        // Cargo's build/<crate>/<hash>/out test layout).
+        let mut cursor = Some(exe_dir);
+        for _ in 0..=5 {
+            let Some(dir) = cursor else {
+                break;
+            };
+            let cand = dir.join(bin_name);
+            if cand.is_file() {
+                return Ok(cand);
             }
+            cursor = dir.parent();
         }
     }
 
@@ -151,7 +151,17 @@ mod tests {
             .expect("rule 3");
         assert_eq!(found3, debug_bin);
 
-        // 4. PATH fallback when current_exe has no sibling or parent binary.
+        // 3b. Cargo build-dir ancestor layout (target/debug/build/<crate>/<hash>/out/test_runner).
+        let build_out = debug_dir.join("build/oz-vfsd/abc12345/out");
+        std::fs::create_dir_all(&build_out).expect("mkdir build out");
+        let nested_test = build_out.join("fuse_live_bin");
+        std::fs::write(&nested_test, b"").expect("write nested test");
+        let found3b =
+            resolve_oz_vfsd_bin_with(None, Some(&nested_test), Some(path_dir.as_os_str()))
+                .expect("rule 3b");
+        assert_eq!(found3b, debug_bin);
+
+        // 4. PATH fallback when current_exe has no sibling or ancestor binary.
         let nowhere = dir.path().join("nowhere/oz");
         let found4 = resolve_oz_vfsd_bin_with(None, Some(&nowhere), Some(path_dir.as_os_str()))
             .expect("rule 4");

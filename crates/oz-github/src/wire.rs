@@ -370,7 +370,7 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
         } else {
             gix::create::Kind::WithWorktree
         };
-        let init_repo = gix::ThreadSafeRepository::init_opts(
+        let mut init_repo = gix::ThreadSafeRepository::init_opts(
             &dst,
             create_kind,
             gix::create::Options {
@@ -381,6 +381,7 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
         )
         .map_err(|err| OzError::Git(format!("failed to initialize destination repository: {err}")))?
         .to_thread_local();
+        let _ = init_repo.committer_or_set_fallback("Ozone", "oz@ozone.dev");
 
         let git_dir = init_repo.git_dir().to_path_buf();
         let global_cfg = GitConfig::load_global(&[])?;

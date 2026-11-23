@@ -86,21 +86,41 @@ fn run_script_retry_etxtbsy(script: &Path) -> std::process::Output {
 }
 
 fn find_system_python3() -> Option<std::path::PathBuf> {
-    for cand in ["/usr/bin/python3", "/bin/python3"] {
-        let p = Path::new(cand);
-        if p.is_file() {
-            return Some(p.to_path_buf());
-        }
-    }
     if let Some(path_env) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_env) {
+            if cfg!(target_os = "macos") && dir == Path::new("/usr/bin") {
+                continue;
+            }
             let p = dir.join("python3");
             if p.is_file() {
                 return Some(p);
             }
         }
     }
+    for cand in [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+        "/bin/python3",
+    ] {
+        let p = Path::new(cand);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
     None
+}
+
+fn python_major_minor_dir(python: &Path) -> String {
+    let out = Command::new(python)
+        .args([
+            "-c",
+            "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')",
+        ])
+        .output()
+        .expect("query python version");
+    assert!(out.status.success(), "python3 --version query failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 #[cfg(unix)]
@@ -128,9 +148,13 @@ fn venv_trampoline_rewrites_and_executes_from_cloned_workspace_path() {
 
     let venv_bin = repo_root.join(".venv/bin");
     std::fs::create_dir_all(&venv_bin).expect("mkdir venv/bin");
+    let py_home = sys_python.parent().unwrap_or_else(|| Path::new("/usr/bin"));
     std::fs::write(
         repo_root.join(".venv/pyvenv.cfg"),
-        "home = /usr/bin\ninclude-system-site-packages = false\n",
+        format!(
+            "home = {}\ninclude-system-site-packages = false\n",
+            py_home.display()
+        ),
     )
     .expect("write pyvenv.cfg");
     symlink(&sys_python, venv_bin.join("python3")).expect("symlink python3");
@@ -741,14 +765,17 @@ fn python_venv_normalizes_pyvenv_cfg_activate_long_trampolines_and_editable_pth(
 
     let venv_root = repo_root.join(".venv");
     let venv_bin = venv_root.join("bin");
-    let sp_dir = venv_root.join("lib/python3.14/site-packages");
+    let py_ver = python_major_minor_dir(&sys_python);
+    let sp_dir = venv_root.join("lib").join(py_ver).join("site-packages");
     std::fs::create_dir_all(&venv_bin).expect("mkdir bin");
     std::fs::create_dir_all(&sp_dir).expect("mkdir sp");
 
+    let py_home = sys_python.parent().unwrap_or_else(|| Path::new("/usr/bin"));
     std::fs::write(
         venv_root.join("pyvenv.cfg"),
         format!(
-            "home = /usr/bin\ninclude-system-site-packages = false\ncommand = /usr/bin/python3 -m venv {}\n",
+            "home = {}\ninclude-system-site-packages = false\ncommand = /usr/bin/python3 -m venv {}\n",
+            py_home.display(),
             venv_root.display()
         ),
     )
@@ -770,7 +797,7 @@ fn python_venv_normalizes_pyvenv_cfg_activate_long_trampolines_and_editable_pth(
     std::fs::write(
         &long_tool,
         format!(
-            "#!/bin/sh\n'''exec' {}/python3 \"$0\" \"$@\"\n' '''\nimport sys, pkg\nprint('LONG:' + sys.prefix + ':' + pkg.MARKER)\n",
+            "#!/bin/sh\n'''exec' {}/python3 \"$0\" \"$@\"\n' '''\nimport os, sys, pkg\nprint('LONG:' + os.path.realpath(sys.prefix) + ':' + pkg.MARKER)\n",
             venv_bin.display()
         ),
     )

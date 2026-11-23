@@ -22,7 +22,7 @@ pub const AI_NOTES_REF: &str = "refs/notes/ai";
 /// Current schema version for [`AiProvenanceNote`].
 pub const AI_PROVENANCE_SCHEMA_VERSION: u32 = 1;
 
-const MAX_CAS_RETRIES: usize = 8;
+const MAX_CAS_RETRIES: usize = 32;
 
 /// Active coding agent session metadata detected from options or environment variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +258,9 @@ pub fn write_provenance_note(
                         "failed to update '{AI_NOTES_REF}' after {MAX_CAS_RETRIES} CAS attempts: {err}"
                     )));
                 }
+                let backoff_ms =
+                    5 + (attempt as u64).min(10) * 3 + ((u64::from(std::process::id()) + attempt as u64 * 7) % 15);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
             }
         }
     }

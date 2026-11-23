@@ -280,7 +280,10 @@ impl OzoneRepo {
 
     /// Opens the underlying repository on real host disk using `gix`.
     pub fn open_gix(&self) -> Result<gix::Repository> {
-        gix::open(&self.repo_root).map_err(|err| OzError::Git(err.to_string()))
+        let mut gix_repo =
+            gix::open(&self.repo_root).map_err(|err| OzError::Git(err.to_string()))?;
+        let _ = gix_repo.committer_or_set_fallback("Ozone", "oz@ozone.dev");
+        Ok(gix_repo)
     }
 
     /// Loads layered Git configuration (`system`, `global`, `local`, `worktree`,
@@ -889,8 +892,10 @@ mod tests {
         assert!(wt_out.status.success());
 
         let found = OzoneRepo::discover(Some(&wt_path)).expect("discover linked worktree");
-        assert_eq!(found.repo_root, repo_root);
-        assert_eq!(found.git_common_dir, repo_root.join(".git"));
+        let canon_root = std::fs::canonicalize(&repo_root).expect("canon repo_root");
+        let canon_common = std::fs::canonicalize(repo_root.join(".git")).expect("canon git_common_dir");
+        assert_eq!(found.repo_root, canon_root);
+        assert_eq!(found.git_common_dir, canon_common);
         assert!(found.is_linked_worktree);
         assert_eq!(found.workspace.as_deref(), Some("app-wt-auth"));
         assert_eq!(found.branch.as_deref(), Some("feat/auth"));

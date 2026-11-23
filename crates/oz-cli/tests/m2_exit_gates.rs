@@ -47,10 +47,17 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
 
         let oz = oz_bin();
-        let sibling = oz.with_file_name(oz_vfsd::vfsd_binary_name());
-        if sibling.is_file() {
-            return sibling;
+        if let Ok(resolved) = oz_vfsd::resolve_oz_vfsd_bin_with(
+            None,
+            Some(&oz),
+            std::env::var_os("PATH").as_deref(),
+        ) {
+            return resolved;
         }
+        if let Ok(resolved) = oz_vfsd::find_oz_vfsd_bin() {
+            return resolved;
+        }
+        let sibling = oz.with_file_name(oz_vfsd::vfsd_binary_name());
 
         let is_release = oz
             .components()
