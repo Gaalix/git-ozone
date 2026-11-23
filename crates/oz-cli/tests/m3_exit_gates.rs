@@ -2806,7 +2806,7 @@ pub fn annual_discount_bps() -> u64 {
     assert_eq!(line_resps.len(), 5);
 
     let tools_list = line_resps[1]["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools_list.len(), 8, "MCP server must advertise all 8 Ozone tools");
+    assert_eq!(tools_list.len(), 10, "MCP server must advertise all 10 Ozone tools");
 
     let (_, cl_body) = content_len_part
         .split_once("\r\n\r\n")

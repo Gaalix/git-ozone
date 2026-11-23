@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pure-Rust JSON-RPC 2.0 Model Context Protocol (`oz mcp`) stdio server supporting both
-//! newline-delimited JSON-RPC lines and LSP-style `Content-Length` framing across all 8
+//! newline-delimited JSON-RPC lines and LSP-style `Content-Length` framing across all 10
 //! Ozone agent tools (`oz_status`, `oz_diff`, `oz_commit`, `oz_ws_spawn`, `oz_radar`,
-//! `oz_checkpoint`, `oz_undo`, `oz_ci_logs`).
+//! `oz_checkpoint`, `oz_undo`, `oz_ci_logs`, `oz_log`, `oz_restore`).
 
 use crate::AiProvenanceNote;
 use crate::notes::{ProvenanceOptions, record_commit_provenance};
 use oz_core::{
-    BackendKind, CommitOptions, CommitOutcome, DiffReport, OzError, OzoneRepo, Result, ScopePolicy,
-    StatusReport, WarningEntry, WorkspaceState, compute_diff, compute_status, render_unified_diff,
+    BackendKind, ChangeKind, CommitOptions, CommitOutcome, DiffReport, LogOptions, OzError,
+    OzoneRepo, RestoreOptions, RestoreOutcome, Result, ScopePolicy, StatusReport, WarningEntry,
+    WorkspaceState, compute_diff, compute_status, log_commits, render_unified_diff, restore_paths,
 };
 use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
 use oz_integrate::{RadarOptions, RadarReport, scan_radar};
@@ -477,6 +478,14 @@ impl McpServer {
                 let args: CiLogsToolArgs = parse_tool_args(&tool_name, args_val)?;
                 self.exec_oz_ci_logs(args)
             }
+            "oz_log" => {
+                let args: LogToolArgs = parse_tool_args(&tool_name, args_val)?;
+                self.exec_oz_log(args)
+            }
+            "oz_restore" => {
+                let args: RestoreToolArgs = parse_tool_args(&tool_name, args_val)?;
+                self.exec_oz_restore(args)
+            }
             _ => {
                 return Err((
                     JSONRPC_INVALID_PARAMS,
@@ -580,12 +589,47 @@ impl McpServer {
             })
             .collect();
 
+        let changes_val = if args.include_lines {
+            serde_json::to_value(&report.changes)?
+        } else {
+            let compact: Vec<McpStatusFileSummary> = report
+                .changes
+                .iter()
+                .map(|c| McpStatusFileSummary {
+                    id: c.id.clone(),
+                    path: c.path.clone(),
+                    old_path: c.old_path.clone(),
+                    kind: c.kind,
+                    additions: c.additions,
+                    deletions: c.deletions,
+                    is_binary: c.is_binary,
+                    pinned: c.pinned,
+                    out_of_scope: c.out_of_scope,
+                    hunks: c
+                        .hunks
+                        .iter()
+                        .map(|h| McpHunkSummary {
+                            id: h.id.clone(),
+                            file_id: h.file_id.clone(),
+                            path: h.path.clone(),
+                            old_start: h.old_start,
+                            old_lines: h.old_lines,
+                            new_start: h.new_start,
+                            new_lines: h.new_lines,
+                            header: h.header.clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            serde_json::to_value(compact)?
+        };
+
         Ok(json!({
             "ok": true,
             "workspace": report.workspace,
             "branch": report.branch,
             "head_oid": report.head_oid,
-            "changes": report.changes,
+            "changes": changes_val,
             "warnings": warnings,
         }))
     }
@@ -829,10 +873,156 @@ impl McpServer {
 
         Ok(serde_json::to_value(McpCiResponse { ok: true, report })?)
     }
+
+    fn exec_oz_log(&self, args: LogToolArgs) -> Result<Value> {
+        let repo =
+            self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
+        let opts = LogOptions {
+            rev: args.rev,
+            all: false,
+            limit: Some(args.limit.unwrap_or(10)),
+            author: args.author,
+            grep: args.grep,
+            search_string: args.pickaxe,
+            search_diff_regex: args.grep_diff,
+            since: args.since,
+            graph: false,
+        };
+        let report = log_commits(&repo, &opts)?;
+        let commits_val = if args.oneline.unwrap_or(true) {
+            let compact: Vec<McpLogCommitSummary> = report
+                .commits
+                .into_iter()
+                .map(|c| McpLogCommitSummary {
+                    oid: c.oid,
+                    short_oid: c.short_oid,
+                    subject: c.subject,
+                    author_name: c.author_name,
+                    author_time: c.author_time.to_rfc3339(),
+                    change_id: c.change_id,
+                    refs: c.refs,
+                })
+                .collect();
+            serde_json::to_value(compact)?
+        } else {
+            serde_json::to_value(report.commits)?
+        };
+
+        Ok(json!({
+            "ok": true,
+            "target_rev": report.target_rev,
+            "unborn": report.unborn,
+            "total_returned": report.total_returned,
+            "commits": commits_val,
+        }))
+    }
+
+    fn exec_oz_restore(&self, args: RestoreToolArgs) -> Result<Value> {
+        let repo =
+            self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
+        let pre_status = compute_status(&repo)?;
+        let actor = self.mcp_actor(&repo);
+
+        let tx = MutationTransaction::begin(
+            &repo,
+            "oz mcp restore",
+            actor,
+            Some(&pre_status.changes),
+        )?;
+        let outcome: RestoreOutcome = restore_paths(
+            &repo,
+            &RestoreOptions {
+                targets: args.targets,
+                source: args.source,
+                remove_untracked: args.remove_untracked,
+            },
+        )?;
+        let post_status = compute_status(&repo)?;
+        let entry = tx.finish(&repo, Some(&post_status.changes))?;
+
+        #[derive(Serialize)]
+        struct McpRestoreResponse {
+            ok: bool,
+            op_id: String,
+            #[serde(flatten)]
+            outcome: RestoreOutcome,
+        }
+
+        Ok(serde_json::to_value(McpRestoreResponse {
+            ok: true,
+            op_id: entry.op_id,
+            outcome,
+        })?)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct McpHunkSummary {
+    id: String,
+    file_id: String,
+    path: String,
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+    header: String,
+}
+
+#[derive(Debug, Serialize)]
+struct McpStatusFileSummary {
+    id: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_path: Option<String>,
+    kind: ChangeKind,
+    additions: u32,
+    deletions: u32,
+    is_binary: bool,
+    pinned: bool,
+    out_of_scope: bool,
+    hunks: Vec<McpHunkSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpLogCommitSummary {
+    oid: String,
+    short_oid: String,
+    subject: String,
+    author_name: String,
+    author_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_id: Option<String>,
+    refs: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct StatusToolArgs {
+    #[serde(default)]
+    include_lines: bool,
+    directory: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LogToolArgs {
+    rev: Option<String>,
+    limit: Option<usize>,
+    author: Option<String>,
+    grep: Option<String>,
+    pickaxe: Option<String>,
+    grep_diff: Option<String>,
+    since: Option<String>,
+    oneline: Option<bool>,
+    directory: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreToolArgs {
+    targets: Vec<String>,
+    source: Option<String>,
+    #[serde(default)]
+    remove_untracked: bool,
     directory: Option<String>,
     workspace: Option<String>,
 }
@@ -1118,16 +1308,17 @@ where
     Ok(())
 }
 
-/// Returns the canonical MCP `tools/list` schema descriptors for all 8 Ozone MCP tools.
+/// Returns the canonical MCP `tools/list` schema descriptors for all 10 Ozone MCP tools.
 #[must_use]
 pub fn mcp_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "oz_status",
-            "description": "Show indexless O(dirty_files) working-tree status with deterministic file IDs (f1, f2) and hunk IDs (h1a, h1b).",
+            "description": "Show indexless O(dirty_files) working-tree status with deterministic file IDs (f1, f2) and hunk IDs (h1a, h1b). Omits full diff lines by default (use oz_diff for line-level diffs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "include_lines": { "type": "boolean", "description": "Include full hunk diff lines (default: false)." },
                     "workspace": { "type": "string", "description": "Optional spawned Ozone workspace name." },
                     "directory": { "type": "string", "description": "Optional explicit directory path." }
                 }
@@ -1239,6 +1430,44 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
                     "pr_number": { "type": "integer" },
                     "run_id": { "type": "integer" },
                     "failing_only": { "type": "boolean" },
+                    "workspace": { "type": "string" },
+                    "directory": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "oz_log",
+            "description": "Inspect compact commit history (defaults to 10 oneline entries without diff bodies).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rev": { "type": "string", "description": "Optional starting commit/branch/tag revision (defaults to HEAD)." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of commits to return (default: 10)." },
+                    "author": { "type": "string", "description": "Filter by author name or email substring." },
+                    "grep": { "type": "string", "description": "Filter commit messages by regex." },
+                    "pickaxe": { "type": "string", "description": "Filter commits changing occurrences of a literal string (-S)." },
+                    "grep_diff": { "type": "string", "description": "Filter commits whose diff lines match a regex (-G)." },
+                    "since": { "type": "string", "description": "Show commits more recent than date/duration (e.g. '2 days ago', '2026-11-01')." },
+                    "oneline": { "type": "boolean", "description": "Emit compact commit summaries (default: true; false for full commit bodies)." },
+                    "workspace": { "type": "string" },
+                    "directory": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "oz_restore",
+            "description": "Selectively restore working-tree files or file IDs (f1) from HEAD or --source while preserving other dirty edits (recorded in OpLog for oz_undo).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["targets"],
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "File paths, directory prefixes, or file IDs (f1) to restore."
+                    },
+                    "source": { "type": "string", "description": "Optional source revision (defaults to HEAD)." },
+                    "remove_untracked": { "type": "boolean", "description": "Delete specified untracked paths not present in source (default: false)." },
                     "workspace": { "type": "string" },
                     "directory": { "type": "string" }
                 }
@@ -1491,11 +1720,11 @@ mod tests {
         assert_eq!(responses[1]["id"], 2);
         assert_eq!(responses[1]["result"], json!({}));
 
-        // 3: tools/list -> all 8 tools
+        // 3: tools/list -> all 10 tools
         let tools = responses[2]["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools
             .iter()
             .map(|t| t["name"].as_str().expect("tool name"))
@@ -1511,13 +1740,19 @@ mod tests {
                 "oz_checkpoint",
                 "oz_undo",
                 "oz_ci_logs",
+                "oz_log",
+                "oz_restore",
             ]
         );
 
-        // 4: oz_status
+        // 4: oz_status (compact by default: omits hunk lines)
         let (is_err, status_json) = extract_tool_json(&responses[3]);
         assert!(!is_err);
         assert_eq!(status_json["changes"].as_array().unwrap().len(), 2);
+        assert!(
+            status_json["changes"][0]["hunks"][0].get("lines").is_none(),
+            "oz_status must omit hunks[].lines by default"
+        );
 
         // 5: oz_diff
         let (is_err, diff_json) = extract_tool_json(&responses[4]);
@@ -1682,5 +1917,119 @@ mod tests {
         let v2: Value = serde_json::from_str(&p2).unwrap();
         assert_eq!(v2["id"], 2);
         assert_eq!(v2["result"]["isError"], false);
+    }
+
+    #[test]
+    fn mcp_status_omits_lines_by_default_and_includes_on_request() {
+        let (_parent, repo_dir) = setup_mcp_repo();
+        let big_body: String = (0..400).map(|i| format!("line_{i} = true\n")).collect();
+        fs::write(repo_dir.join("large.txt"), &big_body).expect("write large");
+
+        let mut server = McpServer::new(Some(repo_dir));
+        let reqs = [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oz_status","arguments":{}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"oz_status","arguments":{"include_lines":true}}}),
+        ];
+        let mut input = Vec::new();
+        for req in &reqs {
+            input.extend_from_slice(&encode_msg(MessageFraming::JsonLine, req));
+        }
+        let mut out = Vec::new();
+        server
+            .serve_stdio(Cursor::new(input), &mut out)
+            .expect("serve_stdio");
+        let resps = decode_all_responses(MessageFraming::JsonLine, &out);
+
+        let (_, compact) = extract_tool_json(&resps[0]);
+        let large_compact = compact["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "large.txt")
+            .expect("large.txt entry");
+        assert!(large_compact["hunks"][0].get("lines").is_none());
+        assert_eq!(large_compact["additions"], 400);
+
+        let (_, verbose) = extract_tool_json(&resps[1]);
+        let large_verbose = verbose["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "large.txt")
+            .expect("large.txt entry");
+        assert_eq!(
+            large_verbose["hunks"][0]["lines"]
+                .as_array()
+                .unwrap()
+                .len(),
+            400
+        );
+    }
+
+    #[test]
+    fn mcp_log_and_restore_with_undo_roundtrip() {
+        let (_parent, repo_dir) = setup_mcp_repo();
+        let original_calc = fs::read_to_string(repo_dir.join("calc.rs")).expect("read orig calc");
+        fs::write(repo_dir.join("calc.rs"), "pub fn add(a: i32, b: i32) -> i32 { 999 }\n")
+            .expect("modify calc");
+        fs::write(repo_dir.join("other.txt"), "keep dirty\n").expect("write other");
+
+        let mut server = McpServer::new(Some(repo_dir.clone()));
+        let reqs_part1 = [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oz_log","arguments":{"limit":5}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"oz_log","arguments":{"limit":1,"oneline":false}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"oz_restore","arguments":{"targets":["calc.rs"]}}}),
+        ];
+        let mut input1 = Vec::new();
+        for req in &reqs_part1 {
+            input1.extend_from_slice(&encode_msg(MessageFraming::JsonLine, req));
+        }
+        let mut out1 = Vec::new();
+        server
+            .serve_stdio(Cursor::new(input1), &mut out1)
+            .expect("serve_stdio part1");
+        let resps1 = decode_all_responses(MessageFraming::JsonLine, &out1);
+
+        let (err1, log_compact) = extract_tool_json(&resps1[0]);
+        assert!(!err1);
+        assert_eq!(log_compact["total_returned"], 1);
+        assert!(log_compact["commits"][0].get("message").is_none());
+        assert_eq!(log_compact["commits"][0]["subject"], "chore: initial commit");
+
+        let (err2, log_full) = extract_tool_json(&resps1[1]);
+        assert!(!err2);
+        assert!(log_full["commits"][0].get("message").is_some());
+
+        let (err3, restore_json) = extract_tool_json(&resps1[2]);
+        assert!(!err3, "restore err: {restore_json}");
+        assert_eq!(restore_json["restored_paths"], json!(["calc.rs"]));
+        assert_eq!(
+            fs::read_to_string(repo_dir.join("calc.rs")).unwrap(),
+            original_calc
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.join("other.txt")).unwrap(),
+            "keep dirty\n"
+        );
+
+        let req4 = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"oz_undo","arguments":{"steps":1}}});
+        let input2 = encode_msg(MessageFraming::JsonLine, &req4);
+        let mut out2 = Vec::new();
+        server
+            .serve_stdio(Cursor::new(input2), &mut out2)
+            .expect("serve_stdio part2");
+        let resps2 = decode_all_responses(MessageFraming::JsonLine, &out2);
+
+        let (err4, undo_json) = extract_tool_json(&resps2[0]);
+        assert!(!err4, "undo err: {undo_json}");
+        assert_eq!(undo_json["undone_op_ids"][0], restore_json["op_id"]);
+        assert_eq!(
+            fs::read_to_string(repo_dir.join("calc.rs")).unwrap(),
+            "pub fn add(a: i32, b: i32) -> i32 { 999 }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.join("other.txt")).unwrap(),
+            "keep dirty\n"
+        );
     }
 }

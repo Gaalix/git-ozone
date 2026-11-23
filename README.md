@@ -13,7 +13,7 @@ Ozone operates **100% colocated inside standard `.git/` repositories** — no re
 1. **Zero-Byte CoW Workspaces with Warm Caches** — Spawn 20 isolated branch workspaces in `../<repo>.oz/<ws>` on macOS (`APFS clonefile`), Linux (`Btrfs`/`XFS`/`bcachefs` `FICLONE` or unprivileged `ext4` FUSE3 via `oz-vfsd`), and Windows (`Dev Drive / ReFS` or `NTFS ProjFS`) with warm `target/`, `node_modules/`, and `.venv/` caches and deterministic `mtime` preservation.
 2. **Lock-Free MVCC OpLog & `< 10 ms` Undo** — Concurrent commits across parallel workspaces never collide on `.git/index.lock` or `.git/packed-refs.lock`. Every mutating command and `oz checkpoint` is recorded in an append-only OpLog so `oz undo` / `oz redo` rewind refs and working-tree edits in milliseconds.
 3. **Stage-Free Working-Tree-First Commits** — Commit directly from the working directory with built-in secret, conflict-marker, `> 50 MB` binary, and `--scope`/`--deny` guardrails, automatic `Change-Id:` trailers, pure-Rust Ed25519 SSH signing, and one-shot `--pick f1 h2a` / `--exclude` partial commits using deterministic file (`f1`) and hunk (`h1a`) IDs.
-4. **Multi-Agent Integration, GitHub Stacks & MCP** — Detect cross-workspace overlaps before merge with `oz radar`, merge atomically in memory with `oz integrate --verify`, manage GitHub stacked PRs with `oz pr stack` / `oz sync` / `oz ci --json`, wire 5 coding agent harnesses with `oz agent setup`, expose 8 structured tools via `oz mcp`, and audit AI vs. human line authorship with `refs/notes/ai` and `oz blame`.
+4. **Multi-Agent Integration, GitHub Stacks & MCP** — Detect cross-workspace overlaps before merge with `oz radar`, merge atomically in memory with `oz integrate --verify`, manage GitHub stacked PRs with `oz pr stack` / `oz sync` / `oz ci --json`, wire 5 coding agent harnesses with `oz agent setup`, expose 10 structured tools via `oz mcp`, and audit AI vs. human line authorship with `refs/notes/ai` and `oz blame`.
 
 ---
 
@@ -159,6 +159,7 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz stash` | `push` / `pop` / `list` / `drop` backed by MVCC OpLog snapshots so `oz undo` reverses stash operations too. |
 | `oz cherry-pick` / `oz revert` | In-memory cherry-pick & revert with `--no-commit`, `--json`, and OpLog undo support. |
 | `oz branch` / `oz tag` | Branch list/create/rename/delete and tag list/create/delete/SSH-signed/verify. |
+| `oz restore` | Selectively restore working-tree paths or file IDs (`f1`) from `HEAD` or `--source` (recorded in OpLog for `oz undo`). |
 | `oz checkpoint` | Capture `< 10 ms` MVCC working-tree checkpoint (`-q/--quiet` for agent hooks). |
 | `oz undo [OP_ID \| --steps N]` / `oz redo` | Sub-10 ms OpLog rewind & re-apply for refs and working-tree edits. |
 | `oz radar` | Detect overlapping hunks, shared-file edits, and out-of-scope edits across workspaces. |
@@ -170,7 +171,7 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz sync` | Fetch, fast-forward base, retarget stacked PRs, rebase downstream, GC merged workspaces, refresh warm baseline. |
 | `oz ci` | Inspect GitHub Check Runs & compact failing Actions job log excerpts (`--json` for agent self-healing). |
 | `oz agent setup` | Install idempotent skills/rules and `oz checkpoint --quiet` hooks for 5 agent harnesses. |
-| `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (8 tools). |
+| `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (10 tools). |
 | `oz blame <PATH>` | Line-level human vs. AI (`refs/notes/ai`) authorship attribution. |
 | `oz gc` / `oz fsck` | Bounded `.git/ozone/oplog/` compaction (`--oplog-days`), integrity checks, and safe `--repair` for interrupted transactions. |
 | `oz completions <SHELL>` | Generate `bash`, `zsh`, `fish`, or `powershell` completions (`clap_complete`). |

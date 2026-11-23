@@ -431,13 +431,14 @@ pub fn render_ozone_workflow_body() -> &'static str {
 Use `oz` instead of multi-step `git add` / `git stash` / `git reset` commands to avoid `.git/index.lock` contention and cut token/command overhead:
 
 - **Status & Hunk IDs:** Run `oz status --json` (or `oz diff --json`) for `O(dirty)` status with deterministic file IDs (`f1`, `f2`) and hunk IDs (`h1a`, `h1b`).
+- **Compact History & Single-File Revert:** Run `oz log --oneline -n 10` for quick history scans, and `oz restore <path|f1>` to discard edits to specific files cleanly (reversible via `oz undo`).
 - **One-Shot Surgical Commits:** Commit whole working trees with `oz commit -m \"feat: ...\"` or commit exact files/hunks without staging via `oz commit -m \"feat: ...\" --pick f1 h2a` (or `--exclude h1b`). Never run interactive `git add -p`.
 - **Isolated CoW Workspaces:** Spawn instant warm workspaces with `oz ws spawn <name> --from main --scope \"crates/foo/**\" --deny \"Cargo.lock\"`.
 - **Live Collision Radar:** Check overlapping edits across parallel workspaces before conflicts happen with `oz radar --json`.
 - **Atomic In-Memory Integration:** Merge workspaces safely with test verification via `oz integrate <ws1> <ws2> --into main --verify \"cargo test\"` (and resolve indexed conflicts with `oz resolve c1 --take ours|theirs`).
 - **Instant Rewind & Checkpoints:** Snapshot dirty state with `oz checkpoint --quiet` and reverse any mutation or checkpoint in `< 10 ms` via `oz undo [op_id | --steps N]`.
 - **CI Self-Healing:** Inspect compact failing GitHub Actions logs with `oz ci --json`.
-- **MCP Tools:** When `oz mcp` is connected, prefer structured tools (`oz_status`, `oz_diff`, `oz_commit`, `oz_ws_spawn`, `oz_radar`, `oz_checkpoint`, `oz_undo`, `oz_ci_logs`).
+- **MCP Tools:** When `oz mcp` is connected, prefer structured tools (`oz_status`, `oz_diff`, `oz_commit`, `oz_log`, `oz_restore`, `oz_ws_spawn`, `oz_radar`, `oz_checkpoint`, `oz_undo`, `oz_ci_logs`).
 "
 }
 

@@ -17,12 +17,13 @@ use oz_agent::{
 use oz_core::{
     BranchCreateOutcome, BranchDeleteOutcome, BranchListReport, BranchRenameOutcome,
     CherryPickOptions, CherryPickOutcome, Envelope, ExitCode, InteractionMode, LogCommitEntry,
-    LogOptions, OZ_STASH_REF, OzError, OzoneRepo, Result, RevertOptions, RevertOutcome,
-    ShowOptions, ShowReport, StashDropOutcome, StashListReport, StashPopOutcome, StashPushOutcome,
-    TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome,
-    apply_stash_pop, branch_create, branch_delete, branch_list, branch_rename, cherry_pick_commit,
-    compute_status, log_commits, prepare_stash_pop, revert_commit, show_commit, stash_drop,
-    stash_list, stash_push, tag_create, tag_delete, tag_list, tag_verify,
+    LogOptions, OZ_STASH_REF, OzError, OzoneRepo, Result, RestoreOptions, RestoreOutcome,
+    RevertOptions, RevertOutcome, ShowOptions, ShowReport, StashDropOutcome, StashListReport,
+    StashPopOutcome, StashPushOutcome, TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport,
+    TagVerifyOutcome, apply_stash_pop, branch_create, branch_delete, branch_list, branch_rename,
+    cherry_pick_commit, compute_status, log_commits, prepare_stash_pop, restore_paths,
+    revert_commit, show_commit, stash_drop, stash_list, stash_push, tag_create, tag_delete,
+    tag_list, tag_verify,
 };
 use oz_oplog::{ActorInfo, ActorKind, MutationTransaction};
 use serde::Serialize;
@@ -1392,6 +1393,66 @@ pub(crate) fn handle_completions(
         print!("{script}");
     }
     ExitCode::Success
+}
+
+// ============================================================================
+// 8. `oz restore` (selective working-tree restore)
+// ============================================================================
+
+#[derive(Debug, Args)]
+pub struct RestoreArgs {
+    /// Revision to restore file contents from (defaults to HEAD).
+    #[arg(short = 's', long = "source", value_name = "REV")]
+    pub source: Option<String>,
+    /// Delete specified untracked paths that do not exist in the source revision.
+    #[arg(long = "remove-untracked")]
+    pub remove_untracked: bool,
+    /// File paths, directory prefixes, or file IDs (`f1`, `f2`) to restore.
+    #[arg(required = true)]
+    pub targets: Vec<String>,
+}
+
+pub(crate) fn handle_restore(
+    args: &RestoreArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<RestoreOutcome>> {
+        let repo = discover_and_recover_repo(directory, true)?;
+        let pre_status = compute_status(&repo)?;
+        let actor = actor_from_mode(mode, &repo);
+        let cmd_label = format!("oz restore {}", args.targets.join(" "));
+        let tx = MutationTransaction::begin(&repo, cmd_label, actor, Some(&pre_status.changes))?;
+        let outcome = restore_paths(
+            &repo,
+            &RestoreOptions {
+                targets: args.targets.clone(),
+                source: args.source.clone(),
+                remove_untracked: args.remove_untracked,
+            },
+        )?;
+        let post_status = compute_status(&repo)?;
+        let entry = tx.finish(&repo, Some(&post_status.changes))?;
+        let op_id = entry.op_id;
+        Ok(Envelope::success(outcome)
+            .with_op_id(op_id.clone())
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid)
+            .with_recovery_command(format!("oz undo {op_id}")))
+    })();
+
+    render_daily_result(mode, res, |env| {
+        let d = &env.data;
+        let short_src = &d.source_oid[..d.source_oid.len().min(7)];
+        if !d.restored_paths.is_empty() {
+            println!("Restored {} file(s) from {short_src}", d.restored_paths.len());
+        }
+        if !d.removed_paths.is_empty() {
+            println!("Removed {} untracked path(s)", d.removed_paths.len());
+        }
+        Ok(())
+    })
 }
 
 #[allow(dead_code)]

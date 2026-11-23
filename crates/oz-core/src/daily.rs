@@ -386,6 +386,58 @@ fn remove_conflicting_non_dir_ancestors(workdir: &Path, target_file: &Path) -> R
     Ok(())
 }
 
+fn write_tree_blob_to_disk(
+    workdir: &Path,
+    gix_repo: &gix::Repository,
+    rel_path: &str,
+    oid: ObjectId,
+    kind: EntryKind,
+) -> Result<()> {
+    let disk_path = workdir.join(rel_path);
+    remove_conflicting_non_dir_ancestors(workdir, &disk_path)?;
+    if let Some(parent) = disk_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Ok(meta) = fs::symlink_metadata(&disk_path) {
+        if meta.is_dir() {
+            fs::remove_dir_all(&disk_path)?;
+        } else if meta.file_type().is_symlink() || kind == EntryKind::Link {
+            fs::remove_file(&disk_path)?;
+        }
+    }
+
+    let blob = gix_repo
+        .find_blob(oid)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+
+    if kind == EntryKind::Link {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let target = std::ffi::OsStr::from_bytes(&blob.data);
+            std::os::unix::fs::symlink(target, &disk_path)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let target = String::from_utf8_lossy(&blob.data);
+            fs::write(&disk_path, target.as_bytes())?;
+        }
+    } else {
+        fs::write(&disk_path, &blob.data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = if kind == EntryKind::BlobExecutable {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(&disk_path, fs::Permissions::from_mode(perm))?;
+        }
+    }
+    Ok(())
+}
+
 fn materialize_tree_delta(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
@@ -421,48 +473,7 @@ fn materialize_tree_delta(
             kind,
         } = op
         {
-            let disk_path = repo.workdir_path.join(rel_path);
-            remove_conflicting_non_dir_ancestors(&repo.workdir_path, &disk_path)?;
-            if let Some(parent) = disk_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if let Ok(meta) = fs::symlink_metadata(&disk_path) {
-                if meta.is_dir() {
-                    fs::remove_dir_all(&disk_path)?;
-                } else if meta.file_type().is_symlink() || *kind == EntryKind::Link {
-                    fs::remove_file(&disk_path)?;
-                }
-            }
-
-            let blob = gix_repo
-                .find_blob(*oid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
-
-            if *kind == EntryKind::Link {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::ffi::OsStrExt;
-                    let target = std::ffi::OsStr::from_bytes(&blob.data);
-                    std::os::unix::fs::symlink(target, &disk_path)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    let target = String::from_utf8_lossy(&blob.data);
-                    fs::write(&disk_path, target.as_bytes())?;
-                }
-            } else {
-                fs::write(&disk_path, &blob.data)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perm = if *kind == EntryKind::BlobExecutable {
-                        0o755
-                    } else {
-                        0o644
-                    };
-                    fs::set_permissions(&disk_path, fs::Permissions::from_mode(perm))?;
-                }
-            }
+            write_tree_blob_to_disk(&repo.workdir_path, gix_repo, rel_path, *oid, *kind)?;
             updated += 1;
         }
     }
@@ -3920,6 +3931,322 @@ pub fn branch_delete(repo: &OzoneRepo, name: &str, force: bool) -> Result<Branch
     Ok(BranchDeleteOutcome {
         name: name.to_string(),
         deleted_oid: branch_oid.to_hex().to_string(),
+    })
+}
+
+// ============================================================================
+// 7. `oz restore` (selective working-tree restore)
+// ============================================================================
+
+/// Options controlling [`restore_paths`].
+#[derive(Debug, Clone, Default)]
+pub struct RestoreOptions {
+    pub targets: Vec<String>,
+    pub source: Option<String>,
+    pub remove_untracked: bool,
+}
+
+/// Structured summary returned by [`restore_paths`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreOutcome {
+    pub source_oid: String,
+    pub restored_paths: Vec<String>,
+    pub removed_paths: Vec<String>,
+}
+
+fn looks_like_file_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('f') else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn looks_like_hunk_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('h') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    let suffix = &rest[digits..];
+    !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+fn normalize_restore_target(workdir: &Path, raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(OzError::InvalidUsage {
+            message: "restore target path cannot be empty".to_string(),
+            recovery: Vec::new(),
+        });
+    }
+    let candidate = Path::new(trimmed);
+    let rel_path = if candidate.is_absolute() {
+        let canon_workdir = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+        let stripped = candidate
+            .strip_prefix(workdir)
+            .or_else(|_| candidate.strip_prefix(&canon_workdir))
+            .map_err(|_| OzError::InvalidUsage {
+                message: format!(
+                    "path '{}' is outside repository root '{}'",
+                    raw,
+                    workdir.display()
+                ),
+                recovery: Vec::new(),
+            })?;
+        stripped.to_path_buf()
+    } else {
+        candidate.to_path_buf()
+    };
+
+    let mut parts = Vec::new();
+    for comp in rel_path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(p) => {
+                let s = p.to_string_lossy();
+                if s == ".git" && parts.is_empty() {
+                    return Err(OzError::InvalidUsage {
+                        message: "cannot restore paths inside `.git/`".to_string(),
+                        recovery: Vec::new(),
+                    });
+                }
+                parts.push(s.into_owned());
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(OzError::InvalidUsage {
+                    message: format!("invalid restore target '{raw}'"),
+                    recovery: Vec::new(),
+                });
+            }
+        }
+    }
+
+    Ok(if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    })
+}
+
+fn collect_tree_leaf_entries(
+    gix_repo: &gix::Repository,
+    tree_id: ObjectId,
+    prefix: &str,
+    out: &mut Vec<(String, ObjectId, EntryKind)>,
+) -> Result<()> {
+    let tree = gix_repo
+        .find_tree(tree_id)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    for entry_res in tree.iter() {
+        let entry = entry_res.map_err(|err| OzError::Git(err.to_string()))?;
+        let name = entry.filename().to_str_lossy();
+        let rel = if prefix.is_empty() || prefix == "." {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let kind = entry.mode().kind();
+        if kind == EntryKind::Tree {
+            collect_tree_leaf_entries(gix_repo, entry.oid().to_owned(), &rel, out)?;
+        } else if kind != EntryKind::Commit {
+            out.push((rel, entry.oid().to_owned(), kind));
+        }
+    }
+    Ok(())
+}
+
+/// Selectively restores working-tree paths or file IDs (`f1`) from `HEAD` or `--source <rev>`,
+/// leaving all other dirty files untouched and keeping `.git/index` aligned with `HEAD`.
+pub fn restore_paths(repo: &OzoneRepo, opts: &RestoreOptions) -> Result<RestoreOutcome> {
+    if opts.targets.is_empty() {
+        return Err(OzError::InvalidUsage {
+            message: "oz restore requires at least one path or file ID (e.g. `oz restore README.md`)".to_string(),
+            recovery: vec!["Run `oz status` to list dirty files and IDs (`f1`, `f2`, ...).".to_string()],
+        });
+    }
+
+    let gix_repo = open_gix_for_workspace(repo)?;
+    let head = resolve_workspace_head(repo, &gix_repo)?;
+
+    let source_commit_oid = if let Some(ref rev) = opts.source {
+        Some(resolve_commit_oid(&gix_repo, rev)?)
+    } else if head.commit_oid.is_some() {
+        head.commit_oid
+    } else if opts.remove_untracked {
+        None
+    } else {
+        return Err(OzError::InvalidUsage {
+            message: "cannot restore from unborn HEAD without commits".to_string(),
+            recovery: vec![
+                "Pass `--remove-untracked` to remove untracked paths, or create an initial commit first."
+                    .to_string(),
+            ],
+        });
+    };
+
+    let source_tree_id = match source_commit_oid {
+        Some(oid) => commit_tree_id(&gix_repo, oid)?,
+        None => ObjectId::empty_tree(gix_repo.object_hash()),
+    };
+    let empty_tree_id = ObjectId::empty_tree(gix_repo.object_hash());
+    let source_tree = if source_tree_id == empty_tree_id {
+        None
+    } else {
+        Some(
+            gix_repo
+                .find_tree(source_tree_id)
+                .map_err(|err| OzError::Git(err.to_string()))?,
+        )
+    };
+
+    let needs_status = opts.targets.iter().any(|t| looks_like_file_id(t.trim()));
+    let file_id_map: HashMap<String, String> = if needs_status {
+        let status = crate::status::compute_status(repo)?;
+        status
+            .changes
+            .into_iter()
+            .map(|c| (c.id, c.path))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let mut to_restore: HashMap<String, (ObjectId, EntryKind)> = HashMap::new();
+    let mut to_remove: BTreeSet<String> = BTreeSet::new();
+
+    for raw_target in &opts.targets {
+        let trimmed = raw_target.trim();
+        if looks_like_hunk_id(trimmed) {
+            return Err(OzError::InvalidUsage {
+                message: format!(
+                    "target '{trimmed}' is a hunk ID; `oz restore` operates on file paths or file IDs (`f1`)"
+                ),
+                recovery: vec![
+                    "Use `oz restore <path|f1>` for whole-file restore, `oz commit --pick ...` for partial commits, or `oz undo` to rewind an operation."
+                        .to_string(),
+                ],
+            });
+        }
+
+        let resolved_raw = if looks_like_file_id(trimmed)
+            && !repo.workdir_path.join(trimmed).exists()
+        {
+            match file_id_map.get(trimmed) {
+                Some(path) => path.as_str(),
+                None => {
+                    return Err(OzError::InvalidUsage {
+                        message: format!("unknown file ID '{trimmed}'"),
+                        recovery: vec![
+                            "Run `oz status` to inspect current `[f1]` file IDs.".to_string(),
+                        ],
+                    });
+                }
+            }
+        } else {
+            trimmed
+        };
+
+        let rel = normalize_restore_target(&repo.workdir_path, resolved_raw)?;
+        if rel == "." {
+            if let Some(ref tree) = source_tree {
+                let mut entries = Vec::new();
+                collect_tree_leaf_entries(&gix_repo, tree.id, ".", &mut entries)?;
+                for (path, oid, kind) in entries {
+                    to_restore.insert(path, (oid, kind));
+                }
+            }
+            continue;
+        }
+
+        let lookup = match source_tree.as_ref() {
+            Some(tree) => tree
+                .lookup_entry_by_path(rel.as_str())
+                .map_err(|err| OzError::Git(err.to_string()))?,
+            None => None,
+        };
+
+        match lookup {
+            Some(entry) => {
+                let kind = entry.mode().kind();
+                if kind == EntryKind::Tree {
+                    let mut entries = Vec::new();
+                    collect_tree_leaf_entries(&gix_repo, entry.oid().to_owned(), &rel, &mut entries)?;
+                    for (path, oid, entry_kind) in entries {
+                        to_restore.insert(path, (oid, entry_kind));
+                    }
+                } else if kind != EntryKind::Commit {
+                    to_restore.insert(rel, (entry.oid().to_owned(), kind));
+                }
+            }
+            None => {
+                let disk_path = repo.workdir_path.join(&rel);
+                let exists_on_disk = fs::symlink_metadata(&disk_path).is_ok();
+                if opts.remove_untracked && exists_on_disk {
+                    to_remove.insert(rel);
+                } else {
+                    let src_label = opts.source.as_deref().unwrap_or("HEAD");
+                    return Err(OzError::InvalidUsage {
+                        message: format!(
+                            "pathspec '{raw_target}' did not match any file(s) in {src_label}"
+                        ),
+                        recovery: vec![
+                            "Pass `--remove-untracked` if you intentionally want to delete an untracked path."
+                                .to_string(),
+                        ],
+                    });
+                }
+            }
+        }
+    }
+
+    let mut restored_paths: Vec<String> = Vec::with_capacity(to_restore.len());
+    let mut restore_entries: Vec<(String, ObjectId, EntryKind)> =
+        to_restore.into_iter().map(|(p, (o, k))| (p, o, k)).collect();
+    restore_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (rel_path, oid, kind) in &restore_entries {
+        write_tree_blob_to_disk(&repo.workdir_path, &gix_repo, rel_path, *oid, *kind)?;
+        restored_paths.push(rel_path.clone());
+    }
+
+    let mut removed_paths: Vec<String> = Vec::with_capacity(to_remove.len());
+    for rel_path in to_remove {
+        let disk_path = repo.workdir_path.join(&rel_path);
+        match fs::symlink_metadata(&disk_path) {
+            Ok(meta) => {
+                if meta.is_dir() {
+                    fs::remove_dir_all(&disk_path)?;
+                } else {
+                    fs::remove_file(&disk_path)?;
+                }
+                prune_empty_parents(&repo.workdir_path, &disk_path);
+                removed_paths.push(rel_path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(OzError::Io(err)),
+        }
+    }
+
+    let mut touched_set: BTreeSet<String> = BTreeSet::new();
+    for p in &restored_paths {
+        touched_set.insert(p.clone());
+    }
+    for p in &removed_paths {
+        touched_set.insert(p.clone());
+    }
+    let touched_paths: Vec<String> = touched_set.into_iter().collect();
+    sync_index_paths_to_tree(repo, &gix_repo, head.tree_id, &touched_paths)?;
+
+    Ok(RestoreOutcome {
+        source_oid: source_commit_oid
+            .map(|id| id.to_hex().to_string())
+            .unwrap_or_else(|| "unborn".to_string()),
+        restored_paths,
+        removed_paths,
     })
 }
 

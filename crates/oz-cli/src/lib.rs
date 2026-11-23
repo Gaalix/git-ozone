@@ -22,9 +22,9 @@ use commands::{
     handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope, write_stdout_line,
 };
 use daily::{
-    BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RevertArgs, ShowArgs, StashArgs, TagArgs,
-    handle_branch, handle_cherry_pick, handle_completions, handle_diff_paged, handle_log,
-    handle_revert, handle_show, handle_stash, handle_tag,
+    BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RestoreArgs, RevertArgs, ShowArgs,
+    StashArgs, TagArgs, handle_branch, handle_cherry_pick, handle_completions, handle_diff_paged,
+    handle_log, handle_restore, handle_revert, handle_show, handle_stash, handle_tag,
 };
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, FilesystemKind, InteractionMode, MountHealth,
@@ -128,6 +128,8 @@ pub enum Commands {
     Tag(TagArgs),
     /// List, create, rename, and delete local branches (recorded in OpLog).
     Branch(BranchArgs),
+    /// Restore working-tree files from HEAD or `--source <REV>` (recorded in OpLog for `oz undo`).
+    Restore(RestoreArgs),
     /// Generate shell completion scripts (`bash`, `zsh`, `fish`, `powershell`).
     Completions(CompletionsArgs),
     /// Initialize colocated `.git/ozone/` metadata, `systemd --user`, or Windows ProjFS.
@@ -413,6 +415,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Revert(args)) => handle_revert(&args, cli.directory.as_deref(), mode),
         Some(Commands::Tag(args)) => handle_tag(&args, cli.directory.as_deref(), mode),
         Some(Commands::Branch(args)) => handle_branch(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Restore(args)) => handle_restore(&args, cli.directory.as_deref(), mode),
         Some(Commands::Completions(args)) => handle_completions(&args, Cli::command(), mode),
         Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),

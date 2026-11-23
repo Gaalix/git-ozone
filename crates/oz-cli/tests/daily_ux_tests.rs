@@ -1165,3 +1165,107 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
     let _ = pty_file.read(&mut buf);
     let _ = &mut pty_file;
 }
+
+// ============================================================================
+// 8. `oz restore` (selective file/ID restore + OpLog undo + index parity)
+// ============================================================================
+
+#[test]
+fn restore_paths_ids_sources_untracked_and_oz_undo_preserve_clean_index() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(tmp.path());
+
+    fs::write(repo.join("a.txt"), "a-v1\n").unwrap();
+    fs::write(repo.join("b.txt"), "b-v1\n").unwrap();
+    assert_eq!(
+        run_oz(&repo, &["commit", "-m", "feat: v1", "--json"], &[]).code,
+        0
+    );
+
+    fs::write(repo.join("a.txt"), "a-v2\n").unwrap();
+    assert_eq!(
+        run_oz(&repo, &["commit", "-m", "feat: v2", "--json"], &[]).code,
+        0
+    );
+
+    // Dirty a.txt, b.txt, and add an untracked file.
+    fs::write(repo.join("a.txt"), "a-dirty\n").unwrap();
+    fs::write(repo.join("b.txt"), "b-dirty\n").unwrap();
+    fs::write(repo.join("scratch.txt"), "temp-untracked\n").unwrap();
+
+    // 1. Restore only a.txt from HEAD -> b.txt and scratch.txt stay dirty untouched.
+    let res_a = run_oz(&repo, &["restore", "a.txt", "--json"], &[]);
+    assert_eq!(res_a.code, 0, "restore a.txt stderr: {}", res_a.stderr);
+    let rj = res_a.unwrap_json();
+    assert_eq!(rj["schema"], OZ_SCHEMA_V1);
+    assert_eq!(rj["ok"], true);
+    assert!(rj["op_id"].as_str().unwrap().starts_with("op_"));
+    assert_eq!(rj["data"]["restored_paths"], serde_json::json!(["a.txt"]));
+    assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a-v2\n");
+    assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b-dirty\n");
+    assert_eq!(
+        fs::read_to_string(repo.join("scratch.txt")).unwrap(),
+        "temp-untracked\n"
+    );
+
+    // 2. `oz undo` reverses `oz restore`!
+    let undo_a = run_oz(&repo, &["undo", "--json"], &[]);
+    assert_eq!(undo_a.code, 0, "undo restore stderr: {}", undo_a.stderr);
+    assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a-dirty\n");
+    assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b-dirty\n");
+
+    // 3. Restore by file ID (`f1` -> `a.txt`).
+    let st = run_oz(&repo, &["status", "--json"], &[]);
+    let first_id = st.unwrap_json()["data"]["changes"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_path = st.unwrap_json()["data"]["changes"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(first_path, "a.txt");
+    let res_fid = run_oz(&repo, &["restore", &first_id, "--json"], &[]);
+    assert_eq!(res_fid.code, 0, "restore f1 stderr: {}", res_fid.stderr);
+    assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a-v2\n");
+
+    // 4. Restore from `--source HEAD~1` -> puts a-v1 in worktree while keeping `.git/index` at HEAD!
+    let res_prev = run_oz(
+        &repo,
+        &["restore", "--source", "HEAD~1", "a.txt", "--json"],
+        &[],
+    );
+    assert_eq!(res_prev.code, 0, "restore HEAD~1 stderr: {}", res_prev.stderr);
+    assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a-v1\n");
+    assert_eq!(
+        sys_git(&repo, &["diff", "--cached", "--name-only"]),
+        "",
+        "oz restore --source HEAD~1 must not stage old blob in .git/index"
+    );
+
+    // 5. Untracked file requires `--remove-untracked`, and `oz undo` brings it back!
+    let fail_untracked = run_oz(&repo, &["restore", "scratch.txt", "--json"], &[]);
+    assert_eq!(fail_untracked.code, 2);
+    assert!(repo.join("scratch.txt").is_file());
+
+    let rm_untracked = run_oz(
+        &repo,
+        &["restore", "--remove-untracked", "scratch.txt", "--json"],
+        &[],
+    );
+    assert_eq!(
+        rm_untracked.code, 0,
+        "restore --remove-untracked stderr: {}",
+        rm_untracked.stderr
+    );
+    assert!(!repo.join("scratch.txt").exists());
+
+    let undo_rm = run_oz(&repo, &["undo", "--json"], &[]);
+    assert_eq!(undo_rm.code, 0);
+    assert_eq!(
+        fs::read_to_string(repo.join("scratch.txt")).unwrap(),
+        "temp-untracked\n"
+    );
+
+    assert_git_fsck_clean(&repo);
+}

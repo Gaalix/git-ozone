@@ -48,6 +48,7 @@ pub fn is_builtin_subcommand(name: &str) -> bool {
             | "revert"
             | "tag"
             | "branch"
+            | "restore"
             | "completions"
             | "help"
     )
