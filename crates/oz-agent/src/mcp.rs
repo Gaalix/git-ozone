@@ -11,8 +11,10 @@ use crate::notes::{ProvenanceOptions, read_provenance_note, record_commit_proven
 use oz_core::{
     BackendKind, ChangeKind, CommitOptions, CommitOutcome, DiffReport, FileChange, LogOptions,
     OzError, OzoneRepo, RestoreOptions, RestoreOutcome, Result, RevisionDiffOptions, ScopePolicy,
-    ShowOptions, StatusReport, WarningEntry, WorkspaceState, compute_diff, compute_revision_diff,
-    compute_status, log_commits, render_unified_diff, restore_paths, show_commit,
+    ShowBlobOptions, ShowOptions, StatusReport, WarningEntry, WorkspaceState,
+    compute_diff_filtered, compute_revision_diff, compute_status, log_commits,
+    parse_rev_path_spec, render_unified_diff, render_unified_diff_numbered, restore_paths,
+    show_blob, show_commit,
 };
 use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
 use oz_integrate::{RadarOptions, RadarReport, scan_radar};
@@ -663,10 +665,12 @@ impl McpServer {
                     rev: args.rev.clone(),
                     range: args.range.clone(),
                     targets: args.targets.clone(),
+                    excludes: args.exclude.clone(),
                 },
             )?
         } else if let Some(first) = args.targets.first()
             && first.contains("..")
+            && !first.starts_with(':')
         {
             compute_revision_diff(
                 &repo,
@@ -675,15 +679,20 @@ impl McpServer {
                     rev: None,
                     range: Some(first.clone()),
                     targets: args.targets[1..].to_vec(),
+                    excludes: args.exclude.clone(),
                 },
             )?
         } else {
-            compute_diff(&repo, &args.targets)?
+            compute_diff_filtered(&repo, &args.targets, &args.exclude)?
         };
         let unified = if args.stat_only {
             None
         } else if args.include_unified.unwrap_or(true) {
-            Some(render_unified_diff(&report))
+            if args.line_numbers {
+                Some(render_unified_diff_numbered(&report))
+            } else {
+                Some(render_unified_diff(&report))
+            }
         } else {
             None
         };
@@ -947,6 +956,7 @@ impl McpServer {
             search_diff_regex: args.grep_diff,
             since: args.since,
             graph: false,
+            paths: args.paths,
         };
         let report = log_commits(&repo, &opts)?;
         let commits_val = if args.oneline.unwrap_or(true) {
@@ -1018,6 +1028,35 @@ impl McpServer {
     fn exec_oz_show(&self, args: ShowToolArgs) -> Result<Value> {
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
+        if let Some(ref raw_spec) = args.rev
+            && let Some((rev_part, path_part)) = parse_rev_path_spec(raw_spec)
+        {
+            let blob = show_blob(
+                &repo,
+                &ShowBlobOptions {
+                    rev: rev_part,
+                    path: path_part,
+                    start_line: args.start_line,
+                    end_line: args.end_line,
+                },
+            )?;
+            return Ok(json!({
+                "ok": true,
+                "kind": "blob",
+                "rev": blob.rev,
+                "commit_oid": blob.commit_oid,
+                "short_oid": blob.short_oid,
+                "path": blob.path,
+                "blob_oid": blob.blob_oid,
+                "size_bytes": blob.size_bytes,
+                "is_binary": blob.is_binary,
+                "total_lines": blob.total_lines,
+                "start_line": blob.start_line,
+                "end_line": blob.end_line,
+                "truncated": blob.truncated,
+                "content": blob.content,
+            }));
+        }
         let report = show_commit(
             &repo,
             &ShowOptions {
@@ -1143,6 +1182,8 @@ struct LogToolArgs {
     grep_diff: Option<String>,
     since: Option<String>,
     oneline: Option<bool>,
+    #[serde(default)]
+    paths: Vec<String>,
     directory: Option<String>,
     workspace: Option<String>,
 }
@@ -1161,11 +1202,15 @@ struct RestoreToolArgs {
 struct DiffToolArgs {
     #[serde(default)]
     targets: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
     base: Option<String>,
     rev: Option<String>,
     range: Option<String>,
     #[serde(default)]
     stat_only: bool,
+    #[serde(default)]
+    line_numbers: bool,
     include_unified: Option<bool>,
     directory: Option<String>,
     workspace: Option<String>,
@@ -1178,6 +1223,8 @@ struct ShowToolArgs {
     stat_only: bool,
     #[serde(default)]
     include_files: bool,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
     directory: Option<String>,
     workspace: Option<String>,
 }
@@ -1488,12 +1535,18 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
                     "targets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional revision range (A..B) as first item, or file IDs (f1), hunk IDs (h1a), or relative file paths."
+                        "description": "Optional revision range (A..B) as first item, or file IDs (f1), hunk IDs (h1a), relative file paths, globs, or `:!<path>` exclusions."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional file paths, directory prefixes, globs, file IDs (f1), or hunk IDs (h1a) to exclude."
                     },
                     "base": { "type": "string", "description": "Optional base commit/branch revision (defaults to comparing against HEAD unless rev is set)." },
                     "rev": { "type": "string", "description": "Optional target commit/branch revision (defaults to HEAD when base is set)." },
                     "range": { "type": "string", "description": "Optional Git revision range expression (`A..B` or `A...B`)." },
                     "stat_only": { "type": "boolean", "description": "Omit hunk diff lines and unified diff text, returning compact file/hunk summaries (default: false)." },
+                    "line_numbers": { "type": "boolean", "description": "Include explicit old/new line numbers in rendered unified diff text (default: false; JSON lines always carry old_line/new_line)." },
                     "include_unified": { "type": "boolean", "description": "Include rendered unified diff text (default: true)." },
                     "workspace": { "type": "string" },
                     "directory": { "type": "string" }
@@ -1617,6 +1670,11 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
                     "grep_diff": { "type": "string", "description": "Filter commits whose diff lines match a regex (-G)." },
                     "since": { "type": "string", "description": "Show commits more recent than date/duration (e.g. '2 days ago', '2026-11-01')." },
                     "oneline": { "type": "boolean", "description": "Emit compact commit summaries (default: true; false for full commit bodies)." },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional file or directory path filters (matching `oz log -- <paths...>`)."
+                    },
                     "workspace": { "type": "string" },
                     "directory": { "type": "string" }
                 }
@@ -1643,13 +1701,15 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "oz_show",
-            "description": "Inspect a commit or tag: metadata, Change-Id, SSH signature verification, refs/notes/ai provenance, diffstat, and unified diff.",
+            "description": "Inspect a commit/tag or read a file blob at any revision (`<rev>:<path>`) without mutating the working tree.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "rev": { "type": "string", "description": "Revision, commit OID, branch, or tag to inspect (defaults to HEAD)." },
+                    "rev": { "type": "string", "description": "Revision, commit OID, branch, tag, or `<rev>:<path>` blob spec (defaults to HEAD)." },
                     "stat_only": { "type": "boolean", "description": "Omit unified diff text and return metadata + diffstat only (default: false)." },
                     "include_files": { "type": "boolean", "description": "Include structured per-file hunk array alongside unified_diff (default: false)." },
+                    "start_line": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line for `<rev>:<path>` blob reads." },
+                    "end_line": { "type": "integer", "minimum": 1, "description": "Optional 1-based ending line for `<rev>:<path>` blob reads." },
                     "workspace": { "type": "string" },
                     "directory": { "type": "string" }
                 }

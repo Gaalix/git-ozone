@@ -11,7 +11,7 @@
       note: "Installs <code>oz</code>, <code>git-ozone</code>, and <code>oz-vfsd</code> on macOS &amp; Linux. Verify with <code>oz doctor</code>."
     },
     deb: {
-      command: "curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.0.0/ozone_1.0.0_amd64.deb\nsudo apt install ./ozone_1.0.0_amd64.deb",
+      command: "curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.1.0/ozone_1.1.0_amd64.deb\nsudo apt install ./ozone_1.1.0_amd64.deb",
       note: "Debian/Ubuntu <code>.deb</code> (<code>amd64</code> / <code>arm64</code>) with <code>Recommends: fuse3</code>. Installs to <code>/usr/bin/</code>."
     },
     winget: {

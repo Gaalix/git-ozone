@@ -186,6 +186,7 @@ fn handle_http_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockStat
                 sha: "1".repeat(40),
                 label: None,
             },
+            ..Default::default()
         };
         let bytes = serde_json::to_vec(&vec![pr]).unwrap();
         write_http(stream, "200 OK", "application/json", None, &bytes);
@@ -219,6 +220,7 @@ fn handle_http_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockStat
                 sha: "1".repeat(40),
                 label: None,
             },
+            ..Default::default()
         };
         let bytes = serde_json::to_vec(&pr).unwrap();
         write_http(stream, "200 OK", "application/json", None, &bytes);

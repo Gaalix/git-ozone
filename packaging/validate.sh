@@ -129,7 +129,11 @@ for required in (
         sys.exit(1)
 print("[PASS] release.yml matrix, pure-Rust guard, archives, .deb, checksums, and signing verified")
 
-# Validate winget manifests
+# Validate winget manifests against Cargo.toml workspace version
+import tomllib
+with pathlib.Path("Cargo.toml").open("rb") as f:
+    pkg_version = tomllib.load(f)["workspace"]["package"]["version"]
+
 wg_ver = docs["packaging/winget/OzoneVCS.Ozone.yaml"]
 wg_inst = docs["packaging/winget/OzoneVCS.Ozone.installer.yaml"]
 wg_loc = docs["packaging/winget/OzoneVCS.Ozone.locale.en-US.yaml"]
@@ -140,22 +144,22 @@ for name, doc, mtype in (
     ("locale", wg_loc, "defaultLocale"),
 ):
     assert doc.get("PackageIdentifier") == "OzoneVCS.Ozone", f"winget {name} PackageIdentifier mismatch"
-    assert doc.get("PackageVersion") == "1.0.0", f"winget {name} PackageVersion mismatch"
+    assert doc.get("PackageVersion") == pkg_version, f"winget {name} PackageVersion mismatch (expected {pkg_version}, got {doc.get('PackageVersion')})"
     assert doc.get("ManifestType") == mtype, f"winget {name} ManifestType mismatch"
     assert doc.get("ManifestVersion") == "1.6.0", f"winget {name} ManifestVersion mismatch"
 
 inst_entry = wg_inst["Installers"][0]
-expected_win_url = "https://github.com/Gaalix/git-ozone/releases/download/v1.0.0/oz-v1.0.0-x86_64-pc-windows-msvc.zip"
+expected_win_url = f"https://github.com/Gaalix/git-ozone/releases/download/v{pkg_version}/oz-v{pkg_version}-x86_64-pc-windows-msvc.zip"
 assert inst_entry["InstallerUrl"] == expected_win_url, f"winget InstallerUrl mismatch: {inst_entry['InstallerUrl']}"
 assert re.fullmatch(r"[A-F0-9]{64}", inst_entry["InstallerSha256"]), "winget InstallerSha256 must be 64 uppercase hex chars"
 
 nested = {item["PortableCommandAlias"]: item["RelativeFilePath"] for item in wg_inst["NestedInstallerFiles"]}
 assert nested == {
-    "oz": r"oz-v1.0.0-x86_64-pc-windows-msvc\oz.exe",
-    "git-ozone": r"oz-v1.0.0-x86_64-pc-windows-msvc\git-ozone.exe",
-    "oz-vfsd": r"oz-v1.0.0-x86_64-pc-windows-msvc\oz-vfsd.exe",
+    "oz": rf"oz-v{pkg_version}-x86_64-pc-windows-msvc\oz.exe",
+    "git-ozone": rf"oz-v{pkg_version}-x86_64-pc-windows-msvc\git-ozone.exe",
+    "oz-vfsd": rf"oz-v{pkg_version}-x86_64-pc-windows-msvc\oz-vfsd.exe",
 }, f"winget NestedInstallerFiles mismatch: {nested}"
-print("[PASS] winget manifests schema, URL, and nested binary layout verified")
+print(f"[PASS] winget manifests schema, URL, and nested binary layout verified (v{pkg_version})")
 
 # Cross-check Homebrew formula archive URLs and test assertions
 rb_text = pathlib.Path("packaging/homebrew/oz.rb").read_text(encoding="utf-8")
@@ -241,16 +245,18 @@ else
   warn "pwsh not installed; skipped PowerShell AST check (static checks passed)"
 fi
 
+PKG_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+
 # 5. Functional test: install.sh --dry-run
-dry_run_out="$(./packaging/install.sh --version 1.0.0 --prefix /tmp/oz-test-prefix --dry-run)"
-printf '%s\n' "$dry_run_out" | grep -Fq "oz-v1.0.0-" || fail "install.sh --dry-run missing archive name"
+dry_run_out="$(./packaging/install.sh --version "$PKG_VERSION" --prefix /tmp/oz-test-prefix --dry-run)"
+printf '%s\n' "$dry_run_out" | grep -Fq "oz-v${PKG_VERSION}-" || fail "install.sh --dry-run missing archive name"
 printf '%s\n' "$dry_run_out" | grep -Fq "SHA256SUMS.txt" || fail "install.sh --dry-run missing SHA256SUMS.txt"
 printf '%s\n' "$dry_run_out" | grep -Fq "/tmp/oz-test-prefix/bin" || fail "install.sh --dry-run missing install dir"
 pass "packaging/install.sh --dry-run"
 
 # 6. Functional test: build-deb.sh --dry-run (amd64 + arm64) and real dpkg-deb build test
 for deb_arch in amd64 arm64; do
-  deb_dry="$(./packaging/deb/build-deb.sh --version 1.0.0 --arch "$deb_arch" --dry-run)"
+  deb_dry="$(./packaging/deb/build-deb.sh --version "$PKG_VERSION" --arch "$deb_arch" --dry-run)"
   printf '%s\n' "$deb_dry" | grep -Fq "Package: ozone" || fail "build-deb.sh (${deb_arch}) missing Package field"
   printf '%s\n' "$deb_dry" | grep -Fq "Architecture: ${deb_arch}" || fail "build-deb.sh (${deb_arch}) missing Architecture field"
   printf '%s\n' "$deb_dry" | grep -Fq "Recommends: fuse3" || fail "build-deb.sh (${deb_arch}) missing Recommends: fuse3"
@@ -269,12 +275,12 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     chmod 0755 "${deb_tmp}/bins/${b}"
   done
   ./packaging/deb/build-deb.sh \
-    --version 1.0.0 \
+    --version "$PKG_VERSION" \
     --arch amd64 \
     --bin-dir "${deb_tmp}/bins" \
     --out-dir "${deb_tmp}/out" >/dev/null
 
-  deb_file="${deb_tmp}/out/ozone_1.0.0_amd64.deb"
+  deb_file="${deb_tmp}/out/ozone_${PKG_VERSION}_amd64.deb"
   [[ -f "$deb_file" ]] || fail "expected .deb not created: ${deb_file}"
   dpkg-deb --info "$deb_file" | grep -Fq "Recommends: fuse3" || fail ".deb metadata missing Recommends: fuse3"
   deb_contents="$(dpkg-deb --contents "$deb_file")"

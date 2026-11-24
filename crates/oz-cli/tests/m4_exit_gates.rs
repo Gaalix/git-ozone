@@ -406,19 +406,20 @@ fn assert_oz_v1_envelope_invariants(v: &Value, expected_ok: bool) {
 
 #[test]
 fn gate1_v1_0_0_version_consistency_and_binstall_contract() {
-    assert_eq!(
-        env!("CARGO_PKG_VERSION"),
-        "1.0.0",
-        "workspace package version must be 1.0.0 for Milestone 4 public launch"
+    let expected_version = env!("CARGO_PKG_VERSION");
+    assert!(
+        expected_version.starts_with("1."),
+        "workspace package version must be 1.x (got {expected_version})"
     );
 
     let root = workspace_root_dir();
 
     // 1. Root Cargo.toml workspace version & repository URL.
     let root_toml = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let expected_toml_ver = format!("version = \"{expected_version}\"");
     assert!(
-        root_toml.contains("version = \"1.0.0\""),
-        "root Cargo.toml must declare version = \"1.0.0\""
+        root_toml.contains(&expected_toml_ver),
+        "root Cargo.toml must declare {expected_toml_ver}"
     );
     assert!(
         root_toml.contains("repository = \"https://github.com/Gaalix/git-ozone\""),
@@ -468,10 +469,10 @@ fn gate1_v1_0_0_version_consistency_and_binstall_contract() {
         "oz-agent",
         "oz-cloud-api",
     ] {
-        let stanza = format!("name = \"{crate_name}\"\nversion = \"1.0.0\"");
+        let stanza = format!("name = \"{crate_name}\"\nversion = \"{expected_version}\"");
         assert!(
             cargo_lock.contains(&stanza),
-            "Cargo.lock missing synced v1.0.0 entry for {crate_name}"
+            "Cargo.lock missing synced v{expected_version} entry for {crate_name}"
         );
     }
 
@@ -488,7 +489,7 @@ fn gate1_v1_0_0_version_consistency_and_binstall_contract() {
         );
     }
 
-    // 5. CLI binary version flags (`oz` and `git-ozone`) emit v1.0.0.
+    // 5. CLI binary version flags (`oz` and `git-ozone`) emit synced workspace version.
     let tmp = TempDir::new().expect("tempdir");
     for (bin, expected_invoked) in [(oz_bin(), "oz"), (git_ozone_bin(), "git-ozone")] {
         let res = run_bin(&bin, tmp.path(), &["--version", "--json"], &[]);
@@ -497,20 +498,23 @@ fn gate1_v1_0_0_version_consistency_and_binstall_contract() {
         assert_oz_v1_envelope_invariants(&v, true);
         assert_eq!(v["data"]["name"], "oz");
         assert_eq!(v["data"]["invoked_as"], expected_invoked);
-        assert_eq!(v["data"]["version"], "1.0.0");
+        assert_eq!(v["data"]["version"], expected_version);
         assert_eq!(v["data"]["pure_rust"], true);
         assert_eq!(v["data"]["non_interactive"], true);
 
         let human = run_bin(&bin, tmp.path(), &["--version"], &[]);
         assert_eq!(human.code, 0);
-        assert_eq!(human.stdout.trim(), format!("{expected_invoked} 1.0.0"));
+        assert_eq!(
+            human.stdout.trim(),
+            format!("{expected_invoked} {expected_version}")
+        );
     }
 
     let subcmd_ver = run_bin(&oz_bin(), tmp.path(), &["version", "--json"], &[]);
     assert_eq!(subcmd_ver.code, 0);
     let sv = subcmd_ver.json.expect("version subcommand json");
     assert_oz_v1_envelope_invariants(&sv, true);
-    assert_eq!(sv["data"]["version"], "1.0.0");
+    assert_eq!(sv["data"]["version"], expected_version);
 }
 
 // ============================================================================
@@ -620,7 +624,7 @@ fn gate3_doctor_json_m4_completeness_and_zero_secret_leakage() {
     assert_eq!(dj["head_oid"], head_oid);
 
     let data = &dj["data"];
-    assert_eq!(data["version"], "1.0.0");
+    assert_eq!(data["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(data["invoked_as"], "git-ozone");
     assert_eq!(data["non_interactive"], true);
 
@@ -796,7 +800,9 @@ fn gate3_doctor_json_m4_completeness_and_zero_secret_leakage() {
         &[("GITHUB_TOKEN", secret_token)],
     );
     assert_eq!(human.code, 0, "human doctor failed: {}", human.stderr);
-    assert!(human.stdout.contains("Ozone Doctor (oz 1.0.0)"));
+    assert!(human
+        .stdout
+        .contains(&format!("Ozone Doctor (oz {})", env!("CARGO_PKG_VERSION"))));
     assert!(!human.stdout.contains("m4_super_secret_token_do_not_leak"));
     assert!(!human.stdout.contains("BEGIN OPENSSH PRIVATE KEY"));
 }

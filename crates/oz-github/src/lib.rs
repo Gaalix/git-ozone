@@ -12,8 +12,10 @@ pub mod sync;
 pub mod wire;
 
 pub use api::{
-    ConditionalGet, GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput, GitHubClient,
-    GitHubJobStep, GitHubPrRef, GitHubPullRequest, GitHubWorkflowRun, UpdatePullRequest,
+    ConditionalGet, CreatePullRequestReviewPayload, GitHubActionsJob, GitHubCheckRun,
+    GitHubCheckRunOutput, GitHubClient, GitHubJobStep, GitHubPrRef, GitHubPullRequest,
+    GitHubPullRequestFile, GitHubPullRequestReview, GitHubReviewCommentPayload, GitHubUser,
+    GitHubWorkflowRun, UpdatePullRequest,
 };
 pub use auth::{
     DEFAULT_GITHUB_API_URL, DiscoveredToken, GitHubAuthProbe, ParsedGitRemote, RemoteScheme,
@@ -35,9 +37,14 @@ pub use ci::{
     summarize_failing_log, watch_ci_status,
 };
 pub use pr::{
-    OZ_STACK_END, OZ_STACK_START, PrCreateOptions, PrCreateOutcome, PrStackOptions,
-    PrStackOutcome, StackPrItem, infer_title_body_and_change_ids, pr_create, pr_stack,
+    OZ_STACK_END, OZ_STACK_START, PrCommentSide, PrCreateOptions, PrCreateOutcome, PrDiffOptions,
+    PrDiffOutcome, PrInlineCommentInput, PrReadOptions, PrReadOutcome, PrReviewEvent,
+    PrReviewOptions, PrReviewOutcome, PrStackOptions, PrStackOutcome, PrViewFileSummary,
+    PrViewOptions, PrViewOutcome, PrViewReviewSummary, StackPrItem,
+    infer_title_body_and_change_ids, parse_github_patch_to_hunks, parse_inline_comment_spec,
+    pr_create, pr_diff, pr_files_to_changes, pr_read, pr_review, pr_stack, pr_view,
     render_stack_navigation_block, strip_stack_navigation_block, upsert_stack_navigation_block,
+    validate_pr_review_comments,
 };
 pub use sync::{
     PullOptions, PullOutcome, PullStrategy, RetargetedPrSummary, SyncOptions, SyncOutcome,

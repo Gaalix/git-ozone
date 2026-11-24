@@ -16,17 +16,17 @@ pub use commands::build_mcp_server;
 use commands::{
     AgentCommand, BlameArgs, CheckpointArgs, CiArgs, CloneArgs, CommitArgs, DiffArgs, FetchArgs,
     IntegrateArgs, McpArgs, PrCommand, PullArgs, PushArgs, RadarArgs, ResolveArgs, SetupArgs,
-    StackCommand, SyncArgs, UndoArgs, WsCommand, handle_agent, handle_blame, handle_checkpoint,
-    handle_ci, handle_clone, handle_commit, handle_diff, handle_fetch, handle_integrate,
-    handle_mcp, handle_pr, handle_pull, handle_push, handle_radar, handle_redo, handle_resolve,
-    handle_setup, handle_stack, handle_status, handle_sync, handle_undo, handle_ws,
+    StackCommand, StatusArgs, SyncArgs, UndoArgs, WsCommand, handle_agent, handle_blame,
+    handle_checkpoint, handle_ci, handle_clone, handle_commit, handle_diff, handle_fetch,
+    handle_integrate, handle_mcp, handle_pr, handle_pull, handle_push, handle_radar, handle_redo,
+    handle_resolve, handle_setup, handle_stack, handle_status, handle_sync, handle_undo, handle_ws,
     print_json_envelope, write_stdout_line,
 };
 use daily::{
-    BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RestoreArgs, RevertArgs, ShowArgs,
-    StashArgs, SwitchArgs, TagArgs, handle_branch, handle_cherry_pick, handle_completions,
-    handle_diff_paged, handle_log, handle_restore, handle_revert, handle_show, handle_stash,
-    handle_switch, handle_tag,
+    BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RestoreArgs, RevParseArgs, RevertArgs,
+    ShowArgs, StashArgs, SwitchArgs, TagArgs, handle_branch, handle_cherry_pick,
+    handle_completions, handle_diff_paged, handle_log, handle_restore, handle_rev_parse,
+    handle_revert, handle_show, handle_stash, handle_switch, handle_tag,
 };
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, FilesystemKind, InteractionMode, MountHealth,
@@ -76,7 +76,7 @@ pub enum Commands {
     #[command(subcommand)]
     Ws(WsCommand),
     /// Show indexless `O(dirty_files)` working-tree status with deterministic `[f1]` / `h1a` IDs.
-    Status,
+    Status(StatusArgs),
     /// Show Histogram unified diffs with deterministic file/hunk IDs.
     Diff(DiffArgs),
     /// Stage-free commit (whole tree or `--pick` / `--exclude` partial) with guardrails & `Change-Id`.
@@ -104,7 +104,7 @@ pub enum Commands {
     Pull(PullArgs),
     /// Push refs over pure-Rust smart `git-receive-pack` (`--atomic`, `--force-with-lease`).
     Push(PushArgs),
-    /// Create and orchestrate GitHub Pull Requests (`create`, `stack`).
+    /// Inspect, diff, read, review, create, and orchestrate GitHub Pull Requests (`view`, `diff`, `read`, `review`, `create`, `stack`).
     #[command(subcommand)]
     Pr(PrCommand),
     /// Sync with remote: fetch, fast-forward base, retarget stacked PRs, rebase, and GC merged workspaces.
@@ -120,8 +120,11 @@ pub enum Commands {
     Blame(BlameArgs),
     /// Show commit history graph with filtering (`--oneline`, `-n`, `--author`, `--grep`, `-S`, `-G`, `--since`).
     Log(LogArgs),
-    /// Show commit metadata, `Change-Id`, `refs/notes/ai` provenance, and diff (`--stat`, `--json`).
+    /// Show commit metadata, `Change-Id`, `refs/notes/ai` provenance, diff, or `<rev>:<path>` blob (`--lines`, `--stat`, `--json`).
     Show(ShowArgs),
+    /// Resolve revisions to full/short OIDs or query repo paths (`--show-toplevel`, `--is-inside-work-tree`, `--short`, `--verify`).
+    #[command(name = "rev-parse")]
+    RevParse(RevParseArgs),
     /// Save and restore dirty working-tree snapshots (`push`, `pop`, `list`, `drop`) backed by OpLog.
     Stash(StashArgs),
     /// Apply the changes introduced by an existing commit onto `HEAD` (recorded in OpLog).
@@ -387,7 +390,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
 
     match cli.command {
         Some(Commands::Ws(ws_cmd)) => handle_ws(ws_cmd, cli.directory.as_deref(), mode),
-        Some(Commands::Status) => handle_status(cli.directory.as_deref(), mode),
+        Some(Commands::Status(args)) => handle_status(&args, cli.directory.as_deref(), mode),
         Some(Commands::Diff(args)) => {
             if pager::pager_allowed_for_mode(mode) {
                 handle_diff_paged(&args, cli.directory.as_deref(), mode)
@@ -419,6 +422,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Blame(args)) => handle_blame(&args, cli.directory.as_deref(), mode),
         Some(Commands::Log(args)) => handle_log(&args, cli.directory.as_deref(), mode),
         Some(Commands::Show(args)) => handle_show(&args, cli.directory.as_deref(), mode),
+        Some(Commands::RevParse(args)) => handle_rev_parse(&args, cli.directory.as_deref(), mode),
         Some(Commands::Stash(args)) => handle_stash(&args, cli.directory.as_deref(), mode),
         Some(Commands::CherryPick(args)) => handle_cherry_pick(&args, cli.directory.as_deref(), mode),
         Some(Commands::Revert(args)) => handle_revert(&args, cli.directory.as_deref(), mode),
@@ -1932,7 +1936,7 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(&argv).expect("parse directory flag");
             assert_eq!(cli.directory.as_deref(), Some(Path::new("/tmp/repo")));
-            assert!(matches!(cli.command, Some(Commands::Status)));
+            assert!(matches!(cli.command, Some(Commands::Status(_))));
         }
 
         let to_os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();

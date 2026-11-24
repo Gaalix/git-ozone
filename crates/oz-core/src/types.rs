@@ -63,6 +63,25 @@ impl fmt::Display for BackendKind {
     }
 }
 
+impl std::str::FromStr for BackendKind {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "apfs_clonefile" | "apfs" => Ok(Self::ApfsClonefile),
+            "linux_ficlone" | "ficlone" | "reflink" => Ok(Self::LinuxFiclone),
+            "linux_fuse3" | "fuse3" | "fuse" => Ok(Self::LinuxFuse3),
+            "windows_refs_clone" | "refs" => Ok(Self::WindowsRefsClone),
+            "windows_proj_fs" | "projfs" => Ok(Self::WindowsProjFs),
+            "cas_hardlink" | "hardlink" => Ok(Self::CasHardlink),
+            other => Err(format!(
+                "unknown CoW backend '{other}'; valid values: auto, cas_hardlink, linux_fuse3, linux_ficlone, apfs_clonefile, windows_refs_clone, windows_proj_fs"
+            )),
+        }
+    }
+}
+
 /// Detected host filesystem kind for a repository or workspace path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +184,10 @@ pub enum DiffLineKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_line: Option<u32>,
     pub content: String,
 }
 

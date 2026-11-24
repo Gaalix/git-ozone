@@ -169,6 +169,7 @@ fn handle_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockState>>) 
                 sha: "1".repeat(40),
                 label: None,
             },
+            ..Default::default()
         };
         write_http(
             stream,
@@ -200,6 +201,7 @@ fn handle_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockState>>) 
                 sha: "1".repeat(40),
                 label: None,
             },
+            ..Default::default()
         };
         write_http(
             stream,

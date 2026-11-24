@@ -14,8 +14,9 @@ use oz_agent::{
 use oz_core::{
     BackendKind, CommitOptions, CommitOutcome, DiffReport, Envelope, EnvelopeError, ExitCode,
     FileChange, InteractionMode, OzError, OzoneRepo, Result, RevisionDiffOptions, ScopePolicy,
-    StatusReport, WarningEntry, compute_diff, compute_revision_diff, compute_status,
-    normalize_lexical, render_unified_diff,
+    StatusReport, WarningEntry, compute_diff_filtered, compute_revision_diff, compute_status,
+    format_numbered_blob_lines, normalize_lexical, parse_line_range, render_unified_diff,
+    render_unified_diff_numbered,
 };
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, detect_filesystem,
@@ -26,10 +27,12 @@ use oz_github::{
     CiWatchOutcome, CloneOptions, CloneOutcome, DEFAULT_MAX_EXCERPT_LINES,
     DEFAULT_WATCH_STARTUP_TIMEOUT_SECS, DEFAULT_WATCH_TIMEOUT_SECS, FetchOptions, FetchOutcome,
     ForceLeaseSpec, HttpAuthScheme, MAX_MCP_WAIT_SECONDS, PrCreateOptions, PrCreateOutcome,
-    PrStackOptions, PrStackOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions,
-    PushOutcome, SyncOptions, SyncOutcome, clone_repo, fetch_remote, pr_create, pr_stack,
-    pull_current_branch, push_refs_with_options, query_ci_job_log, query_ci_status, sync_repo,
-    watch_ci_status,
+    PrDiffOptions, PrDiffOutcome, PrInlineCommentInput, PrReadOptions, PrReadOutcome,
+    PrReviewEvent, PrReviewOptions, PrReviewOutcome, PrStackOptions, PrStackOutcome,
+    PrViewOptions, PrViewOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
+    SyncOptions, SyncOutcome, clone_repo, fetch_remote, parse_inline_comment_spec, pr_create,
+    pr_diff, pr_read, pr_review, pr_stack, pr_view, pull_current_branch, push_refs_with_options,
+    query_ci_job_log, query_ci_status, sync_repo, watch_ci_status,
 };
 use oz_integrate::{
     AbortOutcome, CollisionSeverity, ContinueOutcome, IntegrateOptions, IntegrateOutcome,
@@ -71,6 +74,9 @@ pub struct WsSpawnArgs {
     /// Base revision or commit to branch from (defaults to `HEAD`).
     #[arg(long = "from", value_name = "REV")]
     pub from_ref: Option<String>,
+    /// Explicit CoW backend override (`auto`, `cas_hardlink`, `linux_fuse3`, `linux_ficlone`, `apfs_clonefile`, `windows_refs_clone`, `windows_proj_fs`).
+    #[arg(long = "backend", value_name = "BACKEND")]
+    pub backend: Option<String>,
     /// Skip warm build/dependency cache baseline capture and mtime preservation.
     #[arg(long)]
     pub no_warm: bool,
@@ -107,6 +113,13 @@ pub struct WsGcArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Default, Args)]
+pub struct StatusArgs {
+    /// List every hunk ID inline even when a file has more than 5 hunks.
+    #[arg(long = "hunks")]
+    pub hunks: bool,
+}
+
 #[derive(Debug, Args)]
 pub struct DiffArgs {
     /// Base revision (`--base <REV>`) to compare against `HEAD` or `--rev`.
@@ -118,7 +131,13 @@ pub struct DiffArgs {
     /// Display diffstat summary instead of the full unified diff.
     #[arg(long = "stat")]
     pub stat: bool,
-    /// Revision range (`A..B` / `A...B`), file paths, directory prefixes, file IDs (`f1`), or hunk IDs (`h1a`).
+    /// Render explicit 1-based old/new line numbers alongside each diff line.
+    #[arg(long = "line-numbers", alias = "numbered")]
+    pub line_numbers: bool,
+    /// Exclude file paths, directory prefixes, globs, file IDs (`f1`), or hunk IDs (`h1a`).
+    #[arg(long = "exclude", num_args = 1.., action = clap::ArgAction::Append, value_name = "PATTERN")]
+    pub exclude: Vec<String>,
+    /// Revision range (`A..B` / `A...B`), file paths, directory prefixes, globs, `:!<path>` exclusions, file IDs (`f1`), or hunk IDs (`h1a`).
     pub targets: Vec<String>,
 }
 
@@ -425,6 +444,93 @@ pub enum PrCommand {
     Create(PrCreateArgs),
     /// Push stacked branches atomically and create/update cross-linked stacked PRs.
     Stack(PrStackArgs),
+    /// Inspect PR metadata, full head/base SHAs, changed files, and review states.
+    View(PrViewArgs),
+    /// Show a line-numbered PR diff with deterministic `[f1]` / `[h1a]` IDs (`--stat`, `--exclude`).
+    Diff(PrDiffArgs),
+    /// Read a file at the exact PR head commit without mutating the local working tree.
+    Read(PrReadArgs),
+    /// Submit a PR review with auto-filled `commit_id` and pre-validated inline diff comments.
+    Review(PrReviewArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PrViewArgs {
+    /// Pull request number.
+    pub number: u64,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PrDiffArgs {
+    /// Pull request number.
+    pub number: u64,
+    /// Display diffstat summary instead of the unified diff.
+    #[arg(long = "stat")]
+    pub stat: bool,
+    /// Include explicit 1-based old/new line numbers (enabled by default for `oz pr diff`).
+    #[arg(long = "line-numbers", alias = "numbered")]
+    pub line_numbers: bool,
+    /// Omit explicit old/new line number columns and print standard unified diff lines.
+    #[arg(long = "no-line-numbers", conflicts_with = "line_numbers")]
+    pub no_line_numbers: bool,
+    /// Exclude file paths, directory prefixes, globs, file IDs (`f1`), or hunk IDs (`h1a`).
+    #[arg(long = "exclude", num_args = 1.., action = clap::ArgAction::Append, value_name = "PATTERN")]
+    pub exclude: Vec<String>,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+    /// Optional file paths, directory prefixes, globs, `:!<path>` exclusions, file IDs, or hunk IDs.
+    pub targets: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PrReadArgs {
+    /// Pull request number.
+    pub number: u64,
+    /// Repository-relative file path to read at the PR head commit.
+    pub path: String,
+    /// Optional 1-based inclusive line range (e.g. `300..380`, `10-40`, `50`).
+    #[arg(long = "lines", value_name = "START..END")]
+    pub lines: Option<String>,
+    /// Prefix output lines with 1-based line numbers (enabled by default when `--lines` is set).
+    #[arg(short = 'n', long = "line-numbers", alias = "numbered")]
+    pub line_numbers: bool,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PrReviewArgs {
+    /// Pull request number.
+    pub number: u64,
+    /// Approve the pull request (`APPROVE`).
+    #[arg(long = "approve", conflicts_with_all = ["request_changes", "comment"])]
+    pub approve: bool,
+    /// Request changes on the pull request (`REQUEST_CHANGES`).
+    #[arg(long = "request-changes", conflicts_with_all = ["approve", "comment"])]
+    pub request_changes: bool,
+    /// Submit a general comment review (`COMMENT`, default when no decision flag is given).
+    #[arg(long = "comment", conflicts_with_all = ["approve", "request_changes"])]
+    pub comment: bool,
+    /// Top-level review summary body.
+    #[arg(short = 'b', long = "body", value_name = "TEXT")]
+    pub body: Option<String>,
+    /// Inline diff comment (`<path>:<line>[:LEFT|RIGHT]=<body>` or `<path>:<start>-<end>[:LEFT|RIGHT]=<body>`).
+    #[arg(long = "inline", alias = "comment-inline", action = clap::ArgAction::Append, value_name = "SPEC")]
+    pub inline: Vec<String>,
+    /// Path to a JSON file (or `-` for stdin) containing an array of `{path, line, side?, start_line?, body}` objects.
+    #[arg(long = "comments-file", value_name = "PATH")]
+    pub comments_file: Option<String>,
+    /// Validate all inline comment paths/lines against the PR diff without posting to GitHub.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -621,6 +727,7 @@ struct WsSpawnData {
     scope: Vec<String>,
     deny: Vec<String>,
     mounted: bool,
+    clean: bool,
     spawn_elapsed_ms: f64,
 }
 
@@ -780,10 +887,16 @@ pub(crate) fn handle_ws(
             execute_ws_spawn(&args, directory, mode),
             |env| {
                 let d = &env.data;
+                let commit_suffix = d
+                    .base_commit
+                    .as_deref()
+                    .map(|oid| format!("clean @ {}", &oid[..oid.len().min(12)]))
+                    .unwrap_or_else(|| "clean".to_string());
                 println!(
-                    "spawned workspace '{}' on branch '{}' ({}, {:.1} ms) -> {}",
+                    "spawned workspace '{}' on branch '{}' ({}, {}, {:.1} ms) -> {}",
                     d.workspace,
                     d.branch,
+                    commit_suffix,
                     d.backend,
                     d.spawn_elapsed_ms,
                     d.worktree_path.display()
@@ -850,11 +963,25 @@ fn execute_ws_spawn(
     let actor = actor_from_mode(mode, &repo);
     let tx = MutationTransaction::begin(&repo, cmd_str, actor, Some(&pre_status.changes))?;
 
+    let backend_override = match args.backend.as_deref().map(str::trim) {
+        None | Some("") | Some("auto") => None,
+        Some(raw) => {
+            let parsed = raw.parse::<BackendKind>().map_err(|message| OzError::InvalidUsage {
+                message,
+                recovery: vec![
+                    "Pass `--backend cas_hardlink` (or omit `--backend` for automatic selection)."
+                        .to_string(),
+                ],
+            })?;
+            Some(parsed)
+        }
+    };
+
     let opts = SpawnWorkspaceOptions {
         name: args.name.clone(),
         branch: args.branch.clone(),
         from_ref: args.from_ref.clone(),
-        backend: None,
+        backend: backend_override,
         scope: args.scope.clone(),
         deny: args.deny.clone(),
         warm: !args.no_warm,
@@ -882,6 +1009,7 @@ fn execute_ws_spawn(
             .mount_record
             .as_ref()
             .is_some_and(|m| m.mounted),
+        clean: true,
         spawn_elapsed_ms,
     };
 
@@ -1072,7 +1200,11 @@ pub(crate) fn attach_out_of_scope_warnings(
     env
 }
 
-pub(crate) fn handle_status(directory: Option<&Path>, mode: InteractionMode) -> ExitCode {
+pub(crate) fn handle_status(
+    args: &StatusArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
     let res = (|| -> Result<Envelope<_>> {
         let repo = discover_and_recover_repo(directory, false)?;
         let report = compute_status(&repo)?;
@@ -1099,18 +1231,36 @@ pub(crate) fn handle_status(directory: Option<&Path>, mode: InteractionMode) -> 
             return;
         }
         for change in &r.changes {
-            print_status_change_line(change);
+            print_status_change_line(change, args.hunks);
         }
     })
 }
 
-fn print_status_change_line(change: &FileChange) {
+const MAX_INLINE_STATUS_HUNKS: usize = 5;
+
+fn format_status_hunk_tag(hunk_ids: &[&str], show_all_hunks: bool) -> Option<String> {
+    if hunk_ids.is_empty() {
+        return None;
+    }
+    if show_all_hunks || hunk_ids.len() <= MAX_INLINE_STATUS_HUNKS {
+        Some(format!("hunks: {}", hunk_ids.join(", ")))
+    } else {
+        Some(format!(
+            "{} hunks: {}..{}",
+            hunk_ids.len(),
+            hunk_ids[0],
+            hunk_ids[hunk_ids.len() - 1]
+        ))
+    }
+}
+
+fn print_status_change_line(change: &FileChange, show_all_hunks: bool) {
     let hunk_ids: Vec<&str> = change.hunks.iter().map(|h| h.id.as_str()).collect();
     let mut tags = Vec::new();
     if change.is_binary {
         tags.push("binary".to_string());
-    } else if !hunk_ids.is_empty() {
-        tags.push(format!("hunks: {}", hunk_ids.join(", ")));
+    } else if let Some(hunk_tag) = format_status_hunk_tag(&hunk_ids, show_all_hunks) {
+        tags.push(hunk_tag);
     }
     if change.out_of_scope {
         tags.push("out-of-scope".to_string());
@@ -1142,12 +1292,14 @@ pub(crate) fn resolve_diff_report(repo: &OzoneRepo, args: &DiffArgs) -> Result<D
                 rev: args.rev.clone(),
                 range: None,
                 targets: args.targets.clone(),
+                excludes: args.exclude.clone(),
             },
         );
     }
 
     if let Some(first) = args.targets.first()
         && first.contains("..")
+        && !first.starts_with(':')
     {
         return compute_revision_diff(
             repo,
@@ -1156,11 +1308,12 @@ pub(crate) fn resolve_diff_report(repo: &OzoneRepo, args: &DiffArgs) -> Result<D
                 rev: None,
                 range: Some(first.clone()),
                 targets: args.targets[1..].to_vec(),
+                excludes: args.exclude.clone(),
             },
         );
     }
 
-    compute_diff(repo, &args.targets)
+    compute_diff_filtered(repo, &args.targets, &args.exclude)
 }
 
 pub(crate) fn format_diff_stat(report: &DiffReport) -> String {
@@ -1193,6 +1346,8 @@ pub(crate) fn handle_diff(
         let report = resolve_diff_report(&repo, args)?;
         let unified_diff = if args.stat {
             format_diff_stat(&report)
+        } else if args.line_numbers {
+            render_unified_diff_numbered(&report)
         } else {
             render_unified_diff(&report)
         };
@@ -2396,7 +2551,279 @@ pub(crate) fn handle_pr(
     match cmd {
         PrCommand::Create(args) => handle_pr_create(&args, directory, mode),
         PrCommand::Stack(args) => handle_pr_stack(&args, directory, mode),
+        PrCommand::View(args) => handle_pr_view(&args, directory, mode),
+        PrCommand::Diff(args) => handle_pr_diff(&args, directory, mode),
+        PrCommand::Read(args) => handle_pr_read(&args, directory, mode),
+        PrCommand::Review(args) => handle_pr_review(&args, directory, mode),
     }
+}
+
+fn handle_pr_view(
+    args: &PrViewArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PrViewOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let outcome = pr_view(
+            &repo,
+            &PrViewOptions {
+                number: args.number,
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            },
+        )?;
+        Ok(Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        let pr = &d.pull_request;
+        let state = if pr.is_merged() {
+            "MERGED"
+        } else if pr.draft {
+            "DRAFT"
+        } else {
+            pr.state.as_str()
+        };
+        let author = pr
+            .user
+            .as_ref()
+            .map(|u| u.login.as_str())
+            .unwrap_or("unknown");
+        println!("PR #{} [{}] {}", pr.number, state, pr.title);
+        println!(
+            "  {} -> {}  author={}  (+{}/-{}, {} files)",
+            pr.head.ref_name,
+            pr.base.ref_name,
+            author,
+            d.total_additions,
+            d.total_deletions,
+            d.files.len()
+        );
+        println!("  head={}  base={}", pr.head.sha, pr.base.sha);
+        if !pr.html_url.is_empty() {
+            println!("  url={}", pr.html_url);
+        }
+        if !d.reviews.is_empty() {
+            let summaries: Vec<String> = d
+                .reviews
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}:{}",
+                        r.author.as_deref().unwrap_or("unknown"),
+                        r.state
+                    )
+                })
+                .collect();
+            println!("  reviews: {}", summaries.join(", "));
+        }
+        if let Some(ref body) = pr.body
+            && !body.trim().is_empty()
+        {
+            println!("\n{}", body.trim());
+        }
+        if !d.files.is_empty() {
+            println!("\nFiles:");
+            for f in &d.files {
+                println!(
+                    "  [{}] {}  {} (+{}/-{})",
+                    f.id, f.status, f.path, f.additions, f.deletions
+                );
+            }
+        }
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct PrDiffCliData {
+    #[serde(flatten)]
+    outcome: PrDiffOutcome,
+    unified_diff: String,
+}
+
+fn handle_pr_diff(
+    args: &PrDiffArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PrDiffCliData>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let outcome = pr_diff(
+            &repo,
+            &PrDiffOptions {
+                number: args.number,
+                targets: args.targets.clone(),
+                excludes: args.exclude.clone(),
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            },
+        )?;
+        let numbered = !args.no_line_numbers;
+        let unified_diff = if args.stat {
+            format_diff_stat(&outcome.report)
+        } else if numbered {
+            render_unified_diff_numbered(&outcome.report)
+        } else {
+            render_unified_diff(&outcome.report)
+        };
+        Ok(Envelope::success(PrDiffCliData {
+            outcome,
+            unified_diff,
+        })
+        .with_workspace(repo.workspace)
+        .with_branch(repo.branch)
+        .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        if !env.data.unified_diff.is_empty() {
+            print!("{}", env.data.unified_diff);
+        }
+    })
+}
+
+fn handle_pr_read(
+    args: &PrReadArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PrReadOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let (start_line, end_line) = match args.lines.as_deref() {
+            Some(raw) => parse_line_range(raw)?,
+            None => (None, None),
+        };
+        let outcome = pr_read(
+            &repo,
+            &PrReadOptions {
+                number: args.number,
+                path: args.path.clone(),
+                start_line,
+                end_line,
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            },
+        )?;
+        Ok(Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let b = &env.data.blob;
+        if b.is_binary {
+            println!(
+                "Binary file PR #{} {}:{} ({} bytes, source={})",
+                env.data.pr_number, b.short_oid, b.path, b.size_bytes, env.data.source
+            );
+            return;
+        }
+        let numbered = args.line_numbers || args.lines.is_some();
+        if numbered {
+            print!("{}", format_numbered_blob_lines(&b.content, b.start_line));
+        } else {
+            print!("{}", b.content);
+        }
+    })
+}
+
+fn handle_pr_review(
+    args: &PrReviewArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PrReviewOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let event = if args.approve {
+            PrReviewEvent::Approve
+        } else if args.request_changes {
+            PrReviewEvent::RequestChanges
+        } else {
+            PrReviewEvent::Comment
+        };
+
+        let mut comments: Vec<PrInlineCommentInput> = Vec::new();
+        for spec in &args.inline {
+            comments.push(parse_inline_comment_spec(spec)?);
+        }
+        if let Some(ref file_spec) = args.comments_file {
+            let raw_json = if file_spec == "-" {
+                use std::io::Read as _;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|err| OzError::Other(format!("failed reading comments from stdin: {err}")))?;
+                buf
+            } else {
+                std::fs::read_to_string(file_spec).map_err(|err| {
+                    OzError::Other(format!("failed reading comments file '{file_spec}': {err}"))
+                })?
+            };
+            let parsed: Vec<PrInlineCommentInput> =
+                serde_json::from_str(&raw_json).map_err(|err| OzError::InvalidUsage {
+                    message: format!("invalid comments JSON in '{file_spec}': {err}"),
+                    recovery: vec![
+                        "Expected a JSON array of objects: `[{\"path\":\"src/a.rs\",\"line\":10,\"side\":\"RIGHT\",\"body\":\"...\"}]`."
+                            .to_string(),
+                    ],
+                })?;
+            comments.extend(parsed);
+        }
+
+        let outcome = pr_review(
+            &repo,
+            &PrReviewOptions {
+                number: args.number,
+                event,
+                body: args.body.clone(),
+                comments,
+                dry_run: args.dry_run,
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            },
+        )?;
+        Ok(Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        if d.dry_run {
+            println!(
+                "Dry-run OK for PR #{} ({}) at commit {} ({} inline comment(s) validated)",
+                d.pr_number,
+                d.event,
+                &d.commit_id[..d.commit_id.len().min(12)],
+                d.validated_comments
+            );
+        } else {
+            let url_suffix = d
+                .review
+                .as_ref()
+                .and_then(|r| r.html_url.as_deref())
+                .map(|u| format!(" -> {u}"))
+                .unwrap_or_default();
+            println!(
+                "Submitted {} review on PR #{} at commit {} ({} inline comment(s)){url_suffix}",
+                d.event,
+                d.pr_number,
+                &d.commit_id[..d.commit_id.len().min(12)],
+                d.validated_comments
+            );
+        }
+    })
 }
 
 fn handle_pr_create(

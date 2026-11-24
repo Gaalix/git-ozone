@@ -18,12 +18,14 @@ use oz_core::{
     BranchCreateOutcome, BranchDeleteOutcome, BranchListReport, BranchRenameOutcome,
     CherryPickOptions, CherryPickOutcome, Envelope, ExitCode, InteractionMode, LogCommitEntry,
     LogOptions, OZ_STASH_REF, OzError, OzoneRepo, Result, RestoreOptions, RestoreOutcome,
-    RevertOptions, RevertOutcome, ShowOptions, ShowReport, StashDropOutcome, StashListReport,
-    StashPopOutcome, StashPushOutcome, SwitchOptions, SwitchOutcome, TagCreateOptions,
-    TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome, apply_stash_pop, branch_create,
-    branch_delete, branch_list, branch_rename, cherry_pick_commit, compute_status, log_commits,
-    prepare_stash_pop, restore_paths, revert_commit, show_commit, stash_drop, stash_list,
-    stash_push, switch_branch, tag_create, tag_delete, tag_list, tag_verify,
+    RevParseOptions, RevParseReport, RevertOptions, RevertOutcome, ShowBlobOptions, ShowBlobReport,
+    ShowOptions, ShowReport, StashDropOutcome, StashListReport, StashPopOutcome, StashPushOutcome,
+    SwitchOptions, SwitchOutcome, TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport,
+    TagVerifyOutcome, apply_stash_pop, branch_create, branch_delete, branch_list, branch_rename,
+    cherry_pick_commit, compute_status, format_numbered_blob_lines, log_commits, parse_line_range,
+    parse_rev_path_spec, prepare_stash_pop, restore_paths, rev_parse, revert_commit, show_blob,
+    show_commit, stash_drop, stash_list, stash_push, switch_branch, tag_create, tag_delete,
+    tag_list, tag_verify,
 };
 use oz_oplog::{ActorInfo, ActorKind, MutationTransaction};
 use serde::Serialize;
@@ -114,6 +116,9 @@ where
 pub struct LogArgs {
     /// Optional starting revision, branch, tag, or `A..B` range (defaults to `HEAD`).
     pub rev: Option<String>,
+    /// Optional starting revision passed as a named flag (alias for positional `[REV]`).
+    #[arg(long = "rev", value_name = "REV", conflicts_with = "rev")]
+    pub rev_flag: Option<String>,
     /// Include commits reachable from all local branches and tags.
     #[arg(long)]
     pub all: bool,
@@ -121,7 +126,7 @@ pub struct LogArgs {
     #[arg(long)]
     pub oneline: bool,
     /// Limit the number of commits output.
-    #[arg(short = 'n', long = "max-count", value_name = "N")]
+    #[arg(short = 'n', long = "max-count", alias = "limit", value_name = "N")]
     pub limit: Option<usize>,
     /// Filter commits whose author name or email contains `<PATTERN>`.
     #[arg(long, value_name = "PATTERN")]
@@ -130,10 +135,10 @@ pub struct LogArgs {
     #[arg(long, value_name = "PATTERN")]
     pub grep: Option<String>,
     /// Pickaxe search: match commits that change occurrences of `<STRING>` in file diffs.
-    #[arg(short = 'S', value_name = "STRING")]
+    #[arg(short = 'S', long = "pickaxe", value_name = "STRING")]
     pub search_string: Option<String>,
     /// Diff search: match commits whose changed lines match regex `<PATTERN>`.
-    #[arg(short = 'G', value_name = "PATTERN")]
+    #[arg(short = 'G', long = "grep-diff", value_name = "PATTERN")]
     pub search_diff_regex: Option<String>,
     /// Show commits newer than date or duration (e.g. `2026-11-20`, `"2 days ago"`, `12h`).
     #[arg(long, value_name = "DATE")]
@@ -147,6 +152,9 @@ pub struct LogArgs {
     /// When to emit ANSI color escapes (`auto`, `always`, `never`).
     #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
     pub color: ColorWhen,
+    /// Optional file or directory path filters after `--` (e.g. `oz log -n 10 --oneline -- crates/oz-core/`).
+    #[arg(last = true, value_name = "PATH")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,7 +200,7 @@ pub(crate) fn handle_log(
     let res = (|| -> Result<Envelope<LogCliData>> {
         let repo = discover_and_recover_repo(directory, false)?;
         let opts = LogOptions {
-            rev: args.rev.clone(),
+            rev: args.rev_flag.clone().or_else(|| args.rev.clone()),
             all: args.all,
             limit: args.limit,
             author: args.author.clone(),
@@ -201,6 +209,7 @@ pub(crate) fn handle_log(
             search_diff_regex: args.search_diff_regex.clone(),
             since: args.since.clone(),
             graph: !args.no_graph,
+            paths: args.paths.clone(),
         };
         let report = log_commits(&repo, &opts)?;
         let notes: BTreeMap<String, AiProvenanceNote> =
@@ -327,11 +336,17 @@ fn continuation_prefix(graph_prefix: &str) -> String {
 
 #[derive(Debug, Args)]
 pub struct ShowArgs {
-    /// Revision, commit OID, branch, or tag to inspect (defaults to `HEAD`).
+    /// Revision, commit OID, branch, tag, or `<rev>:<path>` blob spec to inspect (defaults to `HEAD`).
     pub rev: Option<String>,
-    /// Display diffstat summary instead of the full unified diff.
+    /// Display diffstat summary instead of the full unified diff (commit mode).
     #[arg(long)]
     pub stat: bool,
+    /// Optional 1-based inclusive line range for `<rev>:<path>` blob reads (e.g. `300..380`, `10-40`, `50`).
+    #[arg(long = "lines", value_name = "START..END")]
+    pub lines: Option<String>,
+    /// Prefix blob output lines with 1-based line numbers (also enabled automatically when `--lines` is set).
+    #[arg(short = 'n', long = "line-numbers", alias = "numbered")]
+    pub line_numbers: bool,
     /// When to emit ANSI color escapes (`auto`, `always`, `never`).
     #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
     pub color: ColorWhen,
@@ -350,6 +365,12 @@ pub(crate) fn handle_show(
     directory: Option<&Path>,
     mode: InteractionMode,
 ) -> ExitCode {
+    if let Some(ref raw_spec) = args.rev
+        && let Some((rev_part, path_part)) = parse_rev_path_spec(raw_spec)
+    {
+        return handle_show_blob(args, &rev_part, &path_part, directory, mode);
+    }
+
     let res = (|| -> Result<Envelope<ShowCliData>> {
         let repo = discover_and_recover_repo(directory, false)?;
         let report = show_commit(
@@ -380,6 +401,129 @@ pub(crate) fn handle_show(
     })
 }
 
+fn handle_show_blob(
+    args: &ShowArgs,
+    rev_part: &str,
+    path_part: &str,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<ShowBlobReport>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let (start_line, end_line) = match args.lines.as_deref() {
+            Some(raw) => parse_line_range(raw)?,
+            None => (None, None),
+        };
+        let report = show_blob(
+            &repo,
+            &ShowBlobOptions {
+                rev: rev_part.to_string(),
+                path: path_part.to_string(),
+                start_line,
+                end_line,
+            },
+        )?;
+        let head_oid = repo.head_oid.clone();
+        Ok(Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(head_oid))
+    })();
+
+    render_daily_result(mode, res, |env| {
+        let b = &env.data;
+        if b.is_binary {
+            println!(
+                "Binary file {}:{} ({} bytes, blob {})",
+                b.short_oid,
+                b.path,
+                b.size_bytes,
+                &b.blob_oid[..b.blob_oid.len().min(12)]
+            );
+            return Ok(());
+        }
+        let numbered = args.line_numbers || args.lines.is_some();
+        let rendered = if numbered {
+            format_numbered_blob_lines(&b.content, b.start_line)
+        } else {
+            b.content.clone()
+        };
+        emit_paged_output(mode, &rendered)
+    })
+}
+
+// ============================================================================
+// 2b. `oz rev-parse`
+// ============================================================================
+
+#[derive(Debug, Args)]
+pub struct RevParseArgs {
+    /// Revisions, branches, tags, or refs to resolve to object IDs.
+    pub revs: Vec<String>,
+    /// Shorten object IDs to `<LEN>` hex characters (`--short` defaults to 7, or `--short=<LEN>`).
+    #[arg(
+        long = "short",
+        value_name = "LEN",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "7"
+    )]
+    pub short: Option<usize>,
+    /// Verify that exactly one argument resolves to a valid object ID.
+    #[arg(long = "verify")]
+    pub verify: bool,
+    /// Output the non-ambiguous short ref name (e.g. active branch name for `HEAD`).
+    #[arg(long = "abbrev-ref")]
+    pub abbrev_ref: bool,
+    /// Show the absolute path of the repository working-tree top-level directory.
+    #[arg(long = "show-toplevel")]
+    pub show_toplevel: bool,
+    /// Show the `.git` directory path for the current workspace.
+    #[arg(long = "git-dir")]
+    pub git_dir: bool,
+    /// Show the shared common `.git` directory path.
+    #[arg(long = "git-common-dir")]
+    pub git_common_dir: bool,
+    /// Print `true` if inside a Git/Ozone working tree (exits non-zero otherwise).
+    #[arg(long = "is-inside-work-tree")]
+    pub is_inside_work_tree: bool,
+}
+
+pub(crate) fn handle_rev_parse(
+    args: &RevParseArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<RevParseReport>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let report = rev_parse(
+            &repo,
+            &RevParseOptions {
+                revs: args.revs.clone(),
+                short: args.short.map(Some),
+                verify: args.verify,
+                abbrev_ref: args.abbrev_ref,
+                show_toplevel: args.show_toplevel,
+                git_dir: args.git_dir,
+                git_common_dir: args.git_common_dir,
+                is_inside_work_tree: args.is_inside_work_tree,
+            },
+        )?;
+        let head_oid = repo.head_oid.clone();
+        Ok(Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(head_oid))
+    })();
+
+    render_daily_result(mode, res, |env| {
+        for v in &env.data.values {
+            println!("{v}");
+        }
+        Ok(())
+    })
+}
+
 /// Paged `oz diff` dispatch used when stdout is an interactive TTY (`!json && !agent`).
 pub(crate) fn handle_diff_paged(
     args: &crate::commands::DiffArgs,
@@ -391,6 +535,8 @@ pub(crate) fn handle_diff_paged(
         let report = crate::commands::resolve_diff_report(&repo, args)?;
         let rendered = if args.stat {
             crate::commands::format_diff_stat(&report)
+        } else if args.line_numbers {
+            oz_core::render_unified_diff_numbered(&report)
         } else {
             oz_core::render_unified_diff(&report)
         };

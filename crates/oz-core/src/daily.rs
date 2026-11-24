@@ -11,8 +11,8 @@
 
 use crate::commit::{compute_change_id, ensure_change_id_trailer, verify_commit_signature};
 use crate::diff::{
-    DiffReport, compute_file_diff, file_id, filter_changes_by_targets, is_binary_bytes,
-    render_file_unified_diff,
+    DiffReport, compute_file_diff, file_id, filter_changes_by_targets_and_excludes,
+    is_binary_bytes, render_file_unified_diff,
 };
 use crate::error::{OzError, Result};
 use crate::repo::OzoneRepo;
@@ -1203,6 +1203,7 @@ pub struct LogOptions {
     pub search_diff_regex: Option<String>,
     pub since: Option<String>,
     pub graph: bool,
+    pub paths: Vec<String>,
 }
 
 impl Default for LogOptions {
@@ -1217,6 +1218,7 @@ impl Default for LogOptions {
             search_diff_regex: None,
             since: None,
             graph: true,
+            paths: Vec::new(),
         }
     }
 }
@@ -1286,12 +1288,19 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
         });
     }
 
+    let normalized_paths: Vec<LogPathFilter> = opts
+        .paths
+        .iter()
+        .map(|p| LogPathFilter::compile(p))
+        .collect::<Result<Vec<_>>>()?;
+
     let ref_decorations = collect_ref_decorations(repo, &gix_repo)?;
     let has_content_filter = opts.author.is_some()
         || opts.grep.is_some()
         || opts.search_string.is_some()
         || opts.search_diff_regex.is_some()
-        || since_cutoff.is_some();
+        || since_cutoff.is_some()
+        || !normalized_paths.is_empty();
 
     let mut walk_platform = gix_repo
         .rev_walk(starts)
@@ -1361,6 +1370,12 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
         let tree_id = decoded.tree();
         let parent_ids: Vec<ObjectId> = info.parent_ids.to_vec();
 
+        if !normalized_paths.is_empty()
+            && !commit_touches_paths(&gix_repo, tree_id, &parent_ids, &normalized_paths)?
+        {
+            continue;
+        }
+
         if opts.search_string.is_some() || diff_re.is_some() {
             let parent_tree_id = match parent_ids.first() {
                 Some(&pid) => commit_tree_id(&gix_repo, pid)?,
@@ -1372,6 +1387,7 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
                 tree_id,
                 opts.search_string.as_deref(),
                 diff_re.as_ref(),
+                &normalized_paths,
             )? {
                 continue;
             }
@@ -1613,12 +1629,148 @@ fn advance_graph_lanes(
     (prefix, connectors)
 }
 
+struct LogPathFilter {
+    normalized: String,
+    glob: Option<globset::GlobMatcher>,
+}
+
+impl LogPathFilter {
+    fn compile(raw: &str) -> Result<Self> {
+        let replaced = raw.replace('\\', "/");
+        let stripped = replaced.strip_prefix("./").unwrap_or(&replaced);
+        let normalized = stripped.trim_start_matches('/').trim_end_matches('/').to_string();
+        let has_glob = normalized.contains('*')
+            || normalized.contains('?')
+            || normalized.contains('[')
+            || normalized.contains('{');
+        let glob = if has_glob {
+            Some(
+                globset::GlobBuilder::new(&normalized)
+                    .literal_separator(false)
+                    .build()
+                    .map_err(|err| OzError::InvalidUsage {
+                        message: format!("invalid log path pattern '{raw}': {err}"),
+                        recovery: vec!["Pass a valid path or glob after `--`.".to_string()],
+                    })?
+                    .compile_matcher(),
+            )
+        } else {
+            None
+        };
+        Ok(Self { normalized, glob })
+    }
+
+    fn matches_path(&self, path: &str) -> bool {
+        if self.normalized.is_empty() || self.normalized == "." {
+            return true;
+        }
+        if path == self.normalized {
+            return true;
+        }
+        if path
+            .strip_prefix(&self.normalized)
+            .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return true;
+        }
+        self.glob.as_ref().is_some_and(|g| g.is_match(path))
+    }
+}
+
+fn tree_entry_sig(
+    gix_repo: &gix::Repository,
+    tree_id: ObjectId,
+    rel_path: &str,
+) -> Result<Option<(gix::objs::tree::EntryKind, ObjectId)>> {
+    if rel_path.is_empty() || rel_path == "." {
+        return Ok(Some((gix::objs::tree::EntryKind::Tree, tree_id)));
+    }
+    let tree = gix_repo
+        .find_tree(tree_id)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    let entry = tree
+        .lookup_entry_by_path(rel_path)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    Ok(entry.map(|e| (e.mode().kind(), e.object_id())))
+}
+
+fn trees_differ_on_paths(
+    gix_repo: &gix::Repository,
+    lhs_tree_id: ObjectId,
+    rhs_tree_id: ObjectId,
+    paths: &[LogPathFilter],
+) -> Result<bool> {
+    if lhs_tree_id == rhs_tree_id {
+        return Ok(false);
+    }
+    let all_literal = paths.iter().all(|p| p.glob.is_none());
+    if all_literal {
+        for p in paths {
+            let lhs_sig = tree_entry_sig(gix_repo, lhs_tree_id, &p.normalized)?;
+            let rhs_sig = tree_entry_sig(gix_repo, rhs_tree_id, &p.normalized)?;
+            if lhs_sig != rhs_sig {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    let lhs_tree = gix_repo
+        .find_tree(lhs_tree_id)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    let rhs_tree = gix_repo
+        .find_tree(rhs_tree_id)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    let mut state = gix::diff::tree::State::default();
+    let mut recorder = gix::diff::tree::Recorder::default()
+        .track_location(Some(gix::diff::tree::recorder::Location::Path));
+    let lhs_iter = gix::objs::TreeRefIter::from_bytes(&lhs_tree.data, lhs_tree.id.kind());
+    let rhs_iter = gix::objs::TreeRefIter::from_bytes(&rhs_tree.data, rhs_tree.id.kind());
+    gix::diff::tree(lhs_iter, rhs_iter, &mut state, &gix_repo.objects, &mut recorder)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+
+    for record in recorder.records {
+        let loc = match record {
+            gix::diff::tree::recorder::Change::Addition { path, .. }
+            | gix::diff::tree::recorder::Change::Deletion { path, .. }
+            | gix::diff::tree::recorder::Change::Modification { path, .. } => path,
+        };
+        let path_str = loc.to_str_lossy();
+        if paths.iter().any(|p| p.matches_path(&path_str)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn commit_touches_paths(
+    gix_repo: &gix::Repository,
+    commit_tree_id_val: ObjectId,
+    parent_ids: &[ObjectId],
+    paths: &[LogPathFilter],
+) -> Result<bool> {
+    if parent_ids.is_empty() {
+        let empty = ObjectId::empty_tree(gix_repo.object_hash());
+        return trees_differ_on_paths(gix_repo, empty, commit_tree_id_val, paths);
+    }
+    // Standard Git TREESAME simplification: a commit is included when it differs
+    // on the filtered path(s) from all of its parents (for 1-parent commits, differs from parent).
+    for &pid in parent_ids {
+        let p_tree = commit_tree_id(gix_repo, pid)?;
+        if !trees_differ_on_paths(gix_repo, p_tree, commit_tree_id_val, paths)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn commit_diff_matches_filters(
     gix_repo: &gix::Repository,
     parent_tree_id: ObjectId,
     commit_tree_id: ObjectId,
     search_string: Option<&str>,
     diff_re: Option<&SimpleRegex>,
+    path_filters: &[LogPathFilter],
 ) -> Result<bool> {
     if parent_tree_id == commit_tree_id {
         return Ok(false);
@@ -1640,28 +1792,35 @@ fn commit_diff_matches_filters(
         .map_err(|err| OzError::Git(err.to_string()))?;
 
     for record in recorder.records {
-        let (old_oid, new_oid) = match record {
+        let (loc, old_oid, new_oid) = match record {
             gix::diff::tree::recorder::Change::Addition {
-                entry_mode, oid, ..
+                entry_mode,
+                oid,
+                path,
+                ..
             } => {
                 if entry_mode.is_tree() || entry_mode.kind() == EntryKind::Commit {
                     continue;
                 }
-                (None, Some(oid))
+                (path, None, Some(oid))
             }
             gix::diff::tree::recorder::Change::Deletion {
-                entry_mode, oid, ..
+                entry_mode,
+                oid,
+                path,
+                ..
             } => {
                 if entry_mode.is_tree() || entry_mode.kind() == EntryKind::Commit {
                     continue;
                 }
-                (Some(oid), None)
+                (path, Some(oid), None)
             }
             gix::diff::tree::recorder::Change::Modification {
                 previous_entry_mode,
                 previous_oid,
                 entry_mode,
                 oid,
+                path,
                 ..
             } => {
                 if entry_mode.is_tree() || entry_mode.kind() == EntryKind::Commit {
@@ -1674,9 +1833,15 @@ fn commit_diff_matches_filters(
                 } else {
                     Some(previous_oid)
                 };
-                (prev, Some(oid))
+                (path, prev, Some(oid))
             }
         };
+        if !path_filters.is_empty() {
+            let loc_str = loc.to_str_lossy();
+            if !path_filters.iter().any(|p| p.matches_path(&loc_str)) {
+                continue;
+            }
+        }
 
         let old_bytes = match old_oid {
             Some(id) => read_blob_bytes(gix_repo, id)?,
@@ -1942,6 +2107,400 @@ pub fn show_commit(repo: &OzoneRepo, opts: &ShowOptions) -> Result<ShowReport> {
     })
 }
 
+// ============================================================================
+// 2b. `oz show <rev>:<path>` (Blob read at revision) & `oz rev-parse`
+// ============================================================================
+
+/// Options controlling [`show_blob`].
+#[derive(Debug, Clone, Default)]
+pub struct ShowBlobOptions {
+    /// Revision expression (commit, branch, tag, or OID). Defaults to `HEAD` when empty.
+    pub rev: String,
+    /// Repository-relative file path inside the revision's tree.
+    pub path: String,
+    /// Optional 1-based inclusive starting line number.
+    pub start_line: Option<usize>,
+    /// Optional 1-based inclusive ending line number.
+    pub end_line: Option<usize>,
+}
+
+/// Structured blob view returned by [`show_blob`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowBlobReport {
+    pub rev: String,
+    pub commit_oid: String,
+    pub short_oid: String,
+    pub path: String,
+    pub blob_oid: String,
+    pub size_bytes: usize,
+    pub is_binary: bool,
+    pub total_lines: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub truncated: bool,
+    pub content: String,
+}
+
+/// Parses a Git `<rev>:<path>` object specification.
+/// Returns `None` for commit-message search syntax (`:/...`) or specs without a `:`.
+#[must_use]
+pub fn parse_rev_path_spec(spec: &str) -> Option<(String, String)> {
+    let trimmed = spec.trim();
+    if trimmed.starts_with(":/") {
+        return None;
+    }
+    let (lhs, rhs) = trimmed.split_once(':')?;
+    let norm_path = rhs
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+    if norm_path.is_empty() {
+        return None;
+    }
+    let rev = if lhs.is_empty() {
+        "HEAD".to_string()
+    } else {
+        lhs.to_string()
+    };
+    Some((rev, norm_path))
+}
+
+/// Parses a 1-based inclusive line range (`300..380`, `300..=380`, `300-380`, `300:380`, `300`, `300..`, `..50`).
+pub fn parse_line_range(raw: &str) -> Result<(Option<usize>, Option<usize>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(OzError::InvalidUsage {
+            message: "empty line range".to_string(),
+            recovery: vec!["Pass a 1-based range like `--lines 1..50` or `--lines 300-380`.".to_string()],
+        });
+    }
+
+    let parse_num = |s: &str| -> Result<usize> {
+        let n: usize = s.trim().parse().map_err(|_| OzError::InvalidUsage {
+            message: format!("invalid line number '{s}' in line range '{raw}'"),
+            recovery: vec!["Use positive 1-based integers like `--lines 1..50`.".to_string()],
+        })?;
+        if n == 0 {
+            return Err(OzError::InvalidUsage {
+                message: format!("line numbers are 1-based (got 0 in '{raw}')"),
+                recovery: vec!["Start line ranges at 1, e.g. `--lines 1..50`.".to_string()],
+            });
+        }
+        Ok(n)
+    };
+
+    let (start, end) = if let Some((a, b)) = trimmed.split_once("..=") {
+        let s = if a.is_empty() { None } else { Some(parse_num(a)?) };
+        let e = if b.is_empty() { None } else { Some(parse_num(b)?) };
+        (s, e)
+    } else if let Some((a, b)) = trimmed.split_once("..") {
+        let s = if a.is_empty() { None } else { Some(parse_num(a)?) };
+        let e = if b.is_empty() { None } else { Some(parse_num(b)?) };
+        (s, e)
+    } else if let Some((a, b)) = trimmed.split_once(':') {
+        let s = if a.is_empty() { None } else { Some(parse_num(a)?) };
+        let e = if b.is_empty() { None } else { Some(parse_num(b)?) };
+        (s, e)
+    } else if let Some((a, b)) = trimmed.split_once('-') {
+        let s = if a.is_empty() { None } else { Some(parse_num(a)?) };
+        let e = if b.is_empty() { None } else { Some(parse_num(b)?) };
+        (s, e)
+    } else {
+        let n = parse_num(trimmed)?;
+        (Some(n), Some(n))
+    };
+
+    if let (Some(s), Some(e)) = (start, end)
+        && s > e
+    {
+        return Err(OzError::InvalidUsage {
+            message: format!("invalid line range '{raw}': start line {s} > end line {e}"),
+            recovery: vec!["Ensure start <= end (e.g. `--lines 10..40`).".to_string()],
+        });
+    }
+    Ok((start, end))
+}
+
+/// Slices raw text bytes into a 1-based inclusive line range, returning
+/// `(total_lines, start_line, end_line, truncated, sliced_content)`.
+pub fn slice_text_lines(
+    bytes: &[u8],
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> (usize, usize, usize, bool, String) {
+    let text = String::from_utf8_lossy(bytes);
+    let all_lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total_lines = all_lines.len();
+    if total_lines == 0 {
+        return (0, 0, 0, false, String::new());
+    }
+    let s = start_line.unwrap_or(1).max(1);
+    if s > total_lines {
+        return (total_lines, s, total_lines, false, String::new());
+    }
+    let e = end_line.unwrap_or(total_lines).min(total_lines);
+    let truncated = s > 1 || e < total_lines;
+    let content: String = all_lines[(s - 1)..e].concat();
+    (total_lines, s, e, truncated, content)
+}
+
+/// Formats text content with 1-based line numbers starting at `start_line`.
+#[must_use]
+pub fn format_numbered_blob_lines(content: &str, start_line: usize) -> String {
+    if content.is_empty() || start_line == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let max_line = start_line + lines.len().saturating_sub(1);
+    let width = max_line.to_string().len().max(4);
+    let mut out = String::with_capacity(content.len() + lines.len() * (width + 4));
+    for (idx, line) in lines.iter().enumerate() {
+        let num = start_line + idx;
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{num:>width$} | {line}"));
+        if !line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Reads a single file blob from any commit/branch/tag/OID without mutating the working tree.
+pub fn show_blob(repo: &OzoneRepo, opts: &ShowBlobOptions) -> Result<ShowBlobReport> {
+    let gix_repo = open_gix_for_workspace(repo)?;
+    let rev_label = if opts.rev.trim().is_empty() {
+        "HEAD".to_string()
+    } else {
+        opts.rev.trim().to_string()
+    };
+
+    let commit_oid = if rev_label == "HEAD" {
+        let head = resolve_workspace_head(repo, &gix_repo)?;
+        head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
+            message: "repository has no commits yet (HEAD is unborn)".to_string(),
+            recovery: vec!["Create an initial commit with `oz commit -m \"...\"`.".to_string()],
+        })?
+    } else {
+        let id = gix_repo
+            .rev_parse_single(rev_label.as_str())
+            .map_err(|err| OzError::InvalidUsage {
+                message: format!("cannot resolve revision '{rev_label}': {err}"),
+                recovery: vec!["Run `oz log --oneline` or `oz branch` to list valid revisions.".to_string()],
+            })?
+            .detach();
+        gix_repo
+            .find_object(id)
+            .map_err(|err| OzError::Git(err.to_string()))?
+            .peel_to_commit()
+            .map_err(|err| OzError::InvalidUsage {
+                message: format!("revision '{rev_label}' does not point to a commit: {err}"),
+                recovery: Vec::new(),
+            })?
+            .id
+    };
+
+    let tree_id = commit_tree_id(&gix_repo, commit_oid)?;
+    let tree = gix_repo
+        .find_tree(tree_id)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+
+    let norm_path = opts
+        .path
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+
+    let entry = tree
+        .lookup_entry_by_path(&norm_path)
+        .map_err(|err| OzError::Git(err.to_string()))?
+        .ok_or_else(|| OzError::InvalidUsage {
+            message: format!("path '{norm_path}' does not exist in '{rev_label}'"),
+            recovery: vec![format!("Check the path at '{rev_label}' or run `oz show {rev_label} --stat`.")],
+        })?;
+
+    if entry.mode().is_tree() {
+        return Err(OzError::InvalidUsage {
+            message: format!("'{rev_label}:{norm_path}' is a directory, not a file blob"),
+            recovery: vec!["Pass a file path inside that directory (e.g. `<rev>:dir/file.rs`).".to_string()],
+        });
+    }
+
+    let blob_oid = entry.object_id();
+    let blob = gix_repo
+        .find_blob(blob_oid)
+        .map_err(|err| OzError::Git(err.to_string()))?;
+    let bytes = blob.data.as_slice();
+    let size_bytes = bytes.len();
+    let oid_hex = commit_oid.to_hex().to_string();
+    let short_oid = oid_hex[..oid_hex.len().min(7)].to_string();
+
+    if is_binary_bytes(bytes) {
+        return Ok(ShowBlobReport {
+            rev: rev_label,
+            commit_oid: oid_hex,
+            short_oid,
+            path: norm_path,
+            blob_oid: blob_oid.to_hex().to_string(),
+            size_bytes,
+            is_binary: true,
+            total_lines: 0,
+            start_line: 0,
+            end_line: 0,
+            truncated: false,
+            content: String::new(),
+        });
+    }
+
+    let (total_lines, start_line, end_line, truncated, content) =
+        slice_text_lines(bytes, opts.start_line, opts.end_line);
+
+    Ok(ShowBlobReport {
+        rev: rev_label,
+        commit_oid: oid_hex,
+        short_oid,
+        path: norm_path,
+        blob_oid: blob_oid.to_hex().to_string(),
+        size_bytes,
+        is_binary: false,
+        total_lines,
+        start_line,
+        end_line,
+        truncated,
+        content,
+    })
+}
+
+/// Options controlling [`rev_parse`].
+#[derive(Debug, Clone, Default)]
+pub struct RevParseOptions {
+    pub revs: Vec<String>,
+    pub short: Option<Option<usize>>,
+    pub verify: bool,
+    pub abbrev_ref: bool,
+    pub show_toplevel: bool,
+    pub git_dir: bool,
+    pub git_common_dir: bool,
+    pub is_inside_work_tree: bool,
+}
+
+/// One resolved item in a [`RevParseReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevParseEntry {
+    pub query: String,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_oid: Option<String>,
+}
+
+/// Structured output returned by [`rev_parse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevParseReport {
+    pub values: Vec<String>,
+    pub entries: Vec<RevParseEntry>,
+}
+
+/// Resolves revisions and repository metadata queries (`oz rev-parse`).
+pub fn rev_parse(repo: &OzoneRepo, opts: &RevParseOptions) -> Result<RevParseReport> {
+    let gix_repo = open_gix_for_workspace(repo)?;
+    let mut entries = Vec::new();
+
+    if opts.show_toplevel {
+        entries.push(RevParseEntry {
+            query: "--show-toplevel".to_string(),
+            value: repo.repo_root.display().to_string(),
+            full_oid: None,
+        });
+    }
+    if opts.git_dir {
+        entries.push(RevParseEntry {
+            query: "--git-dir".to_string(),
+            value: repo.git_dir.display().to_string(),
+            full_oid: None,
+        });
+    }
+    if opts.git_common_dir {
+        entries.push(RevParseEntry {
+            query: "--git-common-dir".to_string(),
+            value: repo.git_common_dir.display().to_string(),
+            full_oid: None,
+        });
+    }
+    if opts.is_inside_work_tree {
+        entries.push(RevParseEntry {
+            query: "--is-inside-work-tree".to_string(),
+            value: "true".to_string(),
+            full_oid: None,
+        });
+    }
+
+    if opts.verify && opts.revs.len() != 1 {
+        return Err(OzError::InvalidUsage {
+            message: "`--verify` requires a single revision argument".to_string(),
+            recovery: vec!["Run `oz rev-parse --verify HEAD`.".to_string()],
+        });
+    }
+
+    let short_len = opts.short.map(|opt_len| opt_len.unwrap_or(7).clamp(4, 40));
+
+    for rev in &opts.revs {
+        if opts.abbrev_ref {
+            let value = if rev == "HEAD" {
+                repo.branch
+                    .clone()
+                    .unwrap_or_else(|| "HEAD".to_string())
+            } else if let Ok(r) = gix_repo.find_reference(rev.as_str()) {
+                let full = r.name().as_bstr().to_str_lossy().into_owned();
+                full.strip_prefix("refs/heads/")
+                    .or_else(|| full.strip_prefix("refs/remotes/"))
+                    .or_else(|| full.strip_prefix("refs/tags/"))
+                    .unwrap_or(&full)
+                    .to_string()
+            } else {
+                return Err(OzError::InvalidUsage {
+                    message: format!("cannot resolve ref '{rev}' for `--abbrev-ref`"),
+                    recovery: vec!["Run `oz branch` to list available refs.".to_string()],
+                });
+            };
+            entries.push(RevParseEntry {
+                query: rev.clone(),
+                value,
+                full_oid: None,
+            });
+            continue;
+        }
+
+        let oid = if rev == "HEAD" {
+            let head = resolve_workspace_head(repo, &gix_repo)?;
+            head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
+                message: "cannot resolve 'HEAD': repository has no commits yet".to_string(),
+                recovery: vec!["Create an initial commit with `oz commit -m \"...\"`.".to_string()],
+            })?
+        } else {
+            gix_repo
+                .rev_parse_single(rev.as_str())
+                .map_err(|err| OzError::InvalidUsage {
+                    message: format!("cannot resolve revision '{rev}': {err}"),
+                    recovery: vec!["Run `oz branch` or `oz log --oneline` to inspect refs.".to_string()],
+                })?
+                .detach()
+        };
+        let full_hex = oid.to_hex().to_string();
+        let value = match short_len {
+            Some(n) => full_hex[..full_hex.len().min(n)].to_string(),
+            None => full_hex.clone(),
+        };
+        entries.push(RevParseEntry {
+            query: rev.clone(),
+            value,
+            full_oid: Some(full_hex),
+        });
+    }
+
+    let values = entries.iter().map(|e| e.value.clone()).collect();
+    Ok(RevParseReport { values, entries })
+}
+
 fn diff_commit_trees(
     gix_repo: &gix::Repository,
     lhs_tree_id: ObjectId,
@@ -2081,8 +2640,10 @@ pub struct RevisionDiffOptions {
     pub rev: Option<String>,
     /// Optional Git range expression (`A..B`, `A...B`, or single `<rev>`).
     pub range: Option<String>,
-    /// Optional path / directory / file-ID / hunk-ID filters.
+    /// Optional path / directory / file-ID / hunk-ID filters (including `:!<path>` exclusions).
     pub targets: Vec<String>,
+    /// Optional explicit exclusions (`--exclude <path|glob|f1|h1a>`).
+    pub excludes: Vec<String>,
 }
 
 /// Computes Histogram diffs between two commits/revisions (`A..B`, `A...B`, or `--base`/`--rev`),
@@ -2167,10 +2728,10 @@ pub fn compute_revision_diff(repo: &OzoneRepo, opts: &RevisionDiffOptions) -> Re
     let rhs_tree = commit_tree_id(&gix_repo, rhs_commit_oid)?;
 
     let all_files = diff_commit_trees(&gix_repo, lhs_tree, rhs_tree)?;
-    let files = if opts.targets.is_empty() {
+    let files = if opts.targets.is_empty() && opts.excludes.is_empty() {
         all_files
     } else {
-        filter_changes_by_targets(&all_files, &opts.targets)
+        filter_changes_by_targets_and_excludes(&all_files, &opts.targets, &opts.excludes)?
     };
 
     let total_additions = files.iter().map(|f| f.additions).sum();

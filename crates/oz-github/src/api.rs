@@ -20,7 +20,7 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 const CLIENT_USER_AGENT: &str = concat!("ozone-vcs/", env!("CARGO_PKG_VERSION"));
 
 /// Branch pointer on a GitHub Pull Request (`head` or `base`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubPrRef {
     #[serde(rename = "ref")]
     pub ref_name: String,
@@ -29,8 +29,14 @@ pub struct GitHubPrRef {
     pub label: Option<String>,
 }
 
+/// Minimal GitHub user object embedded in PRs and reviews.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubUser {
+    pub login: String,
+}
+
 /// GitHub Pull Request representation returned by REST endpoints.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubPullRequest {
     pub number: u64,
     #[serde(default)]
@@ -49,6 +55,84 @@ pub struct GitHubPullRequest {
     pub body: Option<String>,
     pub head: GitHubPrRef,
     pub base: GitHubPrRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<GitHubUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Changed file entry returned by `GET /repos/{owner}/{repo}/pulls/{number}/files`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubPullRequestFile {
+    pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_filename: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    #[serde(default)]
+    pub changes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+}
+
+/// Pull request review returned by `GET/POST /repos/{owner}/{repo}/pulls/{number}/reviews`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubPullRequestReview {
+    pub id: u64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<GitHubUser>,
+}
+
+/// Single inline comment entry inside [`CreatePullRequestReviewPayload`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubReviewCommentPayload {
+    pub path: String,
+    pub line: u32,
+    pub side: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<String>,
+    pub body: String,
+}
+
+/// Request body for `POST /repos/{owner}/{repo}/pulls/{number}/reviews`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePullRequestReviewPayload {
+    pub commit_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub event: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<GitHubReviewCommentPayload>,
 }
 
 impl GitHubPullRequest {
@@ -365,6 +449,114 @@ impl GitHubClient {
                 ..Default::default()
             },
         )
+    }
+
+    /// Lists all changed files in a pull request (`GET /repos/{owner}/{repo}/pulls/{number}/files`),
+    /// paginating automatically up to GitHub's 3,000-file limit.
+    pub fn list_pull_request_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GitHubPullRequestFile>> {
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}/files");
+        let mut all = Vec::new();
+        for page in 1u32..=30 {
+            let batch: Vec<GitHubPullRequestFile> = self.get_json_with_query(
+                &path,
+                &[
+                    ("per_page".to_string(), "100".to_string()),
+                    ("page".to_string(), page.to_string()),
+                ],
+            )?;
+            let count = batch.len();
+            all.extend(batch);
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Lists reviews on a pull request (`GET /repos/{owner}/{repo}/pulls/{number}/reviews`).
+    pub fn list_pull_request_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GitHubPullRequestReview>> {
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}/reviews");
+        self.get_json_with_query(&path, &[("per_page".to_string(), "100".to_string())])
+    }
+
+    /// Submits a pull request review (`POST /repos/{owner}/{repo}/pulls/{number}/reviews`).
+    pub fn create_pull_request_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        payload: &CreatePullRequestReviewPayload,
+    ) -> Result<GitHubPullRequestReview> {
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}/reviews");
+        self.send_json(http::Method::POST, &path, payload)
+    }
+
+    /// Fetches raw file bytes at a specific ref/commit via the GitHub Contents API
+    /// (`GET /repos/{owner}/{repo}/contents/{path}?ref={git_ref}`).
+    pub fn get_file_contents_at_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        file_path: &str,
+        git_ref: &str,
+    ) -> Result<Vec<u8>> {
+        let trimmed = file_path
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+        let mut full_url =
+            url::Url::parse(&format!("{}/repos/{owner}/{repo}/contents", self.api_base_url))
+                .map_err(|err| OzError::InvalidUsage {
+                    message: format!("invalid GitHub API URL: {err}"),
+                    recovery: Vec::new(),
+                })?;
+        {
+            let mut segs = full_url.path_segments_mut().map_err(|()| OzError::Other(
+                "failed to encode GitHub contents path".to_string(),
+            ))?;
+            for seg in trimmed.split('/').filter(|s| !s.is_empty()) {
+                segs.push(seg);
+            }
+        }
+        full_url.query_pairs_mut().append_pair("ref", git_ref);
+        let endpoint = full_url.to_string();
+        let label = format!("GET /repos/{owner}/{repo}/contents/{trimmed}?ref={git_ref}");
+        let this = self.clone();
+
+        run_blocking_safe(move || {
+            let http_client = this.build_blocking_client()?;
+            let mut req = http_client
+                .get(&endpoint)
+                .header("Accept", "application/vnd.github.raw+json")
+                .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+                .header("User-Agent", CLIENT_USER_AGENT);
+            if let Some(ref tok) = this.token {
+                req = req.bearer_auth(tok);
+            }
+            let resp = req
+                .send()
+                .map_err(|err| OzError::Other(format!("GitHub API request {label} failed: {err}")))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().unwrap_or_default();
+                return Err(map_http_status_error(status, &label, &body));
+            }
+            let bytes = resp
+                .bytes()
+                .map_err(|err| OzError::Other(format!("failed reading {label} body: {err}")))?;
+            Ok(bytes.to_vec())
+        })
     }
 
     /// Executes a GraphQL query against `<api_base_url>/graphql` (or GHE `/api/graphql`).

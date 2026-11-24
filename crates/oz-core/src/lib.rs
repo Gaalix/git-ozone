@@ -47,19 +47,24 @@ pub use config::{
 pub use daily::{
     BranchCreateOutcome, BranchDeleteOutcome, BranchInfo, BranchListReport, BranchRenameOutcome,
     CherryPickOptions, CherryPickOutcome, LogCommitEntry, LogOptions, LogReport, OZ_STASH_REF,
-    PreparedStashPop, RestoreOptions, RestoreOutcome, RevertOptions, RevertOutcome,
-    RevisionDiffOptions, ShowFileStat, ShowOptions, ShowReport, ShowStatSummary, StashDropOutcome,
+    PreparedStashPop, RestoreOptions, RestoreOutcome, RevParseEntry, RevParseOptions,
+    RevParseReport, RevertOptions, RevertOutcome, RevisionDiffOptions, ShowBlobOptions,
+    ShowBlobReport, ShowFileStat, ShowOptions, ShowReport, ShowStatSummary, StashDropOutcome,
     StashEntryRecord, StashItem, StashListReport, StashPopOutcome, StashPushOutcome,
     TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome, apply_stash_pop,
     branch_create, branch_delete, branch_list, branch_rename, cherry_pick_commit,
-    compute_revision_diff, extract_change_id, log_commits, parse_since_timestamp,
-    parse_stash_selector, prepare_stash_pop, restore_paths, revert_commit, show_commit, stash_drop,
-    stash_list, stash_push, tag_create, tag_delete, tag_list, tag_verify,
+    compute_revision_diff, extract_change_id, format_numbered_blob_lines, log_commits,
+    parse_line_range, parse_rev_path_spec, parse_since_timestamp, parse_stash_selector,
+    prepare_stash_pop, restore_paths, rev_parse, revert_commit, show_blob, show_commit,
+    slice_text_lines, stash_drop, stash_list, stash_push, tag_create, tag_delete, tag_list,
+    tag_verify,
 };
 pub use diff::{
-    BINARY_SNIFF_BYTES, DEFAULT_CONTEXT_LINES, DiffReport, compute_diff,
-    compute_diff_with_overrides, file_id, hunk_id, hunk_suffix, is_binary_bytes,
-    render_file_unified_diff, render_hunk_unified_diff, render_unified_diff,
+    BINARY_SNIFF_BYTES, DEFAULT_CONTEXT_LINES, DiffReport, compute_diff, compute_diff_filtered,
+    compute_diff_with_overrides, file_id, filter_changes_by_targets_and_excludes, hunk_id,
+    hunk_suffix, is_binary_bytes, render_file_unified_diff, render_file_unified_diff_numbered,
+    render_hunk_unified_diff, render_hunk_unified_diff_numbered, render_unified_diff,
+    render_unified_diff_numbered,
 };
 pub use envelope::{
     ConflictEntry, Envelope, EnvelopeError, ExitCode, InteractionInput, InteractionMode,

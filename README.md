@@ -27,7 +27,7 @@ Release archives (`oz`, `git-ozone`, and `oz-vfsd`) are published as static pure
 curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash
 ```
 
-Supports `--version v1.0.0`, `--prefix ~/.local`, and `--dry-run`.
+Supports `--version v1.1.0`, `--prefix ~/.local`, and `--dry-run`.
 
 ### Windows (PowerShell Installer)
 
@@ -35,7 +35,7 @@ Supports `--version v1.0.0`, `--prefix ~/.local`, and `--dry-run`.
 irm https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.ps1 | iex
 ```
 
-Supports `-Version v1.0.0`, `-Prefix "$env:LOCALAPPDATA\Ozone"`, and `-DryRun`. To enable Windows `NTFS` virtualization (`Client-ProjFS`) without rebooting, run `oz setup --enable-projfs`.
+Supports `-Version v1.1.0`, `-Prefix "$env:LOCALAPPDATA\Ozone"`, and `-DryRun`. To enable Windows `NTFS` virtualization (`Client-ProjFS`) without rebooting, run `oz setup --enable-projfs`.
 
 ### Cargo (From GitHub, `cargo-binstall`, or Local Checkout)
 
@@ -55,8 +55,8 @@ cargo install --path crates/oz-vfsd --locked
 
 ```bash
 # Download the latest release .deb (amd64 or arm64) and install with Recommends: fuse3
-curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.0.0/ozone_1.0.0_amd64.deb
-sudo apt install ./ozone_1.0.0_amd64.deb
+curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.1.0/ozone_1.1.0_amd64.deb
+sudo apt install ./ozone_1.1.0_amd64.deb
 ```
 
 For self-hosted APT repository instructions, see [`packaging/deb/apt-repo-setup.md`](packaging/deb/apt-repo-setup.md).
@@ -151,11 +151,11 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 
 | Command | Summary |
 | :--- | :--- |
-| `oz ws <spawn\|list\|rm\|gc>` | Manage isolated CoW/VFS workspaces (`../<repo>.oz/<ws>`) and warm cache LRU GC. |
-| `oz status` | Indexless `O(dirty_files)` status emitting deterministic `[f1]` file and `h1a` hunk IDs. |
-| `oz diff [--base/--rev \| A..B] [TARGETS...]` | Histogram unified diffs (working tree or revision ranges) filtered by file IDs (`f1`), hunk IDs (`h1a`), paths, or `--stat`. |
+| `oz ws <spawn\|list\|rm\|gc>` | Manage isolated CoW/VFS workspaces (`--from`, `--branch`, `--backend`, warm cache LRU GC). |
+| `oz status [--hunks]` | Indexless `O(dirty_files)` status emitting deterministic `[f1]` file and collapsed/full `h1a` hunk IDs. |
+| `oz diff [--base/--rev \| A..B] [--exclude PAT] [--line-numbers] [TARGETS...]` | Histogram unified diffs (working tree or revision ranges) with explicit `old_line`/`new_line`, `--exclude` / `:!<path>`, file/hunk IDs, or `--stat`. |
 | `oz commit -m "..."` | Stage-free commit (`--pick`, `--exclude`, `--amend`, `--no-edit`, `-S/--sign`, `--no-verify`, hooks, guardrails, `Change-Id:`). |
-| `oz log` / `oz show` | Colored commit graph (`--oneline`, `--author`, `--grep`, `-S`/`-G`, `--since`) and commit details (`refs/notes/ai`, `--stat`). |
+| `oz log` / `oz show` / `oz rev-parse` | Commit graph (`--oneline`, `--author`, `--grep`, `-S`/`--pickaxe`, `-G`/`--grep-diff`, `--since`, `-- <paths...>`), commit & `<rev>:<path> --lines` blob inspection, and native `rev-parse`. |
 | `oz stash` | `push` / `pop` / `list` / `drop` backed by MVCC OpLog snapshots so `oz undo` reverses stash operations too. |
 | `oz cherry-pick` / `oz revert` | In-memory cherry-pick & revert with `--no-commit`, `--json`, and OpLog undo support. |
 | `oz branch` / `oz switch` / `oz tag` | Branch list/create/rename/delete, safe branch switching (`-c`/`-d`/`-f`), and tag management with OpLog undo. |
@@ -166,10 +166,10 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz integrate <SOURCES...>` | In-memory 3-way merge into `--into <branch>` with `--verify "<cmd>"` and `_integrate/` sandbox. |
 | `oz resolve <ID \| --all> --take <ours\|theirs\|base>` | Resolve structured conflict IDs (`c1`, `c2`) with optional `--continue`. |
 | `oz stack <status\|rebase>` | Inspect and in-memory rebase stacked branches while preserving `Change-Id:` trailers. |
-| `oz clone` / `oz fetch` / `oz pull` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--ff-only`, `--rebase`, `--atomic`, `--force-with-lease`, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
-| `oz pr <create\|stack>` | Create/update single or cross-linked stacked GitHub Pull Requests. |
+| `oz clone` / `oz fetch` / `oz pull` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--ff-only`, `--rebase`, `--atomic`, `--force-with-lease`, `--watch`, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
+| `oz pr <view\|diff\|read\|review\|create\|stack>` | Inspect PRs, view line-numbered PR diffs, read files at PR head, submit pre-validated inline reviews, and create/update single or stacked PRs. |
 | `oz sync` | Fetch, fast-forward base, retarget stacked PRs, rebase downstream, GC merged workspaces, refresh warm baseline. |
-| `oz ci` | Inspect GitHub Check Runs & compact failing Actions job log excerpts (`--json` for agent self-healing). |
+| `oz ci` | Inspect GitHub Check Runs, watch CI (`--watch --json`), and drill into failing Actions job logs (`--job <id>`). |
 | `oz agent setup` | Install idempotent skills/rules and `oz checkpoint --quiet` hooks for 5 agent harnesses. |
 | `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (11 tools). |
 | `oz blame <PATH>` | Line-level human vs. AI (`refs/notes/ai`) authorship attribution. |

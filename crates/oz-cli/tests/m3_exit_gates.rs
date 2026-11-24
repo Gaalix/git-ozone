@@ -1954,6 +1954,7 @@ fn route_github_api(
                     sha: base_sha,
                     label: Some(format!("{owner}:{base_branch}")),
                 },
+                ..Default::default()
             };
             st.prs.push(pr.clone());
             return (
