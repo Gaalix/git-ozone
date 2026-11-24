@@ -44,7 +44,7 @@ imara-diff = "0.2"
 # HTTP, Compression & Encoding (Pure-Rust / rustls)
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "charset", "http2", "json", "rustls"] }
 flate2 = "1.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.12"
 http = "1"
 url = "2.5"
