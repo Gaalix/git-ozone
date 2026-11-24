@@ -22,11 +22,14 @@ use oz_cow::{
     gc_workspaces, list_workspaces, remove_workspace, select_backend, spawn_workspace,
 };
 use oz_github::{
-    CiQueryOptions, CiReport, CloneOptions, CloneOutcome, DEFAULT_MAX_EXCERPT_LINES, FetchOptions,
-    FetchOutcome, ForceLeaseSpec, HttpAuthScheme, PrCreateOptions, PrCreateOutcome, PrStackOptions,
-    PrStackOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, SyncOptions,
-    SyncOutcome, clone_repo, fetch_remote, pr_create, pr_stack, pull_current_branch,
-    push_refs_with_options, query_ci_status, sync_repo,
+    CiJobLogOptions, CiJobLogReport, CiQueryOptions, CiReport, CiWatchEvent, CiWatchOptions,
+    CiWatchOutcome, CloneOptions, CloneOutcome, DEFAULT_MAX_EXCERPT_LINES,
+    DEFAULT_WATCH_STARTUP_TIMEOUT_SECS, DEFAULT_WATCH_TIMEOUT_SECS, FetchOptions, FetchOutcome,
+    ForceLeaseSpec, HttpAuthScheme, MAX_MCP_WAIT_SECONDS, PrCreateOptions, PrCreateOutcome,
+    PrStackOptions, PrStackOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions,
+    PushOutcome, SyncOptions, SyncOutcome, clone_repo, fetch_remote, pr_create, pr_stack,
+    pull_current_branch, push_refs_with_options, query_ci_job_log, query_ci_status, sync_repo,
+    watch_ci_status,
 };
 use oz_integrate::{
     AbortOutcome, CollisionSeverity, ContinueOutcome, IntegrateOptions, IntegrateOutcome,
@@ -43,7 +46,7 @@ use oz_warm::{BaselineSource, gc_baselines};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Workspace lifecycle subcommands (`oz ws ...`).
 #[derive(Debug, Subcommand)]
@@ -378,6 +381,41 @@ pub struct PushArgs {
     /// Bypass `pre-push` verification hooks.
     #[arg(long = "no-verify")]
     pub no_verify: bool,
+    /// Watch GitHub CI checks for the pushed commit until pass, fail-fast, or timeout.
+    #[arg(short = 'w', long = "watch")]
+    pub watch: bool,
+    /// Exit immediately on the first failing CI check when `--watch` is enabled (default).
+    #[arg(long = "fail-fast")]
+    pub fail_fast: bool,
+    /// Wait for every watched CI check to complete even after a failure (requires `--watch`).
+    #[arg(long = "wait-all")]
+    pub wait_all: bool,
+    /// Overall CI watch timeout in seconds (default: 1800).
+    #[arg(
+        long = "timeout",
+        default_value_t = DEFAULT_WATCH_TIMEOUT_SECS,
+        value_name = "SECS"
+    )]
+    pub timeout: u64,
+    /// Grace period in seconds waiting for GitHub to register checks after push (default: 45).
+    #[arg(
+        long = "startup-timeout",
+        default_value_t = DEFAULT_WATCH_STARTUP_TIMEOUT_SECS,
+        value_name = "SECS"
+    )]
+    pub startup_timeout: u64,
+    /// Optional fixed CI polling interval in seconds (defaults to adaptive 5s..30s backoff).
+    #[arg(long = "interval", value_name = "SECS")]
+    pub interval: Option<u64>,
+    /// Only watch CI checks matching this name substring or glob pattern (repeatable).
+    #[arg(long = "check", value_name = "PATTERN")]
+    pub checks: Vec<String>,
+    /// Ignore CI checks matching this name substring or glob pattern (repeatable).
+    #[arg(long = "ignore-check", value_name = "PATTERN")]
+    pub ignore_checks: Vec<String>,
+    /// Stream compact CI state-transition updates to stderr while watching.
+    #[arg(long = "progress")]
+    pub progress: bool,
 }
 
 /// Pull request subcommands (`oz pr ...`).
@@ -478,6 +516,50 @@ pub struct CiArgs {
     /// Remote name (defaults to `origin`).
     #[arg(long = "remote", value_name = "REMOTE")]
     pub remote: Option<String>,
+    /// Block and watch CI checks until pass, fail-fast, superseded, or timeout.
+    #[arg(short = 'w', long = "watch")]
+    pub watch: bool,
+    /// Exit immediately on the first failing check when `--watch` is enabled (default).
+    #[arg(long = "fail-fast")]
+    pub fail_fast: bool,
+    /// Wait for every watched check to finish even after a failure (requires `--watch`).
+    #[arg(long = "wait-all")]
+    pub wait_all: bool,
+    /// Overall watch timeout in seconds (default: 1800).
+    #[arg(
+        long = "timeout",
+        default_value_t = DEFAULT_WATCH_TIMEOUT_SECS,
+        value_name = "SECS"
+    )]
+    pub timeout: u64,
+    /// Startup grace period in seconds waiting for checks to appear (default: 45).
+    #[arg(
+        long = "startup-timeout",
+        default_value_t = DEFAULT_WATCH_STARTUP_TIMEOUT_SECS,
+        value_name = "SECS"
+    )]
+    pub startup_timeout: u64,
+    /// Optional fixed polling interval in seconds (defaults to adaptive 5s..30s backoff).
+    #[arg(long = "interval", value_name = "SECS")]
+    pub interval: Option<u64>,
+    /// Only include/watch checks matching this name substring or glob pattern (repeatable).
+    #[arg(long = "check", value_name = "PATTERN")]
+    pub checks: Vec<String>,
+    /// Ignore checks matching this name substring or glob pattern (repeatable).
+    #[arg(long = "ignore-check", value_name = "PATTERN")]
+    pub ignore_checks: Vec<String>,
+    /// Stream compact state-transition lines to stderr while watching (auto-enabled on interactive TTY).
+    #[arg(long = "progress")]
+    pub progress: bool,
+    /// Fetch logs directly for a single GitHub Actions job ID (mutually exclusive with `--watch`).
+    #[arg(long = "job", value_name = "JOB_ID")]
+    pub job: Option<u64>,
+    /// Optional step name filter when inspecting a job with `--job`.
+    #[arg(long = "step", value_name = "STEP_NAME")]
+    pub step: Option<String>,
+    /// Return cleaned tail lines instead of error-anchor excerpts (used with `--job`).
+    #[arg(long = "raw")]
+    pub raw: bool,
 }
 
 /// Coding agent ecosystem subcommands (`oz agent ...`).
@@ -2142,7 +2224,28 @@ pub(crate) fn handle_push(
     directory: Option<&Path>,
     mode: InteractionMode,
 ) -> ExitCode {
-    let res = (|| -> Result<Envelope<PushOutcome>> {
+    if args.watch && args.delete {
+        let err = OzError::InvalidUsage {
+            message: "cannot combine `--watch` with `--delete` on `oz push`".to_string(),
+            recovery: vec![
+                "oz push --delete <branch>".to_string(),
+                "oz push --watch --json".to_string(),
+            ],
+        };
+        return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {});
+    }
+    if args.fail_fast && args.wait_all {
+        let err = OzError::InvalidUsage {
+            message: "cannot pass both `--fail-fast` and `--wait-all` to `oz push`".to_string(),
+            recovery: vec![
+                "oz push --watch --json".to_string(),
+                "oz push --watch --wait-all --json".to_string(),
+            ],
+        };
+        return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {});
+    }
+
+    let push_res = (|| -> Result<(OzoneRepo, PushOutcome)> {
         let repo = discover_and_recover_repo(directory, false)?;
         let actor = actor_from_mode(mode, &repo);
 
@@ -2169,22 +2272,65 @@ pub(crate) fn handle_push(
             auth_scheme: HttpAuthScheme::BasicToken,
         };
 
-        let outcome = push_refs_with_options(&repo, &opts, args.no_verify, &[], actor)?;
-        let op_id = outcome.op_id.clone();
+        let mut outcome = push_refs_with_options(&repo, &opts, args.no_verify, &[], actor)?;
 
-        let mut env = Envelope::success(outcome)
-            .with_workspace(repo.workspace)
-            .with_branch(repo.branch)
-            .with_head_oid(repo.head_oid);
-        if let Some(id) = op_id {
-            env = env
-                .with_op_id(id.clone())
-                .with_recovery_command(format!("oz undo {id}"));
+        if args.watch {
+            let target_ref = select_pushed_ci_target(&repo, &outcome);
+            let emit_progress =
+                args.progress || (mode.stdout_is_tty && !mode.json && !mode.non_interactive);
+            let watch_opts = CiWatchOptions {
+                query: CiQueryOptions {
+                    target_ref,
+                    pr_number: None,
+                    remote: args.remote.clone(),
+                    max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
+                    include_checks: args.checks.clone(),
+                    ignore_checks: args.ignore_checks.clone(),
+                    auth_token: None,
+                    api_url: None,
+                },
+                fail_fast: !args.wait_all,
+                timeout: Duration::from_secs(args.timeout),
+                startup_timeout: Duration::from_secs(args.startup_timeout),
+                poll_interval: resolve_ci_poll_interval(args.interval),
+            };
+            let ci_report = watch_ci_status(&repo, &watch_opts, |ev| {
+                if emit_progress {
+                    render_watch_progress_event(&ev);
+                }
+            })?;
+            outcome.ci = Some(ci_report);
         }
-        Ok(env)
+
+        Ok((repo, outcome))
     })();
 
-    render_command_result(mode, res, |env| {
+    let (repo, outcome) = match push_res {
+        Ok(pair) => pair,
+        Err(err) => return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {}),
+    };
+
+    let op_id = outcome.op_id.clone();
+    let ci_snapshot = outcome.ci.clone();
+    let mut env = Envelope::success(outcome)
+        .with_workspace(repo.workspace)
+        .with_branch(repo.branch)
+        .with_head_oid(repo.head_oid);
+    if let Some(id) = op_id {
+        env = env
+            .with_op_id(id.clone())
+            .with_recovery_command(format!("oz undo {id}"));
+    }
+
+    let exit_code = if let Some(ref ci_report) = ci_snapshot {
+        apply_ci_report_to_envelope(&mut env, ci_report)
+    } else {
+        ExitCode::Success
+    };
+
+    if mode.json {
+        print_json_envelope(&env);
+    } else {
         let d = &env.data;
         println!(
             "Pushed {} ref(s) to '{}' ({} objects, {} bytes)",
@@ -2210,7 +2356,36 @@ pub(crate) fn handle_push(
                 );
             }
         }
-    })
+        if let Some(ref ci_report) = d.ci {
+            render_ci_report_human(ci_report);
+        }
+    }
+
+    exit_code
+}
+
+fn select_pushed_ci_target(repo: &OzoneRepo, outcome: &PushOutcome) -> Option<String> {
+    if let Some(ref active_branch) = repo.branch {
+        let expected_remote = format!("refs/heads/{active_branch}");
+        if let Some(pushed) = outcome
+            .pushed_refs
+            .iter()
+            .find(|r| !r.deleted && r.remote_ref == expected_remote)
+        {
+            return pushed
+                .new_oid
+                .clone()
+                .or_else(|| Some(active_branch.clone()));
+        }
+    }
+    if let Some(pushed) = outcome
+        .pushed_refs
+        .iter()
+        .find(|r| !r.deleted && r.new_oid.is_some())
+    {
+        return pushed.new_oid.clone();
+    }
+    repo.branch.clone().or_else(|| repo.head_oid.clone())
 }
 
 pub(crate) fn handle_pr(
@@ -2393,31 +2568,98 @@ pub(crate) fn handle_ci(
         };
         return render_command_result::<CiReport, _>(mode, Err(err), |_| {});
     }
+    if args.fail_fast && args.wait_all {
+        let err = OzError::InvalidUsage {
+            message: "cannot pass both `--fail-fast` and `--wait-all` to `oz ci`".to_string(),
+            recovery: vec![
+                "oz ci --watch --json".to_string(),
+                "oz ci --watch --wait-all --json".to_string(),
+            ],
+        };
+        return render_command_result::<CiReport, _>(mode, Err(err), |_| {});
+    }
+    if args.job.is_some() && args.watch {
+        let err = OzError::InvalidUsage {
+            message: "cannot combine `--job` with `--watch` on `oz ci`".to_string(),
+            recovery: vec![
+                "oz ci --job <id> --max-excerpt-lines 150 --json".to_string(),
+                "oz ci --watch --json".to_string(),
+            ],
+        };
+        return render_command_result::<CiReport, _>(mode, Err(err), |_| {});
+    }
+
+    // Direct single-job log drill-down (`oz ci --job <id>`).
+    if let Some(job_id) = args.job {
+        let job_res = (|| -> Result<Envelope<CiJobLogReport>> {
+            let repo = discover_and_recover_repo(directory, false)?;
+            let opts = CiJobLogOptions {
+                job_id,
+                step: args.step.clone(),
+                max_excerpt_lines: args.max_excerpt_lines,
+                raw: args.raw,
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            };
+            let report = query_ci_job_log(&repo, &opts)?;
+            Ok(Envelope::success(report)
+                .with_workspace(repo.workspace)
+                .with_branch(repo.branch)
+                .with_head_oid(repo.head_oid))
+        })();
+
+        return render_command_result(mode, job_res, |env| {
+            let d = &env.data;
+            let conc = d.conclusion.as_deref().unwrap_or(&d.status);
+            println!("CI job {} ({}) [{}]", d.job_id, d.name, conc);
+            if let Some(ref step) = d.selected_step.as_ref().or(d.failing_step.as_ref()) {
+                println!("  step: {step}");
+            }
+            if let Some(ref excerpt) = d.log_excerpt {
+                for line in excerpt.lines() {
+                    println!("    {line}");
+                }
+            }
+        });
+    }
 
     let query_res = (|| -> Result<(OzoneRepo, CiReport)> {
         let repo = discover_and_recover_repo(directory, false)?;
-        let opts = CiQueryOptions {
+        let query_opts = CiQueryOptions {
             target_ref: args.target_ref.clone().or_else(|| args.branch.clone()),
             pr_number: args.pr,
             remote: args.remote.clone(),
             max_excerpt_lines: args.max_excerpt_lines,
+            include_checks: args.checks.clone(),
+            ignore_checks: args.ignore_checks.clone(),
             auth_token: None,
             api_url: None,
         };
-        let report = query_ci_status(&repo, &opts)?;
+        let report = if args.watch {
+            let emit_progress =
+                args.progress || (mode.stdout_is_tty && !mode.json && !mode.non_interactive);
+            let watch_opts = CiWatchOptions {
+                query: query_opts,
+                fail_fast: !args.wait_all,
+                timeout: Duration::from_secs(args.timeout),
+                startup_timeout: Duration::from_secs(args.startup_timeout),
+                poll_interval: resolve_ci_poll_interval(args.interval),
+            };
+            watch_ci_status(&repo, &watch_opts, |ev| {
+                if emit_progress {
+                    render_watch_progress_event(&ev);
+                }
+            })?
+        } else {
+            query_ci_status(&repo, &query_opts)?
+        };
         Ok((repo, report))
     })();
 
     let (repo, report) = match query_res {
         Ok(pair) => pair,
         Err(err) => return render_command_result::<CiReport, _>(mode, Err(err), |_| {}),
-    };
-
-    let has_failures = report.failing_count > 0;
-    let exit_code = if has_failures {
-        ExitCode::ConflictOrCheckFail
-    } else {
-        ExitCode::Success
     };
 
     let branch = (!report.ref_name.is_empty())
@@ -2427,15 +2669,119 @@ pub(crate) fn handle_ci(
         .then(|| report.commit_sha.clone())
         .or(repo.head_oid);
 
+    let report_snapshot = report.clone();
     let mut env = Envelope::success(report)
         .with_workspace(repo.workspace)
         .with_branch(branch)
         .with_head_oid(head_oid);
 
-    if has_failures {
+    let exit_code = apply_ci_report_to_envelope(&mut env, &report_snapshot);
+
+    if mode.json {
+        print_json_envelope(&env);
+    } else {
+        render_ci_report_human(&env.data);
+    }
+
+    exit_code
+}
+
+fn resolve_ci_poll_interval(interval_secs: Option<u64>) -> Option<Duration> {
+    if let Some(secs) = interval_secs {
+        return Some(Duration::from_secs(secs.max(1)));
+    }
+    std::env::var("OZ_CI_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
+fn apply_ci_report_to_envelope<T>(env: &mut Envelope<T>, report: &CiReport) -> ExitCode {
+    if let Some(ref watch) = report.watch {
+        match watch.outcome {
+            CiWatchOutcome::Passed => return ExitCode::Success,
+            CiWatchOutcome::FailedFast | CiWatchOutcome::Failed => {
+                let exit_code = ExitCode::ConflictOrCheckFail;
+                let suffix = if watch.stopped_early {
+                    format!(" (fail-fast; {} still pending)", report.pending_count)
+                } else {
+                    String::new()
+                };
+                let msg = format!(
+                    "{} of {} CI check(s) failing on {}{suffix}",
+                    report.failing_count, report.total_count, report.ref_name
+                );
+                env.ok = false;
+                env.error = Some(EnvelopeError {
+                    code: "check_failed".to_string(),
+                    exit_code: exit_code.as_i32(),
+                    message: msg,
+                });
+                append_ci_failure_recovery(env, report);
+                return exit_code;
+            }
+            CiWatchOutcome::TimedOut => {
+                let exit_code = ExitCode::ConflictOrCheckFail;
+                let msg = format!(
+                    "CI watch timed out after {}s on {} ({} pending, {} failing)",
+                    watch.elapsed_secs,
+                    report.ref_name,
+                    report.pending_count,
+                    report.failing_count
+                );
+                env.ok = false;
+                env.error = Some(EnvelopeError {
+                    code: "watch_timed_out".to_string(),
+                    exit_code: exit_code.as_i32(),
+                    message: msg,
+                });
+                env.recovery_commands.push("oz ci --watch --json".to_string());
+                return exit_code;
+            }
+            CiWatchOutcome::NoChecksTimedOut => {
+                let exit_code = ExitCode::ConflictOrCheckFail;
+                let msg = format!(
+                    "no CI checks registered for {} after {}s",
+                    report.ref_name, watch.elapsed_secs
+                );
+                env.ok = false;
+                env.error = Some(EnvelopeError {
+                    code: "no_checks_timed_out".to_string(),
+                    exit_code: exit_code.as_i32(),
+                    message: msg,
+                });
+                env.recovery_commands.push("oz ci --json".to_string());
+                return exit_code;
+            }
+            CiWatchOutcome::Superseded => {
+                let exit_code = ExitCode::ConflictOrCheckFail;
+                let newer = watch
+                    .superseded_by_sha
+                    .as_deref()
+                    .map(|s| &s[..s.len().min(10)])
+                    .unwrap_or("newer commit");
+                let msg = format!(
+                    "CI watch on {} was superseded by {newer}",
+                    report.ref_name
+                );
+                env.ok = false;
+                env.error = Some(EnvelopeError {
+                    code: "watch_superseded".to_string(),
+                    exit_code: exit_code.as_i32(),
+                    message: msg,
+                });
+                env.recovery_commands.push("oz ci --watch --json".to_string());
+                return exit_code;
+            }
+        }
+    }
+
+    if report.failing_count > 0 {
+        let exit_code = ExitCode::ConflictOrCheckFail;
         let msg = format!(
             "{} of {} CI check(s) failing on {}",
-            env.data.failing_count, env.data.total_count, env.data.ref_name
+            report.failing_count, report.total_count, report.ref_name
         );
         env.ok = false;
         env.error = Some(EnvelopeError {
@@ -2443,36 +2789,116 @@ pub(crate) fn handle_ci(
             exit_code: exit_code.as_i32(),
             message: msg,
         });
-        env = env
-            .with_recovery_command("oz status --json")
-            .with_recovery_command("oz commit --amend")
-            .with_recovery_command("oz push --force-with-lease");
-    }
-
-    if mode.json {
-        print_json_envelope(&env);
+        append_ci_failure_recovery(env, report);
+        exit_code
     } else {
-        let d = &env.data;
-        let short_sha = &d.commit_sha[..d.commit_sha.len().min(10)];
+        ExitCode::Success
+    }
+}
+
+fn append_ci_failure_recovery<T>(env: &mut Envelope<T>, report: &CiReport) {
+    if let Some(job_id) = report
+        .checks
+        .iter()
+        .find(|c| c.log_excerpt.is_some() || c.failing_step.is_some())
+        .and_then(|c| c.job_id)
+    {
+        env.recovery_commands
+            .push(format!("oz ci --job {job_id} --max-excerpt-lines 150 --json"));
+    }
+    env.recovery_commands.push("oz status --json".to_string());
+    env.recovery_commands.push("oz commit --amend".to_string());
+    env.recovery_commands
+        .push("oz push --force-with-lease --watch".to_string());
+}
+
+fn render_watch_progress_event(event: &CiWatchEvent) {
+    match event {
+        CiWatchEvent::WaitingForChecks {
+            ref_name,
+            commit_sha,
+            ..
+        } => {
+            let short = &commit_sha[..commit_sha.len().min(10)];
+            eprintln!("oz ci: waiting for checks on {ref_name} ({short})...");
+        }
+        CiWatchEvent::CheckUpdated {
+            name,
+            status,
+            conclusion,
+            failing_step,
+        } => {
+            let state = conclusion.as_deref().unwrap_or(status.as_str());
+            if let Some(step) = failing_step {
+                eprintln!("oz ci: [{state}] {name} (step: {step})");
+            } else {
+                eprintln!("oz ci: [{state}] {name}");
+            }
+        }
+        CiWatchEvent::RateLimited { retry_after_secs } => {
+            eprintln!("oz ci: GitHub API rate limited; backing off {retry_after_secs}s...");
+        }
+        CiWatchEvent::Superseded { old_sha, new_sha } => {
+            let old_s = &old_sha[..old_sha.len().min(10)];
+            let new_s = &new_sha[..new_sha.len().min(10)];
+            eprintln!("oz ci: commit {old_s} superseded by {new_s}");
+        }
+        CiWatchEvent::Completed {
+            outcome,
+            elapsed_secs,
+            total_count,
+            failing_count,
+            pending_count,
+        } => {
+            eprintln!(
+                "oz ci: {} in {}s ({} total, {} failing, {} pending)",
+                outcome.as_str(),
+                elapsed_secs,
+                total_count,
+                failing_count,
+                pending_count
+            );
+        }
+    }
+}
+
+fn render_ci_report_human(d: &CiReport) {
+    let short_sha = &d.commit_sha[..d.commit_sha.len().min(10)];
+    if let Some(ref w) = d.watch {
+        println!(
+            "CI watch for {} ({short_sha}): {} in {}s ({} total, {} failing, {} pending)",
+            d.ref_name,
+            w.outcome.as_str(),
+            w.elapsed_secs,
+            d.total_count,
+            d.failing_count,
+            d.pending_count
+        );
+        if let Some(ref newer) = w.superseded_by_sha {
+            println!("  superseded by: {}", &newer[..newer.len().min(10)]);
+        }
+    } else {
         println!(
             "CI status for {} ({short_sha}): {} ({} total, {} failing, {} pending)",
             d.ref_name, d.overall_status, d.total_count, d.failing_count, d.pending_count
         );
-        for check in &d.checks {
-            let conc = check.conclusion.as_deref().unwrap_or(&check.status);
+    }
+    for check in &d.checks {
+        let conc = check.conclusion.as_deref().unwrap_or(&check.status);
+        if let Some(jid) = check.job_id {
+            println!("  [{}] {} (job {})", conc, check.name, jid);
+        } else {
             println!("  [{}] {}", conc, check.name);
-            if let Some(ref step) = check.failing_step {
-                println!("    failing step: {step}");
-            }
-            if let Some(ref excerpt) = check.log_excerpt {
-                for line in excerpt.lines() {
-                    println!("      {line}");
-                }
+        }
+        if let Some(ref step) = check.failing_step {
+            println!("    failing step: {step}");
+        }
+        if let Some(ref excerpt) = check.log_excerpt {
+            for line in excerpt.lines() {
+                println!("      {line}");
             }
         }
     }
-
-    exit_code
 }
 
 pub(crate) fn handle_agent(
@@ -2565,6 +2991,61 @@ fn handle_agent_setup(
 #[must_use]
 pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -> McpServer {
     let mut server = McpServer::new(root_dir).with_ci_provider_fn(|repo, req| {
+        let max_lines = req
+            .max_excerpt_lines
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_EXCERPT_LINES);
+
+        // Single-job drill-down (`job_id` provided).
+        if let Some(job_id) = req.job_id {
+            let job_report = query_ci_job_log(
+                repo,
+                &CiJobLogOptions {
+                    job_id,
+                    step: req.step.clone(),
+                    max_excerpt_lines: max_lines,
+                    raw: req.raw,
+                    remote: None,
+                    auth_token: None,
+                    api_url: None,
+                },
+            )?;
+            let is_failing = matches!(
+                job_report.conclusion.as_deref(),
+                Some("failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure")
+            );
+            let is_pending = job_report.status != "completed";
+            let overall = if is_failing {
+                "failing"
+            } else if is_pending {
+                "pending"
+            } else {
+                "passing"
+            };
+            return Ok(CiLogsReport {
+                branch: req.branch.clone().or_else(|| repo.branch.clone()),
+                commit_oid: req.commit_oid.clone().or_else(|| repo.head_oid.clone()),
+                all_passed: !is_failing && !is_pending,
+                overall_status: Some(overall.to_string()),
+                failing_count: Some(usize::from(is_failing)),
+                pending_count: Some(usize::from(is_pending)),
+                watch_outcome: None,
+                elapsed_secs: None,
+                superseded_by_sha: None,
+                recommended_poll_secs: None,
+                checks: vec![CiLogEntry {
+                    name: job_report.name,
+                    status: job_report.status,
+                    conclusion: job_report.conclusion,
+                    failing_step: job_report.selected_step.or(job_report.failing_step),
+                    log_excerpt: job_report.log_excerpt,
+                    job_id: Some(job_report.job_id),
+                    run_id: job_report.run_id,
+                    html_url: job_report.html_url,
+                }],
+            });
+        }
+
         let explicit_commit_override = req
             .commit_oid
             .as_deref()
@@ -2574,18 +3055,36 @@ pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -
             .or_else(|| req.branch.clone())
             .or_else(|| req.commit_oid.clone());
 
-        let ci_report = query_ci_status(
-            repo,
-            &CiQueryOptions {
-                target_ref,
-                pr_number: req.pr_number,
-                remote: None,
-                max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
-                auth_token: None,
-                api_url: None,
-            },
-        )?;
+        let query_opts = CiQueryOptions {
+            target_ref,
+            pr_number: req.pr_number,
+            remote: None,
+            max_excerpt_lines: max_lines,
+            include_checks: req.check_filter.clone(),
+            ignore_checks: req.ignore_checks.clone(),
+            auth_token: None,
+            api_url: None,
+        };
 
+        let wait_secs = req.wait_seconds.unwrap_or(0).min(MAX_MCP_WAIT_SECONDS);
+        let ci_report = if wait_secs > 0 {
+            let startup_secs = req
+                .startup_timeout_seconds
+                .unwrap_or(30)
+                .min(wait_secs);
+            let watch_opts = CiWatchOptions {
+                query: query_opts,
+                fail_fast: req.fail_fast.unwrap_or(true),
+                timeout: Duration::from_secs(wait_secs),
+                startup_timeout: Duration::from_secs(startup_secs),
+                poll_interval: resolve_ci_poll_interval(None),
+            };
+            watch_ci_status(repo, &watch_opts, |_| {})?
+        } else {
+            query_ci_status(repo, &query_opts)?
+        };
+
+        let watch_meta = ci_report.watch;
         let checks = ci_report
             .checks
             .into_iter()
@@ -2611,6 +3110,9 @@ pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -
                 conclusion: c.conclusion,
                 failing_step: c.failing_step,
                 log_excerpt: c.log_excerpt,
+                job_id: c.job_id,
+                run_id: c.run_id,
+                html_url: c.html_url,
             })
             .collect();
 
@@ -2618,6 +3120,13 @@ pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -
             branch: (!ci_report.ref_name.is_empty()).then_some(ci_report.ref_name),
             commit_oid: (!ci_report.commit_sha.is_empty()).then_some(ci_report.commit_sha),
             all_passed: ci_report.all_passed,
+            overall_status: Some(ci_report.overall_status),
+            failing_count: Some(ci_report.failing_count),
+            pending_count: Some(ci_report.pending_count),
+            watch_outcome: watch_meta.as_ref().map(|w| w.outcome.as_str().to_string()),
+            elapsed_secs: watch_meta.as_ref().map(|w| w.elapsed_secs),
+            superseded_by_sha: watch_meta.as_ref().and_then(|w| w.superseded_by_sha.clone()),
+            recommended_poll_secs: watch_meta.as_ref().and_then(|w| w.recommended_poll_secs),
             checks,
         })
     });

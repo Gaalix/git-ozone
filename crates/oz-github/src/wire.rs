@@ -251,6 +251,8 @@ pub struct PushOutcome {
     pub upstream_configured: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub op_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<crate::CiReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -1324,6 +1326,7 @@ fn push_refs_blocking(
         pushed_refs,
         upstream_configured,
         op_id: Some(op_entry.op_id),
+        ci: None,
     })
 }
 

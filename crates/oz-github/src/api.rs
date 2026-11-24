@@ -160,6 +160,27 @@ struct ActionsJobsEnvelope {
     jobs: Vec<GitHubActionsJob>,
 }
 
+/// Outcome of a conditional HTTP GET supporting `If-None-Match` / `ETag` and rate-limit backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalGet<T> {
+    /// Server returned `304 Not Modified` (zero GitHub REST rate-limit cost).
+    NotModified {
+        etag: Option<String>,
+        retry_after_secs: Option<u64>,
+    },
+    /// Server returned `200 OK` with a fresh JSON body and optional `ETag`.
+    Modified {
+        value: T,
+        etag: Option<String>,
+        retry_after_secs: Option<u64>,
+    },
+    /// Server returned `429` or rate-limited `403` with a suggested backoff duration.
+    RateLimited {
+        retry_after_secs: u64,
+        message: String,
+    },
+}
+
 /// Pure-Rust GitHub API client supporting both blocking and async callers safely.
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
@@ -276,6 +297,18 @@ impl GitHubClient {
         self.get_json_with_query(&path, &[])
     }
 
+    /// Conditionally fetches a single pull request with `If-None-Match` (`ETag`) support.
+    pub fn get_pull_request_conditional(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalGet<GitHubPullRequest>> {
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}");
+        self.get_json_conditional(&path, &[], if_none_match)
+    }
+
     /// Creates a new pull request (`POST /repos/{owner}/{repo}/pulls`).
     pub fn create_pull_request(
         &self,
@@ -386,6 +419,23 @@ impl GitHubClient {
         Ok(env.check_runs)
     }
 
+    /// Conditionally lists commit check-runs with `If-None-Match` (`ETag`) support.
+    pub fn list_check_runs_for_ref_conditional(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalGet<Vec<GitHubCheckRun>>> {
+        let encoded_ref = encode_path_segment(git_ref);
+        let path = format!("/repos/{owner}/{repo}/commits/{encoded_ref}/check-runs");
+        let params = vec![("per_page".to_string(), "100".to_string())];
+        Ok(map_conditional(
+            self.get_json_conditional::<CheckRunsEnvelope>(&path, &params, if_none_match)?,
+            |env| env.check_runs,
+        ))
+    }
+
     /// Lists GitHub Actions workflow runs (`GET /repos/{owner}/{repo}/actions/runs`).
     pub fn list_workflow_runs(
         &self,
@@ -406,6 +456,29 @@ impl GitHubClient {
         Ok(env.workflow_runs)
     }
 
+    /// Conditionally lists GitHub Actions workflow runs with `If-None-Match` (`ETag`) support.
+    pub fn list_workflow_runs_conditional(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: Option<&str>,
+        head_sha: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalGet<Vec<GitHubWorkflowRun>>> {
+        let mut params = vec![("per_page".to_string(), "30".to_string())];
+        if let Some(br) = branch {
+            params.push(("branch".to_string(), br.to_string()));
+        }
+        if let Some(sha) = head_sha {
+            params.push(("head_sha".to_string(), sha.to_string()));
+        }
+        let path = format!("/repos/{owner}/{repo}/actions/runs");
+        Ok(map_conditional(
+            self.get_json_conditional::<WorkflowRunsEnvelope>(&path, &params, if_none_match)?,
+            |env| env.workflow_runs,
+        ))
+    }
+
     /// Lists jobs for a GitHub Actions workflow run (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`).
     pub fn list_jobs_for_workflow_run(
         &self,
@@ -417,6 +490,22 @@ impl GitHubClient {
         let params = vec![("per_page".to_string(), "100".to_string())];
         let env: ActionsJobsEnvelope = self.get_json_with_query(&path, &params)?;
         Ok(env.jobs)
+    }
+
+    /// Conditionally lists jobs for a workflow run with `If-None-Match` (`ETag`) support.
+    pub fn list_jobs_for_workflow_run_conditional(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalGet<Vec<GitHubActionsJob>>> {
+        let path = format!("/repos/{owner}/{repo}/actions/runs/{run_id}/jobs");
+        let params = vec![("per_page".to_string(), "100".to_string())];
+        Ok(map_conditional(
+            self.get_json_conditional::<ActionsJobsEnvelope>(&path, &params, if_none_match)?,
+            |env| env.jobs,
+        ))
     }
 
     /// Fetches a single GitHub Actions job (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`).
@@ -507,6 +596,113 @@ impl GitHubClient {
                 .send()
                 .map_err(|err| OzError::Other(format!("GitHub API request {label} failed: {err}")))?;
             decode_json_response(resp, &label)
+        })
+    }
+
+    fn get_json_conditional<T>(
+        &self,
+        path: &str,
+        query_params: &[(String, String)],
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalGet<T>>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        let mut full_url = url::Url::parse(&format!("{}{path}", self.api_base_url)).map_err(|err| {
+            OzError::InvalidUsage {
+                message: format!("invalid GitHub API URL '{}{path}': {err}", self.api_base_url),
+                recovery: Vec::new(),
+            }
+        })?;
+        if !query_params.is_empty() {
+            let mut pairs = full_url.query_pairs_mut();
+            for (k, v) in query_params {
+                pairs.append_pair(k, v);
+            }
+        }
+        let endpoint = full_url.to_string();
+        let label = format!("GET {path}");
+        let inm = if_none_match
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let this = self.clone();
+
+        run_blocking_safe(move || {
+            let http_client = this.build_blocking_client()?;
+            let mut req = http_client
+                .get(&endpoint)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+                .header("User-Agent", CLIENT_USER_AGENT);
+            if let Some(ref tok) = this.token {
+                req = req.bearer_auth(tok);
+            }
+            if let Some(ref etag) = inm {
+                req = req.header("If-None-Match", etag);
+            }
+            let resp = req
+                .send()
+                .map_err(|err| OzError::Other(format!("GitHub API request {label} failed: {err}")))?;
+
+            let status = resp.status();
+            let etag = resp
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let retry_after = parse_rate_limit_backoff_secs(resp.headers());
+
+            if status == StatusCode::NOT_MODIFIED {
+                return Ok(ConditionalGet::NotModified {
+                    etag: etag.or(inm),
+                    retry_after_secs: retry_after,
+                });
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS
+                || (status == StatusCode::FORBIDDEN && is_rate_limited_headers(resp.headers()))
+            {
+                let raw = resp.text().unwrap_or_default();
+                let wait = retry_after.unwrap_or(30);
+                return Ok(ConditionalGet::RateLimited {
+                    retry_after_secs: wait,
+                    message: format!(
+                        "GitHub API rate limited ({status}) on {label}: {}",
+                        truncate_str(raw.trim(), 160)
+                    ),
+                });
+            }
+
+            let raw = resp.text().map_err(|err| {
+                OzError::Other(format!("failed reading {label} response body: {err}"))
+            })?;
+            if !status.is_success() {
+                if status == StatusCode::FORBIDDEN
+                    && raw.to_ascii_lowercase().contains("rate limit")
+                {
+                    return Ok(ConditionalGet::RateLimited {
+                        retry_after_secs: retry_after.unwrap_or(30),
+                        message: format!(
+                            "GitHub API rate limited ({status}) on {label}: {}",
+                            truncate_str(raw.trim(), 160)
+                        ),
+                    });
+                }
+                return Err(map_http_status_error(status, &label, &raw));
+            }
+
+            let value: T = serde_json::from_str(&raw).map_err(|err| {
+                OzError::Other(format!(
+                    "failed parsing JSON response from {label}: {err} (body: {})",
+                    truncate_str(&raw, 240)
+                ))
+            })?;
+            Ok(ConditionalGet::Modified {
+                value,
+                etag,
+                retry_after_secs: retry_after,
+            })
         })
     }
 
@@ -610,4 +806,72 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     } else {
         prefix
     }
+}
+
+fn map_conditional<T, U>(resp: ConditionalGet<T>, f: impl FnOnce(T) -> U) -> ConditionalGet<U> {
+    match resp {
+        ConditionalGet::NotModified {
+            etag,
+            retry_after_secs,
+        } => ConditionalGet::NotModified {
+            etag,
+            retry_after_secs,
+        },
+        ConditionalGet::Modified {
+            value,
+            etag,
+            retry_after_secs,
+        } => ConditionalGet::Modified {
+            value: f(value),
+            etag,
+            retry_after_secs,
+        },
+        ConditionalGet::RateLimited {
+            retry_after_secs,
+            message,
+        } => ConditionalGet::RateLimited {
+            retry_after_secs,
+            message,
+        },
+    }
+}
+
+fn is_rate_limited_headers(headers: &reqwest::header::HeaderMap) -> bool {
+    if headers.contains_key(reqwest::header::RETRY_AFTER) {
+        return true;
+    }
+    headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(0)
+}
+
+fn parse_rate_limit_backoff_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return Some(secs.clamp(1, 300));
+    }
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if remaining == Some(0) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(reset) = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            return Some(reset.saturating_sub(now).clamp(1, 300));
+        }
+        return Some(30);
+    }
+    None
 }

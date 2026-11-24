@@ -6,7 +6,9 @@
 //! self-healing loops. Supports both plain-text logs and PKZIP job log archives.
 
 use crate::CiCheckSummary;
-use crate::api::{GitHubActionsJob, GitHubCheckRun, GitHubClient};
+use crate::api::{
+    ConditionalGet, GitHubActionsJob, GitHubCheckRun, GitHubClient, GitHubWorkflowRun,
+};
 use crate::pr::normalize_short_branch;
 use crate::wire::{open_gix_unrestricted, read_ref_oid};
 use flate2::read::DeflateDecoder;
@@ -14,10 +16,19 @@ use oz_core::{OzError, OzoneRepo, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::time::{Duration, Instant};
 
 /// Default maximum lines included in each failing check's `log_excerpt`.
 pub const DEFAULT_MAX_EXCERPT_LINES: usize = 40;
+/// Default overall watch timeout for `oz ci --watch` (30 minutes).
+pub const DEFAULT_WATCH_TIMEOUT_SECS: u64 = 1800;
+/// Default startup grace period waiting for GitHub to register checks after a push.
+pub const DEFAULT_WATCH_STARTUP_TIMEOUT_SECS: u64 = 45;
+/// Hard ceiling for MCP bounded long-polling (`wait_seconds`) to avoid transport timeouts.
+pub const MAX_MCP_WAIT_SECONDS: u64 = 120;
+
 const MAX_EXCERPT_CHARS: usize = 4096;
+const MAX_EXPANDED_EXCERPT_CHARS: usize = 32_768;
 
 /// Options controlling [`query_ci_status`].
 #[derive(Debug, Clone)]
@@ -30,6 +41,10 @@ pub struct CiQueryOptions {
     pub remote: Option<String>,
     /// Maximum lines per failing check's `log_excerpt` (defaults to `40`).
     pub max_excerpt_lines: usize,
+    /// Optional check-name inclusion patterns (case-insensitive substring or `*`/`?` glob).
+    pub include_checks: Vec<String>,
+    /// Optional check-name exclusion patterns (case-insensitive substring or `*`/`?` glob).
+    pub ignore_checks: Vec<String>,
     /// Explicit GitHub token override.
     pub auth_token: Option<String>,
     /// Explicit GitHub API base URL override (also honors `OZ_GITHUB_API_URL`).
@@ -43,26 +58,191 @@ impl Default for CiQueryOptions {
             pr_number: None,
             remote: None,
             max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
+            include_checks: Vec::new(),
+            ignore_checks: Vec::new(),
             auth_token: None,
             api_url: None,
         }
     }
 }
 
-/// Complete CI health & failure excerpt report returned by [`query_ci_status`].
+/// Terminal or bounded-poll outcome produced by [`watch_ci_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiWatchOutcome {
+    /// All watched checks completed without failures.
+    Passed,
+    /// Exited early (`fail_fast`) as soon as a watched check failed.
+    FailedFast,
+    /// All watched checks completed and at least one failed (`wait_all`).
+    Failed,
+    /// Overall watch timeout expired while checks were still pending.
+    TimedOut,
+    /// Startup grace period expired with zero checks registered for the commit.
+    NoChecksTimedOut,
+    /// A newer commit superseded the watched branch or pull request.
+    Superseded,
+}
+
+impl CiWatchOutcome {
+    /// Canonical snake_case identifier for JSON/error codes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::FailedFast => "failed_fast",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::NoChecksTimedOut => "no_checks_timed_out",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    /// Returns `true` only when watched CI checks all passed.
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
+/// Watch execution metadata attached to [`CiReport::watch`] by [`watch_ci_status`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiWatchMetadata {
+    pub outcome: CiWatchOutcome,
+    pub elapsed_secs: u64,
+    pub polls: u32,
+    pub stopped_early: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_poll_secs: Option<u64>,
+}
+
+/// Options controlling [`watch_ci_status`].
+#[derive(Debug, Clone)]
+pub struct CiWatchOptions {
+    pub query: CiQueryOptions,
+    /// Exit immediately on the first failing watched check (default: `true`).
+    pub fail_fast: bool,
+    /// Overall watch timeout before returning [`CiWatchOutcome::TimedOut`].
+    pub timeout: Duration,
+    /// Grace period waiting for checks to appear when initially `no_checks`.
+    pub startup_timeout: Duration,
+    /// Optional fixed polling interval (defaults to adaptive `5s -> 10s -> 15s -> 30s`).
+    pub poll_interval: Option<Duration>,
+}
+
+impl Default for CiWatchOptions {
+    fn default() -> Self {
+        Self {
+            query: CiQueryOptions::default(),
+            fail_fast: true,
+            timeout: Duration::from_secs(DEFAULT_WATCH_TIMEOUT_SECS),
+            startup_timeout: Duration::from_secs(DEFAULT_WATCH_STARTUP_TIMEOUT_SECS),
+            poll_interval: None,
+        }
+    }
+}
+
+/// Incremental state-change event emitted to optional progress listeners during [`watch_ci_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiWatchEvent {
+    WaitingForChecks {
+        ref_name: String,
+        commit_sha: String,
+        elapsed_secs: u64,
+    },
+    CheckUpdated {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        failing_step: Option<String>,
+    },
+    RateLimited {
+        retry_after_secs: u64,
+    },
+    Superseded {
+        old_sha: String,
+        new_sha: String,
+    },
+    Completed {
+        outcome: CiWatchOutcome,
+        elapsed_secs: u64,
+        total_count: usize,
+        failing_count: usize,
+        pending_count: usize,
+    },
+}
+
+/// Options controlling [`query_ci_job_log`] (`oz ci --job <id>`).
+#[derive(Debug, Clone)]
+pub struct CiJobLogOptions {
+    pub job_id: u64,
+    /// Optional step name filter for ZIP log extraction and excerpt focus.
+    pub step: Option<String>,
+    /// Maximum lines included in `log_excerpt` (defaults to `40`).
+    pub max_excerpt_lines: usize,
+    /// When `true`, returns the cleaned (ANSI/timestamp-stripped) tail instead of error-anchor excerpts.
+    pub raw: bool,
+    /// Remote name (defaults to `"origin"`).
+    pub remote: Option<String>,
+    /// Explicit GitHub token override.
+    pub auth_token: Option<String>,
+    /// Explicit GitHub API base URL override.
+    pub api_url: Option<String>,
+}
+
+impl Default for CiJobLogOptions {
+    fn default() -> Self {
+        Self {
+            job_id: 0,
+            step: None,
+            max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
+            raw: false,
+            remote: None,
+            auth_token: None,
+            api_url: None,
+        }
+    }
+}
+
+/// Single-job log drill-down report returned by [`query_ci_job_log`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiJobLogReport {
+    pub job_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<u64>,
+    pub name: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_step: Option<String>,
+    pub raw: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_excerpt: Option<String>,
+}
+
+/// Complete CI health & failure excerpt report returned by [`query_ci_status`] and [`watch_ci_status`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiReport {
     pub ref_name: String,
     pub commit_sha: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
-    /// Aggregate state: `"passing"`, `"failing"`, `"pending"`, or `"no_checks"`.
+    /// Aggregate state: `"passing"`, `"failing"`, `"pending"`, `"no_checks"`, or `"superseded"`.
     pub overall_status: String,
     pub all_passed: bool,
     pub total_count: usize,
     pub failing_count: usize,
     pub pending_count: usize,
     pub checks: Vec<CiCheckSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<CiWatchMetadata>,
 }
 
 /// Queries GitHub Check Runs and Actions jobs for the target branch/commit/PR, downloads logs
@@ -102,8 +282,6 @@ pub fn query_ci_status(repo: &OzoneRepo, opts: &CiQueryOptions) -> Result<CiRepo
         .list_check_runs_for_ref(owner, gh_repo, query_ref)
         .unwrap_or_default();
 
-    // Also fetch Actions workflow runs + jobs for `commit_sha` / `ref_name` so step failure info
-    // and job IDs are available even when check-runs omits step details.
     let mut jobs_by_id: HashMap<u64, GitHubActionsJob> = HashMap::new();
     let mut jobs_by_name: HashMap<String, GitHubActionsJob> = HashMap::new();
 
@@ -123,10 +301,577 @@ pub fn query_ci_status(repo: &OzoneRepo, opts: &CiQueryOptions) -> Result<CiRepo
         }
     }
 
+    let mut failure_cache = HashMap::new();
+    Ok(assemble_ci_report(
+        &client,
+        owner,
+        gh_repo,
+        ref_name,
+        commit_sha,
+        resolved_pr_num,
+        &check_runs,
+        &jobs_by_id,
+        &jobs_by_name,
+        &opts.include_checks,
+        &opts.ignore_checks,
+        max_lines,
+        &mut failure_cache,
+    ))
+}
+
+/// Polls GitHub Check Runs and Actions jobs until all watched checks pass, a check fails
+/// (`fail_fast` exits immediately with its cleaned log excerpt), a newer commit supersedes
+/// the watched branch/PR, or `timeout` / `startup_timeout` expires.
+///
+/// Uses HTTP `ETag` / `If-None-Match` conditional caching (`304 Not Modified`), rate-limit
+/// backoff, and failure-log caching across ticks.
+pub fn watch_ci_status<F>(
+    repo: &OzoneRepo,
+    opts: &CiWatchOptions,
+    mut on_event: F,
+) -> Result<CiReport>
+where
+    F: FnMut(CiWatchEvent),
+{
+    let query = &opts.query;
+    let remote_name = query
+        .remote
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("origin");
+    let max_lines = if query.max_excerpt_lines == 0 {
+        DEFAULT_MAX_EXCERPT_LINES
+    } else {
+        query.max_excerpt_lines
+    };
+
+    let (client, parsed_remote) = GitHubClient::for_repo(
+        repo,
+        Some(remote_name),
+        query.auth_token.as_deref(),
+        query.api_url.as_deref(),
+    )?;
+    let _ = client.require_authenticated()?;
+    let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
+
+    let (ref_name, commit_sha, resolved_pr_num) =
+        resolve_ci_target(repo, &client, owner, gh_repo, query)?;
+
+    let query_ref = if !commit_sha.is_empty() {
+        commit_sha.clone()
+    } else {
+        ref_name.clone()
+    };
+    let branch_filter = (!ref_name.is_empty() && ref_name != commit_sha && ref_name != "HEAD")
+        .then_some(ref_name.as_str());
+    let sha_filter = (!commit_sha.is_empty()).then_some(commit_sha.as_str());
+    // When watching a branch/PR (not a pinned SHA), query workflow runs by branch so we can
+    // also detect if a newer commit superseded the watched commit.
+    let wf_sha_filter = if branch_filter.is_some() {
+        None
+    } else {
+        sha_filter
+    };
+
+    let start = Instant::now();
+    let mut polls: u32 = 0;
+
+    // ETag + response caches across watch ticks.
+    let mut check_runs_etag: Option<String> = None;
+    let mut cached_check_runs: Vec<GitHubCheckRun> = Vec::new();
+    let mut workflow_runs_etag: Option<String> = None;
+    let mut cached_workflow_runs: Vec<GitHubWorkflowRun> = Vec::new();
+    let mut jobs_cache: HashMap<u64, (Option<String>, Vec<GitHubActionsJob>)> = HashMap::new();
+    let mut pr_etag: Option<String> = None;
+    let mut failure_log_cache: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+
+    // Track last seen `(status, conclusion)` per check name so `on_event` only fires on deltas.
+    let mut seen_states: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut emitted_waiting_for_checks = false;
+
+    loop {
+        polls = polls.saturating_add(1);
+        let mut rate_limit_wait: Option<u64> = None;
+        let mut superseded_by_sha: Option<String> = None;
+
+        // 1. Check PR head SHA drift when watching a pull request.
+        if let Some(pr_num) = resolved_pr_num
+            && !commit_sha.is_empty()
+            && polls > 1
+        {
+            match client.get_pull_request_conditional(owner, gh_repo, pr_num, pr_etag.as_deref()) {
+                Ok(ConditionalGet::Modified { value, etag, .. }) => {
+                    if etag.is_some() {
+                        pr_etag = etag;
+                    }
+                    if !value.head.sha.is_empty() && value.head.sha != commit_sha {
+                        superseded_by_sha = Some(value.head.sha);
+                    }
+                }
+                Ok(ConditionalGet::NotModified { etag, .. }) => {
+                    if etag.is_some() {
+                        pr_etag = etag;
+                    }
+                }
+                Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                    rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
+                }
+                Err(_) => {}
+            }
+        }
+
+        // 2. Conditionally fetch check runs for the target commit/ref.
+        match client.list_check_runs_for_ref_conditional(
+            owner,
+            gh_repo,
+            &query_ref,
+            check_runs_etag.as_deref(),
+        ) {
+            Ok(ConditionalGet::Modified { value, etag, .. }) => {
+                cached_check_runs = value;
+                if etag.is_some() {
+                    check_runs_etag = etag;
+                }
+            }
+            Ok(ConditionalGet::NotModified { etag, .. }) => {
+                if etag.is_some() {
+                    check_runs_etag = etag;
+                }
+            }
+            Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
+            }
+            Err(err) if polls == 1 => return Err(err),
+            Err(_) => {}
+        }
+
+        // 3. Conditionally fetch workflow runs & their jobs.
+        match client.list_workflow_runs_conditional(
+            owner,
+            gh_repo,
+            branch_filter,
+            wf_sha_filter,
+            workflow_runs_etag.as_deref(),
+        ) {
+            Ok(ConditionalGet::Modified { value, etag, .. }) => {
+                cached_workflow_runs = value;
+                if etag.is_some() {
+                    workflow_runs_etag = etag;
+                }
+            }
+            Ok(ConditionalGet::NotModified { etag, .. }) => {
+                if etag.is_some() {
+                    workflow_runs_etag = etag;
+                }
+            }
+            Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
+            }
+            Err(_) => {}
+        }
+
+        // Detect newer commit pushed to the same branch from workflow runs.
+        if superseded_by_sha.is_none()
+            && branch_filter.is_some()
+            && !commit_sha.is_empty()
+            && let Some(newer_run) = cached_workflow_runs.iter().find(|r| {
+                r.head_sha != commit_sha
+                    && !r.head_sha.is_empty()
+                    && r.head_branch.as_deref() == branch_filter
+            })
+        {
+            // Only treat a newer workflow run as superseding if checks on the watched SHA are
+            // cancelled or still non-passing (avoid false positives if someone inspects an older
+            // already-green commit by branch name).
+            let any_cancelled = cached_check_runs
+                .iter()
+                .any(|c| c.conclusion.as_deref() == Some("cancelled"));
+            let all_completed_passed = !cached_check_runs.is_empty()
+                && cached_check_runs
+                    .iter()
+                    .all(|c| c.status == "completed" && !is_failing_conclusion(c.conclusion.as_deref()));
+            if any_cancelled || !all_completed_passed {
+                superseded_by_sha = Some(newer_run.head_sha.clone());
+            }
+        }
+
+        let mut jobs_by_id: HashMap<u64, GitHubActionsJob> = HashMap::new();
+        let mut jobs_by_name: HashMap<String, GitHubActionsJob> = HashMap::new();
+
+        for run in cached_workflow_runs.iter().take(10) {
+            if !commit_sha.is_empty() && run.head_sha != commit_sha {
+                continue;
+            }
+            let prev_etag = jobs_cache.get(&run.id).and_then(|(e, _)| e.clone());
+            match client.list_jobs_for_workflow_run_conditional(
+                owner,
+                gh_repo,
+                run.id,
+                prev_etag.as_deref(),
+            ) {
+                Ok(ConditionalGet::Modified { value, etag, .. }) => {
+                    jobs_cache.insert(run.id, (etag.or(prev_etag), value));
+                }
+                Ok(ConditionalGet::NotModified { etag, .. }) => {
+                    if let Some(entry) = jobs_cache.get_mut(&run.id)
+                        && etag.is_some()
+                    {
+                        entry.0 = etag;
+                    }
+                }
+                Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                    rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
+                }
+                Err(_) => {}
+            }
+            if let Some((_, jobs)) = jobs_cache.get(&run.id) {
+                for job in jobs {
+                    jobs_by_id.insert(job.id, job.clone());
+                    jobs_by_name
+                        .entry(job.name.clone())
+                        .or_insert_with(|| job.clone());
+                }
+            }
+        }
+
+        // If superseded by a newer commit on the branch/PR, finalize immediately without
+        // downloading cancelled job logs as false failures.
+        if let Some(new_sha) = superseded_by_sha {
+            let elapsed_secs = start.elapsed().as_secs();
+            on_event(CiWatchEvent::Superseded {
+                old_sha: commit_sha.clone(),
+                new_sha: new_sha.clone(),
+            });
+            let mut report = assemble_ci_report_inner(
+                &client,
+                owner,
+                gh_repo,
+                ref_name,
+                commit_sha,
+                resolved_pr_num,
+                &cached_check_runs,
+                &jobs_by_id,
+                &jobs_by_name,
+                &query.include_checks,
+                &query.ignore_checks,
+                max_lines,
+                &mut failure_log_cache,
+                false,
+            );
+            report.overall_status = "superseded".to_string();
+            report.all_passed = false;
+            report.watch = Some(CiWatchMetadata {
+                outcome: CiWatchOutcome::Superseded,
+                elapsed_secs,
+                polls,
+                stopped_early: true,
+                superseded_by_sha: Some(new_sha),
+                recommended_poll_secs: None,
+            });
+            on_event(CiWatchEvent::Completed {
+                outcome: CiWatchOutcome::Superseded,
+                elapsed_secs,
+                total_count: report.total_count,
+                failing_count: report.failing_count,
+                pending_count: report.pending_count,
+            });
+            return Ok(report);
+        }
+
+        let mut report = assemble_ci_report(
+            &client,
+            owner,
+            gh_repo,
+            ref_name.clone(),
+            commit_sha.clone(),
+            resolved_pr_num,
+            &cached_check_runs,
+            &jobs_by_id,
+            &jobs_by_name,
+            &query.include_checks,
+            &query.ignore_checks,
+            max_lines,
+            &mut failure_log_cache,
+        );
+
+        let elapsed = start.elapsed();
+        let elapsed_secs = elapsed.as_secs();
+
+        // Emit incremental state-change events for checks.
+        if report.total_count == 0 {
+            if !emitted_waiting_for_checks {
+                emitted_waiting_for_checks = true;
+                on_event(CiWatchEvent::WaitingForChecks {
+                    ref_name: ref_name.clone(),
+                    commit_sha: commit_sha.clone(),
+                    elapsed_secs,
+                });
+            }
+        } else {
+            for check in &report.checks {
+                let state = (check.status.clone(), check.conclusion.clone());
+                let changed = seen_states.get(&check.name) != Some(&state);
+                if changed {
+                    seen_states.insert(check.name.clone(), state);
+                    on_event(CiWatchEvent::CheckUpdated {
+                        name: check.name.clone(),
+                        status: check.status.clone(),
+                        conclusion: check.conclusion.clone(),
+                        failing_step: check.failing_step.clone(),
+                    });
+                }
+            }
+        }
+
+        // Check terminal conditions.
+        if report.total_count > 0 {
+            if report.failing_count > 0 && opts.fail_fast {
+                let stopped_early = report.pending_count > 0;
+                let outcome = if stopped_early {
+                    CiWatchOutcome::FailedFast
+                } else {
+                    CiWatchOutcome::Failed
+                };
+                report.watch = Some(CiWatchMetadata {
+                    outcome,
+                    elapsed_secs,
+                    polls,
+                    stopped_early,
+                    superseded_by_sha: None,
+                    recommended_poll_secs: None,
+                });
+                on_event(CiWatchEvent::Completed {
+                    outcome,
+                    elapsed_secs,
+                    total_count: report.total_count,
+                    failing_count: report.failing_count,
+                    pending_count: report.pending_count,
+                });
+                return Ok(report);
+            }
+
+            if report.pending_count == 0 {
+                let outcome = if report.failing_count > 0 {
+                    CiWatchOutcome::Failed
+                } else {
+                    CiWatchOutcome::Passed
+                };
+                report.watch = Some(CiWatchMetadata {
+                    outcome,
+                    elapsed_secs,
+                    polls,
+                    stopped_early: false,
+                    superseded_by_sha: None,
+                    recommended_poll_secs: None,
+                });
+                on_event(CiWatchEvent::Completed {
+                    outcome,
+                    elapsed_secs,
+                    total_count: report.total_count,
+                    failing_count: report.failing_count,
+                    pending_count: report.pending_count,
+                });
+                return Ok(report);
+            }
+        } else if elapsed >= opts.startup_timeout {
+            let outcome = CiWatchOutcome::NoChecksTimedOut;
+            report.watch = Some(CiWatchMetadata {
+                outcome,
+                elapsed_secs,
+                polls,
+                stopped_early: false,
+                superseded_by_sha: None,
+                recommended_poll_secs: Some(10),
+            });
+            on_event(CiWatchEvent::Completed {
+                outcome,
+                elapsed_secs,
+                total_count: 0,
+                failing_count: 0,
+                pending_count: 0,
+            });
+            return Ok(report);
+        }
+
+        if elapsed >= opts.timeout {
+            let outcome = if report.total_count == 0 {
+                CiWatchOutcome::NoChecksTimedOut
+            } else {
+                CiWatchOutcome::TimedOut
+            };
+            let recommended = recommended_poll_secs(&report.overall_status, elapsed_secs);
+            report.watch = Some(CiWatchMetadata {
+                outcome,
+                elapsed_secs,
+                polls,
+                stopped_early: false,
+                superseded_by_sha: None,
+                recommended_poll_secs: recommended,
+            });
+            on_event(CiWatchEvent::Completed {
+                outcome,
+                elapsed_secs,
+                total_count: report.total_count,
+                failing_count: report.failing_count,
+                pending_count: report.pending_count,
+            });
+            return Ok(report);
+        }
+
+        // Compute next sleep duration (rate-limit backoff takes precedence, clamped to remaining budget).
+        let base_sleep = adaptive_poll_interval(polls.saturating_sub(1), opts.poll_interval);
+        let desired_sleep = if let Some(rl_secs) = rate_limit_wait {
+            on_event(CiWatchEvent::RateLimited {
+                retry_after_secs: rl_secs,
+            });
+            Duration::from_secs(rl_secs).max(base_sleep)
+        } else {
+            base_sleep
+        };
+
+        let effective_deadline = if report.total_count == 0 {
+            opts.startup_timeout.min(opts.timeout)
+        } else {
+            opts.timeout
+        };
+        let remaining = effective_deadline.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            continue;
+        }
+        std::thread::sleep(desired_sleep.min(remaining));
+    }
+}
+
+/// Fetches logs for a single GitHub Actions job (`oz ci --job <id>`) with optional step
+/// filtering, expanded line budget, and raw cleaned-tail output.
+pub fn query_ci_job_log(repo: &OzoneRepo, opts: &CiJobLogOptions) -> Result<CiJobLogReport> {
+    if opts.job_id == 0 {
+        return Err(OzError::InvalidUsage {
+            message: "`--job` requires a positive GitHub Actions job ID".to_string(),
+            recovery: vec!["oz ci --json".to_string()],
+        });
+    }
+    let remote_name = opts
+        .remote
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("origin");
+    let max_lines = if opts.max_excerpt_lines == 0 {
+        DEFAULT_MAX_EXCERPT_LINES
+    } else {
+        opts.max_excerpt_lines
+    };
+
+    let (client, parsed_remote) = GitHubClient::for_repo(
+        repo,
+        Some(remote_name),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+    let _ = client.require_authenticated()?;
+    let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
+
+    let job = client.get_actions_job(owner, gh_repo, opts.job_id)?;
+    let failing_step = job
+        .steps
+        .iter()
+        .find(|st| is_failing_conclusion(st.conclusion.as_deref()))
+        .map(|st| st.name.clone());
+    let target_step = opts
+        .step
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| failing_step.clone());
+
+    let raw_bytes = client.download_job_logs(owner, gh_repo, opts.job_id)?;
+    let decoded = extract_log_text_from_bytes(&raw_bytes, target_step.as_deref())?;
+
+    let (inferred_step, excerpt) = if opts.raw {
+        (
+            target_step.clone(),
+            extract_cleaned_log_tail(&decoded, target_step.as_deref(), max_lines),
+        )
+    } else {
+        summarize_failing_log(&decoded, target_step.as_deref(), max_lines)
+    };
+
+    let run_id = job
+        .run_id
+        .or_else(|| extract_actions_run_id_from_url(job.html_url.as_deref()));
+
+    Ok(CiJobLogReport {
+        job_id: job.id,
+        run_id,
+        name: job.name,
+        status: job.status,
+        conclusion: job.conclusion,
+        html_url: job.html_url,
+        failing_step: failing_step.or(inferred_step),
+        selected_step: target_step,
+        raw: opts.raw,
+        log_excerpt: excerpt,
+    })
+}
+
+#[expect(clippy::too_many_arguments)]
+fn assemble_ci_report(
+    client: &GitHubClient,
+    owner: &str,
+    gh_repo: &str,
+    ref_name: String,
+    commit_sha: String,
+    pr_number: Option<u64>,
+    check_runs: &[GitHubCheckRun],
+    jobs_by_id: &HashMap<u64, GitHubActionsJob>,
+    jobs_by_name: &HashMap<String, GitHubActionsJob>,
+    include_checks: &[String],
+    ignore_checks: &[String],
+    max_lines: usize,
+    failure_cache: &mut HashMap<String, (Option<String>, Option<String>)>,
+) -> CiReport {
+    assemble_ci_report_inner(
+        client,
+        owner,
+        gh_repo,
+        ref_name,
+        commit_sha,
+        pr_number,
+        check_runs,
+        jobs_by_id,
+        jobs_by_name,
+        include_checks,
+        ignore_checks,
+        max_lines,
+        failure_cache,
+        true,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn assemble_ci_report_inner(
+    client: &GitHubClient,
+    owner: &str,
+    gh_repo: &str,
+    ref_name: String,
+    commit_sha: String,
+    pr_number: Option<u64>,
+    check_runs: &[GitHubCheckRun],
+    jobs_by_id: &HashMap<u64, GitHubActionsJob>,
+    jobs_by_name: &HashMap<String, GitHubActionsJob>,
+    include_checks: &[String],
+    ignore_checks: &[String],
+    max_lines: usize,
+    failure_cache: &mut HashMap<String, (Option<String>, Option<String>)>,
+    fetch_failure_logs: bool,
+) -> CiReport {
     let mut summaries: Vec<CiCheckSummary> = Vec::new();
     let mut covered_job_ids: HashSet<u64> = HashSet::new();
 
-    for cr in &check_runs {
+    for cr in check_runs {
         let matched_job = extract_actions_job_id_from_url(cr.details_url.as_deref())
             .or_else(|| extract_actions_job_id_from_url(cr.html_url.as_deref()))
             .and_then(|jid| {
@@ -134,7 +879,13 @@ pub fn query_ci_status(repo: &OzoneRepo, opts: &CiQueryOptions) -> Result<CiRepo
                 jobs_by_id
                     .get(&jid)
                     .cloned()
-                    .or_else(|| client.get_actions_job(owner, gh_repo, jid).ok())
+                    .or_else(|| {
+                        if fetch_failure_logs && is_failing_conclusion(cr.conclusion.as_deref()) {
+                            client.get_actions_job(owner, gh_repo, jid).ok()
+                        } else {
+                            None
+                        }
+                    })
             })
             .or_else(|| {
                 let j = jobs_by_name.get(&cr.name)?.clone();
@@ -142,13 +893,19 @@ pub fn query_ci_status(repo: &OzoneRepo, opts: &CiQueryOptions) -> Result<CiRepo
                 Some(j)
             });
 
+        if !check_matches_filters(&cr.name, include_checks, ignore_checks) {
+            continue;
+        }
+
         summaries.push(build_check_summary(
-            &client,
+            client,
             owner,
             gh_repo,
             Some(cr),
             matched_job.as_ref(),
             max_lines,
+            failure_cache,
+            fetch_failure_logs,
         ));
     }
 
@@ -159,13 +916,18 @@ pub fn query_ci_status(repo: &OzoneRepo, opts: &CiQueryOptions) -> Result<CiRepo
         .collect();
     extra_jobs.sort_by_key(|j| j.id);
     for job in extra_jobs {
+        if !check_matches_filters(&job.name, include_checks, ignore_checks) {
+            continue;
+        }
         summaries.push(build_check_summary(
-            &client,
+            client,
             owner,
             gh_repo,
             None,
             Some(job),
             max_lines,
+            failure_cache,
+            fetch_failure_logs,
         ));
     }
 
@@ -190,17 +952,98 @@ pub fn query_ci_status(repo: &OzoneRepo, opts: &CiQueryOptions) -> Result<CiRepo
     };
     let all_passed = total_count > 0 && failing_count == 0 && pending_count == 0;
 
-    Ok(CiReport {
+    CiReport {
         ref_name,
         commit_sha,
-        pr_number: resolved_pr_num,
+        pr_number,
         overall_status,
         all_passed,
         total_count,
         failing_count,
         pending_count,
         checks: summaries,
-    })
+        watch: None,
+    }
+}
+
+fn adaptive_poll_interval(poll_index: u32, fixed: Option<Duration>) -> Duration {
+    if let Some(d) = fixed {
+        return d;
+    }
+    match poll_index {
+        0..=1 => Duration::from_secs(5),
+        2..=4 => Duration::from_secs(10),
+        5..=8 => Duration::from_secs(15),
+        _ => Duration::from_secs(30),
+    }
+}
+
+fn recommended_poll_secs(overall_status: &str, elapsed_secs: u64) -> Option<u64> {
+    match overall_status {
+        "no_checks" => Some(10),
+        "pending" => Some(if elapsed_secs >= 120 { 30 } else { 15 }),
+        _ => None,
+    }
+}
+
+pub(crate) fn check_matches_filters(
+    name: &str,
+    include_checks: &[String],
+    ignore_checks: &[String],
+) -> bool {
+    let included = if include_checks.is_empty() {
+        true
+    } else {
+        include_checks
+            .iter()
+            .filter(|p| !p.trim().is_empty())
+            .any(|pat| pattern_matches_ci_name(pat, name))
+    };
+    if !included {
+        return false;
+    }
+    !ignore_checks
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .any(|pat| pattern_matches_ci_name(pat, name))
+}
+
+fn pattern_matches_ci_name(pattern: &str, name: &str) -> bool {
+    let p = pattern.trim().to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    if p.contains('*') || p.contains('?') {
+        wildcard_match(&p, &n)
+    } else {
+        n.contains(&p)
+    }
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_idx, mut match_idx) = (None, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_idx = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(si) = star_idx {
+            pi = si + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn resolve_ci_target(
@@ -263,6 +1106,7 @@ fn resolve_ci_target(
     Ok((branch, sha, matched_pr))
 }
 
+#[expect(clippy::too_many_arguments)]
 fn build_check_summary(
     client: &GitHubClient,
     owner: &str,
@@ -270,6 +1114,8 @@ fn build_check_summary(
     check_run: Option<&GitHubCheckRun>,
     job: Option<&GitHubActionsJob>,
     max_lines: usize,
+    failure_cache: &mut HashMap<String, (Option<String>, Option<String>)>,
+    fetch_failure_logs: bool,
 ) -> CiCheckSummary {
     let name = check_run
         .map(|c| c.name.clone())
@@ -283,13 +1129,29 @@ fn build_check_summary(
         .and_then(|c| c.conclusion.clone())
         .or_else(|| job.and_then(|j| j.conclusion.clone()));
 
-    if !is_failing_conclusion(conclusion.as_deref()) {
+    let job_id_opt = job
+        .map(|j| j.id)
+        .or_else(|| check_run.and_then(|c| extract_actions_job_id_from_url(c.details_url.as_deref())))
+        .or_else(|| check_run.and_then(|c| extract_actions_job_id_from_url(c.html_url.as_deref())));
+    let run_id_opt = job
+        .and_then(|j| j.run_id)
+        .or_else(|| check_run.and_then(|c| extract_actions_run_id_from_url(c.details_url.as_deref())))
+        .or_else(|| check_run.and_then(|c| extract_actions_run_id_from_url(c.html_url.as_deref())))
+        .or_else(|| job.and_then(|j| extract_actions_run_id_from_url(j.html_url.as_deref())));
+    let html_url = check_run
+        .and_then(|c| c.html_url.clone().or_else(|| c.details_url.clone()))
+        .or_else(|| job.and_then(|j| j.html_url.clone()));
+
+    if !is_failing_conclusion(conclusion.as_deref()) || !fetch_failure_logs {
         return CiCheckSummary {
             name,
             status,
             conclusion,
             failing_step: None,
             log_excerpt: None,
+            job_id: job_id_opt,
+            run_id: run_id_opt,
+            html_url,
         };
     }
 
@@ -300,10 +1162,21 @@ fn build_check_summary(
             .map(|st| st.name.clone())
     });
 
-    let job_id_opt = job
-        .map(|j| j.id)
-        .or_else(|| check_run.and_then(|c| extract_actions_job_id_from_url(c.details_url.as_deref())))
-        .or_else(|| check_run.and_then(|c| extract_actions_job_id_from_url(c.html_url.as_deref())));
+    let cache_key = job_id_opt
+        .map(|jid| format!("job:{jid}"))
+        .unwrap_or_else(|| format!("name:{name}"));
+    if let Some((cached_step, cached_excerpt)) = failure_cache.get(&cache_key) {
+        return CiCheckSummary {
+            name,
+            status,
+            conclusion,
+            failing_step: step_from_job.or_else(|| cached_step.clone()),
+            log_excerpt: cached_excerpt.clone(),
+            job_id: job_id_opt,
+            run_id: run_id_opt,
+            html_url,
+        };
+    }
 
     let mut raw_log_text = None;
     if let Some(jid) = job_id_opt
@@ -337,12 +1210,18 @@ fn build_check_summary(
         None => (None, None),
     };
 
+    let final_step = step_from_job.or(parsed_step);
+    failure_cache.insert(cache_key, (final_step.clone(), excerpt.clone()));
+
     CiCheckSummary {
         name,
         status,
         conclusion,
-        failing_step: step_from_job.or(parsed_step),
+        failing_step: final_step,
         log_excerpt: excerpt,
+        job_id: job_id_opt,
+        run_id: run_id_opt,
+        html_url,
     }
 }
 
@@ -355,7 +1234,7 @@ pub(crate) fn is_failing_conclusion(conclusion: Option<&str>) -> bool {
 
 fn extract_actions_job_id_from_url(url: Option<&str>) -> Option<u64> {
     let u = url?;
-    // Matches `.../actions/runs/<run_id>/job/<job_id>` or `.../runs/<job_id>`
+    // Matches `.../actions/runs/<run_id>/job/<job_id>` or `.../jobs/<job_id>`
     if let Some((_, after)) = u.split_once("/job/") {
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(id) = digits.parse::<u64>() {
@@ -363,6 +1242,17 @@ fn extract_actions_job_id_from_url(url: Option<&str>) -> Option<u64> {
         }
     }
     if let Some((_, after)) = u.split_once("/jobs/") {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(id) = digits.parse::<u64>() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn extract_actions_run_id_from_url(url: Option<&str>) -> Option<u64> {
+    let u = url?;
+    if let Some((_, after)) = u.split_once("/actions/runs/") {
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(id) = digits.parse::<u64>() {
             return Some(id);
@@ -665,9 +1555,10 @@ pub fn summarize_failing_log(
         cleaned_lines[start..].to_vec()
     };
 
+    let max_chars = excerpt_char_budget(max_lines);
     let mut excerpt = excerpt_lines.join("\n").trim().to_string();
-    if excerpt.len() > MAX_EXCERPT_CHARS {
-        let mut cut = MAX_EXCERPT_CHARS;
+    if excerpt.len() > max_chars {
+        let mut cut = max_chars;
         while !excerpt.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -677,6 +1568,82 @@ pub fn summarize_failing_log(
 
     let step = known_step.map(str::to_string).or(inferred_step);
     (step, (!excerpt.is_empty()).then_some(excerpt))
+}
+
+fn excerpt_char_budget(max_lines: usize) -> usize {
+    if max_lines <= DEFAULT_MAX_EXCERPT_LINES {
+        MAX_EXCERPT_CHARS
+    } else {
+        max_lines
+            .saturating_mul(160)
+            .clamp(MAX_EXCERPT_CHARS, MAX_EXPANDED_EXCERPT_CHARS)
+    }
+}
+
+/// Cleans raw GitHub Actions logs (stripping BOM, runner timestamps, ANSI codes, and debug lines)
+/// and returns the last `max_lines` lines (optionally scoped to a matching `##[group]` step).
+fn extract_cleaned_log_tail(
+    raw_log: &str,
+    step_filter: Option<&str>,
+    max_lines: usize,
+) -> Option<String> {
+    let step_needle = step_filter.map(sanitize_step_needle).filter(|s| !s.is_empty());
+    let mut all_cleaned: Vec<String> = Vec::new();
+    let mut step_cleaned: Vec<String> = Vec::new();
+    let mut active_group: Option<String> = None;
+
+    for raw_line in raw_log.lines() {
+        let no_bom = raw_line.trim_start_matches('\u{feff}');
+        let no_ts = strip_actions_timestamp(no_bom);
+        let clean = strip_ansi_escapes(no_ts).trim_end().to_string();
+        let trimmed = clean.trim();
+
+        if let Some(group_title) = trimmed.strip_prefix("##[group]") {
+            let g = group_title.trim();
+            if !g.is_empty() {
+                active_group = Some(g.to_string());
+            }
+            continue;
+        }
+        if trimmed == "##[endgroup]" || trimmed.starts_with("##[debug]") {
+            continue;
+        }
+        let normalized = if let Some(err_body) = trimmed.strip_prefix("##[error]") {
+            format!("error: {}", err_body.trim())
+        } else {
+            clean
+        };
+
+        if let Some(ref needle) = step_needle
+            && active_group
+                .as_deref()
+                .is_some_and(|g| sanitize_step_needle(g).contains(needle))
+        {
+            step_cleaned.push(normalized.clone());
+        }
+        all_cleaned.push(normalized);
+    }
+
+    let source = if !step_cleaned.is_empty() {
+        step_cleaned
+    } else {
+        all_cleaned
+    };
+    if source.is_empty() {
+        return None;
+    }
+
+    let start = source.len().saturating_sub(max_lines);
+    let mut tail = source[start..].join("\n").trim().to_string();
+    let max_chars = excerpt_char_budget(max_lines);
+    if tail.len() > max_chars {
+        let mut cut = tail.len() - max_chars;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail = format!("... [truncated]\n{}", &tail[cut..]);
+    }
+    (!tail.is_empty()).then_some(tail)
 }
 
 fn is_high_signal_error_line(line: &str) -> bool {
@@ -853,5 +1820,50 @@ mod tests {
         assert!(!excerpt.contains('\x1b'));
         assert!(excerpt.contains("error[E0425]: cannot find value `missing_var` in this scope"));
         assert!(excerpt.contains("--> src/lib.rs:42:9"));
+    }
+
+    #[test]
+    fn check_name_filtering_supports_substrings_and_globs() {
+        assert!(check_matches_filters(
+            "Rust / cargo-clippy (ubuntu-latest)",
+            &["clippy".to_string()],
+            &[]
+        ));
+        assert!(!check_matches_filters(
+            "Rust / cargo-test (ubuntu-latest)",
+            &["clippy".to_string()],
+            &[]
+        ));
+        assert!(check_matches_filters(
+            "Rust / cargo-test (ubuntu-latest)",
+            &["*ubuntu*".to_string()],
+            &["*macos*".to_string()]
+        ));
+        assert!(!check_matches_filters(
+            "codecov/patch",
+            &[],
+            &["codecov".to_string()]
+        ));
+    }
+
+    #[test]
+    fn extracts_run_id_and_raw_log_tail() {
+        assert_eq!(
+            extract_actions_run_id_from_url(Some(
+                "https://github.com/acme/rocket/actions/runs/500123/job/9001"
+            )),
+            Some(500_123)
+        );
+
+        let raw_log = "2026-11-18T13:20:00Z ##[group]Build\n\
+2026-11-18T13:20:01Z line 1\n\
+2026-11-18T13:20:02Z line 2\n\
+2026-11-18T13:20:03Z ##[endgroup]\n\
+2026-11-18T13:20:04Z ##[group]Run tests\n\
+2026-11-18T13:20:05Z \x1b[32mok\x1b[0m test_a\n\
+2026-11-18T13:20:06Z \x1b[31mfail\x1b[0m test_b\n\
+2026-11-18T13:20:07Z summary line\n";
+        let tail = extract_cleaned_log_tail(raw_log, Some("Run tests"), 2).expect("tail");
+        assert_eq!(tail, "fail test_b\nsummary line");
     }
 }

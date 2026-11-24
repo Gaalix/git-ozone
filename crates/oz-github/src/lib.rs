@@ -12,8 +12,8 @@ pub mod sync;
 pub mod wire;
 
 pub use api::{
-    GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput, GitHubClient, GitHubJobStep,
-    GitHubPrRef, GitHubPullRequest, GitHubWorkflowRun, UpdatePullRequest,
+    ConditionalGet, GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput, GitHubClient,
+    GitHubJobStep, GitHubPrRef, GitHubPullRequest, GitHubWorkflowRun, UpdatePullRequest,
 };
 pub use auth::{
     DEFAULT_GITHUB_API_URL, DiscoveredToken, GitHubAuthProbe, ParsedGitRemote, RemoteScheme,
@@ -28,8 +28,11 @@ pub use ssh_config::{
     resolve_ssh_host, resolve_ssh_host_with_context,
 };
 pub use ci::{
-    CiQueryOptions, CiReport, DEFAULT_MAX_EXCERPT_LINES, extract_log_text_from_bytes,
-    query_ci_status, strip_actions_timestamp, strip_ansi_escapes, summarize_failing_log,
+    CiJobLogOptions, CiJobLogReport, CiQueryOptions, CiReport, CiWatchEvent, CiWatchMetadata,
+    CiWatchOptions, CiWatchOutcome, DEFAULT_MAX_EXCERPT_LINES, DEFAULT_WATCH_STARTUP_TIMEOUT_SECS,
+    DEFAULT_WATCH_TIMEOUT_SECS, MAX_MCP_WAIT_SECONDS, extract_log_text_from_bytes,
+    query_ci_job_log, query_ci_status, strip_actions_timestamp, strip_ansi_escapes,
+    summarize_failing_log, watch_ci_status,
 };
 pub use pr::{
     OZ_STACK_END, OZ_STACK_START, PrCreateOptions, PrCreateOutcome, PrStackOptions,
@@ -74,4 +77,10 @@ pub struct CiCheckSummary {
     pub conclusion: Option<String>,
     pub failing_step: Option<String>,
     pub log_excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
 }

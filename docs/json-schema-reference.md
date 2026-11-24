@@ -399,7 +399,7 @@ Key M4 diagnostic fields:
 * **`oz pr create [-t] [-b] [-B] [-H] [-d] [--no-push] [--remote]`:** `{ "pull_request": { "number", "html_url", "state", "draft", "merged", "title", "body"?, "head": { "ref", "sha" }, "base": { "ref", "sha" } }, "created", "pushed", "head_branch", "base_branch", "change_ids" }`
 * **`oz pr stack [branches...] [-B] [-d] [--no-push] [--remote]`:** `{ "root_base", "pushed", "atomic_push_op_id", "items": [ { "number", "html_url", "title", "head_branch", "base_branch", "status", "created", "change_ids" } ] }`
 * **`oz sync [--remote] [--base] [--no-fetch] [--no-rebase] [--no-gc] [--no-warm] [--push]`:** `{ "remote", "base_branch", "previous_base_oid"?, "base_oid"?, "fetched", "fast_forwarded", "merged_branches", "retargeted_prs": [ { "number", "head_branch", "old_base", "new_base" } ], "rebased_branches", "removed_workspaces", "deleted_branches", "pruned_checkpoints", "baseline_refreshed", "op_id"?, "warnings"? }`
-* **`oz ci [--ref <rev> | --branch <branch>] [--pr <num>] [--max-excerpt-lines <N>] [--remote]`:**
+* **`oz ci [--ref <rev> | --branch <branch>] [--pr <num>] [--max-excerpt-lines <N>] [--check <PAT>] [--ignore-check <PAT>] [--watch [--fail-fast | --wait-all] [--timeout <SECS>] [--startup-timeout <SECS>] [--interval <SECS>] [--progress]] [--job <ID> [--step <NAME>] [--raw]] [--remote]`:**
   ```json
   {
     "ref_name": "feat/pkce",
@@ -409,22 +409,31 @@ Key M4 diagnostic fields:
     "all_passed": false,
     "total_count": 3,
     "failing_count": 1,
-    "pending_count": 0,
+    "pending_count": 1,
     "checks": [
       {
         "name": "cargo test",
         "status": "completed",
         "conclusion": "failure",
         "failing_step": "Run unit tests",
-        "log_excerpt": "test auth::pkce_verifier ... FAILED\nassertion `left == right` failed"
+        "log_excerpt": "test auth::pkce_verifier ... FAILED\nassertion `left == right` failed",
+        "job_id": 701,
+        "run_id": 900,
+        "html_url": "https://github.com/acme/rocket/actions/runs/900/job/701"
       }
-    ]
+    ],
+    "watch": {
+      "outcome": "failed_fast",
+      "elapsed_secs": 38,
+      "polls": 5,
+      "stopped_early": true
+    }
   }
   ```
-  When `failing_count > 0`, `oz ci --json` exits with code **`1`**, sets top-level `ok: false` and `error.code: "check_failed"`, and still returns the full `CiReport` in `data`.
+  When `failing_count > 0`, `oz ci --json` exits with code **`1`**, sets top-level `ok: false` and `error.code: "check_failed"`, and still returns the full `CiReport` in `data`. Under `--watch`, `watch.outcome` is one of `"passed"` (exit `0`), `"failed_fast"` / `"failed"` (`"check_failed"`), `"timed_out"` (`"watch_timed_out"`), `"no_checks_timed_out"` (`"no_checks_timed_out"`), or `"superseded"` (`"watch_superseded"`), all non-passing outcomes exiting with code **`1`**. Under `--job <ID>`, returns `CiJobLogReport`: `{ "job_id", "run_id"?, "name", "status", "conclusion"?, "html_url"?, "failing_step"?, "selected_step"?, "raw", "log_excerpt"? }`.
 * **`oz clone`:** `{ "destination", "git_dir", "remote_name", "remote_url", "protocol_version", "branch"?, "head_oid"?, "partial_clone", "filter"?, "filter_negotiated", "checked_out_files", "op_id"?, "warnings"? }`
 * **`oz fetch`:** `{ "remote", "remote_url", "protocol_version", "pack_received", "filter_negotiated", "updated_refs": [ { "remote_ref", "local_ref", "old_oid"?, "new_oid", "forced" } ], "pruned_refs", "op_id"?, "warnings"? }`
-* **`oz push`:** `{ "remote", "remote_url", "atomic", "pack_objects_sent", "pack_bytes_sent", "pushed_refs": [ { "local_ref"?, "remote_ref", "old_oid"?, "new_oid"?, "deleted", "forced" } ], "upstream_configured", "op_id"? }`
+* **`oz push [--watch [--wait-all] [--timeout <SECS>] [--startup-timeout <SECS>] [--check <PAT>] [--ignore-check <PAT>] [--progress]]`:** `{ "remote", "remote_url", "atomic", "pack_objects_sent", "pack_bytes_sent", "pushed_refs": [ { "local_ref"?, "remote_ref", "old_oid"?, "new_oid"?, "deleted", "forced" } ], "upstream_configured", "op_id"?, "ci"? }`
 
 ---
 
@@ -486,4 +495,4 @@ Every `tools/call` returns an MCP `CallToolResult`: `{ "content": [{ "type": "te
 | `oz_radar` | *(none)* | `base`, `include_committed` (default `true`), `workspaces[]`, `directory` | Cross-workspace collision radar. |
 | `oz_checkpoint` | *(none)* | `message`, `workspace`, `directory` | Capture `< 10 ms` MVCC checkpoint in OpLog & `refs/ozone/checkpoints/<ws>`. |
 | `oz_undo` | *(none)* | `op_id`, `steps` (integer >= 1, default `1`), `workspace`, `directory` | Rewind OpLog mutations/checkpoints (`op_id` and `steps` are mutually exclusive). |
-| `oz_ci_logs` | *(none)* | `branch`, `commit_oid`, `pr_number`, `run_id`, `failing_only`, `workspace`, `directory` | Fetch GitHub CI check status and compact failing log excerpts. |
+| `oz_ci_logs` | *(none)* | `branch`, `commit_oid`, `pr_number`, `run_id`, `job_id`, `step`, `raw`, `max_excerpt_lines`, `failing_only`, `wait_seconds` (`0..=120`), `fail_fast`, `startup_timeout_seconds`, `check_filter[]`, `ignore_checks[]`, `workspace`, `directory` | Fetch GitHub CI check status, compact failing log excerpts, bounded long-poll watching, or single-job log drill-down. |

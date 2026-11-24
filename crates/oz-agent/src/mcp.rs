@@ -64,8 +64,29 @@ pub struct CiLogsRequest {
     pub pr_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub raw: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_excerpt_lines: Option<usize>,
     #[serde(default)]
     pub failing_only: bool,
+    /// Bounded long-poll duration in seconds (`0` = snapshot; capped at `120`s by provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_seconds: Option<u64>,
+    /// Exit early on first failure when `wait_seconds > 0` (defaults to `true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_fast: Option<bool>,
+    /// Grace period in seconds when zero checks are registered (when `wait_seconds > 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_filter: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_checks: Vec<String>,
 }
 
 /// Single CI check or job log excerpt returned by `oz_ci_logs`.
@@ -79,6 +100,12 @@ pub struct CiLogEntry {
     pub failing_step: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
 }
 
 /// Structured CI check & failing log report returned by [`CiLogProvider`].
@@ -89,6 +116,20 @@ pub struct CiLogsReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_oid: Option<String>,
     pub all_passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overall_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_poll_secs: Option<u64>,
     pub checks: Vec<CiLogEntry>,
 }
 
@@ -870,7 +911,16 @@ impl McpServer {
             commit_oid: args.commit_oid.or_else(|| repo.head_oid.clone()),
             pr_number: args.pr_number,
             run_id: args.run_id,
+            job_id: args.job_id,
+            step: args.step,
+            raw: args.raw.unwrap_or(false),
+            max_excerpt_lines: args.max_excerpt_lines,
             failing_only: args.failing_only.unwrap_or(false),
+            wait_seconds: args.wait_seconds,
+            fail_fast: args.fail_fast,
+            startup_timeout_seconds: args.startup_timeout_seconds,
+            check_filter: args.check_filter.unwrap_or_default(),
+            ignore_checks: args.ignore_checks.unwrap_or_default(),
         };
         let report = provider.fetch_ci_logs(&repo, &req)?;
 
@@ -1197,7 +1247,16 @@ struct CiLogsToolArgs {
     commit_oid: Option<String>,
     pr_number: Option<u64>,
     run_id: Option<u64>,
+    job_id: Option<u64>,
+    step: Option<String>,
+    raw: Option<bool>,
+    max_excerpt_lines: Option<usize>,
     failing_only: Option<bool>,
+    wait_seconds: Option<u64>,
+    fail_fast: Option<bool>,
+    startup_timeout_seconds: Option<u64>,
+    check_filter: Option<Vec<String>>,
+    ignore_checks: Option<Vec<String>>,
     directory: Option<String>,
     workspace: Option<String>,
 }
@@ -1521,7 +1580,7 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "oz_ci_logs",
-            "description": "Fetch CI check status and compact failing step logs for agent self-healing.",
+            "description": "Fetch GitHub CI check status, compact failing step logs, optional bounded long-poll watching (wait_seconds <= 120), or single-job log drill-down (job_id).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1529,7 +1588,16 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
                     "commit_oid": { "type": "string" },
                     "pr_number": { "type": "integer" },
                     "run_id": { "type": "integer" },
+                    "job_id": { "type": "integer", "description": "Directly fetch cleaned logs for a single GitHub Actions job ID." },
+                    "step": { "type": "string", "description": "Optional step name filter when inspecting a job_id." },
+                    "raw": { "type": "boolean", "description": "Return cleaned tail lines instead of error-anchor excerpts (with job_id)." },
+                    "max_excerpt_lines": { "type": "integer", "minimum": 1, "description": "Maximum lines per failing check or job log excerpt (default: 40)." },
                     "failing_only": { "type": "boolean" },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 120, "description": "Bounded long-poll wait in seconds (0 = instant snapshot; capped at 120s). Returns early on pass, fail_fast, or superseded." },
+                    "fail_fast": { "type": "boolean", "description": "Exit early on first failure when wait_seconds > 0 (default: true)." },
+                    "startup_timeout_seconds": { "type": "integer", "minimum": 0, "maximum": 120, "description": "Grace period waiting for checks to appear on a newly pushed commit (default: 30 when wait_seconds > 0)." },
+                    "check_filter": { "type": "array", "items": { "type": "string" }, "description": "Only include checks matching these name substrings or globs." },
+                    "ignore_checks": { "type": "array", "items": { "type": "string" }, "description": "Ignore checks matching these name substrings or globs." },
                     "workspace": { "type": "string" },
                     "directory": { "type": "string" }
                 }
@@ -1692,6 +1760,13 @@ mod tests {
                     branch: req.branch.clone(),
                     commit_oid: req.commit_oid.clone(),
                     all_passed: false,
+                    overall_status: Some("failing".to_string()),
+                    failing_count: Some(1),
+                    pending_count: Some(0),
+                    watch_outcome: None,
+                    elapsed_secs: None,
+                    superseded_by_sha: None,
+                    recommended_poll_secs: None,
                     checks: vec![CiLogEntry {
                         name: "cargo-test".to_string(),
                         status: "completed".to_string(),
@@ -1700,6 +1775,9 @@ mod tests {
                         log_excerpt: Some(
                             "assertion `left == right` failed at src/lib.rs:42".to_string(),
                         ),
+                        job_id: Some(701),
+                        run_id: Some(900),
+                        html_url: None,
                     }],
                 })
             });

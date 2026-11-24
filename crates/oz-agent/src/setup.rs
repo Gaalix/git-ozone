@@ -438,7 +438,7 @@ Use `oz` instead of multi-step `git add` / `git stash` / `git reset` commands to
 - **Live Collision Radar:** Check overlapping edits across parallel workspaces before conflicts happen with `oz radar --json`.
 - **Atomic In-Memory Integration:** Merge workspaces safely with test verification via `oz integrate <ws1> <ws2> --into main --verify \"cargo test\"` (and resolve indexed conflicts with `oz resolve c1 --take ours|theirs`).
 - **Instant Rewind & Checkpoints:** Snapshot dirty state with `oz checkpoint --quiet` and reverse any mutation or checkpoint in `< 10 ms` via `oz undo [op_id | --steps N]`.
-- **CI Self-Healing:** Inspect compact failing GitHub Actions logs with `oz ci --json`.
+- **CI Watching & Self-Healing:** Inspect CI snapshots with `oz ci --json`, or block silently until CI passes/fails-fast (with cleaned failure excerpts) via a single backgrounded `oz ci --watch --json` (or `oz push --watch --json`). Drill into deeper logs for a specific failing job with `oz ci --job <id> --max-excerpt-lines 150 --json`. In MCP-only environments, call `oz_ci_logs` with `wait_seconds: 60` (bounded long-poll) and follow `recommended_poll_secs` if still pending.
 - **MCP Tools:** When `oz mcp` is connected and structured tool calls are preferred (or in shell-less harnesses), use `oz_status`, `oz_diff`, `oz_show`, `oz_commit`, `oz_log`, `oz_restore`, `oz_ws_spawn`, `oz_radar`, `oz_checkpoint`, `oz_undo`, and `oz_ci_logs` (always passing `\"directory\": \"<repo-root>\"`).
 "
 }

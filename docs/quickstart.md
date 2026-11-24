@@ -127,6 +127,13 @@ oz pr stack
 # Fetch GitHub Check Runs & compact failing Actions job log excerpts (exit code 1 on failure)
 oz ci --json
 
+# Watch CI silently until pass or fail-fast (or push & watch in one step)
+oz ci --watch --json
+oz push --watch --json
+
+# Drill into deeper cleaned logs for a specific failing Actions job
+oz ci --job 701 --max-excerpt-lines 150 --json
+
 # After PRs merge: fetch origin, fast-forward main, retarget downstream PR bases,
 # rebase local downstream branches, prune merged CoW workspaces, and refresh warm baseline
 oz sync
