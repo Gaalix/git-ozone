@@ -1105,9 +1105,25 @@ mod linux_impl {
             }
         }
 
+        fn add_path_shared_requests(reqs: &mut BTreeMap<PathBuf, PathLockMode>, target: &Path) {
+            if target.as_os_str().is_empty() {
+                reqs.entry(PathBuf::new()).or_insert(PathLockMode::Shared);
+                return;
+            }
+            for anc in ancestors_inclusive(target) {
+                reqs.entry(anc).or_insert(PathLockMode::Shared);
+            }
+        }
+
         fn lock_path(&self, target: &Path) -> PathLockGuard<'_> {
             let mut reqs = BTreeMap::new();
             Self::add_path_requests(&mut reqs, target);
+            self.acquire(reqs)
+        }
+
+        fn lock_path_shared(&self, target: &Path) -> PathLockGuard<'_> {
+            let mut reqs = BTreeMap::new();
+            Self::add_path_shared_requests(&mut reqs, target);
             self.acquire(reqs)
         }
 
@@ -1318,6 +1334,99 @@ mod linux_impl {
             }
         }
 
+        /// Resolves `parent/name` (handling `.` and `..`) and acquires a shared path lock
+        /// covering both `parent` and the resolved target path, retrying if `parent` moved
+        /// concurrently while waiting on `path_locks`.
+        fn lock_lookup_path(
+            &self,
+            parent: INodeNo,
+            name: &OsStr,
+        ) -> std::result::Result<(PathBuf, PathLockGuard<'_>), Errno> {
+            loop {
+                let parent_rel = self.lock_state().inodes.resolve_ino_path(parent)?;
+                let (rel, lock_target) = if name == "." {
+                    (parent_rel.clone(), parent_rel.clone())
+                } else if name == ".." {
+                    let target = parent_rel
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    // Locking `parent_rel` as Shared covers `parent_rel` and all of its
+                    // ancestors (including `target` when non-empty).
+                    (target, parent_rel.clone())
+                } else {
+                    let child = Self::child_rel_path(&parent_rel, name);
+                    (child.clone(), child)
+                };
+                let guard = self.path_locks.lock_path_shared(&lock_target);
+                match self.lock_state().inodes.resolve_ino_path(parent) {
+                    Ok(current) if current == parent_rel => return Ok((rel, guard)),
+                    Ok(_) => drop(guard),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// Stats `ino` while holding a shared path lock (with inode-path revalidation on
+        /// concurrent renames), falling back to an open file descriptor when unlinked.
+        fn getattr_inner(
+            &self,
+            ino: INodeNo,
+            fh: Option<FileHandle>,
+        ) -> std::result::Result<FileAttr, Errno> {
+            let locked = loop {
+                let candidate = {
+                    let inner = self.lock_state();
+                    match inner.inodes.resolve_ino_path(ino) {
+                        Ok(rel) => Ok(rel),
+                        Err(_) => {
+                            let open_file = fh
+                                .and_then(|handle| inner.open_files.get(&handle))
+                                .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
+                                .map(|open| Arc::clone(&open.file));
+                            Err(open_file)
+                        }
+                    }
+                };
+                let rel = match candidate {
+                    Ok(rel) => rel,
+                    Err(open_file) => break Err(open_file),
+                };
+                let guard = self.path_locks.lock_path_shared(&rel);
+                let still_valid =
+                    self.lock_state().inodes.resolve_ino_path(ino).as_ref() == Ok(&rel);
+                if still_valid {
+                    break Ok((rel, guard));
+                }
+                drop(guard);
+            };
+
+            match locked {
+                Ok((rel, _path_guard)) => {
+                    if let Ok(attr) = self.stat_resolved_unlocked(&rel, false) {
+                        return Ok(attr);
+                    }
+                    let open_file = {
+                        let inner = self.lock_state();
+                        fh.and_then(|handle| inner.open_files.get(&handle))
+                            .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
+                            .map(|open| Arc::clone(&open.file))
+                    };
+                    if let Some(file) = open_file
+                        && let Ok(meta) = file.metadata()
+                    {
+                        return Ok(metadata_to_file_attr(ino, &meta));
+                    }
+                    Err(Errno::ENOENT)
+                }
+                Err(Some(file)) => file
+                    .metadata()
+                    .map(|meta| metadata_to_file_attr(ino, &meta))
+                    .map_err(|_| Errno::ENOENT),
+                Err(None) => Err(Errno::ENOENT),
+            }
+        }
+
         #[cfg(test)]
         pub(super) fn test_copy_up_entry(
             &self,
@@ -1340,6 +1449,37 @@ mod linux_impl {
 
         #[cfg(test)]
         pub(super) fn test_stat_resolved(
+            &self,
+            rel: &Path,
+            inc_lookup: bool,
+        ) -> std::result::Result<FileAttr, Errno> {
+            let _guard = self.path_locks.lock_path_shared(rel);
+            self.stat_resolved_unlocked(rel, inc_lookup)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_getattr_ino(
+            &self,
+            ino: INodeNo,
+        ) -> std::result::Result<FileAttr, Errno> {
+            self.getattr_inner(ino, None)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_rename_subtree_inodes(&self, src_rel: &Path, dst_rel: &Path) {
+            self.lock_state().inodes.rename_subtree(src_rel, dst_rel);
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_resolve_ino_path(
+            &self,
+            ino: INodeNo,
+        ) -> std::result::Result<PathBuf, Errno> {
+            self.lock_state().inodes.resolve_ino_path(ino)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_stat_under_held_lock(
             &self,
             rel: &Path,
             inc_lookup: bool,
@@ -1585,6 +1725,9 @@ mod linux_impl {
 
         /// Resolves and stats `rel` outside `self.state`, acquiring `self.state` only briefly
         /// for the pure in-memory [`InodeTable`] lookup/insert or detach.
+        ///
+        /// Caller must hold a shared or exclusive [`PathLockGuard`] covering `rel` so
+        /// `detach_path` / `lookup_or_insert` cannot race with concurrent `rename` or `create`.
         fn stat_resolved_unlocked(
             &self,
             rel: &Path,
@@ -1826,26 +1969,16 @@ mod linux_impl {
 
     impl Filesystem for OzoneOverlayFs {
         fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-            let parent_rel = match self.lock_state().inodes.resolve_ino_path(parent) {
-                Ok(p) => p,
+            if name != "." && name != ".." && !is_valid_child_name(name) {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            let (rel, _path_guard) = match self.lock_lookup_path(parent, name) {
+                Ok(v) => v,
                 Err(e) => {
                     reply.error(e);
                     return;
                 }
-            };
-            let rel = if name == "." {
-                parent_rel
-            } else if name == ".." {
-                parent_rel
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default()
-            } else {
-                if !is_valid_child_name(name) {
-                    reply.error(Errno::EINVAL);
-                    return;
-                }
-                Self::child_rel_path(&parent_rel, name)
             };
 
             match self.stat_resolved_unlocked(&rel, true) {
@@ -1859,28 +1992,10 @@ mod linux_impl {
         }
 
         fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-            let (rel, open_file) = {
-                let inner = self.lock_state();
-                let rel = inner.inodes.resolve_ino_path(ino).ok();
-                let open_file = fh
-                    .and_then(|handle| inner.open_files.get(&handle))
-                    .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
-                    .map(|open| Arc::clone(&open.file));
-                (rel, open_file)
-            };
-            if let Some(rel) = rel
-                && let Ok(attr) = self.stat_resolved_unlocked(&rel, false)
-            {
-                reply.attr(&ZERO_TTL, &attr);
-                return;
+            match self.getattr_inner(ino, fh) {
+                Ok(attr) => reply.attr(&ZERO_TTL, &attr),
+                Err(e) => reply.error(e),
             }
-            if let Some(file) = open_file
-                && let Ok(meta) = file.metadata()
-            {
-                reply.attr(&ZERO_TTL, &metadata_to_file_attr(ino, &meta));
-                return;
-            }
-            reply.error(Errno::ENOENT);
         }
 
         fn setattr(
@@ -3475,23 +3590,35 @@ mod tests {
 
         locked_barrier.wait();
 
-        // Parallel lookups & reads across both `dir_b/other.txt` and `dir_a/heavy.bin`.
+        // Parallel lookups, getattr, and reads across unrelated (`dir_b/other.txt`) and sibling
+        // (`dir_a/sibling.txt`, sharing `dir_a`) paths must complete immediately without blocking.
         let other_attr = fs
             .test_stat_resolved(Path::new("dir_b/other.txt"), true)
             .expect("lookup unrelated path while heavy copy-up holds path lock");
+        assert_eq!(
+            fs.test_getattr_ino(other_attr.ino)
+                .expect("getattr unrelated path")
+                .size,
+            b"other-data".len() as u64
+        );
         assert_eq!(
             fs.test_read_file_via_ino(other_attr.ino)
                 .expect("read unrelated path"),
             b"other-data"
         );
-        let heavy_attr = fs
-            .test_stat_resolved(Path::new("dir_a/heavy.bin"), true)
-            .expect("lookup locked path must not block on path lock");
+        let sibling_attr = fs
+            .test_stat_resolved(Path::new("dir_a/sibling.txt"), true)
+            .expect("lookup sibling path while heavy copy-up holds Shared(dir_a)");
         assert_eq!(
-            fs.test_read_file_via_ino(heavy_attr.ino)
-                .expect("read heavy baseline")
-                .len(),
-            64 * 1024
+            fs.test_getattr_ino(sibling_attr.ino)
+                .expect("getattr sibling path")
+                .size,
+            b"sibling-data".len() as u64
+        );
+        assert_eq!(
+            fs.test_read_file_via_ino(sibling_attr.ino)
+                .expect("read sibling path"),
+            b"sibling-data"
         );
 
         // Unrelated copy-up and sibling copy-up under the same parent (`dir_a` held Shared)
@@ -3511,6 +3638,17 @@ mod tests {
 
         release_barrier.wait();
         holder.join().expect("join holder");
+
+        // Lookup on `dir_a/heavy.bin` succeeds immediately once its exclusive path lock drops.
+        let heavy_attr = fs
+            .test_stat_resolved(Path::new("dir_a/heavy.bin"), true)
+            .expect("lookup heavy after copy-up finishes");
+        assert_eq!(
+            fs.test_read_file_via_ino(heavy_attr.ino)
+                .expect("read heavy baseline")
+                .len(),
+            64 * 1024
+        );
 
         // Phase 2: Exclusive lock on parent directory `dir_a` (e.g. directory rename/rmdir)
         // must serialize against a descendant copy-up (`dir_a/child.txt`) until released.
@@ -3654,6 +3792,91 @@ mod tests {
             0,
             "path lock table must reclaim all idle slots"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_getattr_during_rename_and_lookup_during_create_never_corrupt_inodes() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = test_cfg(dir.path());
+        let base = cfg.baseline_dir.as_ref().expect("base");
+        std::fs::write(base.join("a.txt"), b"hello-rename").expect("write a.txt");
+
+        let fs = Arc::new(linux_impl::OzoneOverlayFs::new(cfg.clone()));
+        let attr_a = fs
+            .test_stat_resolved(Path::new("a.txt"), true)
+            .expect("initial lookup a.txt");
+
+        // Regression 1: `getattr(ino_a)` runs in the critical window after `rename("a.txt", "b.txt")`
+        // has moved the file on disk and written the whiteout for `"a.txt"`, BEFORE updating
+        // `inodes.rename_subtree("a.txt", "b.txt")`. Shared path locking + revalidation must
+        // prevent `getattr` from detaching `"a.txt"` and orphaning `ino_a`.
+        let rename_ready = Arc::new(Barrier::new(2));
+        let fs_r = Arc::clone(&fs);
+        let cfg_r = cfg.clone();
+        let ready_r = Arc::clone(&rename_ready);
+        let rename_thread = std::thread::spawn(move || {
+            let _guard = fs_r.test_lock_two_paths(Path::new("a.txt"), Path::new("b.txt"));
+            std::fs::write(cfg_r.upper_dir.join("b.txt"), b"hello-rename").expect("write upper b");
+            let wh_a = marker_path(&cfg_r.whiteouts_dir(), Path::new("a.txt"), WHITEOUT_SUFFIX);
+            std::fs::write(&wh_a, b"").expect("write wh a");
+            // Signal `getattr` thread while disk state has `"a.txt"` gone and `"b.txt"` present,
+            // but `InodeTable` still maps `ino_a -> "a.txt"`.
+            ready_r.wait();
+            std::thread::sleep(Duration::from_millis(30));
+            fs_r.test_rename_subtree_inodes(Path::new("a.txt"), Path::new("b.txt"));
+        });
+
+        rename_ready.wait();
+        let attr_after = fs
+            .test_getattr_ino(attr_a.ino)
+            .expect("getattr must serialize with rename and follow renamed inode");
+        rename_thread.join().expect("join rename thread");
+
+        assert_eq!(attr_after.ino, attr_a.ino);
+        assert_eq!(attr_after.size, b"hello-rename".len() as u64);
+        assert_eq!(
+            fs.test_resolve_ino_path(attr_a.ino)
+                .expect("ino_a must remain attached at b.txt"),
+            PathBuf::from("b.txt")
+        );
+        assert_eq!(
+            fs.test_read_file_via_ino(attr_a.ino)
+                .expect("read renamed inode"),
+            b"hello-rename"
+        );
+
+        // Regression 2: concurrent `lookup("fresh.txt")` during `create("fresh.txt")` must
+        // serialize on the path lock and observe the newly created inode rather than detaching it.
+        let create_ready = Arc::new(Barrier::new(2));
+        let fs_c = Arc::clone(&fs);
+        let cfg_c = cfg.clone();
+        let ready_c = Arc::clone(&create_ready);
+        let create_thread = std::thread::spawn(move || {
+            let _guard = fs_c.test_lock_path(Path::new("fresh.txt"));
+            ready_c.wait();
+            std::thread::sleep(Duration::from_millis(30));
+            std::fs::write(cfg_c.upper_dir.join("fresh.txt"), b"created").expect("write fresh");
+            fs_c.test_stat_under_held_lock(Path::new("fresh.txt"), true)
+                .expect("create inserts inode")
+        });
+
+        create_ready.wait();
+        let lookup_attr = fs
+            .test_stat_resolved(Path::new("fresh.txt"), true)
+            .expect("lookup serialized behind create must see fresh.txt");
+        let created_attr = create_thread.join().expect("join create thread");
+
+        assert_eq!(lookup_attr.ino, created_attr.ino);
+        assert_eq!(
+            fs.test_resolve_ino_path(created_attr.ino)
+                .expect("newly created inode must not be detached"),
+            PathBuf::from("fresh.txt")
+        );
+        assert_eq!(fs.test_active_path_locks(), 0);
     }
 
     #[cfg(target_os = "linux")]
