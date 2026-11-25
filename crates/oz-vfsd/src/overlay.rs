@@ -11,7 +11,9 @@
 use crate::protocol::{DirtyPathEntry, MountSpec};
 use oz_core::{ChangeKind, OzError, Result};
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs::FileType as StdFileType;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
@@ -843,7 +845,8 @@ mod linux_impl {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const ZERO_TTL: Duration = Duration::ZERO;
@@ -1027,31 +1030,291 @@ mod linux_impl {
 
     type DirSnapshot = Arc<Vec<(INodeNo, FileType, OsString)>>;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PathLockMode {
+        Shared,
+        Exclusive,
+    }
+
+    #[derive(Debug, Default)]
+    struct PathSlot {
+        readers: usize,
+        writer: bool,
+    }
+
+    /// Hierarchical per-path lock table separating slow blocking filesystem I/O (copy-up,
+    /// directory tree materialization, rename, rmdir) from the short-lived in-memory
+    /// [`InnerState`] mutex.
+    ///
+    /// Strict lock ordering (acyclic — deadlock-free):
+    /// 1. Level 1: [`PathLockGuard`] acquired atomically (all-or-nothing) across proper
+    ///    ancestors (`Shared`) and target path(s) (`Exclusive`). Callers must never hold
+    ///    `OzoneOverlayFs::state` or another [`PathLockGuard`] when acquiring.
+    /// 2. Level 2: `OzoneOverlayFs::state` (`Mutex<InnerState>`) for fast, pure in-memory
+    ///    `InodeTable` / `open_files` / `open_dirs` operations only.
+    #[derive(Debug, Default)]
+    struct PathLockTable {
+        slots: Mutex<HashMap<PathBuf, PathSlot>>,
+        cvar: Condvar,
+    }
+
+    pub(super) struct PathLockGuard<'a> {
+        table: &'a PathLockTable,
+        acquired: Vec<(PathBuf, PathLockMode)>,
+    }
+
+    impl Drop for PathLockGuard<'_> {
+        fn drop(&mut self) {
+            let mut slots = self
+                .table
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (path, mode) in &self.acquired {
+                if let Some(slot) = slots.get_mut(path) {
+                    match mode {
+                        PathLockMode::Shared => {
+                            slot.readers = slot.readers.saturating_sub(1);
+                        }
+                        PathLockMode::Exclusive => {
+                            slot.writer = false;
+                        }
+                    }
+                    if slot.readers == 0 && !slot.writer {
+                        slots.remove(path);
+                    }
+                }
+            }
+            self.table.cvar.notify_all();
+        }
+    }
+
+    impl PathLockTable {
+        fn add_path_requests(reqs: &mut BTreeMap<PathBuf, PathLockMode>, target: &Path) {
+            if target.as_os_str().is_empty() {
+                reqs.insert(PathBuf::new(), PathLockMode::Exclusive);
+                return;
+            }
+            let prefixes = ancestors_inclusive(target);
+            if let Some((last, proper_ancestors)) = prefixes.split_last() {
+                for anc in proper_ancestors {
+                    reqs.entry(anc.clone()).or_insert(PathLockMode::Shared);
+                }
+                // Exclusive always dominates Shared when two locked paths overlap an ancestor.
+                reqs.insert(last.clone(), PathLockMode::Exclusive);
+            }
+        }
+
+        fn lock_path(&self, target: &Path) -> PathLockGuard<'_> {
+            let mut reqs = BTreeMap::new();
+            Self::add_path_requests(&mut reqs, target);
+            self.acquire(reqs)
+        }
+
+        fn lock_two_paths(&self, first: &Path, second: &Path) -> PathLockGuard<'_> {
+            let mut reqs = BTreeMap::new();
+            Self::add_path_requests(&mut reqs, first);
+            Self::add_path_requests(&mut reqs, second);
+            self.acquire(reqs)
+        }
+
+        fn acquire(&self, reqs: BTreeMap<PathBuf, PathLockMode>) -> PathLockGuard<'_> {
+            let ordered: Vec<(PathBuf, PathLockMode)> = reqs.into_iter().collect();
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                let conflict = ordered.iter().any(|(path, mode)| {
+                    slots.get(path).is_some_and(|slot| match mode {
+                        PathLockMode::Shared => slot.writer,
+                        PathLockMode::Exclusive => slot.writer || slot.readers > 0,
+                    })
+                });
+                if !conflict {
+                    for (path, mode) in &ordered {
+                        let slot = slots.entry(path.clone()).or_default();
+                        match mode {
+                            PathLockMode::Shared => slot.readers += 1,
+                            PathLockMode::Exclusive => slot.writer = true,
+                        }
+                    }
+                    return PathLockGuard {
+                        table: self,
+                        acquired: ordered,
+                    };
+                }
+                slots = self
+                    .cvar
+                    .wait(slots)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+
+        #[cfg(test)]
+        fn active_slot_count(&self) -> usize {
+            self.slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+        }
+    }
+
     #[derive(Debug)]
     struct InnerState {
         inodes: InodeTable,
         next_fh: u64,
         open_files: HashMap<FileHandle, OpenFile>,
         open_dirs: HashMap<FileHandle, Option<DirSnapshot>>,
-        next_tmp: u64,
+    }
+
+    struct LockedRenamePaths<'a> {
+        src_parent: PathBuf,
+        src_rel: PathBuf,
+        dst_parent: PathBuf,
+        dst_rel: PathBuf,
+        _guard: PathLockGuard<'a>,
     }
 
     pub(crate) struct OzoneOverlayFs {
         cfg: OverlayMountConfig,
+        path_locks: PathLockTable,
         state: Mutex<InnerState>,
+        next_tmp: AtomicU64,
     }
 
     impl OzoneOverlayFs {
         pub(crate) fn new(cfg: OverlayMountConfig) -> Self {
             Self {
                 cfg,
+                path_locks: PathLockTable::default(),
                 state: Mutex::new(InnerState {
                     inodes: InodeTable::new(),
                     next_fh: 1,
                     open_files: HashMap::new(),
                     open_dirs: HashMap::new(),
-                    next_tmp: 1,
                 }),
+                next_tmp: AtomicU64::new(1),
+            }
+        }
+
+        fn lock_state(&self) -> MutexGuard<'_, InnerState> {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn child_rel_path(parent_rel: &Path, name: &OsStr) -> PathBuf {
+            if parent_rel.as_os_str().is_empty() {
+                PathBuf::from(name)
+            } else {
+                parent_rel.join(name)
+            }
+        }
+
+        /// Resolves `ino` to its current virtual path and acquires its exclusive path lock,
+        /// retrying if a concurrent rename moved `ino` while waiting on `path_locks`.
+        fn lock_ino_path(
+            &self,
+            ino: INodeNo,
+        ) -> std::result::Result<(PathBuf, PathLockGuard<'_>), Errno> {
+            loop {
+                let rel = self.lock_state().inodes.resolve_ino_path(ino)?;
+                let guard = self.path_locks.lock_path(&rel);
+                match self.lock_state().inodes.resolve_ino_path(ino) {
+                    Ok(current) if current == rel => return Ok((rel, guard)),
+                    Ok(_) => drop(guard),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// Resolves `parent` and acquires the exclusive path lock for `parent/name`,
+        /// retrying if a concurrent rename moved `parent` while waiting on `path_locks`.
+        fn lock_parent_child(
+            &self,
+            parent: INodeNo,
+            name: &OsStr,
+        ) -> std::result::Result<(PathBuf, PathBuf, PathLockGuard<'_>), Errno> {
+            loop {
+                let parent_rel = self.lock_state().inodes.resolve_ino_path(parent)?;
+                let rel = Self::child_rel_path(&parent_rel, name);
+                let guard = self.path_locks.lock_path(&rel);
+                match self.lock_state().inodes.resolve_ino_path(parent) {
+                    Ok(current) if current == parent_rel => return Ok((parent_rel, rel, guard)),
+                    Ok(_) => drop(guard),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// Resolves `(parent, newparent)` and atomically acquires path locks on both
+        /// `parent/name` and `newparent/newname`, retrying if either moved concurrently.
+        /// Returns `Ok(None)` for a POSIX no-op self-rename (`src_rel == dst_rel`).
+        fn lock_rename_paths(
+            &self,
+            parent: INodeNo,
+            name: &OsStr,
+            newparent: INodeNo,
+            newname: &OsStr,
+        ) -> std::result::Result<Option<LockedRenamePaths<'_>>, Errno> {
+            loop {
+                let (src_parent, dst_parent) = {
+                    let inner = self.lock_state();
+                    let src_parent = inner.inodes.resolve_ino_path(parent)?;
+                    let dst_parent = inner.inodes.resolve_ino_path(newparent)?;
+                    (src_parent, dst_parent)
+                };
+                let src_rel = Self::child_rel_path(&src_parent, name);
+                let dst_rel = Self::child_rel_path(&dst_parent, newname);
+                if src_rel == dst_rel {
+                    return Ok(None);
+                }
+                if dst_rel.starts_with(&src_rel) {
+                    return Err(Errno::EINVAL);
+                }
+                let guard = self.path_locks.lock_two_paths(&src_rel, &dst_rel);
+                let valid = {
+                    let inner = self.lock_state();
+                    let cur_src = inner.inodes.resolve_ino_path(parent)?;
+                    let cur_dst = inner.inodes.resolve_ino_path(newparent)?;
+                    cur_src == src_parent && cur_dst == dst_parent
+                };
+                if valid {
+                    return Ok(Some(LockedRenamePaths {
+                        src_parent,
+                        src_rel,
+                        dst_parent,
+                        dst_rel,
+                        _guard: guard,
+                    }));
+                }
+                drop(guard);
+            }
+        }
+
+        /// Resolves `(ino, newparent)` and atomically acquires path locks on `old_rel` and
+        /// `newparent/newname`, retrying if either moved concurrently.
+        fn lock_link_paths(
+            &self,
+            ino: INodeNo,
+            newparent: INodeNo,
+            newname: &OsStr,
+        ) -> std::result::Result<(PathBuf, PathBuf, PathBuf, PathLockGuard<'_>), Errno> {
+            loop {
+                let (old_rel, new_parent_rel) = {
+                    let inner = self.lock_state();
+                    let old_rel = inner.inodes.resolve_ino_path(ino)?;
+                    let new_parent_rel = inner.inodes.resolve_ino_path(newparent)?;
+                    (old_rel, new_parent_rel)
+                };
+                let new_rel = Self::child_rel_path(&new_parent_rel, newname);
+                let guard = self.path_locks.lock_two_paths(&old_rel, &new_rel);
+                let valid = {
+                    let inner = self.lock_state();
+                    let cur_old = inner.inodes.resolve_ino_path(ino)?;
+                    let cur_parent = inner.inodes.resolve_ino_path(newparent)?;
+                    cur_old == old_rel && cur_parent == new_parent_rel
+                };
+                if valid {
+                    return Ok((old_rel, new_parent_rel, new_rel, guard));
+                }
+                drop(guard);
             }
         }
 
@@ -1061,8 +1324,50 @@ mod linux_impl {
             rel: &Path,
             truncate_to_zero: bool,
         ) -> std::result::Result<(), Errno> {
-            let mut inner = self.state.lock().map_err(|_| Errno::EIO)?;
-            self.copy_up_entry(&mut inner, rel, truncate_to_zero)
+            let _guard = self.path_locks.lock_path(rel);
+            self.copy_up_entry_unlocked(rel, truncate_to_zero)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_lock_path(&self, rel: &Path) -> PathLockGuard<'_> {
+            self.path_locks.lock_path(rel)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_lock_two_paths(&self, first: &Path, second: &Path) -> PathLockGuard<'_> {
+            self.path_locks.lock_two_paths(first, second)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_stat_resolved(
+            &self,
+            rel: &Path,
+            inc_lookup: bool,
+        ) -> std::result::Result<FileAttr, Errno> {
+            self.stat_resolved_unlocked(rel, inc_lookup)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_read_file_via_ino(
+            &self,
+            ino: INodeNo,
+        ) -> std::result::Result<Vec<u8>, Errno> {
+            let rel = self.lock_state().inodes.resolve_ino_path(ino)?;
+            let resolved = resolve_rel_path(&self.cfg, &rel).ok_or(Errno::ENOENT)?;
+            std::fs::read(&resolved.host_path).map_err(|e| errno_from_io(&e))
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_active_path_locks(&self) -> usize {
+            self.path_locks.active_slot_count()
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_poison_state(&self) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = self.state.lock();
+                panic!("intentional poison for recovery test");
+            }));
         }
 
         fn upper_path(&self, rel: &Path) -> PathBuf {
@@ -1131,10 +1436,24 @@ mod linux_impl {
                         if !lower_meta.file_type().is_dir() {
                             return Err(Errno::ENOTDIR);
                         }
-                        std::fs::create_dir(&upper_cand).map_err(|err| errno_from_io(&err))?;
-                        let mode = lower_meta.mode() & 0o7777;
-                        let _ = std::fs::set_permissions(&upper_cand, Permissions::from_mode(mode));
-                        let _ = copy_timestamps(&upper_cand, &lower_meta);
+                        match std::fs::create_dir(&upper_cand) {
+                            Ok(()) => {
+                                let mode = lower_meta.mode() & 0o7777;
+                                let _ = std::fs::set_permissions(
+                                    &upper_cand,
+                                    Permissions::from_mode(mode),
+                                );
+                                let _ = copy_timestamps(&upper_cand, &lower_meta);
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                                let existing = std::fs::symlink_metadata(&upper_cand)
+                                    .map_err(|e| errno_from_io(&e))?;
+                                if !existing.file_type().is_dir() {
+                                    return Err(Errno::ENOTDIR);
+                                }
+                            }
+                            Err(err) => return Err(errno_from_io(&err)),
+                        }
                     }
                     Err(e) => return Err(errno_from_io(&e)),
                 }
@@ -1142,9 +1461,10 @@ mod linux_impl {
             Ok(())
         }
 
-        fn copy_up_entry(
+        /// Copies `rel` from lower layers into `upper_dir` without holding `self.state`.
+        /// Caller must hold an exclusive [`PathLockGuard`] covering `rel`.
+        fn copy_up_entry_unlocked(
             &self,
-            inner: &mut InnerState,
             rel: &Path,
             truncate_to_zero: bool,
         ) -> std::result::Result<(), Errno> {
@@ -1172,12 +1492,23 @@ mod linux_impl {
 
             let ft = lower_meta.file_type();
             if ft.is_dir() {
-                std::fs::create_dir(&upper_target).map_err(|e| errno_from_io(&e))?;
-                let _ = std::fs::set_permissions(
-                    &upper_target,
-                    Permissions::from_mode(lower_meta.mode() & 0o7777),
-                );
-                let _ = copy_timestamps(&upper_target, &lower_meta);
+                match std::fs::create_dir(&upper_target) {
+                    Ok(()) => {
+                        let _ = std::fs::set_permissions(
+                            &upper_target,
+                            Permissions::from_mode(lower_meta.mode() & 0o7777),
+                        );
+                        let _ = copy_timestamps(&upper_target, &lower_meta);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let existing = std::fs::symlink_metadata(&upper_target)
+                            .map_err(|err| errno_from_io(&err))?;
+                        if !existing.file_type().is_dir() {
+                            return Err(Errno::ENOTDIR);
+                        }
+                    }
+                    Err(e) => return Err(errno_from_io(&e)),
+                }
             } else if ft.is_symlink() {
                 let target =
                     std::fs::read_link(&resolved.host_path).map_err(|e| errno_from_io(&e))?;
@@ -1187,8 +1518,7 @@ mod linux_impl {
             } else if ft.is_file() {
                 let tmp_dir = self.cfg.meta_dir.join("tmp");
                 std::fs::create_dir_all(&tmp_dir).map_err(|e| errno_from_io(&e))?;
-                let tmp_seq = inner.next_tmp;
-                inner.next_tmp += 1;
+                let tmp_seq = self.next_tmp.fetch_add(1, Ordering::Relaxed);
                 let tmp_path = tmp_dir.join(format!("copyup.{tmp_seq}"));
                 let mut dst = OpenOptions::new()
                     .create_new(true)
@@ -1233,55 +1563,51 @@ mod linux_impl {
             Ok(())
         }
 
-        fn materialize_lower_dir_tree(
+        /// Recursively copies all lower-layer entries under `rel_dir` into `upper_dir` without
+        /// holding `self.state`. Caller must hold an exclusive [`PathLockGuard`] on `rel_dir`.
+        fn materialize_lower_dir_tree_unlocked(
             &self,
-            inner: &mut InnerState,
             rel_dir: &Path,
-            removed_lower_files: &mut Vec<PathBuf>,
         ) -> std::result::Result<(), Errno> {
             self.ensure_upper_dir(rel_dir)?;
             let entries =
                 list_merged_dir_entries(&self.cfg, rel_dir).map_err(|e| errno_from_io(&e))?;
             for entry in entries {
-                let child_rel = if rel_dir.as_os_str().is_empty() {
-                    PathBuf::from(&entry.name)
-                } else {
-                    rel_dir.join(&entry.name)
-                };
-                if entry.layer != LayerKind::Upper && !entry.file_type.is_dir() {
-                    removed_lower_files.push(child_rel.clone());
-                }
+                let child_rel = Self::child_rel_path(rel_dir, &entry.name);
                 if entry.file_type.is_dir() {
-                    self.materialize_lower_dir_tree(inner, &child_rel, removed_lower_files)?;
+                    self.materialize_lower_dir_tree_unlocked(&child_rel)?;
                 } else {
-                    self.copy_up_entry(inner, &child_rel, false)?;
+                    self.copy_up_entry_unlocked(&child_rel, false)?;
                 }
             }
             Ok(())
         }
 
-        fn stat_resolved(
+        /// Resolves and stats `rel` outside `self.state`, acquiring `self.state` only briefly
+        /// for the pure in-memory [`InodeTable`] lookup/insert or detach.
+        fn stat_resolved_unlocked(
             &self,
-            inner: &mut InnerState,
             rel: &Path,
             inc_lookup: bool,
         ) -> std::result::Result<FileAttr, Errno> {
-            let resolved = match resolve_rel_path(&self.cfg, rel) {
-                Some(r) => r,
-                None => {
-                    inner.inodes.detach_path(rel);
-                    return Err(Errno::ENOENT);
+            let Some(resolved) = resolve_rel_path(&self.cfg, rel) else {
+                self.lock_state().inodes.detach_path(rel);
+                return Err(Errno::ENOENT);
+            };
+            let meta = match std::fs::symlink_metadata(&resolved.host_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.lock_state().inodes.detach_path(rel);
+                    return Err(errno_from_io(&e));
                 }
             };
-            let meta = std::fs::symlink_metadata(&resolved.host_path).map_err(|e| {
-                inner.inodes.detach_path(rel);
-                errno_from_io(&e)
-            })?;
             let is_dir = meta.file_type().is_dir();
             let ino = if rel.as_os_str().is_empty() {
                 INodeNo::ROOT
             } else {
-                inner.inodes.lookup_or_insert(rel, is_dir, inc_lookup)
+                self.lock_state()
+                    .inodes
+                    .lookup_or_insert(rel, is_dir, inc_lookup)
             };
             Ok(metadata_to_file_attr(ino, &meta))
         }
@@ -1387,6 +1713,8 @@ mod linux_impl {
         }
         let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
         let times = [to_libc_timespec(atime), to_libc_timespec(mtime)];
+        // SAFETY: `c_path` is a valid NUL-terminated C string and `times` is an initialized
+        // 2-element `[libc::timespec; 2]` array valid for the duration of `utimensat`.
         let rc = unsafe {
             libc::utimensat(
                 libc::AT_FDCWD,
@@ -1410,6 +1738,8 @@ mod linux_impl {
             return Ok(());
         }
         let times = [to_libc_timespec(atime), to_libc_timespec(mtime)];
+        // SAFETY: `file.as_raw_fd()` is an open file descriptor owned by `file`, and `times`
+        // points to a valid initialized 2-element `[libc::timespec; 2]` array.
         let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
         if rc != 0 {
             return Err(errno_from_io(&std::io::Error::last_os_error()));
@@ -1438,6 +1768,8 @@ mod linux_impl {
         let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
         let uid_val = uid.map_or(u32::MAX as libc::uid_t, |u| u as libc::uid_t);
         let gid_val = gid.map_or(u32::MAX as libc::gid_t, |g| g as libc::gid_t);
+        // SAFETY: `c_path` is a valid NUL-terminated C string; `uid_val`/`gid_val` use
+        // `(uid_t)-1` / `(gid_t)-1` (`u32::MAX`) to leave omitted IDs unchanged per POSIX.
         let rc = unsafe { libc::lchown(c_path.as_ptr(), uid_val, gid_val) };
         if rc != 0 {
             return Err(errno_from_io(&std::io::Error::last_os_error()));
@@ -1494,8 +1826,7 @@ mod linux_impl {
 
     impl Filesystem for OzoneOverlayFs {
         fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let parent_rel = match inner.inodes.resolve_ino_path(parent) {
+            let parent_rel = match self.lock_state().inodes.resolve_ino_path(parent) {
                 Ok(p) => p,
                 Err(e) => {
                     reply.error(e);
@@ -1514,37 +1845,37 @@ mod linux_impl {
                     reply.error(Errno::EINVAL);
                     return;
                 }
-                if parent_rel.as_os_str().is_empty() {
-                    PathBuf::from(name)
-                } else {
-                    parent_rel.join(name)
-                }
+                Self::child_rel_path(&parent_rel, name)
             };
 
-            match self.stat_resolved(&mut inner, &rel, true) {
+            match self.stat_resolved_unlocked(&rel, true) {
                 Ok(attr) => reply.entry(&ZERO_TTL, &attr, Generation(0)),
                 Err(e) => reply.error(e),
             }
         }
 
         fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            inner.inodes.forget(ino, nlookup);
+            self.lock_state().inodes.forget(ino, nlookup);
         }
 
         fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            if let Ok(rel) = inner.inodes.resolve_ino_path(ino)
-                && let Ok(attr) = self.stat_resolved(&mut inner, &rel, false)
+            let (rel, open_file) = {
+                let inner = self.lock_state();
+                let rel = inner.inodes.resolve_ino_path(ino).ok();
+                let open_file = fh
+                    .and_then(|handle| inner.open_files.get(&handle))
+                    .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
+                    .map(|open| Arc::clone(&open.file));
+                (rel, open_file)
+            };
+            if let Some(rel) = rel
+                && let Ok(attr) = self.stat_resolved_unlocked(&rel, false)
             {
                 reply.attr(&ZERO_TTL, &attr);
                 return;
             }
-            let open_match = fh
-                .and_then(|handle| inner.open_files.get(&handle))
-                .or_else(|| inner.open_files.values().find(|o| o.ino == ino));
-            if let Some(open) = open_match
-                && let Ok(meta) = open.file.metadata()
+            if let Some(file) = open_file
+                && let Ok(meta) = file.metadata()
             {
                 reply.attr(&ZERO_TTL, &metadata_to_file_attr(ino, &meta));
                 return;
@@ -1570,23 +1901,54 @@ mod linux_impl {
             _flags: Option<BsdFileFlags>,
             reply: ReplyAttr,
         ) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let rel_res = inner.inodes.resolve_ino_path(ino);
+            let locked = loop {
+                let candidate = {
+                    let inner = self.lock_state();
+                    match inner.inodes.resolve_ino_path(ino) {
+                        Ok(rel) => Ok(rel),
+                        Err(err) => {
+                            let open_match = fh
+                                .and_then(|handle| inner.open_files.get(&handle))
+                                .or_else(|| {
+                                    inner
+                                        .open_files
+                                        .values()
+                                        .find(|o| o.ino == ino && o.writable)
+                                        .or_else(|| {
+                                            inner.open_files.values().find(|o| o.ino == ino)
+                                        })
+                                })
+                                .map(|open| (Arc::clone(&open.file), open.writable));
+                            Err((err, open_match))
+                        }
+                    }
+                };
+                let rel = match candidate {
+                    Ok(rel) => rel,
+                    Err(unlinked) => break Err(unlinked),
+                };
+                let guard = self.path_locks.lock_path(&rel);
+                let recheck = {
+                    let inner = self.lock_state();
+                    if inner.inodes.resolve_ino_path(ino).as_ref() == Ok(&rel) {
+                        let writable_fh_file = fh
+                            .and_then(|handle| inner.open_files.get(&handle))
+                            .filter(|open| open.writable)
+                            .map(|open| Arc::clone(&open.file));
+                        Some(writable_fh_file)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(writable_fh_file) = recheck {
+                    break Ok((rel, guard, writable_fh_file));
+                }
+                drop(guard);
+            };
 
-            if let Err(err) = rel_res {
-                let open_match =
-                    fh.and_then(|handle| inner.open_files.get(&handle))
-                        .or_else(|| {
-                            inner
-                                .open_files
-                                .values()
-                                .find(|o| o.ino == ino && o.writable)
-                                .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
-                        });
-                if let Some(open) = open_match {
-                    let file = Arc::clone(&open.file);
-                    let writable = open.writable;
-                    drop(inner);
+            let (rel, _path_guard, writable_fh_file) = match locked {
+                Ok(v) => v,
+                Err((_err, Some((file, writable)))) => {
                     if let Some(new_size) = size {
                         if !writable {
                             reply.error(Errno::EACCES);
@@ -1613,13 +1975,14 @@ mod linux_impl {
                     }
                     return;
                 }
-                reply.error(err);
-                return;
-            }
+                Err((err, None)) => {
+                    reply.error(err);
+                    return;
+                }
+            };
 
-            let rel = rel_res.expect("checked above");
             let truncate_zero = size == Some(0);
-            if let Err(e) = self.copy_up_entry(&mut inner, &rel, truncate_zero) {
+            if let Err(e) = self.copy_up_entry_unlocked(&rel, truncate_zero) {
                 reply.error(e);
                 return;
             }
@@ -1644,11 +2007,8 @@ mod linux_impl {
             if let Some(new_size) = size
                 && !truncate_zero
             {
-                let res = if let Some(handle) = fh
-                    && let Some(open) = inner.open_files.get(&handle)
-                    && open.writable
-                {
-                    open.file.set_len(new_size)
+                let res = if let Some(ref open_file) = writable_fh_file {
+                    open_file.set_len(new_size)
                 } else {
                     OpenOptions::new()
                         .write(true)
@@ -1687,8 +2047,7 @@ mod linux_impl {
         }
 
         fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-            let inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(rel) = inner.inodes.resolve_ino_path(ino) else {
+            let Ok(rel) = self.lock_state().inodes.resolve_ino_path(ino) else {
                 reply.error(Errno::ENOENT);
                 return;
             };
@@ -1696,7 +2055,6 @@ mod linux_impl {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            drop(inner);
             match std::fs::read_link(&resolved.host_path) {
                 Ok(target) => reply.data(target.as_os_str().as_bytes()),
                 Err(e) => reply.error(errno_from_io(&e)),
@@ -1722,15 +2080,12 @@ mod linux_impl {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(parent_rel) = inner.inodes.resolve_ino_path(parent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let rel = if parent_rel.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                parent_rel.join(name)
+            let (parent_rel, rel, _path_guard) = match self.lock_parent_child(parent, name) {
+                Ok(v) => v,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             };
             if resolve_rel_path(&self.cfg, &rel).is_some() {
                 reply.error(Errno::EEXIST);
@@ -1753,7 +2108,7 @@ mod linux_impl {
             {
                 Ok(_) => {
                     let _ = std::fs::set_permissions(&upper_path, Permissions::from_mode(eff_mode));
-                    match self.stat_resolved(&mut inner, &rel, true) {
+                    match self.stat_resolved_unlocked(&rel, true) {
                         Ok(attr) => reply.entry(&ZERO_TTL, &attr, Generation(0)),
                         Err(e) => reply.error(e),
                     }
@@ -1775,15 +2130,12 @@ mod linux_impl {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(parent_rel) = inner.inodes.resolve_ino_path(parent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let rel = if parent_rel.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                parent_rel.join(name)
+            let (parent_rel, rel, _path_guard) = match self.lock_parent_child(parent, name) {
+                Ok(v) => v,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             };
             if resolve_rel_path(&self.cfg, &rel).is_some() {
                 reply.error(Errno::EEXIST);
@@ -1815,7 +2167,7 @@ mod linux_impl {
                 }
             }
 
-            match self.stat_resolved(&mut inner, &rel, true) {
+            match self.stat_resolved_unlocked(&rel, true) {
                 Ok(attr) => reply.entry(&ZERO_TTL, &attr, Generation(0)),
                 Err(e) => reply.error(e),
             }
@@ -1826,15 +2178,12 @@ mod linux_impl {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(parent_rel) = inner.inodes.resolve_ino_path(parent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let rel = if parent_rel.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                parent_rel.join(name)
+            let (parent_rel, rel, _path_guard) = match self.lock_parent_child(parent, name) {
+                Ok(v) => v,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             };
             let Some(resolved) = resolve_rel_path(&self.cfg, &rel) else {
                 reply.error(Errno::ENOENT);
@@ -1867,7 +2216,7 @@ mod linux_impl {
                 }
             }
 
-            inner.inodes.detach_path(&rel);
+            self.lock_state().inodes.detach_path(&rel);
             reply.ok();
         }
 
@@ -1876,15 +2225,12 @@ mod linux_impl {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(parent_rel) = inner.inodes.resolve_ino_path(parent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let rel = if parent_rel.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                parent_rel.join(name)
+            let (parent_rel, rel, _path_guard) = match self.lock_parent_child(parent, name) {
+                Ok(v) => v,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             };
             let Some(resolved) = resolve_rel_path(&self.cfg, &rel) else {
                 reply.error(Errno::ENOENT);
@@ -1931,7 +2277,7 @@ mod linux_impl {
                 }
             }
 
-            inner.inodes.detach_path(&rel);
+            self.lock_state().inodes.detach_path(&rel);
             reply.ok();
         }
 
@@ -1947,15 +2293,12 @@ mod linux_impl {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(parent_rel) = inner.inodes.resolve_ino_path(parent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let rel = if parent_rel.as_os_str().is_empty() {
-                PathBuf::from(link_name)
-            } else {
-                parent_rel.join(link_name)
+            let (parent_rel, rel, _path_guard) = match self.lock_parent_child(parent, link_name) {
+                Ok(v) => v,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             };
             if resolve_rel_path(&self.cfg, &rel).is_some() {
                 reply.error(Errno::EEXIST);
@@ -1975,7 +2318,7 @@ mod linux_impl {
                 return;
             }
 
-            match self.stat_resolved(&mut inner, &rel, true) {
+            match self.stat_resolved_unlocked(&rel, true) {
                 Ok(attr) => reply.entry(&ZERO_TTL, &attr, Generation(0)),
                 Err(e) => reply.error(e),
             }
@@ -2000,34 +2343,23 @@ mod linux_impl {
                 return;
             }
 
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(src_parent) = inner.inodes.resolve_ino_path(parent) else {
-                reply.error(Errno::ENOENT);
-                return;
+            let LockedRenamePaths {
+                src_parent,
+                src_rel,
+                dst_parent,
+                dst_rel,
+                _guard: _path_guard,
+            } = match self.lock_rename_paths(parent, name, newparent, newname) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    reply.ok();
+                    return;
+                }
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             };
-            let Ok(dst_parent) = inner.inodes.resolve_ino_path(newparent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let src_rel = if src_parent.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                src_parent.join(name)
-            };
-            let dst_rel = if dst_parent.as_os_str().is_empty() {
-                PathBuf::from(newname)
-            } else {
-                dst_parent.join(newname)
-            };
-
-            if src_rel == dst_rel {
-                reply.ok();
-                return;
-            }
-            if dst_rel.starts_with(&src_rel) {
-                reply.error(Errno::EINVAL);
-                return;
-            }
 
             let Some(src_resolved) = resolve_rel_path(&self.cfg, &src_rel) else {
                 reply.error(Errno::ENOENT);
@@ -2091,7 +2423,7 @@ mod linux_impl {
                     reply.ok();
                     return;
                 }
-                if let Err(e) = self.copy_up_entry(&mut inner, &src_rel, false) {
+                if let Err(e) = self.copy_up_entry_unlocked(&src_rel, false) {
                     reply.error(e);
                     return;
                 }
@@ -2113,16 +2445,13 @@ mod linux_impl {
                         return;
                     }
                 }
-                inner.inodes.rename_subtree(&src_rel, &dst_rel);
+                self.lock_state().inodes.rename_subtree(&src_rel, &dst_rel);
                 reply.ok();
                 return;
             }
 
             // Directory rename: materialize any lower-only entries into upper/src_rel before moving.
-            let mut moved_lower_files = Vec::new();
-            if let Err(e) =
-                self.materialize_lower_dir_tree(&mut inner, &src_rel, &mut moved_lower_files)
-            {
+            if let Err(e) = self.materialize_lower_dir_tree_unlocked(&src_rel) {
                 reply.error(e);
                 return;
             }
@@ -2196,7 +2525,7 @@ mod linux_impl {
                 }
             }
 
-            inner.inodes.rename_subtree(&src_rel, &dst_rel);
+            self.lock_state().inodes.rename_subtree(&src_rel, &dst_rel);
             reply.ok();
         }
 
@@ -2212,20 +2541,14 @@ mod linux_impl {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(old_rel) = inner.inodes.resolve_ino_path(ino) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let Ok(new_parent_rel) = inner.inodes.resolve_ino_path(newparent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let new_rel = if new_parent_rel.as_os_str().is_empty() {
-                PathBuf::from(newname)
-            } else {
-                new_parent_rel.join(newname)
-            };
+            let (old_rel, new_parent_rel, new_rel, _path_guard) =
+                match self.lock_link_paths(ino, newparent, newname) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
+                };
             if resolve_rel_path(&self.cfg, &new_rel).is_some() {
                 reply.error(Errno::EEXIST);
                 return;
@@ -2243,7 +2566,7 @@ mod linux_impl {
                 return;
             }
 
-            if let Err(e) = self.copy_up_entry(&mut inner, &old_rel, false) {
+            if let Err(e) = self.copy_up_entry_unlocked(&old_rel, false) {
                 reply.error(e);
                 return;
             }
@@ -2264,7 +2587,7 @@ mod linux_impl {
                 reply.error(errno_from_io(&e));
                 return;
             }
-            if let Err(e) = inner.inodes.add_alias(ino, new_rel, true) {
+            if let Err(e) = self.lock_state().inodes.add_alias(ino, new_rel, true) {
                 reply.error(e);
                 return;
             }
@@ -2277,19 +2600,20 @@ mod linux_impl {
         }
 
         fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(rel) = inner.inodes.resolve_ino_path(ino) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-
             let acc = flags.acc_mode();
             let wants_trunc = (flags.0 & libc::O_TRUNC) != 0;
             let wants_write =
                 matches!(acc, OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR) || wants_trunc;
 
             let file = if wants_write {
-                if let Err(e) = self.copy_up_entry(&mut inner, &rel, wants_trunc) {
+                let (rel, _path_guard) = match self.lock_ino_path(ino) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
+                };
+                if let Err(e) = self.copy_up_entry_unlocked(&rel, wants_trunc) {
                     reply.error(e);
                     return;
                 }
@@ -2314,6 +2638,10 @@ mod linux_impl {
                     }
                 }
             } else {
+                let Ok(rel) = self.lock_state().inodes.resolve_ino_path(ino) else {
+                    reply.error(Errno::ENOENT);
+                    return;
+                };
                 let Some(resolved) = resolve_rel_path(&self.cfg, &rel) else {
                     reply.error(Errno::ENOENT);
                     return;
@@ -2327,16 +2655,20 @@ mod linux_impl {
                 }
             };
 
-            let fh = FileHandle(inner.next_fh);
-            inner.next_fh += 1;
-            inner.open_files.insert(
-                fh,
-                OpenFile {
-                    ino,
-                    file: Arc::new(file),
-                    writable: wants_write,
-                },
-            );
+            let fh = {
+                let mut inner = self.lock_state();
+                let fh = FileHandle(inner.next_fh);
+                inner.next_fh += 1;
+                inner.open_files.insert(
+                    fh,
+                    OpenFile {
+                        ino,
+                        file: Arc::new(file),
+                        writable: wants_write,
+                    },
+                );
+                fh
+            };
             // Keep FopenFlags empty so host-side writes/undo updates are never stale-cached.
             reply.opened(fh, FopenFlags::empty());
         }
@@ -2352,15 +2684,23 @@ mod linux_impl {
             _lock_owner: Option<LockOwner>,
             reply: ReplyData,
         ) {
-            let file = {
-                let inner = self.state.lock().expect("vfsd lock poisoned");
+            let file_or_rel = {
+                let inner = self.lock_state();
                 if let Some(open) = inner.open_files.get(&fh) {
-                    Arc::clone(&open.file)
+                    Ok(Arc::clone(&open.file))
                 } else {
-                    let Ok(rel) = inner.inodes.resolve_ino_path(ino) else {
-                        reply.error(Errno::EBADF);
-                        return;
-                    };
+                    match inner.inodes.resolve_ino_path(ino) {
+                        Ok(rel) => Err(rel),
+                        Err(_) => {
+                            reply.error(Errno::EBADF);
+                            return;
+                        }
+                    }
+                }
+            };
+            let file = match file_or_rel {
+                Ok(f) => f,
+                Err(rel) => {
                     let Some(resolved) = resolve_rel_path(&self.cfg, &rel) else {
                         reply.error(Errno::ENOENT);
                         return;
@@ -2404,7 +2744,7 @@ mod linux_impl {
             reply: ReplyWrite,
         ) {
             let file = {
-                let inner = self.state.lock().expect("vfsd lock poisoned");
+                let inner = self.lock_state();
                 let Some(open) = inner.open_files.get(&fh) else {
                     reply.error(Errno::EBADF);
                     return;
@@ -2445,8 +2785,8 @@ mod linux_impl {
             _flush: bool,
             reply: ReplyEmpty,
         ) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            inner.open_files.remove(&fh);
+            // Drop the removed `OpenFile` outside `self.state` so `close(fd)` never runs locked.
+            let _closed = { self.lock_state().open_files.remove(&fh) };
             reply.ok();
         }
 
@@ -2459,7 +2799,7 @@ mod linux_impl {
             reply: ReplyEmpty,
         ) {
             let file = {
-                let inner = self.state.lock().expect("vfsd lock poisoned");
+                let inner = self.lock_state();
                 let Some(open) = inner.open_files.get(&fh) else {
                     reply.error(Errno::EBADF);
                     return;
@@ -2491,15 +2831,12 @@ mod linux_impl {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(parent_rel) = inner.inodes.resolve_ino_path(parent) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let rel = if parent_rel.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                parent_rel.join(name)
+            let (parent_rel, rel, _path_guard) = match self.lock_parent_child(parent, name) {
+                Ok(v) => v,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             };
 
             let excl = (flags & libc::O_EXCL) != 0;
@@ -2511,7 +2848,7 @@ mod linux_impl {
             }
             if !excl
                 && existed
-                && let Err(e) = self.copy_up_entry(&mut inner, &rel, trunc)
+                && let Err(e) = self.copy_up_entry_unlocked(&rel, trunc)
             {
                 reply.error(e);
                 return;
@@ -2567,29 +2904,36 @@ mod linux_impl {
                 let _ = std::fs::set_permissions(&upper_path, Permissions::from_mode(eff_mode));
             }
 
-            let attr = match self.stat_resolved(&mut inner, &rel, true) {
-                Ok(a) => a,
+            let meta = match std::fs::symlink_metadata(&upper_path) {
+                Ok(m) => m,
                 Err(e) => {
-                    reply.error(e);
+                    reply.error(errno_from_io(&e));
                     return;
                 }
             };
-            let fh = FileHandle(inner.next_fh);
-            inner.next_fh += 1;
-            inner.open_files.insert(
-                fh,
-                OpenFile {
-                    ino: attr.ino,
-                    file: Arc::new(file),
-                    writable: true,
-                },
-            );
+            let (attr, fh) = {
+                let mut inner = self.lock_state();
+                let ino = inner
+                    .inodes
+                    .lookup_or_insert(&rel, meta.file_type().is_dir(), true);
+                let attr = metadata_to_file_attr(ino, &meta);
+                let fh = FileHandle(inner.next_fh);
+                inner.next_fh += 1;
+                inner.open_files.insert(
+                    fh,
+                    OpenFile {
+                        ino,
+                        file: Arc::new(file),
+                        writable: true,
+                    },
+                );
+                (attr, fh)
+            };
             reply.created(&ZERO_TTL, &attr, Generation(0), fh, FopenFlags::empty());
         }
 
         fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(rel) = inner.inodes.resolve_ino_path(ino) else {
+            let Ok(rel) = self.lock_state().inodes.resolve_ino_path(ino) else {
                 reply.error(Errno::ENOENT);
                 return;
             };
@@ -2599,9 +2943,13 @@ mod linux_impl {
             };
             match std::fs::symlink_metadata(&resolved.host_path) {
                 Ok(meta) if meta.file_type().is_dir() => {
-                    let fh = FileHandle(inner.next_fh);
-                    inner.next_fh += 1;
-                    inner.open_dirs.insert(fh, None);
+                    let fh = {
+                        let mut inner = self.lock_state();
+                        let fh = FileHandle(inner.next_fh);
+                        inner.next_fh += 1;
+                        inner.open_dirs.insert(fh, None);
+                        fh
+                    };
                     reply.opened(fh, FopenFlags::empty());
                 }
                 Ok(_) => reply.error(Errno::ENOTDIR),
@@ -2617,80 +2965,88 @@ mod linux_impl {
             offset: u64,
             mut reply: ReplyDirectory,
         ) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-
             // Reuse the directory snapshot across paginated `readdir` calls (`offset > 0`) on
             // the same directory handle so large directories enumerate in O(M) instead of O(M^2).
             // Re-reading at `offset == 0` (fresh opendir / rewinddir) always refreshes from disk
             // so host-side mutations (`oz undo`) remain immediately visible.
-            let snapshot: DirSnapshot = if offset > 0
-                && let Some(Some(cached)) = inner.open_dirs.get(&fh)
-            {
-                Arc::clone(cached)
-            } else {
-                let Ok(rel_dir) = inner.inodes.resolve_ino_path(ino) else {
-                    reply.error(Errno::ENOENT);
-                    return;
-                };
-                let Some(resolved) = resolve_rel_path(&self.cfg, &rel_dir) else {
-                    reply.error(Errno::ENOENT);
-                    return;
-                };
-                match std::fs::symlink_metadata(&resolved.host_path) {
-                    Ok(meta) if meta.file_type().is_dir() => {}
-                    Ok(_) => {
-                        reply.error(Errno::ENOTDIR);
-                        return;
-                    }
-                    Err(e) => {
-                        reply.error(errno_from_io(&e));
-                        return;
+            let cached_or_rel = {
+                let inner = self.lock_state();
+                if offset > 0
+                    && let Some(Some(cached)) = inner.open_dirs.get(&fh)
+                {
+                    Ok(Arc::clone(cached))
+                } else {
+                    match inner.inodes.resolve_ino_path(ino) {
+                        Ok(rel_dir) => Err(rel_dir),
+                        Err(e) => {
+                            reply.error(e);
+                            return;
+                        }
                     }
                 }
+            };
 
-                let merged = match list_merged_dir_entries(&self.cfg, &rel_dir) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        reply.error(errno_from_io(&e));
+            let snapshot: DirSnapshot = match cached_or_rel {
+                Ok(cached) => cached,
+                Err(rel_dir) => {
+                    let Some(resolved) = resolve_rel_path(&self.cfg, &rel_dir) else {
+                        reply.error(Errno::ENOENT);
                         return;
+                    };
+                    match std::fs::symlink_metadata(&resolved.host_path) {
+                        Ok(meta) if meta.file_type().is_dir() => {}
+                        Ok(_) => {
+                            reply.error(Errno::ENOTDIR);
+                            return;
+                        }
+                        Err(e) => {
+                            reply.error(errno_from_io(&e));
+                            return;
+                        }
                     }
-                };
 
-                let parent_ino = if rel_dir.as_os_str().is_empty() {
-                    INodeNo::ROOT
-                } else {
-                    let parent_rel = rel_dir.parent().map(Path::to_path_buf).unwrap_or_default();
-                    if parent_rel.as_os_str().is_empty() {
+                    let merged = match list_merged_dir_entries(&self.cfg, &rel_dir) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            reply.error(errno_from_io(&e));
+                            return;
+                        }
+                    };
+
+                    let mut inner = self.lock_state();
+                    let parent_ino = if rel_dir.as_os_str().is_empty() {
                         INodeNo::ROOT
                     } else {
-                        inner.inodes.lookup_or_insert(&parent_rel, true, false)
-                    }
-                };
-
-                let mut all_entries: Vec<(INodeNo, FileType, OsString)> =
-                    Vec::with_capacity(merged.len() + 2);
-                all_entries.push((ino, FileType::Directory, OsString::from(".")));
-                all_entries.push((parent_ino, FileType::Directory, OsString::from("..")));
-
-                for item in merged {
-                    let child_rel = if rel_dir.as_os_str().is_empty() {
-                        PathBuf::from(&item.name)
-                    } else {
-                        rel_dir.join(&item.name)
+                        let parent_rel =
+                            rel_dir.parent().map(Path::to_path_buf).unwrap_or_default();
+                        if parent_rel.as_os_str().is_empty() {
+                            INodeNo::ROOT
+                        } else {
+                            inner.inodes.lookup_or_insert(&parent_rel, true, false)
+                        }
                     };
-                    let is_dir = item.file_type.is_dir();
-                    let child_ino = inner.inodes.lookup_or_insert(&child_rel, is_dir, false);
-                    let kind = FileType::from_std(item.file_type).unwrap_or(FileType::RegularFile);
-                    all_entries.push((child_ino, kind, item.name));
-                }
 
-                let arc = Arc::new(all_entries);
-                if let Some(slot) = inner.open_dirs.get_mut(&fh) {
-                    *slot = Some(Arc::clone(&arc));
+                    let mut all_entries: Vec<(INodeNo, FileType, OsString)> =
+                        Vec::with_capacity(merged.len() + 2);
+                    all_entries.push((ino, FileType::Directory, OsString::from(".")));
+                    all_entries.push((parent_ino, FileType::Directory, OsString::from("..")));
+
+                    for item in merged {
+                        let child_rel = Self::child_rel_path(&rel_dir, &item.name);
+                        let is_dir = item.file_type.is_dir();
+                        let child_ino = inner.inodes.lookup_or_insert(&child_rel, is_dir, false);
+                        let kind =
+                            FileType::from_std(item.file_type).unwrap_or(FileType::RegularFile);
+                        all_entries.push((child_ino, kind, item.name));
+                    }
+
+                    let arc = Arc::new(all_entries);
+                    if let Some(slot) = inner.open_dirs.get_mut(&fh) {
+                        *slot = Some(Arc::clone(&arc));
+                    }
+                    arc
                 }
-                arc
             };
-            drop(inner);
 
             for (idx, (entry_ino, kind, name)) in snapshot.iter().enumerate().skip(offset as usize)
             {
@@ -2710,8 +3066,7 @@ mod linux_impl {
             _flags: OpenFlags,
             reply: ReplyEmpty,
         ) {
-            let mut inner = self.state.lock().expect("vfsd lock poisoned");
-            inner.open_dirs.remove(&fh);
+            let _closed = { self.lock_state().open_dirs.remove(&fh) };
             reply.ok();
         }
 
@@ -2723,18 +3078,15 @@ mod linux_impl {
             datasync: bool,
             reply: ReplyEmpty,
         ) {
-            let upper_dir_path = {
-                let inner = self.state.lock().expect("vfsd lock poisoned");
-                let Ok(rel_dir) = inner.inodes.resolve_ino_path(ino) else {
-                    reply.error(Errno::ENOENT);
-                    return;
-                };
-                if resolve_rel_path(&self.cfg, &rel_dir).is_none() {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-                self.upper_path(&rel_dir)
+            let Ok(rel_dir) = self.lock_state().inodes.resolve_ino_path(ino) else {
+                reply.error(Errno::ENOENT);
+                return;
             };
+            if resolve_rel_path(&self.cfg, &rel_dir).is_none() {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            let upper_dir_path = self.upper_path(&rel_dir);
             if let Ok(meta) = std::fs::symlink_metadata(&upper_dir_path)
                 && meta.file_type().is_dir()
                 && let Ok(dir_file) = File::open(&upper_dir_path)
@@ -2758,7 +3110,11 @@ mod linux_impl {
                 reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
                 return;
             };
+            // SAFETY: `libc::statvfs` is a plain C struct of integer fields where all-zero bits
+            // is a valid initial representation before being populated by `libc::statvfs`.
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: `c_path` is a valid NUL-terminated C string and `&mut stat` is a valid,
+            // aligned, writable `libc::statvfs` output struct.
             let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
             if rc != 0 {
                 reply.error(errno_from_io(&std::io::Error::last_os_error()));
@@ -2777,8 +3133,7 @@ mod linux_impl {
         }
 
         fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-            let inner = self.state.lock().expect("vfsd lock poisoned");
-            let Ok(rel) = inner.inodes.resolve_ino_path(ino) else {
+            let Ok(rel) = self.lock_state().inodes.resolve_ino_path(ino) else {
                 reply.error(Errno::ENOENT);
                 return;
             };
@@ -2786,7 +3141,6 @@ mod linux_impl {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            drop(inner);
             let Ok(meta) = std::fs::symlink_metadata(&resolved.host_path) else {
                 reply.error(Errno::ENOENT);
                 return;
@@ -3082,5 +3436,249 @@ mod tests {
         // Verify lazy_unmount_fuse does not hang or panic on a non-existent path.
         let missing = dir.path().join("not-a-mount");
         lazy_unmount_fuse(&missing).expect("lazy unmount missing path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_copy_up_does_not_block_parallel_lookups_reads_or_unrelated_copy_ups() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = test_cfg(dir.path());
+        let base = cfg.baseline_dir.as_ref().expect("base");
+
+        std::fs::create_dir_all(base.join("dir_a")).expect("mkdir dir_a");
+        std::fs::create_dir_all(base.join("dir_b")).expect("mkdir dir_b");
+        std::fs::write(base.join("dir_a/heavy.bin"), vec![0xABu8; 64 * 1024]).expect("write heavy");
+        std::fs::write(base.join("dir_a/sibling.txt"), b"sibling-data").expect("write sibling");
+        std::fs::write(base.join("dir_a/child.txt"), b"child-data").expect("write child");
+        std::fs::write(base.join("dir_b/other.txt"), b"other-data").expect("write other");
+
+        let fs = Arc::new(linux_impl::OzoneOverlayFs::new(cfg.clone()));
+
+        // Phase 1: Hold an exclusive path lock on `dir_a/heavy.bin` (simulating a slow copy-up)
+        // and prove deterministically via barriers that lookups, reads, sibling copy-ups, and
+        // unrelated copy-ups all finish BEFORE `dir_a/heavy.bin` is released.
+        let locked_barrier = Arc::new(Barrier::new(2));
+        let release_barrier = Arc::new(Barrier::new(2));
+        let fs_holder = Arc::clone(&fs);
+        let b_locked = Arc::clone(&locked_barrier);
+        let b_release = Arc::clone(&release_barrier);
+
+        let holder = std::thread::spawn(move || {
+            let _guard = fs_holder.test_lock_path(Path::new("dir_a/heavy.bin"));
+            b_locked.wait();
+            b_release.wait();
+        });
+
+        locked_barrier.wait();
+
+        // Parallel lookups & reads across both `dir_b/other.txt` and `dir_a/heavy.bin`.
+        let other_attr = fs
+            .test_stat_resolved(Path::new("dir_b/other.txt"), true)
+            .expect("lookup unrelated path while heavy copy-up holds path lock");
+        assert_eq!(
+            fs.test_read_file_via_ino(other_attr.ino)
+                .expect("read unrelated path"),
+            b"other-data"
+        );
+        let heavy_attr = fs
+            .test_stat_resolved(Path::new("dir_a/heavy.bin"), true)
+            .expect("lookup locked path must not block on path lock");
+        assert_eq!(
+            fs.test_read_file_via_ino(heavy_attr.ino)
+                .expect("read heavy baseline")
+                .len(),
+            64 * 1024
+        );
+
+        // Unrelated copy-up and sibling copy-up under the same parent (`dir_a` held Shared)
+        // must both complete without stalling on `dir_a/heavy.bin`.
+        fs.test_copy_up_entry(Path::new("dir_b/other.txt"), false)
+            .expect("copy-up unrelated file");
+        fs.test_copy_up_entry(Path::new("dir_a/sibling.txt"), false)
+            .expect("copy-up sibling file");
+        assert_eq!(
+            std::fs::read(cfg.upper_dir.join("dir_b/other.txt")).expect("read upper other"),
+            b"other-data"
+        );
+        assert_eq!(
+            std::fs::read(cfg.upper_dir.join("dir_a/sibling.txt")).expect("read upper sibling"),
+            b"sibling-data"
+        );
+
+        release_barrier.wait();
+        holder.join().expect("join holder");
+
+        // Phase 2: Exclusive lock on parent directory `dir_a` (e.g. directory rename/rmdir)
+        // must serialize against a descendant copy-up (`dir_a/child.txt`) until released.
+        let dir_guard = fs.test_lock_path(Path::new("dir_a"));
+        let child_done = Arc::new(AtomicBool::new(false));
+        let fs_child = Arc::clone(&fs);
+        let done_flag = Arc::clone(&child_done);
+        let child_thread = std::thread::spawn(move || {
+            fs_child
+                .test_copy_up_entry(Path::new("dir_a/child.txt"), false)
+                .expect("child copy-up");
+            done_flag.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !child_done.load(Ordering::SeqCst),
+            "descendant copy-up must wait while ancestor directory is exclusively locked"
+        );
+        drop(dir_guard);
+        child_thread.join().expect("join child");
+        assert!(child_done.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(cfg.upper_dir.join("dir_a/child.txt")).expect("read upper child"),
+            b"child-data"
+        );
+        assert_eq!(fs.test_active_path_locks(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_copy_up_ab_ba_locks_and_lookups_are_deadlock_free_and_preserve_data() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = test_cfg(dir.path());
+        let base = cfg.baseline_dir.as_ref().expect("base");
+
+        std::fs::create_dir_all(base.join("nested/deep")).expect("mkdir nested");
+        for i in 0..12 {
+            let payload = format!("payload-{i:02}-{}", "x".repeat(4096));
+            std::fs::write(base.join(format!("nested/deep/file_{i:02}.txt")), &payload)
+                .expect("write nested file");
+            std::fs::set_permissions(
+                base.join(format!("nested/deep/file_{i:02}.txt")),
+                std::os::unix::fs::PermissionsExt::from_mode(if i % 2 == 0 {
+                    0o755
+                } else {
+                    0o644
+                }),
+            )
+            .expect("chmod");
+        }
+
+        let fs = Arc::new(linux_impl::OzoneOverlayFs::new(cfg.clone()));
+        let mut handles = Vec::new();
+
+        // 4 threads concurrently copying up overlapping + distinct files under `nested/deep/`
+        // (stressing both same-path serialization and concurrent `ensure_upper_dir` creation).
+        for tid in 0..4usize {
+            let fs_c = Arc::clone(&fs);
+            handles.push(std::thread::spawn(move || {
+                for round in 0..3 {
+                    for i in 0..12 {
+                        let idx = (i + tid * 3 + round) % 12;
+                        let rel = PathBuf::from(format!("nested/deep/file_{idx:02}.txt"));
+                        fs_c.test_copy_up_entry(&rel, false)
+                            .expect("concurrent copy_up must succeed");
+                    }
+                }
+            }));
+        }
+
+        // 2 threads performing continuous parallel lookups and reads.
+        for tid in 0..2usize {
+            let fs_r = Arc::clone(&fs);
+            handles.push(std::thread::spawn(move || {
+                for iter in 0..40 {
+                    let idx = (iter + tid * 5) % 12;
+                    let rel = PathBuf::from(format!("nested/deep/file_{idx:02}.txt"));
+                    let attr = fs_r
+                        .test_stat_resolved(&rel, false)
+                        .expect("parallel lookup must succeed");
+                    let data = fs_r
+                        .test_read_file_via_ino(attr.ino)
+                        .expect("parallel read must succeed");
+                    let expected = format!("payload-{idx:02}-{}", "x".repeat(4096));
+                    assert_eq!(data, expected.as_bytes());
+                }
+            }));
+        }
+
+        // 2 threads hammering opposite-order AB-BA and ancestor/descendant `lock_two_paths`.
+        for tid in 0..2usize {
+            let fs_l = Arc::clone(&fs);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..60 {
+                    let (a, b) = if tid == 0 {
+                        (
+                            Path::new("nested/deep/file_00.txt"),
+                            Path::new("nested/deep/file_01.txt"),
+                        )
+                    } else {
+                        (
+                            Path::new("nested/deep/file_01.txt"),
+                            Path::new("nested/deep/file_00.txt"),
+                        )
+                    };
+                    let _g1 = fs_l.test_lock_two_paths(a, b);
+                    drop(_g1);
+
+                    let (c, d) = if tid == 0 {
+                        (Path::new("nested"), Path::new("other_dir"))
+                    } else {
+                        (Path::new("other_dir"), Path::new("nested/deep/file_02.txt"))
+                    };
+                    let _g2 = fs_l.test_lock_two_paths(c, d);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        for i in 0..12 {
+            let rel = format!("nested/deep/file_{i:02}.txt");
+            let expected = format!("payload-{i:02}-{}", "x".repeat(4096));
+            let upper_p = cfg.upper_dir.join(&rel);
+            assert_eq!(
+                std::fs::read_to_string(&upper_p).expect("read upper"),
+                expected
+            );
+            let mode = std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&upper_p).expect("meta").permissions(),
+            ) & 0o777;
+            assert_eq!(mode, if i % 2 == 0 { 0o755 } else { 0o644 });
+        }
+        assert_eq!(
+            fs.test_active_path_locks(),
+            0,
+            "path lock table must reclaim all idle slots"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn poisoned_state_lock_recovers_gracefully_without_panicking() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = test_cfg(dir.path());
+        let base = cfg.baseline_dir.as_ref().expect("base");
+        std::fs::write(base.join("survivor.txt"), b"still-here").expect("write");
+
+        let fs = linux_impl::OzoneOverlayFs::new(cfg.clone());
+        fs.test_poison_state();
+
+        let attr = fs
+            .test_stat_resolved(Path::new("survivor.txt"), true)
+            .expect("lookup recovers from poisoned state lock");
+        assert_eq!(
+            fs.test_read_file_via_ino(attr.ino).expect("read recovers"),
+            b"still-here"
+        );
+        fs.test_copy_up_entry(Path::new("survivor.txt"), false)
+            .expect("copy_up succeeds after poison recovery");
+        assert_eq!(
+            std::fs::read(cfg.upper_dir.join("survivor.txt")).expect("read upper"),
+            b"still-here"
+        );
     }
 }

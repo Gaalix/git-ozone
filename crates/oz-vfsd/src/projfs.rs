@@ -54,8 +54,7 @@ pub fn system_time_to_filetime(st: SystemTime) -> i64 {
             }
         }
     };
-    let ticks =
-        (unix_secs + UNIX_TO_WINDOWS_EPOCH_SECS) * TICKS_PER_SECOND + (subsec_nanos / 100);
+    let ticks = (unix_secs + UNIX_TO_WINDOWS_EPOCH_SECS) * TICKS_PER_SECOND + (subsec_nanos / 100);
     ticks.clamp(0, i128::from(i64::MAX)) as i64
 }
 
@@ -146,8 +145,8 @@ pub fn prj_file_name_match(name: &str, search_expr: &str) -> bool {
             }
             '<' => {
                 for ni in (0..=n).rev() {
-                    curr_row[ni] = next_row[ni]
-                        || (ni < n && Some(ni) != last_dot_idx && curr_row[ni + 1]);
+                    curr_row[ni] =
+                        next_row[ni] || (ni < n && Some(ni) != last_dot_idx && curr_row[ni + 1]);
                 }
             }
             '?' => {
@@ -182,9 +181,7 @@ pub fn prj_file_name_match(name: &str, search_expr: &str) -> bool {
 }
 
 fn is_hidden_marker_name(name: &str) -> bool {
-    name.ends_with(WHITEOUT_SUFFIX)
-        || name.ends_with(OPAQUE_SUFFIX)
-        || name.ends_with(".oz_opq")
+    name.ends_with(WHITEOUT_SUFFIX) || name.ends_with(OPAQUE_SUFFIX) || name.ends_with(".oz_opq")
 }
 
 /// Normalizes a virtual relative path (accepting both `/` and `\` separators) while rejecting `..`.
@@ -256,10 +253,11 @@ pub struct ProjFsDirEntry {
     pub host_path: PathBuf,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl ProjFsDirEntry {
     /// Converts entry metadata into the C-ABI `PRJ_FILE_BASIC_INFO` layout.
     #[must_use]
-    pub fn to_basic_info(&self) -> PrjFileBasicInfo {
+    pub(crate) fn to_basic_info(&self) -> PrjFileBasicInfo {
         PrjFileBasicInfo {
             is_directory: u8::from(self.is_dir),
             file_size: if self.is_dir {
@@ -292,10 +290,11 @@ pub struct ProjFsPlaceholderInfo {
     pub file_attributes: u32,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl ProjFsPlaceholderInfo {
     /// Converts placeholder metadata into the C-ABI `PRJ_FILE_BASIC_INFO` layout.
     #[must_use]
-    pub fn to_basic_info(&self) -> PrjFileBasicInfo {
+    pub(crate) fn to_basic_info(&self) -> PrjFileBasicInfo {
         PrjFileBasicInfo {
             is_directory: u8::from(self.is_dir),
             file_size: if self.is_dir {
@@ -412,7 +411,7 @@ impl ProjFsLayerEngine {
         let is_root = norm_dir.as_os_str().is_empty();
         let filter_expr = search_expr.filter(|s| !s.is_empty() && *s != "*");
 
-        let mut out = Vec::with_capacity(merged.len());
+        let mut keyed: Vec<(ProjFsDirEntry, Vec<u16>)> = Vec::with_capacity(merged.len());
         for entry in merged {
             let name = entry.name.to_string_lossy().into_owned();
             if is_hidden_marker_name(&name) {
@@ -431,23 +430,28 @@ impl ProjFsLayerEngine {
             else {
                 continue;
             };
-            let (is_dir, file_size, ctime, atime, mtime, attrs) = extract_file_times_and_attrs(&meta);
-            out.push(ProjFsDirEntry {
-                name,
-                is_dir,
-                file_size,
-                creation_time: ctime,
-                last_access_time: atime,
-                last_write_time: mtime,
-                change_time: mtime,
-                file_attributes: attrs,
-                layer: entry.layer,
-                host_path: entry.host_path,
-            });
+            let (is_dir, file_size, ctime, atime, mtime, attrs) =
+                extract_file_times_and_attrs(&meta);
+            let sort_key = utf16_upper_units(&name);
+            keyed.push((
+                ProjFsDirEntry {
+                    name,
+                    is_dir,
+                    file_size,
+                    creation_time: ctime,
+                    last_access_time: atime,
+                    last_write_time: mtime,
+                    change_time: mtime,
+                    file_attributes: attrs,
+                    layer: entry.layer,
+                    host_path: entry.host_path,
+                },
+                sort_key,
+            ));
         }
 
-        out.sort_by(|a, b| prj_file_name_compare(&a.name, &b.name));
-        Ok(out)
+        keyed.sort_by(|(a, key_a), (b, key_b)| key_a.cmp(key_b).then_with(|| a.name.cmp(&b.name)));
+        Ok(keyed.into_iter().map(|(entry, _)| entry).collect())
     }
 
     /// Resolves placeholder metadata for `rel_path` across layers.
@@ -786,7 +790,11 @@ impl ProjFsLayerEngine {
         Ok(())
     }
 
-    fn sync_real_files_from_mount_tree(&self, mount_dir: &Path, dst_rel_root: &Path) -> io::Result<()> {
+    fn sync_real_files_from_mount_tree(
+        &self,
+        mount_dir: &Path,
+        dst_rel_root: &Path,
+    ) -> io::Result<()> {
         for entry in WalkDir::new(mount_dir)
             .follow_links(false)
             .into_iter()
@@ -959,7 +967,10 @@ fn extract_file_times_and_attrs(meta: &std::fs::Metadata) -> (bool, u64, i64, i6
     let mtime_st = meta.modified().unwrap_or(UNIX_EPOCH);
     let mtime = system_time_to_filetime(mtime_st);
     let ctime = meta.created().map(system_time_to_filetime).unwrap_or(mtime);
-    let atime = meta.accessed().map(system_time_to_filetime).unwrap_or(mtime);
+    let atime = meta
+        .accessed()
+        .map(system_time_to_filetime)
+        .unwrap_or(mtime);
     let attrs = if is_dir {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
@@ -998,19 +1009,21 @@ fn remove_subtree_markers(root: &Path, rel: &Path, suffix: &str) -> io::Result<(
 // ----------------------------------------------------------------------------
 
 /// Windows `GUID` ABI representation (16 bytes).
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrjGuid {
-    pub data1: u32,
-    pub data2: u16,
-    pub data3: u16,
-    pub data4: [u8; 8],
+pub(crate) struct PrjGuid {
+    pub(crate) data1: u32,
+    pub(crate) data2: u16,
+    pub(crate) data3: u16,
+    pub(crate) data4: [u8; 8],
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl PrjGuid {
     /// Constructs a [`PrjGuid`] from RFC 4122 big-endian bytes.
     #[must_use]
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self {
             data1: u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             data2: u16::from_be_bytes([bytes[4], bytes[5]]),
@@ -1024,58 +1037,75 @@ impl PrjGuid {
 
     /// Converts back to canonical 16-byte representation.
     #[must_use]
-    pub const fn to_bytes(self) -> [u8; 16] {
+    pub(crate) const fn to_bytes(self) -> [u8; 16] {
         let d1 = self.data1.to_be_bytes();
         let d2 = self.data2.to_be_bytes();
         let d3 = self.data3.to_be_bytes();
         [
-            d1[0], d1[1], d1[2], d1[3], d2[0], d2[1], d3[0], d3[1], self.data4[0], self.data4[1],
-            self.data4[2], self.data4[3], self.data4[4], self.data4[5], self.data4[6],
+            d1[0],
+            d1[1],
+            d1[2],
+            d1[3],
+            d2[0],
+            d2[1],
+            d3[0],
+            d3[1],
+            self.data4[0],
+            self.data4[1],
+            self.data4[2],
+            self.data4[3],
+            self.data4[4],
+            self.data4[5],
+            self.data4[6],
             self.data4[7],
         ]
     }
 }
 
 /// C-ABI `PRJ_FILE_BASIC_INFO` struct.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrjFileBasicInfo {
-    pub is_directory: u8,
-    pub file_size: i64,
-    pub creation_time: i64,
-    pub last_access_time: i64,
-    pub last_write_time: i64,
-    pub change_time: i64,
-    pub file_attributes: u32,
+pub(crate) struct PrjFileBasicInfo {
+    pub(crate) is_directory: u8,
+    pub(crate) file_size: i64,
+    pub(crate) creation_time: i64,
+    pub(crate) last_access_time: i64,
+    pub(crate) last_write_time: i64,
+    pub(crate) change_time: i64,
+    pub(crate) file_attributes: u32,
 }
 
 /// C-ABI `PRJ_PLACEHOLDER_VERSION_INFO` struct.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct PrjPlaceholderVersionInfo {
-    pub provider_id: [u8; 128],
-    pub content_id: [u8; 128],
+pub(crate) struct PrjPlaceholderVersionInfo {
+    pub(crate) provider_id: [u8; 128],
+    pub(crate) content_id: [u8; 128],
 }
 
 /// C-ABI `PRJ_PLACEHOLDER_INFO` struct.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct PrjPlaceholderInfo {
-    pub file_basic_info: PrjFileBasicInfo,
-    pub ea_buffer_size: u32,
-    pub offset_to_first_ea: u32,
-    pub security_buffer_size: u32,
-    pub offset_to_security_descriptor: u32,
-    pub streams_info_buffer_size: u32,
-    pub offset_to_first_stream_info: u32,
-    pub version_info: PrjPlaceholderVersionInfo,
-    pub variable_data: [u8; 1],
+pub(crate) struct PrjPlaceholderInfo {
+    pub(crate) file_basic_info: PrjFileBasicInfo,
+    pub(crate) ea_buffer_size: u32,
+    pub(crate) offset_to_first_ea: u32,
+    pub(crate) security_buffer_size: u32,
+    pub(crate) offset_to_security_descriptor: u32,
+    pub(crate) streams_info_buffer_size: u32,
+    pub(crate) offset_to_first_stream_info: u32,
+    pub(crate) version_info: PrjPlaceholderVersionInfo,
+    pub(crate) variable_data: [u8; 1],
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl PrjPlaceholderInfo {
     /// Builds a zero-EA/security/streams `PRJ_PLACEHOLDER_INFO` header from `basic`.
     #[must_use]
-    pub const fn from_basic(basic: PrjFileBasicInfo) -> Self {
+    pub(crate) const fn from_basic(basic: PrjFileBasicInfo) -> Self {
         Self {
             file_basic_info: basic,
             ea_buffer_size: 0,
@@ -1094,46 +1124,50 @@ impl PrjPlaceholderInfo {
 }
 
 /// C-ABI `PRJ_CALLBACK_DATA` struct.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
-pub struct PrjCallbackData {
-    pub size: u32,
-    pub flags: u32,
-    pub namespace_virtualization_context: *mut core::ffi::c_void,
-    pub command_id: i32,
-    pub file_id: PrjGuid,
-    pub data_stream_id: PrjGuid,
-    pub file_path_name: *const u16,
-    pub version_info: *const PrjPlaceholderVersionInfo,
-    pub triggering_process_id: u32,
-    pub triggering_process_image_file_name: *const u16,
-    pub instance_context: *mut core::ffi::c_void,
+pub(crate) struct PrjCallbackData {
+    pub(crate) size: u32,
+    pub(crate) flags: u32,
+    pub(crate) namespace_virtualization_context: *mut core::ffi::c_void,
+    pub(crate) command_id: i32,
+    pub(crate) file_id: PrjGuid,
+    pub(crate) data_stream_id: PrjGuid,
+    pub(crate) file_path_name: *const u16,
+    pub(crate) version_info: *const PrjPlaceholderVersionInfo,
+    pub(crate) triggering_process_id: u32,
+    pub(crate) triggering_process_image_file_name: *const u16,
+    pub(crate) instance_context: *mut core::ffi::c_void,
 }
 
 /// C-ABI `PRJ_NOTIFICATION_MAPPING` struct.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
-pub struct PrjNotificationMapping {
-    pub notification_bit_mask: u32,
-    pub notification_root: *const u16,
+pub(crate) struct PrjNotificationMapping {
+    pub(crate) notification_bit_mask: u32,
+    pub(crate) notification_root: *const u16,
 }
 
 /// C-ABI `PRJ_STARTVIRTUALIZING_OPTIONS` struct.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
-pub struct PrjStartVirtualizingOptions {
-    pub flags: u32,
-    pub pool_thread_count: u32,
-    pub concurrent_thread_count: u32,
-    pub notification_mappings: *mut PrjNotificationMapping,
-    pub notification_mappings_count: u32,
+pub(crate) struct PrjStartVirtualizingOptions {
+    pub(crate) flags: u32,
+    pub(crate) pool_thread_count: u32,
+    pub(crate) concurrent_thread_count: u32,
+    pub(crate) notification_mappings: *mut PrjNotificationMapping,
+    pub(crate) notification_mappings_count: u32,
 }
 
 /// C-ABI `PRJ_CALLBACKS` struct.
+#[cfg(any(target_os = "windows", test))]
 #[repr(C)]
-pub struct PrjCallbacks {
-    pub start_directory_enumeration:
+pub(crate) struct PrjCallbacks {
+    pub(crate) start_directory_enumeration:
         Option<unsafe extern "system" fn(*const PrjCallbackData, *const PrjGuid) -> i32>,
-    pub end_directory_enumeration:
+    pub(crate) end_directory_enumeration:
         Option<unsafe extern "system" fn(*const PrjCallbackData, *const PrjGuid) -> i32>,
-    pub get_directory_enumeration: Option<
+    pub(crate) get_directory_enumeration: Option<
         unsafe extern "system" fn(
             *const PrjCallbackData,
             *const PrjGuid,
@@ -1141,11 +1175,12 @@ pub struct PrjCallbacks {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
-    pub get_placeholder_info: Option<unsafe extern "system" fn(*const PrjCallbackData) -> i32>,
-    pub get_file_data:
+    pub(crate) get_placeholder_info:
+        Option<unsafe extern "system" fn(*const PrjCallbackData) -> i32>,
+    pub(crate) get_file_data:
         Option<unsafe extern "system" fn(*const PrjCallbackData, u64, u32) -> i32>,
-    pub query_file_name: Option<unsafe extern "system" fn(*const PrjCallbackData) -> i32>,
-    pub notification: Option<
+    pub(crate) query_file_name: Option<unsafe extern "system" fn(*const PrjCallbackData) -> i32>,
+    pub(crate) notification: Option<
         unsafe extern "system" fn(
             *const PrjCallbackData,
             u8,
@@ -1154,7 +1189,7 @@ pub struct PrjCallbacks {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
-    pub cancel_command: Option<unsafe extern "system" fn(*const PrjCallbackData)>,
+    pub(crate) cancel_command: Option<unsafe extern "system" fn(*const PrjCallbackData)>,
 }
 
 /// Per-enumeration cache state shared by ProjFS directory enumeration callbacks.
@@ -1231,23 +1266,19 @@ pub fn step_dir_enum_buffer(
     PRJ_S_OK
 }
 
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
-#[allow(dead_code)]
 const PRJ_S_OK: i32 = 0;
-#[allow(dead_code)]
 const PRJ_E_FAIL: i32 = 0x8000_4005_u32 as i32;
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const PRJ_E_OUTOFMEMORY: i32 = 0x8007_000E_u32 as i32;
-#[allow(dead_code)]
 const ERROR_FILE_NOT_FOUND_HR: i32 = 0x8007_0002_u32 as i32;
-#[allow(dead_code)]
 const ERROR_INSUFFICIENT_BUFFER_HR: i32 = 0x8007_007A_u32 as i32;
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const ERROR_REPARSE_ENCOUNTERED_HR: i32 = 0x8007_112B_u32 as i32;
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const ERROR_ALREADY_EXISTS_HR: i32 = 0x8007_00B7_u32 as i32;
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const PRJ_NOTIFY_MASK: u32 = PRJ_NOTIFY_NEW_FILE_CREATED
     | PRJ_NOTIFY_FILE_OVERWRITTEN
     | PRJ_NOTIFY_PRE_DELETE
@@ -1286,12 +1317,12 @@ pub fn hresult_from_io_error(err: &io::Error) -> i32 {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(target_os = "windows", test))]
 fn catch_hresult(f: impl FnOnce() -> i32) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(PRJ_E_FAIL)
 }
 
-#[allow(dead_code)]
+#[cfg(any(target_os = "windows", test))]
 fn encode_wide_z(os: &OsStr) -> Vec<u16> {
     #[cfg(windows)]
     {
@@ -1307,26 +1338,67 @@ fn encode_wide_z(os: &OsStr) -> Vec<u16> {
     }
 }
 
-#[allow(dead_code)]
+/// Decodes a NUL-terminated UTF-16 string pointer from Win32/ProjFS into a Rust [`String`].
+///
+/// # Safety
+/// `ptr` must either be null or point to a valid, properly aligned, NUL-terminated sequence
+/// of `u16` code units that remains readable for the duration of this call.
+#[cfg(any(target_os = "windows", test))]
 unsafe fn decode_wide_z(ptr: *const u16) -> String {
     if ptr.is_null() {
         return String::new();
     }
     let mut len = 0usize;
-    while unsafe { *ptr.add(len) } != 0 {
+    loop {
+        // SAFETY: Caller guarantees `ptr` points to a readable, NUL-terminated UTF-16 buffer,
+        // so advancing up to and including the terminating NUL unit stays within the allocation.
+        let unit = unsafe { *ptr.add(len) };
+        if unit == 0 {
+            break;
+        }
         len += 1;
     }
-    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+    // SAFETY: We just verified `ptr` is non-null and readable for `len` consecutive `u16` units
+    // preceding the NUL terminator, and the caller guarantees it remains valid for this call.
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    String::from_utf16_lossy(slice)
 }
 
-// Thin (<120 lines) Windows-only dynamic ProjectedFSLib.dll wrapper.
+// Windows-only dynamic ProjectedFSLib.dll wrapper.
 #[cfg(target_os = "windows")]
 mod win32 {
     use super::*;
     use core::ffi::{c_char, c_void};
     use std::ffi::CStr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+    type PrjMarkDirFn = unsafe extern "system" fn(
+        *const u16,
+        *const u16,
+        *const PrjPlaceholderVersionInfo,
+        *const PrjGuid,
+    ) -> i32;
+    type PrjStartVirtFn = unsafe extern "system" fn(
+        *const u16,
+        *const PrjCallbacks,
+        *const c_void,
+        *const PrjStartVirtualizingOptions,
+        *mut *mut c_void,
+    ) -> i32;
+    type PrjStopVirtFn = unsafe extern "system" fn(*mut c_void);
+    type PrjAllocBufFn = unsafe extern "system" fn(*mut c_void, usize) -> *mut c_void;
+    type PrjFreeBufFn = unsafe extern "system" fn(*mut c_void);
+    type PrjWritePlaceholderFn =
+        unsafe extern "system" fn(*mut c_void, *const u16, *const PrjPlaceholderInfo, u32) -> i32;
+    type PrjWriteFileDataFn =
+        unsafe extern "system" fn(*mut c_void, *const PrjGuid, *mut c_void, u64, u32) -> i32;
+    type PrjFillDirEntryFn =
+        unsafe extern "system" fn(*const u16, *mut PrjFileBasicInfo, *mut c_void) -> i32;
+    type PrjFileNameMatchFn = unsafe extern "system" fn(*const u16, *const u16) -> u8;
+    type PrjFileNameCompareFn = unsafe extern "system" fn(*const u16, *const u16) -> i32;
+
+    // SAFETY: Standard Win32 kernel32.dll dynamic library loading entry points with exact
+    // `extern "system"` (stdcall/x64) signatures documented by Microsoft Windows SDK.
     unsafe extern "system" {
         fn LoadLibraryExW(lp_lib: *const u16, h_file: *mut c_void, dw_flags: u32) -> *mut c_void;
         fn FreeLibrary(h_module: *mut c_void) -> i32;
@@ -1334,155 +1406,439 @@ mod win32 {
     }
 
     struct DllHandle(*mut c_void);
+
+    // SAFETY: A Win32 `HMODULE` returned by `LoadLibraryExW` is a process-wide immutable handle
+    // valid on any thread until `FreeLibrary` is invoked during `Drop` when the owning
+    // `Arc<ProjFsApi>` count reaches zero.
+    unsafe impl Send for DllHandle {}
+
+    // SAFETY: Sharing read-only references to `DllHandle` across ProjFS worker threads is sound
+    // because `DllHandle` has no interior mutability and keeps the DLL mapped until unique drop.
+    unsafe impl Sync for DllHandle {}
+
     impl Drop for DllHandle {
-        fn drop(&mut self) { if !self.0.is_null() { unsafe { FreeLibrary(self.0); } } }
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was obtained from `LoadLibraryExW` and is freed exactly once
+                // when the final `Arc<ProjFsApi>` drops after `PrjStopVirtualizing` has drained
+                // all callbacks.
+                unsafe {
+                    FreeLibrary(self.0);
+                }
+            }
+        }
     }
-    struct AlignedBuf(*mut c_void, unsafe extern "system" fn(*mut c_void));
+
+    struct AlignedBuf(*mut c_void, PrjFreeBufFn);
     impl Drop for AlignedBuf {
-        fn drop(&mut self) { if !self.0.is_null() { unsafe { (self.1)(self.0); } } }
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by `PrjAllocateAlignedBuffer` and `self.1` is
+                // the matching `PrjFreeAlignedBuffer` entry point from the still-loaded DLL;
+                // freed exactly once here.
+                unsafe {
+                    (self.1)(self.0);
+                }
+            }
+        }
     }
 
     pub(super) struct ProjFsApi {
         _dll: DllHandle,
-        mark_dir: unsafe extern "system" fn(*const u16, *const u16, *const PrjPlaceholderVersionInfo, *const PrjGuid) -> i32,
-        start_virt: unsafe extern "system" fn(*const u16, *const PrjCallbacks, *const c_void, *const PrjStartVirtualizingOptions, *mut *mut c_void) -> i32,
-        stop_virt: unsafe extern "system" fn(*mut c_void),
-        alloc_buf: unsafe extern "system" fn(*mut c_void, usize) -> *mut c_void,
-        free_buf: unsafe extern "system" fn(*mut c_void),
-        write_placeholder: unsafe extern "system" fn(*mut c_void, *const u16, *const PrjPlaceholderInfo, u32) -> i32,
-        write_file_data: unsafe extern "system" fn(*mut c_void, *const PrjGuid, *mut c_void, u64, u32) -> i32,
-        fill_dir_entry: unsafe extern "system" fn(*const u16, *mut PrjFileBasicInfo, *mut c_void) -> i32,
-        file_name_match: unsafe extern "system" fn(*const u16, *const u16) -> u8,
-        file_name_compare: unsafe extern "system" fn(*const u16, *const u16) -> i32,
+        mark_dir: PrjMarkDirFn,
+        start_virt: PrjStartVirtFn,
+        stop_virt: PrjStopVirtFn,
+        alloc_buf: PrjAllocBufFn,
+        free_buf: PrjFreeBufFn,
+        write_placeholder: PrjWritePlaceholderFn,
+        write_file_data: PrjWriteFileDataFn,
+        fill_dir_entry: PrjFillDirEntryFn,
+        file_name_match: PrjFileNameMatchFn,
+        file_name_compare: PrjFileNameCompareFn,
     }
 
     impl ProjFsApi {
         fn load(ws: &str, mp: &Path) -> Result<Self> {
             let dll_w = encode_wide_z(OsStr::new("ProjectedFSLib.dll"));
-            let handle = unsafe { LoadLibraryExW(dll_w.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+            // SAFETY: `dll_w` is NUL-terminated UTF-16, `h_file` is null as required by Win32,
+            // and `LOAD_LIBRARY_SEARCH_SYSTEM32` restricts loading to `%SystemRoot%\System32`.
+            let handle = unsafe {
+                LoadLibraryExW(
+                    dll_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            };
             if handle.is_null() {
                 let err = io::Error::last_os_error();
                 return Err(OzError::MountUnavailable {
-                    workspace: ws.to_string(), path: mp.to_path_buf(), errno: err.raw_os_error(),
-                    message: format!("failed to load ProjectedFSLib.dll (enable Client-ProjFS via `oz setup`): {err}"),
+                    workspace: ws.to_string(),
+                    path: mp.to_path_buf(),
+                    errno: err.raw_os_error(),
+                    message: format!(
+                        "failed to load ProjectedFSLib.dll (enable Client-ProjFS via `oz setup`): {err}"
+                    ),
                 });
             }
             let dll = DllHandle(handle);
             let sym = |name: &CStr| -> Result<*const c_void> {
+                // SAFETY: `dll.0` is a valid non-null `HMODULE` kept alive for the lifetime of
+                // `dll`, and `name.as_ptr()` is a valid NUL-terminated ASCII C string.
                 let p = unsafe { GetProcAddress(dll.0, name.as_ptr()) };
-                (!p.is_null()).then_some(p).ok_or_else(|| OzError::MountUnavailable {
-                    workspace: ws.to_string(), path: mp.to_path_buf(), errno: None,
-                    message: format!("missing ProjectedFSLib.dll export {}", name.to_string_lossy()),
-                })
+                (!p.is_null())
+                    .then_some(p)
+                    .ok_or_else(|| OzError::MountUnavailable {
+                        workspace: ws.to_string(),
+                        path: mp.to_path_buf(),
+                        errno: None,
+                        message: format!(
+                            "missing ProjectedFSLib.dll export {}",
+                            name.to_string_lossy()
+                        ),
+                    })
             };
+
+            let mark_dir_ptr = sym(c"PrjMarkDirectoryAsPlaceholder")?;
+            let start_virt_ptr = sym(c"PrjStartVirtualizing")?;
+            let stop_virt_ptr = sym(c"PrjStopVirtualizing")?;
+            let alloc_buf_ptr = sym(c"PrjAllocateAlignedBuffer")?;
+            let free_buf_ptr = sym(c"PrjFreeAlignedBuffer")?;
+            let write_placeholder_ptr = sym(c"PrjWritePlaceholderInfo")?;
+            let write_file_data_ptr = sym(c"PrjWriteFileData")?;
+            let fill_dir_entry_ptr = sym(c"PrjFillDirEntryBuffer")?;
+            let file_name_match_ptr = sym(c"PrjFileNameMatch")?;
+            let file_name_compare_ptr = sym(c"PrjFileNameCompare")?;
+
+            // SAFETY: Every pointer returned by `GetProcAddress` above is non-null, belongs to
+            // `ProjectedFSLib.dll` (kept resident by `_dll: DllHandle`), and matches the exact
+            // `extern "system"` C-ABI signature documented in `projectedfslib.h`. Size-checked
+            // `std::mem::transmute` guarantees pointer and function-pointer widths match.
             unsafe {
                 Ok(Self {
-                    mark_dir: std::mem::transmute_copy(&sym(c"PrjMarkDirectoryAsPlaceholder")?),
-                    start_virt: std::mem::transmute_copy(&sym(c"PrjStartVirtualizing")?),
-                    stop_virt: std::mem::transmute_copy(&sym(c"PrjStopVirtualizing")?),
-                    alloc_buf: std::mem::transmute_copy(&sym(c"PrjAllocateAlignedBuffer")?),
-                    free_buf: std::mem::transmute_copy(&sym(c"PrjFreeAlignedBuffer")?),
-                    write_placeholder: std::mem::transmute_copy(&sym(c"PrjWritePlaceholderInfo")?),
-                    write_file_data: std::mem::transmute_copy(&sym(c"PrjWriteFileData")?),
-                    fill_dir_entry: std::mem::transmute_copy(&sym(c"PrjFillDirEntryBuffer")?),
-                    file_name_match: std::mem::transmute_copy(&sym(c"PrjFileNameMatch")?),
-                    file_name_compare: std::mem::transmute_copy(&sym(c"PrjFileNameCompare")?),
+                    mark_dir: std::mem::transmute::<*const c_void, PrjMarkDirFn>(mark_dir_ptr),
+                    start_virt: std::mem::transmute::<*const c_void, PrjStartVirtFn>(
+                        start_virt_ptr,
+                    ),
+                    stop_virt: std::mem::transmute::<*const c_void, PrjStopVirtFn>(stop_virt_ptr),
+                    alloc_buf: std::mem::transmute::<*const c_void, PrjAllocBufFn>(alloc_buf_ptr),
+                    free_buf: std::mem::transmute::<*const c_void, PrjFreeBufFn>(free_buf_ptr),
+                    write_placeholder: std::mem::transmute::<*const c_void, PrjWritePlaceholderFn>(
+                        write_placeholder_ptr,
+                    ),
+                    write_file_data: std::mem::transmute::<*const c_void, PrjWriteFileDataFn>(
+                        write_file_data_ptr,
+                    ),
+                    fill_dir_entry: std::mem::transmute::<*const c_void, PrjFillDirEntryFn>(
+                        fill_dir_entry_ptr,
+                    ),
+                    file_name_match: std::mem::transmute::<*const c_void, PrjFileNameMatchFn>(
+                        file_name_match_ptr,
+                    ),
+                    file_name_compare: std::mem::transmute::<*const c_void, PrjFileNameCompareFn>(
+                        file_name_compare_ptr,
+                    ),
                     _dll: dll,
                 })
             }
         }
     }
 
-    pub(super) struct WinState { engine: ProjFsLayerEngine, api: Arc<ProjFsApi>, enums: Mutex<ProjFsEnumCache> }
-    unsafe fn ctx<'a>(cb: *const PrjCallbackData) -> Option<&'a WinState> {
-        (!cb.is_null()).then(|| unsafe { &*cb }).and_then(|c| (!c.instance_context.is_null()).then(|| unsafe { &*(c.instance_context as *const WinState) }))
+    pub(super) struct WinState {
+        engine: ProjFsLayerEngine,
+        api: Arc<ProjFsApi>,
+        enums: Mutex<ProjFsEnumCache>,
     }
 
+    impl WinState {
+        fn lock_enums(&self) -> MutexGuard<'_, ProjFsEnumCache> {
+            self.enums.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    // Compile-time enforcement that `WinState` (shared across ProjFS callback pool threads)
+    // and its underlying `ProjFsApi` / `DllHandle` are both `Send` and `Sync`.
+    const _: fn() = || {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WinState>();
+    };
+
+    /// Recovers the shared `&WinState` from a ProjFS callback's `instance_context`.
+    ///
+    /// # Safety
+    /// `cb` must be null or point to a valid, initialized `PrjCallbackData` provided by ProjFS
+    /// whose `instance_context` (if non-null) is the `Box<WinState>` pointer registered via
+    /// `PrjStartVirtualizing` and guaranteed to outlive `'a` until `PrjStopVirtualizing` returns.
+    unsafe fn ctx<'a>(cb: *const PrjCallbackData) -> Option<&'a WinState> {
+        if cb.is_null() {
+            return None;
+        }
+        // SAFETY: Caller guarantees `cb` is non-null and points to a valid `PrjCallbackData`.
+        let cb_ref = unsafe { &*cb };
+        if cb_ref.instance_context.is_null() {
+            return None;
+        }
+        // SAFETY: `instance_context` was created with `Box::into_raw(Box::new(WinState { .. }))`
+        // in `mount()`, `WinState: Sync`, and `stop_and_free()` waits for `PrjStopVirtualizing`
+        // to drain all callbacks before reclaiming the box.
+        Some(unsafe { &*(cb_ref.instance_context as *const WinState) })
+    }
+
+    /// ProjFS `PRJ_START_DIRECTORY_ENUMERATION_CB` trampoline.
+    ///
+    /// # Safety
+    /// Invoked by `ProjectedFSLib.dll` with valid `cb` and `id` pointers (or null) while the
+    /// virtualization instance is active.
     unsafe extern "system" fn start_enum_cb(cb: *const PrjCallbackData, id: *const PrjGuid) -> i32 {
-        catch_hresult(|| match (unsafe { ctx(cb) }, (!id.is_null()).then(|| unsafe { *id })) {
-            (Some(st), Some(g)) => { st.enums.lock().expect("projfs enum lock").start(g.to_bytes()); PRJ_S_OK }
-            _ => PRJ_E_FAIL,
-        })
-    }
-    unsafe extern "system" fn end_enum_cb(cb: *const PrjCallbackData, id: *const PrjGuid) -> i32 {
-        catch_hresult(|| match (unsafe { ctx(cb) }, (!id.is_null()).then(|| unsafe { *id })) {
-            (Some(st), Some(g)) => { st.enums.lock().expect("projfs enum lock").end(&g.to_bytes()); PRJ_S_OK }
-            _ => PRJ_E_FAIL,
-        })
-    }
-    unsafe extern "system" fn get_enum_cb(cb: *const PrjCallbackData, id: *const PrjGuid, expr: *const u16, buf: *mut c_void) -> i32 {
         catch_hresult(|| {
-            let (Some(st), Some(g)) = (unsafe { ctx(cb) }, (!id.is_null()).then(|| unsafe { *id })) else { return PRJ_E_FAIL; };
-            if buf.is_null() { return PRJ_E_FAIL; }
+            // SAFETY: ProjFS supplies a valid `PrjCallbackData` while the instance is live.
+            let Some(st) = (unsafe { ctx(cb) }) else {
+                return PRJ_E_FAIL;
+            };
+            if id.is_null() {
+                return PRJ_E_FAIL;
+            }
+            // SAFETY: `id` was checked non-null and points to a valid `PrjGuid` for this callback.
+            let g = unsafe { *id };
+            st.lock_enums().start(g.to_bytes());
+            PRJ_S_OK
+        })
+    }
+
+    /// ProjFS `PRJ_END_DIRECTORY_ENUMERATION_CB` trampoline.
+    ///
+    /// # Safety
+    /// Invoked by `ProjectedFSLib.dll` with valid `cb` and `id` pointers (or null) while the
+    /// virtualization instance is active.
+    unsafe extern "system" fn end_enum_cb(cb: *const PrjCallbackData, id: *const PrjGuid) -> i32 {
+        catch_hresult(|| {
+            // SAFETY: ProjFS supplies a valid `PrjCallbackData` while the instance is live.
+            let Some(st) = (unsafe { ctx(cb) }) else {
+                return PRJ_E_FAIL;
+            };
+            if id.is_null() {
+                return PRJ_E_FAIL;
+            }
+            // SAFETY: `id` was checked non-null and points to a valid `PrjGuid` for this callback.
+            let g = unsafe { *id };
+            st.lock_enums().end(&g.to_bytes());
+            PRJ_S_OK
+        })
+    }
+
+    /// ProjFS `PRJ_GET_DIRECTORY_ENUMERATION_CB` trampoline.
+    ///
+    /// # Safety
+    /// Invoked by `ProjectedFSLib.dll` with valid `cb`, `id`, optional NUL-terminated `expr`,
+    /// and output enumeration buffer handle `buf` while the virtualization instance is active.
+    unsafe extern "system" fn get_enum_cb(
+        cb: *const PrjCallbackData,
+        id: *const PrjGuid,
+        expr: *const u16,
+        buf: *mut c_void,
+    ) -> i32 {
+        catch_hresult(|| {
+            // SAFETY: ProjFS supplies a valid `PrjCallbackData` while the instance is live.
+            let Some(st) = (unsafe { ctx(cb) }) else {
+                return PRJ_E_FAIL;
+            };
+            if id.is_null() || buf.is_null() {
+                return PRJ_E_FAIL;
+            }
+            // SAFETY: `id` was checked non-null and points to a valid `PrjGuid`.
+            let g = unsafe { *id };
+            // SAFETY: `ctx(cb)` succeeded, so `cb` is non-null and valid for this callback.
             let cb_ref = unsafe { &*cb };
+            // SAFETY: `cb_ref.file_path_name` is either null or a NUL-terminated UTF-16 path
+            // owned by ProjFS for the duration of this callback.
             let rel_dir = unsafe { decode_wide_z(cb_ref.file_path_name) };
-            let expr_s = (!expr.is_null()).then(|| unsafe { decode_wide_z(expr) });
+            let expr_s = if expr.is_null() {
+                None
+            } else {
+                // SAFETY: `expr` was checked non-null and is a NUL-terminated UTF-16 search
+                // expression owned by ProjFS for this callback.
+                Some(unsafe { decode_wide_z(expr) })
+            };
             let restart = (cb_ref.flags & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN) != 0;
             let single = (cb_ref.flags & PRJ_CB_DATA_FLAG_ENUM_RETURN_SINGLE_ENTRY) != 0;
-            let mut enums = st.enums.lock().expect("projfs enum lock");
+            let mut enums = st.lock_enums();
             let id_bytes = g.to_bytes();
             if let Err(e) = enums.prepare(id_bytes, restart, || {
-                let mut rows = st.engine.enumerate_dir(&rel_dir, None)?;
-                if let Some(ref pat) = expr_s && !pat.is_empty() && pat != "*" {
+                let rows = st.engine.enumerate_dir(&rel_dir, None)?;
+                // Schwartzian transform: encode each entry name to NUL-terminated UTF-16 once
+                // before filtering and sorting rather than allocating twice per comparator call.
+                let mut keyed: Vec<(ProjFsDirEntry, Vec<u16>)> = rows
+                    .into_iter()
+                    .map(|entry| {
+                        let name_w = encode_wide_z(OsStr::new(&entry.name));
+                        (entry, name_w)
+                    })
+                    .collect();
+                if let Some(ref pat) = expr_s
+                    && !pat.is_empty()
+                    && pat != "*"
+                {
                     let pat_w = encode_wide_z(OsStr::new(pat));
-                    rows.retain(|r| unsafe { (st.api.file_name_match)(encode_wide_z(OsStr::new(&r.name)).as_ptr(), pat_w.as_ptr()) != 0 });
+                    keyed.retain(|(_, name_w)| {
+                        // SAFETY: Both `name_w` and `pat_w` are NUL-terminated UTF-16 slices live
+                        // for the duration of the `PrjFileNameMatch` call.
+                        unsafe { (st.api.file_name_match)(name_w.as_ptr(), pat_w.as_ptr()) != 0 }
+                    });
                 }
-                rows.sort_by(|a, b| unsafe { (st.api.file_name_compare)(encode_wide_z(OsStr::new(&a.name)).as_ptr(), encode_wide_z(OsStr::new(&b.name)).as_ptr()).cmp(&0) });
-                Ok(rows)
-            }) { return hresult_from_io_error(&e); }
+                keyed.sort_by(|(_, a_w), (_, b_w)| {
+                    // SAFETY: Both `a_w` and `b_w` are NUL-terminated UTF-16 slices live for the
+                    // duration of the `PrjFileNameCompare` call.
+                    let cmp = unsafe { (st.api.file_name_compare)(a_w.as_ptr(), b_w.as_ptr()) };
+                    cmp.cmp(&0)
+                });
+                Ok(keyed.into_iter().map(|(entry, _)| entry).collect())
+            }) {
+                return hresult_from_io_error(&e);
+            }
             let (entries, idx) = enums.cursor_slice(&id_bytes);
             step_dir_enum_buffer(entries, idx, single, |entry| {
                 let mut basic = entry.to_basic_info();
-                unsafe { (st.api.fill_dir_entry)(encode_wide_z(OsStr::new(&entry.name)).as_ptr(), &mut basic, buf) }
+                let name_w = encode_wide_z(OsStr::new(&entry.name));
+                // SAFETY: `name_w` is NUL-terminated UTF-16, `&mut basic` is a valid initialized
+                // `PrjFileBasicInfo`, and `buf` is the non-null ProjFS enumeration buffer handle.
+                unsafe { (st.api.fill_dir_entry)(name_w.as_ptr(), &mut basic, buf) }
             })
         })
     }
+
+    /// ProjFS `PRJ_GET_PLACEHOLDER_INFO_CB` trampoline.
+    ///
+    /// # Safety
+    /// Invoked by `ProjectedFSLib.dll` with a valid `cb` pointer while the virtualization
+    /// instance is active.
     unsafe extern "system" fn get_placeholder_cb(cb: *const PrjCallbackData) -> i32 {
         catch_hresult(|| {
-            let Some(st) = (unsafe { ctx(cb) }) else { return PRJ_E_FAIL; };
+            // SAFETY: ProjFS supplies a valid `PrjCallbackData` while the instance is live.
+            let Some(st) = (unsafe { ctx(cb) }) else {
+                return PRJ_E_FAIL;
+            };
+            // SAFETY: `ctx(cb)` succeeded, so `cb` is non-null and valid for this callback.
             let cb_ref = unsafe { &*cb };
-            match st.engine.placeholder_info(unsafe { decode_wide_z(cb_ref.file_path_name) }) {
+            // SAFETY: `cb_ref.file_path_name` is null or a NUL-terminated UTF-16 path from ProjFS.
+            let rel_path = unsafe { decode_wide_z(cb_ref.file_path_name) };
+            match st.engine.placeholder_info(rel_path) {
                 Ok(Some(info)) => {
                     let ph = PrjPlaceholderInfo::from_basic(info.to_basic_info());
                     let dst_w = encode_wide_z(OsStr::new(&info.windows_rel_path));
-                    unsafe { (st.api.write_placeholder)(cb_ref.namespace_virtualization_context, dst_w.as_ptr(), &ph, std::mem::size_of::<PrjPlaceholderInfo>() as u32) }
+                    // SAFETY: `namespace_virtualization_context` is the live ProjFS context for
+                    // this callback, `dst_w` is NUL-terminated UTF-16, and `&ph` is a valid
+                    // `PrjPlaceholderInfo` of `size_of::<PrjPlaceholderInfo>()` bytes.
+                    unsafe {
+                        (st.api.write_placeholder)(
+                            cb_ref.namespace_virtualization_context,
+                            dst_w.as_ptr(),
+                            &ph,
+                            std::mem::size_of::<PrjPlaceholderInfo>() as u32,
+                        )
+                    }
                 }
                 Ok(None) => ERROR_FILE_NOT_FOUND_HR,
                 Err(e) => hresult_from_io_error(&e),
             }
         })
     }
-    unsafe extern "system" fn get_file_data_cb(cb: *const PrjCallbackData, byte_offset: u64, length: u32) -> i32 {
+
+    /// ProjFS `PRJ_GET_FILE_DATA_CB` trampoline.
+    ///
+    /// # Safety
+    /// Invoked by `ProjectedFSLib.dll` with a valid `cb` pointer while the virtualization
+    /// instance is active.
+    unsafe extern "system" fn get_file_data_cb(
+        cb: *const PrjCallbackData,
+        byte_offset: u64,
+        length: u32,
+    ) -> i32 {
         catch_hresult(|| {
-            if length == 0 { return PRJ_S_OK; }
-            let Some(st) = (unsafe { ctx(cb) }) else { return PRJ_E_FAIL; };
+            if length == 0 {
+                return PRJ_S_OK;
+            }
+            // SAFETY: ProjFS supplies a valid `PrjCallbackData` while the instance is live.
+            let Some(st) = (unsafe { ctx(cb) }) else {
+                return PRJ_E_FAIL;
+            };
+            // SAFETY: `ctx(cb)` succeeded, so `cb` is non-null and valid for this callback.
             let cb_ref = unsafe { &*cb };
+            // SAFETY: `cb_ref.file_path_name` is null or a NUL-terminated UTF-16 path from ProjFS.
             let rel = unsafe { decode_wide_z(cb_ref.file_path_name) };
             let cap = (length as usize).min(64 * 1024);
+            // SAFETY: `namespace_virtualization_context` is valid for this callback and `cap > 0`.
             let raw = unsafe { (st.api.alloc_buf)(cb_ref.namespace_virtualization_context, cap) };
-            if raw.is_null() { return PRJ_E_OUTOFMEMORY; }
+            if raw.is_null() {
+                return PRJ_E_OUTOFMEMORY;
+            }
             let buf = AlignedBuf(raw, st.api.free_buf);
             let (mut off, mut rem) = (byte_offset, length as usize);
             while rem > 0 {
-                let bytes = match st.engine.read_hydration_data(&rel, off, rem.min(cap)) {
+                let want = rem.min(cap);
+                let bytes = match st.engine.read_hydration_data(&rel, off, want) {
                     Ok(b) if b.is_empty() => break,
                     Ok(b) => b,
                     Err(e) => return hresult_from_io_error(&e),
                 };
-                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.0.cast::<u8>(), bytes.len()); }
-                let hr = unsafe { (st.api.write_file_data)(cb_ref.namespace_virtualization_context, &cb_ref.data_stream_id, buf.0, off, bytes.len() as u32) };
-                if hr < 0 { return hr; }
+                debug_assert!(bytes.len() <= cap && bytes.len() <= want);
+                if bytes.len() > cap || bytes.len() > want {
+                    return PRJ_E_FAIL;
+                }
+                let Ok(chunk_len) = u32::try_from(bytes.len()) else {
+                    return PRJ_E_FAIL;
+                };
+                // SAFETY: `buf.0` is a non-null aligned buffer of at least `cap` writable bytes
+                // allocated by `PrjAllocateAlignedBuffer`, `bytes.len() <= cap` was just checked,
+                // and `bytes` is a freshly allocated `Vec<u8>` disjoint from `buf.0`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.0.cast::<u8>(), bytes.len());
+                }
+                // SAFETY: `buf.0` contains `chunk_len` initialized bytes aligned for ProjFS, and
+                // `namespace_virtualization_context` and `&cb_ref.data_stream_id` are valid for
+                // this callback.
+                let hr = unsafe {
+                    (st.api.write_file_data)(
+                        cb_ref.namespace_virtualization_context,
+                        &cb_ref.data_stream_id,
+                        buf.0,
+                        off,
+                        chunk_len,
+                    )
+                };
+                if hr < 0 {
+                    return hr;
+                }
                 off += bytes.len() as u64;
                 rem -= bytes.len();
             }
             PRJ_S_OK
         })
     }
-    unsafe extern "system" fn notify_cb(cb: *const PrjCallbackData, _is_dir: u8, kind: u32, dest: *const u16, _params: *mut c_void) -> i32 {
+
+    /// ProjFS `PRJ_NOTIFICATION_CB` trampoline.
+    ///
+    /// # Safety
+    /// Invoked by `ProjectedFSLib.dll` with a valid `cb` pointer and optional NUL-terminated
+    /// `dest` path while the virtualization instance is active.
+    unsafe extern "system" fn notify_cb(
+        cb: *const PrjCallbackData,
+        _is_dir: u8,
+        kind: u32,
+        dest: *const u16,
+        _params: *mut c_void,
+    ) -> i32 {
         catch_hresult(|| {
+            // SAFETY: ProjFS supplies a valid `PrjCallbackData` while the instance is live.
             if let Some(st) = unsafe { ctx(cb) } {
-                let rel = unsafe { decode_wide_z((*cb).file_path_name) };
-                let dst = (!dest.is_null()).then(|| unsafe { decode_wide_z(dest) });
+                // SAFETY: `ctx(cb)` succeeded, so `cb` is non-null and valid for this callback.
+                let cb_ref = unsafe { &*cb };
+                // SAFETY: `cb_ref.file_path_name` is null or a NUL-terminated UTF-16 path.
+                let rel = unsafe { decode_wide_z(cb_ref.file_path_name) };
+                let dst = if dest.is_null() {
+                    None
+                } else {
+                    // SAFETY: `dest` was checked non-null and is a NUL-terminated UTF-16 path.
+                    Some(unsafe { decode_wide_z(dest) })
+                };
                 let _ = dispatch_projfs_notification(&st.engine, kind, &rel, dst.as_deref());
             }
             PRJ_S_OK
@@ -1495,27 +1851,98 @@ mod win32 {
         let api = Arc::new(ProjFsApi::load(&spec.workspace, &cfg.mount_point)?);
         let root_w = encode_wide_z(cfg.mount_point.as_os_str());
         let guid = PrjGuid::from_bytes(compute_instance_guid(&spec.git_dir, &spec.workspace));
-        let mark_hr = unsafe { (api.mark_dir)(root_w.as_ptr(), std::ptr::null(), std::ptr::null(), &guid) };
-        if mark_hr < 0 && mark_hr != ERROR_REPARSE_ENCOUNTERED_HR && mark_hr != ERROR_ALREADY_EXISTS_HR {
-            return Err(OzError::MountUnavailable { workspace: spec.workspace.clone(), path: cfg.mount_point, errno: Some(mark_hr), message: format!("PrjMarkDirectoryAsPlaceholder failed (HRESULT 0x{:08x})", mark_hr as u32) });
+        // SAFETY: `root_w` is NUL-terminated UTF-16, optional target/version pointers are null
+        // per `PrjMarkDirectoryAsPlaceholder` docs, and `&guid` points to a valid `PrjGuid`.
+        let mark_hr =
+            unsafe { (api.mark_dir)(root_w.as_ptr(), std::ptr::null(), std::ptr::null(), &guid) };
+        if mark_hr < 0
+            && mark_hr != ERROR_REPARSE_ENCOUNTERED_HR
+            && mark_hr != ERROR_ALREADY_EXISTS_HR
+        {
+            return Err(OzError::MountUnavailable {
+                workspace: spec.workspace.clone(),
+                path: cfg.mount_point,
+                errno: Some(mark_hr),
+                message: format!(
+                    "PrjMarkDirectoryAsPlaceholder failed (HRESULT 0x{:08x})",
+                    mark_hr as u32
+                ),
+            });
         }
-        let state_ptr = Box::into_raw(Box::new(WinState { engine: ProjFsLayerEngine::from_spec(spec), api: Arc::clone(&api), enums: Mutex::new(ProjFsEnumCache::default()) }));
+        let state_ptr = Box::into_raw(Box::new(WinState {
+            engine: ProjFsLayerEngine::from_spec(spec),
+            api: Arc::clone(&api),
+            enums: Mutex::new(ProjFsEnumCache::default()),
+        }));
         let empty_w: [u16; 1] = [0];
-        let mut mapping = PrjNotificationMapping { notification_bit_mask: PRJ_NOTIFY_MASK, notification_root: empty_w.as_ptr() };
-        let opts = PrjStartVirtualizingOptions { flags: 0, pool_thread_count: 0, concurrent_thread_count: 0, notification_mappings: &mut mapping, notification_mappings_count: 1 };
-        let cbs = PrjCallbacks { start_directory_enumeration: Some(start_enum_cb), end_directory_enumeration: Some(end_enum_cb), get_directory_enumeration: Some(get_enum_cb), get_placeholder_info: Some(get_placeholder_cb), get_file_data: Some(get_file_data_cb), query_file_name: None, notification: Some(notify_cb), cancel_command: None };
+        let mut mapping = PrjNotificationMapping {
+            notification_bit_mask: PRJ_NOTIFY_MASK,
+            notification_root: empty_w.as_ptr(),
+        };
+        let opts = PrjStartVirtualizingOptions {
+            flags: 0,
+            pool_thread_count: 0,
+            concurrent_thread_count: 0,
+            notification_mappings: &mut mapping,
+            notification_mappings_count: 1,
+        };
+        let cbs = PrjCallbacks {
+            start_directory_enumeration: Some(start_enum_cb),
+            end_directory_enumeration: Some(end_enum_cb),
+            get_directory_enumeration: Some(get_enum_cb),
+            get_placeholder_info: Some(get_placeholder_cb),
+            get_file_data: Some(get_file_data_cb),
+            query_file_name: None,
+            notification: Some(notify_cb),
+            cancel_command: None,
+        };
         let mut ns_ctx: *mut c_void = std::ptr::null_mut();
-        let hr = unsafe { (api.start_virt)(root_w.as_ptr(), &cbs, state_ptr.cast(), &opts, &mut ns_ctx) };
+        // SAFETY: `root_w` is NUL-terminated UTF-16; `&cbs`, `&opts` (and its `mapping` /
+        // `empty_w` pointers), and `&mut ns_ctx` live across `PrjStartVirtualizing` (which copies
+        // options/callbacks internally); `state_ptr` is a valid heap-allocated `WinState` that
+        // remains alive until `stop_and_free` drains callbacks via `PrjStopVirtualizing`.
+        let hr = unsafe {
+            (api.start_virt)(root_w.as_ptr(), &cbs, state_ptr.cast(), &opts, &mut ns_ctx)
+        };
         if hr < 0 || ns_ctx.is_null() {
-            unsafe { drop(Box::from_raw(state_ptr)); }
-            return Err(OzError::MountUnavailable { workspace: spec.workspace.clone(), path: cfg.mount_point, errno: Some(hr), message: format!("PrjStartVirtualizing failed (HRESULT 0x{:08x})", hr as u32) });
+            // SAFETY: Virtualization failed to start, so no ProjFS callbacks hold `state_ptr`;
+            // reclaim the uniquely owned `Box<WinState>` allocated above.
+            unsafe {
+                drop(Box::from_raw(state_ptr));
+            }
+            return Err(OzError::MountUnavailable {
+                workspace: spec.workspace.clone(),
+                path: cfg.mount_point,
+                errno: Some(hr),
+                message: format!("PrjStartVirtualizing failed (HRESULT 0x{:08x})", hr as u32),
+            });
         }
-        Ok(MountedProjFs { config: cfg, ns_ctx, state_ptr, api })
+        Ok(MountedProjFs {
+            config: cfg,
+            ns_ctx,
+            state_ptr,
+            api,
+        })
     }
 
     pub(super) fn stop_and_free(m: &mut MountedProjFs) {
-        if !m.ns_ctx.is_null() { unsafe { (m.api.stop_virt)(m.ns_ctx); } m.ns_ctx = std::ptr::null_mut(); }
-        if !m.state_ptr.is_null() { unsafe { drop(Box::from_raw(m.state_ptr)); } m.state_ptr = std::ptr::null_mut(); }
+        if !m.ns_ctx.is_null() {
+            // SAFETY: `m.ns_ctx` was returned by `PrjStartVirtualizing` and is stopped at most
+            // once (`m.ns_ctx` is nulled immediately); `PrjStopVirtualizing` synchronously drains
+            // all in-flight ProjFS callbacks before returning.
+            unsafe {
+                (m.api.stop_virt)(m.ns_ctx);
+            }
+            m.ns_ctx = std::ptr::null_mut();
+        }
+        if !m.state_ptr.is_null() {
+            // SAFETY: `PrjStopVirtualizing` above has returned so no ProjFS callback can access
+            // `m.state_ptr`, and `m.state_ptr` is reclaimed at most once (`nulled` immediately).
+            unsafe {
+                drop(Box::from_raw(m.state_ptr));
+            }
+            m.state_ptr = std::ptr::null_mut();
+        }
     }
 }
 
@@ -1528,8 +1955,14 @@ pub struct MountedProjFs {
     api: std::sync::Arc<win32::ProjFsApi>,
 }
 
+// SAFETY: `MountedProjFs` uniquely owns the ProjFS virtualization context (`ns_ctx`) and boxed
+// `WinState` (`state_ptr`, where `WinState: Send + Sync`); `PrjStopVirtualizing` may be invoked
+// from any thread during `unmount`/`Drop`.
 #[cfg(target_os = "windows")]
 unsafe impl Send for MountedProjFs {}
+
+// SAFETY: Shared references to `MountedProjFs` only allow reading `config: OverlayMountConfig`;
+// `ns_ctx` and `state_ptr` are only mutated via `&mut self` in `unmount`/`Drop`.
 #[cfg(target_os = "windows")]
 unsafe impl Sync for MountedProjFs {}
 
@@ -1604,6 +2037,135 @@ mod tests {
         assert_eq!(offset_of!(PrjCallbackData, file_path_name), 56);
         assert_eq!(offset_of!(PrjCallbackData, triggering_process_id), 72);
         assert_eq!(offset_of!(PrjCallbackData, instance_context), 88);
+        assert_eq!(size_of::<PrjNotificationMapping>(), 16);
+        assert_eq!(offset_of!(PrjNotificationMapping, notification_root), 8);
+        assert_eq!(size_of::<PrjStartVirtualizingOptions>(), 32);
+        assert_eq!(
+            offset_of!(PrjStartVirtualizingOptions, notification_mappings),
+            16
+        );
+        assert_eq!(size_of::<PrjCallbacks>(), 64);
+
+        // Exercise C-ABI struct constructors/fields so layout tests validate every struct field.
+        let guid_bytes = compute_instance_guid(Path::new("/repo/.git"), "layout");
+        let guid = PrjGuid::from_bytes(guid_bytes);
+        assert_eq!(guid.to_bytes(), guid_bytes);
+        let dir_entry = ProjFsDirEntry {
+            name: "sample.txt".to_string(),
+            is_dir: false,
+            file_size: 42,
+            creation_time: 1,
+            last_access_time: 2,
+            last_write_time: 3,
+            change_time: 4,
+            file_attributes: FILE_ATTRIBUTE_ARCHIVE,
+            layer: LayerKind::Baseline,
+            host_path: PathBuf::from("sample.txt"),
+        };
+        let ph_entry = ProjFsPlaceholderInfo {
+            rel_path: "sample.txt".to_string(),
+            windows_rel_path: "sample.txt".to_string(),
+            host_path: PathBuf::from("sample.txt"),
+            layer: LayerKind::Baseline,
+            is_dir: false,
+            file_size: 42,
+            creation_time: 1,
+            last_access_time: 2,
+            last_write_time: 3,
+            change_time: 4,
+            file_attributes: FILE_ATTRIBUTE_ARCHIVE,
+        };
+        assert_eq!(dir_entry.to_basic_info(), ph_entry.to_basic_info());
+        let ph = PrjPlaceholderInfo::from_basic(dir_entry.to_basic_info());
+        assert_eq!(ph.file_basic_info.file_size, 42);
+        assert_eq!(ph.ea_buffer_size, 0);
+        assert_eq!(ph.offset_to_first_ea, 0);
+        assert_eq!(ph.security_buffer_size, 0);
+        assert_eq!(ph.offset_to_security_descriptor, 0);
+        assert_eq!(ph.streams_info_buffer_size, 0);
+        assert_eq!(ph.offset_to_first_stream_info, 0);
+        assert_eq!(ph.version_info.provider_id[0], 0);
+        assert_eq!(ph.version_info.content_id[0], 0);
+        assert_eq!(ph.variable_data, [0]);
+
+        let cb_data = PrjCallbackData {
+            size: size_of::<PrjCallbackData>() as u32,
+            flags: 0,
+            namespace_virtualization_context: std::ptr::null_mut(),
+            command_id: 0,
+            file_id: guid,
+            data_stream_id: guid,
+            file_path_name: std::ptr::null(),
+            version_info: std::ptr::null(),
+            triggering_process_id: 0,
+            triggering_process_image_file_name: std::ptr::null(),
+            instance_context: std::ptr::null_mut(),
+        };
+        assert_eq!(cb_data.size as usize, size_of::<PrjCallbackData>());
+        assert_eq!(cb_data.flags, 0);
+        assert!(cb_data.namespace_virtualization_context.is_null());
+        assert_eq!(cb_data.command_id, 0);
+        assert_eq!(cb_data.file_id, guid);
+        assert_eq!(cb_data.data_stream_id, guid);
+        assert!(cb_data.file_path_name.is_null());
+        assert!(cb_data.version_info.is_null());
+        assert_eq!(cb_data.triggering_process_id, 0);
+        assert!(cb_data.triggering_process_image_file_name.is_null());
+        assert!(cb_data.instance_context.is_null());
+
+        let mut mapping = PrjNotificationMapping {
+            notification_bit_mask: 0,
+            notification_root: std::ptr::null(),
+        };
+        assert_eq!(mapping.notification_bit_mask, 0);
+        assert!(mapping.notification_root.is_null());
+        let opts = PrjStartVirtualizingOptions {
+            flags: 0,
+            pool_thread_count: 0,
+            concurrent_thread_count: 0,
+            notification_mappings: &mut mapping,
+            notification_mappings_count: 1,
+        };
+        assert_eq!(opts.flags, 0);
+        assert_eq!(opts.pool_thread_count, 0);
+        assert_eq!(opts.concurrent_thread_count, 0);
+        assert!(!opts.notification_mappings.is_null());
+        assert_eq!(opts.notification_mappings_count, 1);
+
+        let cbs = PrjCallbacks {
+            start_directory_enumeration: None,
+            end_directory_enumeration: None,
+            get_directory_enumeration: None,
+            get_placeholder_info: None,
+            get_file_data: None,
+            query_file_name: None,
+            notification: None,
+            cancel_command: None,
+        };
+        assert!(cbs.start_directory_enumeration.is_none());
+        assert!(cbs.end_directory_enumeration.is_none());
+        assert!(cbs.get_directory_enumeration.is_none());
+        assert!(cbs.get_placeholder_info.is_none());
+        assert!(cbs.get_file_data.is_none());
+        assert!(cbs.query_file_name.is_none());
+        assert!(cbs.notification.is_none());
+        assert!(cbs.cancel_command.is_none());
+    }
+
+    #[test]
+    fn wide_string_roundtrip_and_catch_hresult_guard_panics() {
+        let wide = encode_wide_z(OsStr::new("sub\\café.txt"));
+        assert_eq!(wide.last(), Some(&0));
+        // SAFETY: `wide` is a NUL-terminated UTF-16 Vec valid for the duration of this call.
+        assert_eq!(unsafe { decode_wide_z(wide.as_ptr()) }, "sub\\café.txt");
+        // SAFETY: `decode_wide_z` explicitly accepts null pointers and returns an empty string.
+        assert_eq!(unsafe { decode_wide_z(std::ptr::null()) }, "");
+
+        assert_eq!(catch_hresult(|| PRJ_S_OK), PRJ_S_OK);
+        assert_eq!(
+            catch_hresult(|| panic!("simulated callback panic")),
+            PRJ_E_FAIL
+        );
     }
 
     #[test]
@@ -1666,7 +2228,11 @@ mod tests {
             layer: LayerKind::Baseline,
             host_path: PathBuf::from(name),
         };
-        let entries = vec![make_entry("a.txt"), make_entry("b.txt"), make_entry("c.txt")];
+        let entries = vec![
+            make_entry("a.txt"),
+            make_entry("b.txt"),
+            make_entry("c.txt"),
+        ];
         let mut idx = 0usize;
 
         // First entry overflows buffer (`added == 0`) -> must return ERROR_INSUFFICIENT_BUFFER_HR
