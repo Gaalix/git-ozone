@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pure-Rust `refs/notes/ai` Git notes engine and automatic line-level AI commit provenance
-//! recorder built on `gix` + `imara-diff` (100% interoperable with `git notes --ref=ai`).
+//! recorder built on `gix` (`gix::diff::blob`) (100% interoperable with `git notes --ref=ai`).
 
 use crate::{AiProvenanceNote, LineRangeAttribution};
 use chrono::Utc;
 use gix::bstr::ByteSlice;
+use gix::diff::blob::{Algorithm, Diff, InternedInput, sources};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::refs::FullName;
 use gix::refs::Target;
 use gix::refs::transaction::{PreviousValue, RefEdit};
-use imara_diff::{Algorithm, Diff, InternedInput, sources};
 use oz_core::{OzError, OzoneRepo, Result, is_binary_bytes};
 use std::collections::BTreeMap;
 
@@ -258,8 +258,9 @@ pub fn write_provenance_note(
                         "failed to update '{AI_NOTES_REF}' after {MAX_CAS_RETRIES} CAS attempts: {err}"
                     )));
                 }
-                let backoff_ms =
-                    5 + (attempt as u64).min(10) * 3 + ((u64::from(std::process::id()) + attempt as u64 * 7) % 15);
+                let backoff_ms = 5
+                    + (attempt as u64).min(10) * 3
+                    + ((u64::from(std::process::id()) + attempt as u64 * 7) % 15);
                 std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
             }
         }
@@ -325,7 +326,7 @@ pub(crate) fn load_provenance_notes_gix(
 
 /// Computes exact 1-indexed added/modified new-file [`LineRangeAttribution`]s introduced by
 /// `commit_or_rev` relative to its first parent (or the empty tree for root commits) via
-/// `gix` + `imara-diff` (`Algorithm::Histogram`).
+/// `gix::diff::blob` (`Algorithm::Histogram`).
 pub fn compute_commit_line_attributions(
     repo: &OzoneRepo,
     commit_or_rev: &str,

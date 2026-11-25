@@ -28,9 +28,7 @@ use oz_cow::materialize::{apply_tree_delta_to_dir, compute_tree_delta};
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, gc_workspaces, list_workspaces, remove_workspace,
 };
-use oz_integrate::{
-    IntegrateOptions, StackRebaseOptions, integrate, stack_rebase, stack_status,
-};
+use oz_integrate::{IntegrateOptions, StackRebaseOptions, integrate, stack_rebase, stack_status};
 use oz_oplog::{ActorInfo, MutationTransaction, list_entries};
 use oz_warm::{BaselineSource, gc_baselines, resolve_or_capture_baseline};
 use serde::{Deserialize, Serialize};
@@ -100,11 +98,7 @@ pub struct SyncOutcome {
 /// 5. Rebases local downstream stacked branches onto updated `main` via `oz-integrate`
 /// 6. Removes & GCs merged CoW workspaces (`oz-cow`) and prunes merged checkpoints (`refs/ozone/*checkpoints/*`)
 /// 7. Refreshes the quiescent `oz-warm` baseline
-pub fn sync_repo(
-    repo: &OzoneRepo,
-    opts: &SyncOptions,
-    actor: ActorInfo,
-) -> Result<SyncOutcome> {
+pub fn sync_repo(repo: &OzoneRepo, opts: &SyncOptions, actor: ActorInfo) -> Result<SyncOutcome> {
     let main_repo = if repo.is_linked_worktree || repo.workspace.is_some() {
         OzoneRepo::discover(Some(&repo.repo_root))?
     } else {
@@ -326,7 +320,7 @@ pub fn sync_repo(
                     .unwrap_or_else(|| base_branch.clone());
             }
             if merged_set.contains(&resolved_base) {
-                resolved_base = base_branch.clone();
+                resolved_base.clone_from(&base_branch);
             }
 
             if resolved_base != old_base && resolved_base != pr_item.head.ref_name {
@@ -422,7 +416,7 @@ pub fn sync_repo(
                     auth_token: opts.auth_token.clone(),
                     auth_scheme: opts.git_auth_scheme,
                 },
-                actor.clone(),
+                actor,
             )?;
             if push_out.op_id.is_some() {
                 last_op_id = push_out.op_id;
@@ -492,7 +486,8 @@ pub fn sync_repo(
 
     // Delete any remaining merged local branches not checked out in any worktree.
     let gix_cleanup = open_gix_unrestricted(&refreshed_main.repo_root)?;
-    let checked_out_refs = collect_checked_out_branch_refs(&gix_cleanup, &refreshed_main.git_common_dir)?;
+    let checked_out_refs =
+        collect_checked_out_branch_refs(&gix_cleanup, &refreshed_main.git_common_dir)?;
     for merged_br in &merged_set {
         let full_ref = format!("refs/heads/{merged_br}");
         if checked_out_refs.contains(&full_ref) {
@@ -658,9 +653,7 @@ fn fast_forward_local_base(
     }
 
     let entry = tx.finish(tx_repo, pre_dirty.as_deref())?;
-    Ok(FastForwardResult::Updated {
-        op_id: entry.op_id,
-    })
+    Ok(FastForwardResult::Updated { op_id: entry.op_id })
 }
 
 /// Strategy used by [`pull_current_branch`] to incorporate upstream commits.
@@ -795,30 +788,27 @@ pub fn pull_current_branch(
     let tracking_ref = format!("refs/remotes/{tracking_short}");
 
     let local_oid = read_ref_oid(&gix_after, &local_ref)?;
-    let upstream_oid = read_ref_oid(&gix_after, &tracking_ref)?.ok_or_else(|| {
-        OzError::InvalidUsage {
+    let upstream_oid =
+        read_ref_oid(&gix_after, &tracking_ref)?.ok_or_else(|| OzError::InvalidUsage {
             message: format!(
                 "remote-tracking ref '{tracking_short}' was not found on remote '{remote_name}'"
             ),
             recovery: vec![format!(
                 "Specify branch explicitly: `oz pull {remote_name} <branch>`"
             )],
-        }
-    })?;
+        })?;
     let previous_oid = local_oid.map(|id| id.to_hex().to_string());
 
     if local_oid == Some(upstream_oid)
-        || local_oid.is_some_and(|l| is_ancestor_commit(&gix_after, upstream_oid, l).unwrap_or(false))
+        || local_oid
+            .is_some_and(|l| is_ancestor_commit(&gix_after, upstream_oid, l).unwrap_or(false))
     {
         return Ok(PullOutcome {
             remote: remote_name,
             branch: current_branch,
             upstream_ref: tracking_short,
             previous_oid,
-            head_oid: local_oid
-                .unwrap_or(upstream_oid)
-                .to_hex()
-                .to_string(),
+            head_oid: local_oid.unwrap_or(upstream_oid).to_hex().to_string(),
             strategy: PullStrategy::UpToDate,
             updated: false,
             fetched: true,
@@ -878,10 +868,7 @@ pub fn pull_current_branch(
             message: format!(
                 "cannot fast-forward '{current_branch}' to '{tracking_short}'; branches have diverged"
             ),
-            recovery: vec![
-                "oz pull --rebase".to_string(),
-                "oz pull".to_string(),
-            ],
+            recovery: vec!["oz pull --rebase".to_string(), "oz pull".to_string()],
         });
     }
 
@@ -1024,9 +1011,7 @@ fn transplant_children_of_squash_merged_branches(
     for (br_name, orig_tip_oid, merged_base_oid, commits_above_merged) in unmerged_targets {
         // Check if an intermediate unmerged parent in `commits_above_merged` was already rewritten!
         let mut start_idx = 0usize;
-        let mut current_onto = *rewritten_tips
-            .get(&merged_base_oid)
-            .unwrap_or(&new_base_id);
+        let mut current_onto = *rewritten_tips.get(&merged_base_oid).unwrap_or(&new_base_id);
 
         for (idx, cid) in commits_above_merged.iter().enumerate() {
             if let Some(&already_new) = rewritten_tips.get(cid) {
@@ -1109,8 +1094,8 @@ fn transplant_children_of_squash_merged_branches(
             .detach();
 
         let full_ref = format!("refs/heads/{br_name}");
-        let full_name = FullName::try_from(full_ref.as_str())
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let full_name =
+            FullName::try_from(full_ref.as_str()).map_err(|err| OzError::Git(err.to_string()))?;
         ref_edits.push(RefEdit::update(
             full_name,
             current_onto,
@@ -1183,9 +1168,7 @@ fn write_rebased_commit(
     let orig = gix_repo
         .find_commit(orig_commit_oid)
         .map_err(|err| OzError::Git(err.to_string()))?;
-    let decoded = orig
-        .decode()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let decoded = orig.decode().map_err(|err| OzError::Git(err.to_string()))?;
     let author = decoded
         .author()
         .map_err(|err| OzError::Git(err.to_string()))?

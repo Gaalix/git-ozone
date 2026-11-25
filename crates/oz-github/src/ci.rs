@@ -238,7 +238,10 @@ fn is_passing_check(c: &CiCheckSummary) -> bool {
         && c.failing_step.is_none()
         && c.log_excerpt.is_none()
         && matches!(
-            c.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            c.conclusion
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
             Some("success" | "neutral" | "skipped")
         )
 }
@@ -464,7 +467,11 @@ pub fn query_ci_runs(repo: &OzoneRepo, opts: &CiRunsOptions) -> Result<CiRunsRep
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("origin");
-    let limit = if opts.limit == 0 { 10 } else { opts.limit.min(50) };
+    let limit = if opts.limit == 0 {
+        10
+    } else {
+        opts.limit.min(50)
+    };
     let branch_filter = opts
         .branch
         .as_deref()
@@ -480,13 +487,8 @@ pub fn query_ci_runs(repo: &OzoneRepo, opts: &CiRunsOptions) -> Result<CiRunsRep
     let _ = client.require_authenticated()?;
     let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
 
-    let raw_runs = client.list_workflow_runs_limited(
-        owner,
-        gh_repo,
-        branch_filter.as_deref(),
-        None,
-        limit,
-    )?;
+    let raw_runs =
+        client.list_workflow_runs_limited(owner, gh_repo, branch_filter.as_deref(), None, limit)?;
 
     let runs: Vec<CiWorkflowRunSummary> = raw_runs
         .into_iter()
@@ -516,7 +518,10 @@ pub fn query_ci_runs(repo: &OzoneRepo, opts: &CiRunsOptions) -> Result<CiRunsRep
         if !r.status.eq_ignore_ascii_case("completed") {
             pending_count += 1;
         } else if matches!(
-            r.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            r.conclusion
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
             Some("success" | "neutral" | "skipped")
         ) {
             passing_count += 1;
@@ -586,7 +591,8 @@ fn query_ci_status_with_client(
     let mut jobs_by_id: HashMap<u64, GitHubActionsJob> = HashMap::new();
     let mut jobs_by_name: HashMap<String, GitHubActionsJob> = HashMap::new();
 
-    let branch_filter = (!ref_name.is_empty() && ref_name != commit_sha).then_some(ref_name.as_str());
+    let branch_filter =
+        (!ref_name.is_empty() && ref_name != commit_sha).then_some(ref_name.as_str());
     let sha_filter = (!commit_sha.is_empty()).then_some(commit_sha.as_str());
     if let Ok(runs) = client.list_workflow_runs(owner, gh_repo, branch_filter, sha_filter) {
         for run in runs.into_iter().take(10) {
@@ -752,8 +758,14 @@ pub fn query_workflow_ci_status(
     let _ = client.require_authenticated()?;
     let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
 
-    let (resolved_wf_id, runs) =
-        fetch_workflow_runs_resolved(&client, owner, gh_repo, workflow_query, branch_filter.as_deref(), limit)?;
+    let (resolved_wf_id, runs) = fetch_workflow_runs_resolved(
+        &client,
+        owner,
+        gh_repo,
+        workflow_query,
+        branch_filter.as_deref(),
+        limit,
+    )?;
 
     let mut failure_cache = HashMap::new();
     let summaries = build_workflow_run_summaries(
@@ -864,7 +876,9 @@ where
                         runs_etag = etag;
                     }
                 }
-                Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                Ok(ConditionalGet::RateLimited {
+                    retry_after_secs, ..
+                }) => {
                     rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
                 }
                 Err(_) => {}
@@ -890,7 +904,9 @@ where
                         entry.0 = etag;
                     }
                 }
-                Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                Ok(ConditionalGet::RateLimited {
+                    retry_after_secs, ..
+                }) => {
                     rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
                 }
                 Err(_) => {}
@@ -1094,11 +1110,19 @@ fn fetch_workflow_runs_resolved(
         || normalized.ends_with(".yaml");
 
     if looks_direct {
-        match client.list_workflow_runs_for_workflow(owner, gh_repo, &normalized, branch_filter, limit) {
+        match client.list_workflow_runs_for_workflow(
+            owner,
+            gh_repo,
+            &normalized,
+            branch_filter,
+            limit,
+        ) {
             Ok(runs) => return Ok((normalized, runs)),
             Err(first_err) => {
                 // Fall back to resolving by workflow catalog (e.g., mismatched extension or display name).
-                if let Ok(resolved_id) = resolve_workflow_from_catalog(client, owner, gh_repo, workflow_query) {
+                if let Ok(resolved_id) =
+                    resolve_workflow_from_catalog(client, owner, gh_repo, workflow_query)
+                {
                     let runs = client.list_workflow_runs_for_workflow(
                         owner,
                         gh_repo,
@@ -1114,7 +1138,13 @@ fn fetch_workflow_runs_resolved(
     }
 
     let resolved_id = resolve_workflow_from_catalog(client, owner, gh_repo, workflow_query)?;
-    let runs = client.list_workflow_runs_for_workflow(owner, gh_repo, &resolved_id, branch_filter, limit)?;
+    let runs = client.list_workflow_runs_for_workflow(
+        owner,
+        gh_repo,
+        &resolved_id,
+        branch_filter,
+        limit,
+    )?;
     Ok((resolved_id, runs))
 }
 
@@ -1294,7 +1324,12 @@ fn assemble_workflow_report(
             } else {
                 "passing"
             };
-            (overall.to_string(), failing == 0 && pending == 0, failing, pending)
+            (
+                overall.to_string(),
+                failing == 0 && pending == 0,
+                failing,
+                pending,
+            )
         } else {
             ("no_runs".to_string(), false, 0, 0)
         };
@@ -1412,7 +1447,8 @@ where
                             gix_repo.as_ref(),
                             &value.head.sha,
                             &commit_sha,
-                        ) || initial_stale_pr_sha.as_deref() == Some(value.head.sha.as_str())
+                        ) || initial_stale_pr_sha.as_deref()
+                            == Some(value.head.sha.as_str())
                         {
                             // GitHub's PR API (`pulls/{n}.head.sha`) can lag behind `git push`
                             // for several seconds; an ancestor or pre-push stale SHA is API lag,
@@ -1427,7 +1463,9 @@ where
                         pr_etag = etag;
                     }
                 }
-                Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                Ok(ConditionalGet::RateLimited {
+                    retry_after_secs, ..
+                }) => {
                     rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
                 }
                 Err(_) => {}
@@ -1452,7 +1490,9 @@ where
                     check_runs_etag = etag;
                 }
             }
-            Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+            Ok(ConditionalGet::RateLimited {
+                retry_after_secs, ..
+            }) => {
                 rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
             }
             Err(err) if polls == 1 => return Err(err),
@@ -1478,7 +1518,9 @@ where
                     workflow_runs_etag = etag;
                 }
             }
-            Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+            Ok(ConditionalGet::RateLimited {
+                retry_after_secs, ..
+            }) => {
                 rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
             }
             Err(_) => {}
@@ -1487,7 +1529,11 @@ where
         // Track whether we have observed a workflow run for `commit_sha`, and record pre-existing
         // older runs on poll 1 (before the newly pushed run registers) so we never mistake them
         // for a newer superseding commit.
-        if !commit_sha.is_empty() && cached_workflow_runs.iter().any(|r| r.head_sha == commit_sha) {
+        if !commit_sha.is_empty()
+            && cached_workflow_runs
+                .iter()
+                .any(|r| r.head_sha == commit_sha)
+        {
             seen_watched_workflow_run = true;
         }
         if polls == 1 && !seen_watched_workflow_run {
@@ -1523,9 +1569,9 @@ where
                 .iter()
                 .any(|c| c.conclusion.as_deref() == Some("cancelled"));
             let all_completed_passed = !cached_check_runs.is_empty()
-                && cached_check_runs
-                    .iter()
-                    .all(|c| c.status == "completed" && !is_failing_conclusion(c.conclusion.as_deref()));
+                && cached_check_runs.iter().all(|c| {
+                    c.status == "completed" && !is_failing_conclusion(c.conclusion.as_deref())
+                });
             if any_cancelled || !all_completed_passed {
                 superseded_by_sha = Some(newer_run.head_sha.clone());
             }
@@ -1555,7 +1601,9 @@ where
                         entry.0 = etag;
                     }
                 }
-                Ok(ConditionalGet::RateLimited { retry_after_secs, .. }) => {
+                Ok(ConditionalGet::RateLimited {
+                    retry_after_secs, ..
+                }) => {
                     rate_limit_wait = Some(rate_limit_wait.unwrap_or(0).max(retry_after_secs));
                 }
                 Err(_) => {}
@@ -1911,16 +1959,13 @@ fn assemble_ci_report_inner(
             .or_else(|| extract_actions_job_id_from_url(cr.html_url.as_deref()))
             .and_then(|jid| {
                 covered_job_ids.insert(jid);
-                jobs_by_id
-                    .get(&jid)
-                    .cloned()
-                    .or_else(|| {
-                        if fetch_failure_logs && is_failing_conclusion(cr.conclusion.as_deref()) {
-                            client.get_actions_job(owner, gh_repo, jid).ok()
-                        } else {
-                            None
-                        }
-                    })
+                jobs_by_id.get(&jid).cloned().or_else(|| {
+                    if fetch_failure_logs && is_failing_conclusion(cr.conclusion.as_deref()) {
+                        client.get_actions_job(owner, gh_repo, jid).ok()
+                    } else {
+                        None
+                    }
+                })
             })
             .or_else(|| {
                 let j = jobs_by_name.get(&cr.name)?.clone();
@@ -1971,10 +2016,7 @@ fn assemble_ci_report_inner(
         .iter()
         .filter(|s| is_failing_conclusion(s.conclusion.as_deref()))
         .count();
-    let pending_count = summaries
-        .iter()
-        .filter(|s| s.status != "completed")
-        .count();
+    let pending_count = summaries.iter().filter(|s| s.status != "completed").count();
 
     let overall_status = if total_count == 0 {
         "no_checks".to_string()
@@ -2125,7 +2167,12 @@ fn resolve_ci_target(
                 return Ok((short, oid.to_hex().to_string(), None, None));
             }
             if let Ok(oid) = gix_repo.rev_parse_single(trimmed) {
-                return Ok((trimmed.to_string(), oid.detach().to_hex().to_string(), None, None));
+                return Ok((
+                    trimmed.to_string(),
+                    oid.detach().to_hex().to_string(),
+                    None,
+                    None,
+                ));
             }
             return Ok((trimmed.to_string(), String::new(), None, None));
         }
@@ -2194,11 +2241,15 @@ fn build_check_summary(
 
     let job_id_opt = job
         .map(|j| j.id)
-        .or_else(|| check_run.and_then(|c| extract_actions_job_id_from_url(c.details_url.as_deref())))
+        .or_else(|| {
+            check_run.and_then(|c| extract_actions_job_id_from_url(c.details_url.as_deref()))
+        })
         .or_else(|| check_run.and_then(|c| extract_actions_job_id_from_url(c.html_url.as_deref())));
     let run_id_opt = job
         .and_then(|j| j.run_id)
-        .or_else(|| check_run.and_then(|c| extract_actions_run_id_from_url(c.details_url.as_deref())))
+        .or_else(|| {
+            check_run.and_then(|c| extract_actions_run_id_from_url(c.details_url.as_deref()))
+        })
         .or_else(|| check_run.and_then(|c| extract_actions_run_id_from_url(c.html_url.as_deref())))
         .or_else(|| job.and_then(|j| extract_actions_run_id_from_url(j.html_url.as_deref())));
     let html_url = check_run
@@ -2386,8 +2437,7 @@ fn sanitize_step_needle(s: &str) -> String {
 }
 
 fn is_zip_archive(bytes: &[u8]) -> bool {
-    bytes.len() >= 4
-        && (bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06"))
+    bytes.len() >= 4 && (bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06"))
 }
 
 /// Pure-Rust PKZIP reader supporting Central Directory (`PK\x05\x06` + `PK\x01\x02`) and Local
@@ -2445,7 +2495,8 @@ fn extract_zip_text_entries(bytes: &[u8]) -> Result<Vec<(String, String)>> {
                     if name_end > bytes.len() {
                         break;
                     }
-                    let file_name = String::from_utf8_lossy(&bytes[cursor + 46..name_end]).into_owned();
+                    let file_name =
+                        String::from_utf8_lossy(&bytes[cursor + 46..name_end]).into_owned();
                     cursor = name_end + extra_len + comment_len;
 
                     if file_name.ends_with('/') {
@@ -2590,7 +2641,7 @@ pub fn summarize_failing_log(
     for (idx, line) in cleaned_lines.iter().enumerate() {
         if is_high_signal_error_line(line) {
             if inferred_step.is_none() {
-                inferred_step = group_for_line[idx].clone();
+                inferred_step.clone_from(&group_for_line[idx]);
             }
             let start = idx.saturating_sub(1);
             let end = (idx + 4).min(cleaned_lines.len());
@@ -2650,7 +2701,9 @@ fn extract_cleaned_log_tail(
     step_filter: Option<&str>,
     max_lines: usize,
 ) -> Option<String> {
-    let step_needle = step_filter.map(sanitize_step_needle).filter(|s| !s.is_empty());
+    let step_needle = step_filter
+        .map(sanitize_step_needle)
+        .filter(|s| !s.is_empty());
     let mut all_cleaned: Vec<String> = Vec::new();
     let mut step_cleaned: Vec<String> = Vec::new();
     let mut active_group: Option<String> = None;
@@ -2872,7 +2925,8 @@ mod tests {
 2026-11-18T13:20:02.4444444Z ##[endgroup]\n\
 2026-11-18T13:20:02.5555555Z ##[error]Process completed with exit code 101.\n";
 
-        let zip_bytes = build_single_file_zip_deflate("build/4_Run cargo test.txt", raw_log.as_bytes());
+        let zip_bytes =
+            build_single_file_zip_deflate("build/4_Run cargo test.txt", raw_log.as_bytes());
         let decoded = extract_log_text_from_bytes(&zip_bytes, Some("Run cargo test"))
             .expect("decode zip log");
 

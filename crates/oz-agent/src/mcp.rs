@@ -12,9 +12,8 @@ use oz_core::{
     BackendKind, ChangeKind, CommitOptions, CommitOutcome, DiffReport, FileChange, LogOptions,
     OzError, OzoneRepo, RestoreOptions, RestoreOutcome, Result, RevisionDiffOptions, ScopePolicy,
     ShowBlobOptions, ShowOptions, StatusReport, WarningEntry, WorkspaceState,
-    compute_diff_filtered, compute_revision_diff, compute_status, log_commits,
-    parse_rev_path_spec, render_unified_diff, render_unified_diff_numbered, restore_paths,
-    show_blob, show_commit,
+    compute_diff_filtered, compute_revision_diff, compute_status, log_commits, parse_rev_path_spec,
+    render_unified_diff, render_unified_diff_numbered, restore_paths, show_blob, show_commit,
 };
 use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
 use oz_integrate::{RadarOptions, RadarReport, scan_radar};
@@ -25,9 +24,9 @@ use oz_oplog::{
 use oz_warm::BaselineSource;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Default MCP protocol version negotiated when client requests an unknown or older version.
@@ -45,6 +44,13 @@ pub const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 pub const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 standard error code: Internal JSON-RPC error.
 pub const JSONRPC_INTERNAL_ERROR: i32 = -32603;
+
+/// Maximum permitted length in bytes of a single MCP framing line (header or JSON-RPC line).
+pub const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum permitted length in bytes of a single MCP `Content-Length`-framed message payload.
+pub const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum permitted number of header lines in a single `Content-Length`-framed MCP message.
+pub const MAX_MCP_HEADER_LINES: usize = 32;
 
 /// Wire framing auto-detected per incoming MCP message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,14 +183,18 @@ pub struct McpCallToolResult {
     pub is_error: bool,
 }
 
-/// Built-in Ozone Model Context Protocol (`oz mcp`) server instance.
-pub struct McpServer {
+struct McpServerState {
     root_dir: Option<PathBuf>,
     session_id: String,
     client_name: Option<String>,
     protocol_version: String,
     initialized: bool,
     ci_provider: Option<Arc<dyn CiLogProvider>>,
+}
+
+/// Built-in Ozone Model Context Protocol (`oz mcp`) server instance.
+pub struct McpServer {
+    state: Arc<Mutex<McpServerState>>,
 }
 
 impl Default for McpServer {
@@ -198,39 +208,50 @@ impl McpServer {
     #[must_use]
     pub fn new(root_dir: Option<PathBuf>) -> Self {
         Self {
-            root_dir,
-            session_id: format!("mcp_{}", new_op_id()),
-            client_name: None,
-            protocol_version: MCP_PROTOCOL_VERSION_2024.to_string(),
-            initialized: false,
-            ci_provider: None,
+            state: Arc::new(Mutex::new(McpServerState {
+                root_dir,
+                session_id: format!("mcp_{}", new_op_id()),
+                client_name: None,
+                protocol_version: MCP_PROTOCOL_VERSION_2024.to_string(),
+                initialized: false,
+                ci_provider: None,
+            })),
         }
     }
 
     /// Attaches a [`CiLogProvider`] implementation used to fulfill `oz_ci_logs` tool calls.
     #[must_use]
-    pub fn with_ci_provider<P>(mut self, provider: P) -> Self
+    pub fn with_ci_provider<P>(self, provider: P) -> Self
     where
         P: CiLogProvider + 'static,
     {
-        self.ci_provider = Some(Arc::new(provider));
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ci_provider = Some(Arc::new(provider));
         self
     }
 
     /// Attaches a closure used to fulfill `oz_ci_logs` tool calls with full parameter type inference.
     #[must_use]
-    pub fn with_ci_provider_fn<F>(mut self, f: F) -> Self
+    pub fn with_ci_provider_fn<F>(self, f: F) -> Self
     where
         F: Fn(&OzoneRepo, &CiLogsRequest) -> Result<CiLogsReport> + Send + Sync + 'static,
     {
-        self.ci_provider = Some(Arc::new(f));
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ci_provider = Some(Arc::new(f));
         self
     }
 
     /// Overrides the default MCP session identifier recorded in `refs/notes/ai`.
     #[must_use]
-    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
-        self.session_id = session_id.into();
+    pub fn with_session_id(self, session_id: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session_id = session_id.into();
         self
     }
 
@@ -266,13 +287,26 @@ impl McpServer {
     }
 
     /// Runs the MCP server asynchronously over any `AsyncBufRead` + `AsyncWrite` streams until EOF.
+    ///
+    /// Offloads synchronous repository and tool execution onto Tokio's blocking pool via
+    /// [`tokio::task::spawn_blocking`] so both `current_thread` and `multi_thread` runtimes
+    /// remain responsive while tools execute.
     pub async fn serve_async<R, W>(&mut self, mut reader: R, mut writer: W) -> Result<()>
     where
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
         while let Some((framing, raw_payload)) = read_framed_message_async(&mut reader).await? {
-            if let Some(resp_json) = self.process_raw_payload(&raw_payload)? {
+            let state = Arc::clone(&self.state);
+            let maybe_resp = tokio::task::spawn_blocking(move || {
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.process_raw_payload(&raw_payload)
+            })
+            .await
+            .map_err(|err| OzError::Other(format!("MCP worker task failed: {err}")))??;
+            if let Some(resp_json) = maybe_resp {
                 write_framed_message_async(&mut writer, framing, &resp_json).await?;
             }
         }
@@ -282,11 +316,20 @@ impl McpServer {
     /// Processes a single raw JSON-RPC payload string and returns the serialized JSON-RPC response
     /// (or `Ok(None)` for JSON-RPC notifications).
     pub fn process_raw_payload(&mut self, raw: &str) -> Result<Option<String>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .process_raw_payload(raw)
+    }
+}
+
+impl McpServerState {
+    fn process_raw_payload(&mut self, raw: &str) -> Result<Option<String>> {
         let parsed: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(err) => {
                 let err_resp = jsonrpc_error_response(
-                    Value::Null,
+                    &Value::Null,
                     JSONRPC_PARSE_ERROR,
                     format!("Parse error: {err}"),
                 );
@@ -305,7 +348,7 @@ impl McpServer {
             Value::Array(batch) => {
                 if batch.is_empty() {
                     let err_resp = jsonrpc_error_response(
-                        Value::Null,
+                        &Value::Null,
                         JSONRPC_INVALID_REQUEST,
                         "Invalid Request: batch array must not be empty",
                     );
@@ -320,7 +363,7 @@ impl McpServer {
                             }
                         }
                         _ => responses.push(jsonrpc_error_response(
-                            Value::Null,
+                            &Value::Null,
                             JSONRPC_INVALID_REQUEST,
                             "Invalid Request: batch element must be an object",
                         )),
@@ -334,7 +377,7 @@ impl McpServer {
             }
             _ => {
                 let err_resp = jsonrpc_error_response(
-                    Value::Null,
+                    &Value::Null,
                     JSONRPC_INVALID_REQUEST,
                     "Invalid Request: top-level JSON value must be an object",
                 );
@@ -349,7 +392,7 @@ impl McpServer {
 
         if has_id && !matches!(raw_id, Value::Null | Value::String(_) | Value::Number(_)) {
             return Some(jsonrpc_error_response(
-                Value::Null,
+                &Value::Null,
                 JSONRPC_INVALID_REQUEST,
                 "Invalid Request: 'id' must be a string, number, or null",
             ));
@@ -360,7 +403,7 @@ impl McpServer {
             _ => {
                 return has_id.then(|| {
                     jsonrpc_error_response(
-                        raw_id,
+                        &raw_id,
                         JSONRPC_INVALID_REQUEST,
                         "Invalid Request: 'jsonrpc' must equal '2.0'",
                     )
@@ -376,7 +419,7 @@ impl McpServer {
         else {
             return has_id.then(|| {
                 jsonrpc_error_response(
-                    raw_id,
+                    &raw_id,
                     JSONRPC_INVALID_REQUEST,
                     "Invalid Request: 'method' must be a non-empty string",
                 )
@@ -394,7 +437,7 @@ impl McpServer {
         }
 
         let dispatch_res = match method.as_str() {
-            "initialize" => self.handle_initialize(params),
+            "initialize" => self.handle_initialize(params.as_ref()),
             "notifications/initialized" | "initialized" => {
                 self.initialized = true;
                 Ok(json!({}))
@@ -409,16 +452,16 @@ impl McpServer {
         };
 
         Some(match dispatch_res {
-            Ok(result_val) => jsonrpc_success_response(raw_id, result_val),
-            Err((code, msg)) => jsonrpc_error_response(raw_id, code, msg),
+            Ok(result_val) => jsonrpc_success_response(&raw_id, &result_val),
+            Err((code, msg)) => jsonrpc_error_response(&raw_id, code, msg),
         })
     }
 
     fn handle_initialize(
         &mut self,
-        params: Option<Value>,
+        params: Option<&Value>,
     ) -> std::result::Result<Value, (i32, String)> {
-        if let Some(ref p) = params {
+        if let Some(p) = params {
             let Some(map) = p.as_object() else {
                 return Err((
                     JSONRPC_INVALID_PARAMS,
@@ -492,11 +535,11 @@ impl McpServer {
         let tool_outcome: Result<Value> = match tool_name.as_str() {
             "oz_status" => {
                 let args: StatusToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_status(args)
+                self.exec_oz_status(&args)
             }
             "oz_diff" => {
                 let args: DiffToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_diff(args)
+                self.exec_oz_diff(&args)
             }
             "oz_commit" => {
                 let args: CommitToolArgs = parse_tool_args(&tool_name, args_val)?;
@@ -512,7 +555,7 @@ impl McpServer {
             }
             "oz_checkpoint" => {
                 let args: CheckpointToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_checkpoint(args)
+                self.exec_oz_checkpoint(&args)
             }
             "oz_undo" => {
                 let args: UndoToolArgs = parse_tool_args(&tool_name, args_val)?;
@@ -610,7 +653,7 @@ impl McpServer {
         }
     }
 
-    fn exec_oz_status(&self, args: StatusToolArgs) -> Result<Value> {
+    fn exec_oz_status(&self, args: &StatusToolArgs) -> Result<Value> {
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let report: StatusReport = compute_status(&repo)?;
@@ -653,7 +696,7 @@ impl McpServer {
         }))
     }
 
-    fn exec_oz_diff(&self, args: DiffToolArgs) -> Result<Value> {
+    fn exec_oz_diff(&self, args: &DiffToolArgs) -> Result<Value> {
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let is_range = args.range.is_some() || args.base.is_some() || args.rev.is_some();
@@ -850,7 +893,7 @@ impl McpServer {
         Ok(serde_json::to_value(McpRadarResponse { ok: true, report })?)
     }
 
-    fn exec_oz_checkpoint(&self, args: CheckpointToolArgs) -> Result<Value> {
+    fn exec_oz_checkpoint(&self, args: &CheckpointToolArgs) -> Result<Value> {
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let status = compute_status(&repo)?;
@@ -993,12 +1036,8 @@ impl McpServer {
         let pre_status = compute_status(&repo)?;
         let actor = self.mcp_actor(&repo);
 
-        let tx = MutationTransaction::begin(
-            &repo,
-            "oz mcp restore",
-            actor,
-            Some(&pre_status.changes),
-        )?;
+        let tx =
+            MutationTransaction::begin(&repo, "oz mcp restore", actor, Some(&pre_status.changes))?;
         let outcome: RestoreOutcome = restore_paths(
             &repo,
             &RestoreOptions {
@@ -1320,7 +1359,7 @@ fn parse_tool_args<T: for<'de> Deserialize<'de>>(
     })
 }
 
-fn jsonrpc_success_response(id: Value, result: Value) -> Value {
+fn jsonrpc_success_response(id: &Value, result: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -1328,7 +1367,7 @@ fn jsonrpc_success_response(id: Value, result: Value) -> Value {
     })
 }
 
-fn jsonrpc_error_response(id: Value, code: i32, message: impl Into<String>) -> Value {
+fn jsonrpc_error_response(id: &Value, code: i32, message: impl Into<String>) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -1349,46 +1388,121 @@ fn parse_content_length_value(trimmed: &str) -> Option<Result<usize>> {
     if !name.trim().eq_ignore_ascii_case("content-length") {
         return None;
     }
-    Some(
-        rest.trim()
-            .parse::<usize>()
-            .map_err(|err| OzError::InvalidUsage {
-                message: format!("invalid MCP Content-Length header '{}': {err}", rest.trim()),
-                recovery: Vec::new(),
-            }),
-    )
+    let raw = rest.trim();
+    Some(match raw.parse::<u64>() {
+        Ok(len_u64) => {
+            if len_u64 > MAX_MCP_MESSAGE_BYTES as u64 {
+                Err(OzError::InvalidUsage {
+                    message: format!(
+                        "MCP Content-Length {len_u64} exceeds maximum allowed message size of {MAX_MCP_MESSAGE_BYTES} bytes"
+                    ),
+                    recovery: Vec::new(),
+                })
+            } else {
+                usize::try_from(len_u64).map_err(|_| OzError::InvalidUsage {
+                    message: format!(
+                        "MCP Content-Length {len_u64} exceeds platform allocation limit"
+                    ),
+                    recovery: Vec::new(),
+                })
+            }
+        }
+        Err(err) => Err(OzError::InvalidUsage {
+            message: format!("invalid MCP Content-Length header '{raw}': {err}"),
+            recovery: Vec::new(),
+        }),
+    })
+}
+
+fn read_bounded_line_sync<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    buf.clear();
+    let limit = (max_bytes as u64).saturating_add(1);
+    let n = Read::take(reader.by_ref(), limit).read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > max_bytes {
+        return Err(OzError::InvalidUsage {
+            message: format!("MCP framing line exceeds maximum allowed size of {max_bytes} bytes"),
+            recovery: Vec::new(),
+        });
+    }
+    let s = std::str::from_utf8(buf).map_err(|err| OzError::InvalidUsage {
+        message: format!("MCP framing line is not valid UTF-8: {err}"),
+        recovery: Vec::new(),
+    })?;
+    Ok(Some(s.to_owned()))
+}
+
+async fn read_bounded_line_async<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf.clear();
+    let limit = (max_bytes as u64).saturating_add(1);
+    let n = (&mut *reader).take(limit).read_until(b'\n', buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > max_bytes {
+        return Err(OzError::InvalidUsage {
+            message: format!("MCP framing line exceeds maximum allowed size of {max_bytes} bytes"),
+            recovery: Vec::new(),
+        });
+    }
+    let s = std::str::from_utf8(buf).map_err(|err| OzError::InvalidUsage {
+        message: format!("MCP framing line is not valid UTF-8: {err}"),
+        recovery: Vec::new(),
+    })?;
+    Ok(Some(s.to_owned()))
 }
 
 fn read_framed_message_sync<R: BufRead>(
     reader: &mut R,
 ) -> Result<Option<(MessageFraming, String)>> {
-    let mut line = String::new();
+    let mut line_buf = Vec::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
+        let Some(line) = read_bounded_line_sync(reader, &mut line_buf, MAX_MCP_LINE_BYTES)? else {
             return Ok(None);
-        }
+        };
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             continue;
         }
 
         if looks_like_header_line(trimmed) {
+            let mut header_count: usize = 1;
             let mut content_len = parse_content_length_value(trimmed).transpose()?;
             loop {
-                line.clear();
-                let hn = reader.read_line(&mut line)?;
-                if hn == 0 {
+                let Some(header_line) =
+                    read_bounded_line_sync(reader, &mut line_buf, MAX_MCP_LINE_BYTES)?
+                else {
                     return Err(OzError::InvalidUsage {
                         message: "unexpected EOF while reading MCP Content-Length headers"
                             .to_string(),
                         recovery: Vec::new(),
                     });
-                }
-                let h_trimmed = line.trim_end_matches(['\r', '\n']);
+                };
+                let h_trimmed = header_line.trim_end_matches(['\r', '\n']);
                 if h_trimmed.is_empty() {
                     break;
+                }
+                header_count += 1;
+                if header_count > MAX_MCP_HEADER_LINES {
+                    return Err(OzError::InvalidUsage {
+                        message: format!(
+                            "MCP message exceeds maximum header line count of {MAX_MCP_HEADER_LINES}"
+                        ),
+                        recovery: Vec::new(),
+                    });
                 }
                 if let Some(parsed_len) = parse_content_length_value(h_trimmed) {
                     content_len = Some(parsed_len?);
@@ -1399,6 +1513,14 @@ fn read_framed_message_sync<R: BufRead>(
                 message: "missing Content-Length header in header-framed MCP message".to_string(),
                 recovery: Vec::new(),
             })?;
+            if len > MAX_MCP_MESSAGE_BYTES {
+                return Err(OzError::InvalidUsage {
+                    message: format!(
+                        "MCP Content-Length {len} exceeds maximum allowed message size of {MAX_MCP_MESSAGE_BYTES} bytes"
+                    ),
+                    recovery: Vec::new(),
+                });
+            }
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf)?;
             let payload = String::from_utf8(buf).map_err(|err| OzError::InvalidUsage {
@@ -1436,33 +1558,42 @@ async fn read_framed_message_async<R>(reader: &mut R) -> Result<Option<(MessageF
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut line = String::new();
+    let mut line_buf = Vec::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
+        let Some(line) = read_bounded_line_async(reader, &mut line_buf, MAX_MCP_LINE_BYTES).await?
+        else {
             return Ok(None);
-        }
+        };
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             continue;
         }
 
         if looks_like_header_line(trimmed) {
+            let mut header_count: usize = 1;
             let mut content_len = parse_content_length_value(trimmed).transpose()?;
             loop {
-                line.clear();
-                let hn = reader.read_line(&mut line).await?;
-                if hn == 0 {
+                let Some(header_line) =
+                    read_bounded_line_async(reader, &mut line_buf, MAX_MCP_LINE_BYTES).await?
+                else {
                     return Err(OzError::InvalidUsage {
                         message: "unexpected EOF while reading MCP Content-Length headers"
                             .to_string(),
                         recovery: Vec::new(),
                     });
-                }
-                let h_trimmed = line.trim_end_matches(['\r', '\n']);
+                };
+                let h_trimmed = header_line.trim_end_matches(['\r', '\n']);
                 if h_trimmed.is_empty() {
                     break;
+                }
+                header_count += 1;
+                if header_count > MAX_MCP_HEADER_LINES {
+                    return Err(OzError::InvalidUsage {
+                        message: format!(
+                            "MCP message exceeds maximum header line count of {MAX_MCP_HEADER_LINES}"
+                        ),
+                        recovery: Vec::new(),
+                    });
                 }
                 if let Some(parsed_len) = parse_content_length_value(h_trimmed) {
                     content_len = Some(parsed_len?);
@@ -1473,6 +1604,14 @@ where
                 message: "missing Content-Length header in header-framed MCP message".to_string(),
                 recovery: Vec::new(),
             })?;
+            if len > MAX_MCP_MESSAGE_BYTES {
+                return Err(OzError::InvalidUsage {
+                    message: format!(
+                        "MCP Content-Length {len} exceeds maximum allowed message size of {MAX_MCP_MESSAGE_BYTES} bytes"
+                    ),
+                    recovery: Vec::new(),
+                });
+            }
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).await?;
             let payload = String::from_utf8(buf).map_err(|err| OzError::InvalidUsage {
@@ -2211,10 +2350,7 @@ mod tests {
             .find(|c| c["path"] == "large.txt")
             .expect("large.txt entry");
         assert_eq!(
-            large_verbose["hunks"][0]["lines"]
-                .as_array()
-                .unwrap()
-                .len(),
+            large_verbose["hunks"][0]["lines"].as_array().unwrap().len(),
             400
         );
     }
@@ -2223,8 +2359,11 @@ mod tests {
     fn mcp_log_and_restore_with_undo_roundtrip() {
         let (_parent, repo_dir) = setup_mcp_repo();
         let original_calc = fs::read_to_string(repo_dir.join("calc.rs")).expect("read orig calc");
-        fs::write(repo_dir.join("calc.rs"), "pub fn add(a: i32, b: i32) -> i32 { 999 }\n")
-            .expect("modify calc");
+        fs::write(
+            repo_dir.join("calc.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { 999 }\n",
+        )
+        .expect("modify calc");
         fs::write(repo_dir.join("other.txt"), "keep dirty\n").expect("write other");
 
         let mut server = McpServer::new(Some(repo_dir.clone()));
@@ -2247,7 +2386,10 @@ mod tests {
         assert!(!err1);
         assert_eq!(log_compact["total_returned"], 1);
         assert!(log_compact["commits"][0].get("message").is_none());
-        assert_eq!(log_compact["commits"][0]["subject"], "chore: initial commit");
+        assert_eq!(
+            log_compact["commits"][0]["subject"],
+            "chore: initial commit"
+        );
 
         let (err2, log_full) = extract_tool_json(&resps1[1]);
         assert!(!err2);
@@ -2291,8 +2433,11 @@ mod tests {
         let (_parent, repo_dir) = setup_mcp_repo();
         let repo = OzoneRepo::discover(Some(&repo_dir)).expect("discover");
 
-        fs::write(repo_dir.join("calc.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b + 1 }\n")
-            .unwrap();
+        fs::write(
+            repo_dir.join("calc.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b + 1 }\n",
+        )
+        .unwrap();
         fs::write(repo_dir.join("extra.rs"), "pub const X: u32 = 42;\n").unwrap();
         let commit_out = commit_changes(&repo, &CommitOptions::new("feat: second commit"))
             .expect("commit second");
@@ -2318,7 +2463,12 @@ mod tests {
         assert!(!err1, "show default err: {show_default}");
         assert_eq!(show_default["commit_oid"], commit_out.commit_oid);
         assert_eq!(show_default["subject"], "feat: second commit");
-        assert!(show_default["unified_diff"].as_str().unwrap().contains("a + b + 1"));
+        assert!(
+            show_default["unified_diff"]
+                .as_str()
+                .unwrap()
+                .contains("a + b + 1")
+        );
         assert!(show_default["files"].is_null());
 
         let (err2, show_stat) = extract_tool_json(&resps[1]);
@@ -2343,5 +2493,305 @@ mod tests {
                 assert!(h.get("lines").is_none());
             }
         }
+    }
+
+    #[test]
+    fn mcp_sync_framing_rejects_oversized_content_length() {
+        let mut huge = Cursor::new(b"Content-Length: 999999999999\r\n\r\n{}".as_slice());
+        let err = read_framed_message_sync(&mut huge).expect_err("must reject 999999999999");
+        assert!(
+            err.to_string()
+                .contains("exceeds maximum allowed message size"),
+            "unexpected error: {err}"
+        );
+
+        let over_by_one = format!("Content-Length: {}\r\n\r\n", MAX_MCP_MESSAGE_BYTES + 1);
+        let mut cursor = Cursor::new(over_by_one.into_bytes());
+        let err = read_framed_message_sync(&mut cursor).expect_err("must reject MAX+1");
+        assert!(
+            err.to_string()
+                .contains("exceeds maximum allowed message size"),
+            "unexpected error: {err}"
+        );
+
+        let mut overflow =
+            Cursor::new(b"Content-Length: 999999999999999999999999999\r\n\r\n".as_slice());
+        let err = read_framed_message_sync(&mut overflow).expect_err("must reject u64 overflow");
+        assert!(
+            err.to_string()
+                .contains("invalid MCP Content-Length header"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_async_framing_rejects_oversized_content_length() {
+        let mut huge = tokio::io::BufReader::new(Cursor::new(
+            b"Content-Length: 999999999999\r\n\r\n{}".as_slice(),
+        ));
+        let err = read_framed_message_async(&mut huge)
+            .await
+            .expect_err("must reject 999999999999");
+        assert!(
+            err.to_string()
+                .contains("exceeds maximum allowed message size"),
+            "unexpected error: {err}"
+        );
+
+        let over_by_one = format!("Content-Length: {}\r\n\r\n", MAX_MCP_MESSAGE_BYTES + 1);
+        let mut cursor = tokio::io::BufReader::new(Cursor::new(over_by_one.into_bytes()));
+        let err = read_framed_message_async(&mut cursor)
+            .await
+            .expect_err("must reject MAX+1");
+        assert!(
+            err.to_string()
+                .contains("exceeds maximum allowed message size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_sync_framing_rejects_oversized_single_line() {
+        // An infinite stream with no newline must terminate immediately after MAX_MCP_LINE_BYTES + 1 bytes.
+        let mut infinite = std::io::BufReader::new(std::io::repeat(b'a'));
+        let err = read_framed_message_sync(&mut infinite).expect_err("must reject infinite line");
+        assert!(
+            err.to_string().contains("exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+
+        // A finite line just 1 byte over MAX_MCP_LINE_BYTES must also be rejected.
+        let mut oversized = vec![b'x'; MAX_MCP_LINE_BYTES + 1];
+        oversized.push(b'\n');
+        let mut cursor = Cursor::new(oversized);
+        let err = read_framed_message_sync(&mut cursor).expect_err("must reject oversized line");
+        assert!(
+            err.to_string().contains("exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+
+        // Oversized header line must also be rejected without unbounded allocation.
+        let mut oversized_hdr = b"Content-Length: 2\r\nX-Pad: ".to_vec();
+        oversized_hdr.extend(std::iter::repeat_n(b'z', MAX_MCP_LINE_BYTES));
+        oversized_hdr.extend_from_slice(b"\r\n\r\n{}");
+        let mut hdr_cursor = Cursor::new(oversized_hdr);
+        let err = read_framed_message_sync(&mut hdr_cursor)
+            .expect_err("must reject oversized header line");
+        assert!(
+            err.to_string().contains("exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_async_framing_rejects_oversized_single_line() {
+        let mut infinite = tokio::io::BufReader::new(tokio::io::repeat(b'a'));
+        let err = read_framed_message_async(&mut infinite)
+            .await
+            .expect_err("must reject infinite async line");
+        assert!(
+            err.to_string().contains("exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+
+        let mut oversized = vec![b'x'; MAX_MCP_LINE_BYTES + 1];
+        oversized.push(b'\n');
+        let mut cursor = tokio::io::BufReader::new(Cursor::new(oversized));
+        let err = read_framed_message_async(&mut cursor)
+            .await
+            .expect_err("must reject oversized async line");
+        assert!(
+            err.to_string().contains("exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+
+        let mut oversized_hdr = b"Content-Length: 2\r\nX-Pad: ".to_vec();
+        oversized_hdr.extend(std::iter::repeat_n(b'z', MAX_MCP_LINE_BYTES));
+        oversized_hdr.extend_from_slice(b"\r\n\r\n{}");
+        let mut hdr_cursor = tokio::io::BufReader::new(Cursor::new(oversized_hdr));
+        let err = read_framed_message_async(&mut hdr_cursor)
+            .await
+            .expect_err("must reject oversized async header line");
+        assert!(
+            err.to_string().contains("exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_sync_framing_enforces_header_line_limit() {
+        use std::fmt::Write as _;
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let mut valid = format!("Content-Length: {}\r\n", body.len());
+        for i in 1..MAX_MCP_HEADER_LINES {
+            let _ = write!(valid, "X-Extra-{i}: ok\r\n");
+        }
+        valid.push_str("\r\n");
+        valid.push_str(body);
+
+        let mut valid_cursor = Cursor::new(valid.into_bytes());
+        let (framing, payload) = read_framed_message_sync(&mut valid_cursor)
+            .expect("exactly MAX_MCP_HEADER_LINES headers should succeed")
+            .expect("message present");
+        assert_eq!(framing, MessageFraming::ContentLength);
+        assert_eq!(payload, body);
+
+        let mut too_many = format!("Content-Length: {}\r\n", body.len());
+        for i in 1..=MAX_MCP_HEADER_LINES {
+            let _ = write!(too_many, "X-Extra-{i}: nope\r\n");
+        }
+        too_many.push_str("\r\n");
+        too_many.push_str(body);
+
+        let mut bad_cursor = Cursor::new(too_many.into_bytes());
+        let err = read_framed_message_sync(&mut bad_cursor)
+            .expect_err("more than MAX_MCP_HEADER_LINES headers must fail");
+        assert!(
+            err.to_string().contains("maximum header line count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_async_framing_enforces_header_line_limit() {
+        use std::fmt::Write as _;
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let mut valid = format!("Content-Length: {}\r\n", body.len());
+        for i in 1..MAX_MCP_HEADER_LINES {
+            let _ = write!(valid, "X-Extra-{i}: ok\r\n");
+        }
+        valid.push_str("\r\n");
+        valid.push_str(body);
+
+        let mut valid_cursor = tokio::io::BufReader::new(Cursor::new(valid.into_bytes()));
+        let (framing, payload) = read_framed_message_async(&mut valid_cursor)
+            .await
+            .expect("exactly MAX_MCP_HEADER_LINES headers should succeed")
+            .expect("message present");
+        assert_eq!(framing, MessageFraming::ContentLength);
+        assert_eq!(payload, body);
+
+        let mut too_many = format!("Content-Length: {}\r\n", body.len());
+        for i in 1..=MAX_MCP_HEADER_LINES {
+            let _ = write!(too_many, "X-Extra-{i}: nope\r\n");
+        }
+        too_many.push_str("\r\n");
+        too_many.push_str(body);
+
+        let mut bad_cursor = tokio::io::BufReader::new(Cursor::new(too_many.into_bytes()));
+        let err = read_framed_message_async(&mut bad_cursor)
+            .await
+            .expect_err("more than MAX_MCP_HEADER_LINES headers must fail");
+        assert!(
+            err.to_string().contains("maximum header line count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_serve_async_offloads_blocking_work_on_current_thread_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (_parent, repo_dir) = setup_mcp_repo();
+        let runtime_thread_id = std::thread::current().id();
+        let provider_thread_differs = Arc::new(AtomicBool::new(false));
+        let provider_started = Arc::new(tokio::sync::Notify::new());
+        let allow_provider_finish = Arc::new(std::sync::Condvar::new());
+        let finish_flag = Arc::new(Mutex::new(false));
+
+        let differs_clone = Arc::clone(&provider_thread_differs);
+        let started_clone = Arc::clone(&provider_started);
+        let cvar_clone = Arc::clone(&allow_provider_finish);
+        let flag_clone = Arc::clone(&finish_flag);
+
+        let mut server = McpServer::new(Some(repo_dir)).with_ci_provider_fn(move |_repo, _req| {
+            differs_clone.store(
+                std::thread::current().id() != runtime_thread_id,
+                Ordering::SeqCst,
+            );
+            started_clone.notify_one();
+            let mut done = flag_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*done {
+                let (guard, timeout) = cvar_clone
+                    .wait_timeout(done, Duration::from_secs(5))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                done = guard;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            Ok(CiLogsReport {
+                branch: Some("main".to_string()),
+                commit_oid: None,
+                all_passed: true,
+                overall_status: Some("passing".to_string()),
+                failing_count: Some(0),
+                pending_count: Some(0),
+                watch_outcome: None,
+                elapsed_secs: None,
+                superseded_by_sha: None,
+                recommended_poll_secs: None,
+                checks: Vec::new(),
+            })
+        });
+
+        let wire_in = encode_msg(
+            MessageFraming::JsonLine,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oz_ci_logs","arguments":{}}}),
+        );
+        let reader = tokio::io::BufReader::new(Cursor::new(wire_in));
+        let mut wire_out: Vec<u8> = Vec::new();
+
+        // Spawn a concurrent task on the SAME single-threaded runtime: if `serve_async` blocked
+        // the runtime thread, this task could never run and `allow_provider_finish` would time out!
+        let unblocker = tokio::spawn(async move {
+            provider_started.notified().await;
+            let mut done = finish_flag
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *done = true;
+            allow_provider_finish.notify_all();
+        });
+
+        server
+            .serve_async(reader, &mut wire_out)
+            .await
+            .expect("serve_async on current_thread runtime");
+        unblocker.await.expect("unblocker task");
+
+        assert!(
+            provider_thread_differs.load(Ordering::SeqCst),
+            "blocking tool execution must run off the Tokio runtime thread"
+        );
+        let resps = decode_all_responses(MessageFraming::JsonLine, &wire_out);
+        assert_eq!(resps.len(), 1);
+        let (is_err, ci_json) = extract_tool_json(&resps[0]);
+        assert!(!is_err);
+        assert_eq!(ci_json["all_passed"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_serve_async_works_on_multi_thread_runtime() {
+        let (_parent, repo_dir) = setup_mcp_repo();
+        let mut server = McpServer::new(Some(repo_dir));
+        let wire_in = encode_msg(
+            MessageFraming::ContentLength,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oz_status","arguments":{}}}),
+        );
+        let reader = tokio::io::BufReader::new(Cursor::new(wire_in));
+        let mut wire_out = Vec::new();
+        server
+            .serve_async(reader, &mut wire_out)
+            .await
+            .expect("serve_async on multi_thread runtime");
+        let resps = decode_all_responses(MessageFraming::ContentLength, &wire_out);
+        assert_eq!(resps.len(), 1);
+        let (is_err, _) = extract_tool_json(&resps[0]);
+        assert!(!is_err);
     }
 }

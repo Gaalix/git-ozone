@@ -25,6 +25,7 @@ use oz_integrate::{StackBranchStatus, stack_status};
 use oz_oplog::ActorInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 
 /// Opening HTML comment marker for Ozone's managed PR stack navigation block.
 pub const OZ_STACK_START: &str = "<!-- oz-stack-start -->";
@@ -148,7 +149,9 @@ pub fn pr_create(
             message: format!(
                 "PR head branch '{head_branch}' must differ from base branch '{base_branch}'"
             ),
-            recovery: vec!["Spawn or switch to a feature branch before running `oz pr create`.".to_string()],
+            recovery: vec![
+                "Spawn or switch to a feature branch before running `oz pr create`.".to_string(),
+            ],
         });
     }
 
@@ -173,10 +176,7 @@ pub fn pr_create(
         .map(str::to_string)
         .unwrap_or(inferred_title);
 
-    let raw_body = opts
-        .body
-        .clone()
-        .unwrap_or(inferred_body);
+    let raw_body = opts.body.clone().unwrap_or(inferred_body);
     let body_with_change_id = attach_change_ids_to_body(&raw_body, &change_ids);
 
     let mut pushed = false;
@@ -331,9 +331,7 @@ pub fn pr_stack(
     let open_prs = client.list_pull_requests(owner, gh_repo, Some("open"), None, None)?;
     let mut open_by_head: HashMap<String, GitHubPullRequest> = HashMap::new();
     for pr in open_prs {
-        open_by_head
-            .entry(pr.head.ref_name.clone())
-            .or_insert(pr);
+        open_by_head.entry(pr.head.ref_name.clone()).or_insert(pr);
     }
 
     struct DraftedStackPr {
@@ -355,9 +353,8 @@ pub fn pr_stack(
             infer_title_body_and_change_ids(&gix_repo, &expected_base, &node.branch)?;
 
         if let Some(existing) = open_by_head.remove(&node.branch) {
-            let existing_clean = strip_stack_navigation_block(
-                existing.body.as_deref().unwrap_or_default(),
-            );
+            let existing_clean =
+                strip_stack_navigation_block(existing.body.as_deref().unwrap_or_default());
             let base_prose = if existing_clean.trim().is_empty() {
                 inferred_body
             } else {
@@ -471,7 +468,7 @@ pub fn render_stack_navigation_block(
     let mut out = String::new();
     out.push_str(OZ_STACK_START);
     out.push('\n');
-    out.push_str(&format!("### Stacked PRs (base: `{root_base}`)\n\n"));
+    let _ = write!(out, "### Stacked PRs (base: `{root_base}`)\n\n");
     out.push_str("| Current | PR | Branch | Base | Status |\n");
     out.push_str("| :---: | :--- | :--- | :--- | :--- |\n");
     for item in items {
@@ -485,10 +482,11 @@ pub fn render_stack_navigation_block(
         } else {
             format!("[#{}]({})", item.number, item.html_url)
         };
-        out.push_str(&format!(
-            "| {} | {} | `{}` | `{}` | {} |\n",
+        let _ = writeln!(
+            out,
+            "| {} | {} | `{}` | `{}` | {} |",
             marker, pr_link, item.head_branch, item.base_branch, item.status
-        ));
+        );
     }
     out.push_str(OZ_STACK_END);
     out
@@ -497,10 +495,8 @@ pub fn render_stack_navigation_block(
 /// Inserts or replaces the `<!-- oz-stack-start --> ... <!-- oz-stack-end -->` section in `body` idempotently.
 #[must_use]
 pub fn upsert_stack_navigation_block(body: &str, block: &str) -> String {
-    if let (Some(start_idx), Some(end_rel)) = (
-        body.find(OZ_STACK_START),
-        body.find(OZ_STACK_END),
-    ) && end_rel >= start_idx
+    if let (Some(start_idx), Some(end_rel)) = (body.find(OZ_STACK_START), body.find(OZ_STACK_END))
+        && end_rel >= start_idx
     {
         let after_end = end_rel + OZ_STACK_END.len();
         let prefix = body[..start_idx].trim_end();
@@ -612,7 +608,7 @@ fn discover_ordered_stack(
                     if requested_set.contains(p) {
                         break;
                     }
-                    cur_parent = by_name.get(p).and_then(| info| info.parent_branch.clone());
+                    cur_parent = by_name.get(p).and_then(|info| info.parent_branch.clone());
                 }
                 ordered.push(OrderedStackNode {
                     branch: status_item.branch.clone(),
@@ -654,10 +650,7 @@ fn discover_ordered_stack(
             .filter(|b| selected.contains(&b.branch))
             .map(|b| OrderedStackNode {
                 branch: b.branch.clone(),
-                parent_branch: b
-                    .parent_branch
-                    .clone()
-                    .filter(|p| selected.contains(p)),
+                parent_branch: b.parent_branch.clone().filter(|p| selected.contains(p)),
             })
             .collect());
     }
@@ -718,12 +711,11 @@ pub fn infer_title_body_and_change_ids(
         recovery: vec!["oz status --json".to_string()],
     })?;
 
-    let base_oid = read_ref_oid(gix_repo, &format!("refs/heads/{base_branch}"))?
-        .or_else(|| {
-            read_ref_oid(gix_repo, &format!("refs/remotes/origin/{base_branch}"))
-                .ok()
-                .flatten()
-        });
+    let base_oid = read_ref_oid(gix_repo, &format!("refs/heads/{base_branch}"))?.or_else(|| {
+        read_ref_oid(gix_repo, &format!("refs/remotes/origin/{base_branch}"))
+            .ok()
+            .flatten()
+    });
 
     let stop_oid = match base_oid {
         Some(b_id) => gix_repo
@@ -782,7 +774,7 @@ pub fn infer_title_body_and_change_ids(
         }
         summary.push_str("### Commits\n");
         for s in &subjects {
-            summary.push_str(&format!("- {s}\n"));
+            let _ = writeln!(summary, "- {s}");
         }
         summary.trim_end().to_string()
     };
@@ -847,7 +839,7 @@ fn attach_change_ids_to_body(body: &str, change_ids: &[String]) -> String {
         if idx > 0 {
             out.push('\n');
         }
-        out.push_str(&format!("Change-Id: {cid}"));
+        let _ = write!(out, "Change-Id: {cid}");
     }
     out
 }
@@ -891,9 +883,7 @@ fn humanize_branch_title(branch: &str) -> String {
 
 pub(crate) fn normalize_short_branch(raw: &str) -> String {
     let t = raw.trim();
-    t.strip_prefix("refs/heads/")
-        .unwrap_or(t)
-        .to_string()
+    t.strip_prefix("refs/heads/").unwrap_or(t).to_string()
 }
 
 // ============================================================================
@@ -1176,7 +1166,9 @@ pub struct PrReviewOutcome {
 pub fn parse_inline_comment_spec(raw: &str) -> Result<PrInlineCommentInput> {
     let Some((loc_part, body_part)) = raw.split_once('=') else {
         return Err(OzError::InvalidUsage {
-            message: format!("invalid inline comment '{raw}': expected `<path>:<line>[:LEFT|RIGHT]=<body>`"),
+            message: format!(
+                "invalid inline comment '{raw}': expected `<path>:<line>[:LEFT|RIGHT]=<body>`"
+            ),
             recovery: vec![
                 "Example: `--inline src/index.ts:401=Handle empty payload`.".to_string(),
             ],
@@ -1193,7 +1185,9 @@ pub fn parse_inline_comment_spec(raw: &str) -> Result<PrInlineCommentInput> {
     let parts: Vec<&str> = loc_part.split(':').collect();
     if parts.len() < 2 {
         return Err(OzError::InvalidUsage {
-            message: format!("invalid inline comment location '{loc_part}': expected `<path>:<line>[:LEFT|RIGHT]`"),
+            message: format!(
+                "invalid inline comment location '{loc_part}': expected `<path>:<line>[:LEFT|RIGHT]`"
+            ),
             recovery: vec!["Example: `--inline src/index.ts:401=Check null`.".to_string()],
         });
     }
@@ -1208,7 +1202,11 @@ pub fn parse_inline_comment_spec(raw: &str) -> Result<PrInlineCommentInput> {
             };
             (&parts[..parts.len() - 2], parts[parts.len() - 2], side)
         } else {
-            (&parts[..parts.len() - 1], parts[parts.len() - 1], PrCommentSide::Right)
+            (
+                &parts[..parts.len() - 1],
+                parts[parts.len() - 1],
+                PrCommentSide::Right,
+            )
         }
     } else {
         (&parts[..1], parts[1], PrCommentSide::Right)
@@ -1244,10 +1242,13 @@ pub fn parse_inline_comment_spec(raw: &str) -> Result<PrInlineCommentInput> {
         }
         (if s == e { None } else { Some(s) }, e)
     } else {
-        let l: u32 = line_token.trim().parse().map_err(|_| OzError::InvalidUsage {
-            message: format!("invalid line number '{line_token}' in '{raw}'"),
-            recovery: Vec::new(),
-        })?;
+        let l: u32 = line_token
+            .trim()
+            .parse()
+            .map_err(|_| OzError::InvalidUsage {
+                message: format!("invalid line number '{line_token}' in '{raw}'"),
+                recovery: Vec::new(),
+            })?;
         if l == 0 {
             return Err(OzError::InvalidUsage {
                 message: format!("line numbers must be >= 1 in '{raw}'"),
@@ -1434,12 +1435,11 @@ pub fn pr_files_to_changes(files: &[GitHubPullRequestFile]) -> Vec<FileChange> {
 }
 
 fn format_contiguous_ranges(lines: &BTreeSet<u32>) -> String {
-    if lines.is_empty() {
-        return "<none>".to_string();
-    }
-    let mut ranges = Vec::new();
     let mut iter = lines.iter().copied();
-    let mut start = iter.next().unwrap();
+    let Some(mut start) = iter.next() else {
+        return "<none>".to_string();
+    };
+    let mut ranges = Vec::new();
     let mut prev = start;
     for n in iter {
         if n == prev + 1 {
@@ -1483,11 +1483,8 @@ pub fn validate_pr_review_comments(
             .trim_start_matches('/')
             .to_string();
         let Some(file) = by_path.get(norm_path.as_str()) else {
-            let sample_paths: Vec<String> = pr_changes
-                .iter()
-                .take(10)
-                .map(|f| f.path.clone())
-                .collect();
+            let sample_paths: Vec<String> =
+                pr_changes.iter().take(10).map(|f| f.path.clone()).collect();
             return Err(OzError::InvalidUsage {
                 message: format!(
                     "inline comment path '{norm_path}' is not in PR #{pr_number} changed files"
@@ -1864,10 +1861,7 @@ pub fn group_review_threads(
             line: root.line,
             original_line: root.original_line,
             start_line: root.start_line.or(root.original_start_line),
-            side: root
-                .side
-                .clone()
-                .unwrap_or_else(|| "RIGHT".to_string()),
+            side: root.side.clone().unwrap_or_else(|| "RIGHT".to_string()),
             is_resolved: gql_meta.map(|m| m.is_resolved),
             is_outdated,
             diff_hunk: root.diff_hunk.clone(),
@@ -2048,7 +2042,9 @@ pub fn pr_review(repo: &OzoneRepo, opts: &PrReviewOptions) -> Result<PrReviewOut
         && validated_payloads.is_empty()
     {
         return Err(OzError::InvalidUsage {
-            message: "`oz pr review --comment` requires `--body` and/or at least one inline comment".to_string(),
+            message:
+                "`oz pr review --comment` requires `--body` and/or at least one inline comment"
+                    .to_string(),
             recovery: vec![format!(
                 "oz pr review {} --comment --body \"LGTM\" or `--inline path:line=note`",
                 opts.number
@@ -2191,16 +2187,14 @@ pub fn pr_list(repo: &OzoneRepo, opts: &PrListOptions) -> Result<PrListOutcome> 
             recovery: vec!["oz pr list --state open".to_string()],
         });
     }
-    let limit = if opts.limit == 0 { 20 } else { opts.limit.min(100) };
+    let limit = if opts.limit == 0 {
+        20
+    } else {
+        opts.limit.min(100)
+    };
 
-    let use_search = opts
-        .search
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty())
-        || opts
-            .author
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
+    let use_search = opts.search.as_deref().is_some_and(|s| !s.trim().is_empty())
+        || opts.author.as_deref().is_some_and(|s| !s.trim().is_empty())
         || !opts.labels.is_empty()
         || state == "merged";
 
@@ -2517,7 +2511,10 @@ pub fn pr_reply(repo: &OzoneRepo, opts: &PrReplyOptions) -> Result<PrReplyOutcom
     if opts.body.trim().is_empty() {
         return Err(OzError::InvalidUsage {
             message: "reply body cannot be empty".to_string(),
-            recovery: vec![format!("oz pr reply {} {} -m \"...\"", opts.number, opts.target)],
+            recovery: vec![format!(
+                "oz pr reply {} {} -m \"...\"",
+                opts.number, opts.target
+            )],
         });
     }
     let (client, owner, repo_name) = resolve_github_pr_client(
@@ -2651,7 +2648,8 @@ pub fn pr_resolve(repo: &OzoneRepo, opts: &PrResolveOptions) -> Result<PrResolve
         (None, cleaned.to_string())
     } else {
         let raw_inline = client.list_pull_request_comments(&owner, &repo_name, opts.number)?;
-        let gql_meta = client.list_pull_request_review_threads_graphql(&owner, &repo_name, opts.number)?;
+        let gql_meta =
+            client.list_pull_request_review_threads_graphql(&owner, &repo_name, opts.number)?;
         let threads = group_review_threads(&raw_inline, &gql_meta);
         let (handle, tid_opt, _) =
             resolve_thread_target(&threads, cleaned).ok_or_else(|| OzError::InvalidUsage {
@@ -2744,10 +2742,14 @@ pub fn pr_status(repo: &OzoneRepo, opts: &PrStatusOptions) -> Result<PrStatusOut
         }
     }
     if target_numbers.is_empty() {
-        let branch = repo.branch.as_deref().ok_or_else(|| OzError::InvalidUsage {
-            message: "no PR numbers specified and HEAD is detached; pass `--pr <num,...>`".to_string(),
-            recovery: vec!["oz pr status --pr 3338,3339 --json".to_string()],
-        })?;
+        let branch = repo
+            .branch
+            .as_deref()
+            .ok_or_else(|| OzError::InvalidUsage {
+                message: "no PR numbers specified and HEAD is detached; pass `--pr <num,...>`"
+                    .to_string(),
+                recovery: vec!["oz pr status --pr 3338,3339 --json".to_string()],
+            })?;
         let pr = find_open_pr_for_head(&client, &owner, &repo_name, branch)?.ok_or_else(|| {
             OzError::CheckFailed {
                 message: format!("no open pull request found for branch '{branch}'"),
@@ -2773,7 +2775,10 @@ pub fn pr_status(repo: &OzoneRepo, opts: &PrStatusOptions) -> Result<PrStatusOut
             .list_pull_request_review_threads_graphql(&owner, &repo_name, num)
             .unwrap_or_default();
         let threads = group_review_threads(&raw_inline, &gql_meta);
-        let unresolved_threads = threads.iter().filter(|t| t.is_resolved != Some(true)).count();
+        let unresolved_threads = threads
+            .iter()
+            .filter(|t| t.is_resolved != Some(true))
+            .count();
 
         let check_runs = client
             .list_check_runs_for_ref(&owner, &repo_name, &pr.head.sha)
@@ -2785,7 +2790,10 @@ pub fn pr_status(repo: &OzoneRepo, opts: &PrStatusOptions) -> Result<PrStatusOut
             if !cr.status.eq_ignore_ascii_case("completed") {
                 ci_pending += 1;
             } else if matches!(
-                cr.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+                cr.conclusion
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
                 Some("success" | "neutral" | "skipped")
             ) {
                 ci_passing += 1;
@@ -2862,10 +2870,15 @@ mod tests {
         ];
 
         let block_10 = render_stack_navigation_block("main", &items, 10);
-        assert!(block_10.contains("| 👉 | [#10](https://github.com/acme/repo/pull/10) | `stack-1` | `main` | Open |"));
-        assert!(block_10.contains("|  | [#11](https://github.com/acme/repo/pull/11) | `stack-2` | `stack-1` | Draft |"));
+        assert!(block_10.contains(
+            "| 👉 | [#10](https://github.com/acme/repo/pull/10) | `stack-1` | `main` | Open |"
+        ));
+        assert!(block_10.contains(
+            "|  | [#11](https://github.com/acme/repo/pull/11) | `stack-2` | `stack-1` | Draft |"
+        ));
 
-        let body1 = upsert_stack_navigation_block("Initial description\n\nChange-Id: I111", &block_10);
+        let body1 =
+            upsert_stack_navigation_block("Initial description\n\nChange-Id: I111", &block_10);
         let block_10_updated = render_stack_navigation_block("main", &items, 11);
         let body2 = upsert_stack_navigation_block(&body1, &block_10_updated);
 
@@ -2892,11 +2905,26 @@ mod tests {
         assert_eq!(h.old_start, 396);
         assert_eq!(h.new_start, 396);
         assert_eq!(h.lines.len(), 5);
-        assert_eq!((h.lines[0].old_line, h.lines[0].new_line), (Some(396), Some(396)));
-        assert_eq!((h.lines[1].old_line, h.lines[1].new_line), (Some(397), None));
-        assert_eq!((h.lines[2].old_line, h.lines[2].new_line), (None, Some(397)));
-        assert_eq!((h.lines[3].old_line, h.lines[3].new_line), (None, Some(398)));
-        assert_eq!((h.lines[4].old_line, h.lines[4].new_line), (Some(398), Some(399)));
+        assert_eq!(
+            (h.lines[0].old_line, h.lines[0].new_line),
+            (Some(396), Some(396))
+        );
+        assert_eq!(
+            (h.lines[1].old_line, h.lines[1].new_line),
+            (Some(397), None)
+        );
+        assert_eq!(
+            (h.lines[2].old_line, h.lines[2].new_line),
+            (None, Some(397))
+        );
+        assert_eq!(
+            (h.lines[3].old_line, h.lines[3].new_line),
+            (None, Some(398))
+        );
+        assert_eq!(
+            (h.lines[4].old_line, h.lines[4].new_line),
+            (Some(398), Some(399))
+        );
     }
 
     #[test]
@@ -2909,9 +2937,7 @@ mod tests {
             deletions: 1,
             changes: 3,
             sha: None,
-            patch: Some(
-                "@@ -10,3 +10,4 @@\n ctx1\n-old2\n+new2\n+new3\n ctx4".to_string(),
-            ),
+            patch: Some("@@ -10,3 +10,4 @@\n ctx1\n-old2\n+new2\n+new3\n ctx4".to_string()),
         }];
         let changes = pr_files_to_changes(&pr_files);
 

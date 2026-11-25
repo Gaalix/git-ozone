@@ -1,16 +1,16 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Pure-Rust line-level `oz blame <file>` engine walking commit history via `gix` + `imara-diff`
+//! Pure-Rust line-level `oz blame <file>` engine walking commit history via `gix` (`gix::diff::blob`)
 //! and joining originating commits and 1-indexed origin line numbers against `refs/notes/ai`.
 
 use crate::AiProvenanceNote;
 use crate::notes::{load_provenance_notes_gix, open_gix_with_fallback, resolve_commit_oid};
 use chrono::{DateTime, TimeZone, Utc};
 use gix::bstr::ByteSlice;
+use gix::diff::blob::{Algorithm, Diff, Hunk, InternedInput, sources};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
-use imara_diff::{Algorithm, Diff, InternedInput, sources};
 use oz_core::{OzError, OzoneRepo, Result, WorkspaceState, is_binary_bytes};
 use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -433,7 +433,7 @@ fn trace_line_origins(
             let input = InternedInput::new(parent_blob.data.as_slice(), curr_bytes.as_slice());
             let mut diff = Diff::compute(Algorithm::Histogram, &input);
             diff.postprocess_lines(&input);
-            let hunks: Vec<imara_diff::Hunk> = diff.hunks().collect();
+            let hunks: Vec<Hunk> = diff.hunks().collect();
 
             let mut to_parent = Vec::new();
             let mut still_modified = Vec::new();
@@ -502,7 +502,7 @@ fn enqueue_suspects(
     Ok(())
 }
 
-fn map_after_line_to_before(after_line: u32, hunks: &[imara_diff::Hunk]) -> Option<u32> {
+fn map_after_line_to_before(after_line: u32, hunks: &[Hunk]) -> Option<u32> {
     let mut delta: i64 = 0;
     for h in hunks {
         if after_line < h.after.start {

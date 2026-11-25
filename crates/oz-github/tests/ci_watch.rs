@@ -13,6 +13,7 @@ use oz_github::{
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -234,7 +235,13 @@ fn handle_http_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockStat
         let etag = step.etag.clone();
         if inm.as_deref() == Some(etag.as_str()) {
             st.not_modified_responses += 1;
-            write_http(stream, "304 Not Modified", "application/json", Some(&etag), b"");
+            write_http(
+                stream,
+                "304 Not Modified",
+                "application/json",
+                Some(&etag),
+                b"",
+            );
             return;
         }
         let body = serde_json::to_vec(&json!({
@@ -251,7 +258,13 @@ fn handle_http_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockStat
         let step = st.current_step();
         let etag = format!("wf-{}", step.etag);
         if inm.as_deref() == Some(etag.as_str()) {
-            write_http(stream, "304 Not Modified", "application/json", Some(&etag), b"");
+            write_http(
+                stream,
+                "304 Not Modified",
+                "application/json",
+                Some(&etag),
+                b"",
+            );
             return;
         }
         let body = serde_json::to_vec(&json!({
@@ -264,7 +277,12 @@ fn handle_http_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockStat
     }
 
     // GET /repos/:o/:r/actions/runs/:run_id/jobs
-    if method == "GET" && tail.len() == 4 && tail[0] == "actions" && tail[1] == "runs" && tail[3] == "jobs" {
+    if method == "GET"
+        && tail.len() == 4
+        && tail[0] == "actions"
+        && tail[1] == "runs"
+        && tail[3] == "jobs"
+    {
         let run_id: u64 = tail[2].parse().unwrap_or(0);
         let step = st.current_step();
         let jobs = step.jobs_by_run.get(&run_id).cloned().unwrap_or_default();
@@ -278,7 +296,12 @@ fn handle_http_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockStat
     }
 
     // GET /repos/:o/:r/actions/jobs/:job_id/logs
-    if method == "GET" && tail.len() == 4 && tail[0] == "actions" && tail[1] == "jobs" && tail[3] == "logs" {
+    if method == "GET"
+        && tail.len() == 4
+        && tail[0] == "actions"
+        && tail[1] == "jobs"
+        && tail[3] == "logs"
+    {
         let job_id: u64 = tail[2].parse().unwrap_or(0);
         *st.job_log_downloads.entry(job_id).or_insert(0) += 1;
         let bytes = st.job_logs.get(&job_id).cloned().unwrap_or_default();
@@ -311,7 +334,7 @@ fn write_http(
         body.len()
     );
     if let Some(tag) = etag {
-        hdr.push_str(&format!("ETag: {tag}\r\n"));
+        let _ = write!(hdr, "ETag: {tag}\r\n");
     }
     hdr.push_str("\r\n");
     let _ = stream.write_all(hdr.as_bytes());
@@ -331,7 +354,12 @@ fn init_test_repo(dir: &Path, branch: &str) -> (OzoneRepo, String) {
     run_git(&["init", "-b", branch]);
     run_git(&["config", "user.name", "Test"]);
     run_git(&["config", "user.email", "test@example.com"]);
-    run_git(&["remote", "add", "origin", "https://github.com/acme/rocket.git"]);
+    run_git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/rocket.git",
+    ]);
     fs::write(dir.join("lib.rs"), "pub fn ok() -> bool { true }\n").expect("write");
     let repo = OzoneRepo::discover(Some(dir)).expect("discover");
     let outcome = commit_changes(
@@ -346,14 +374,25 @@ fn init_test_repo(dir: &Path, branch: &str) -> (OzoneRepo, String) {
     (repo, outcome.commit_oid)
 }
 
-fn make_check(id: u64, name: &str, status: &str, conclusion: Option<&str>, run_id: u64, job_id: u64) -> GitHubCheckRun {
+fn make_check(
+    id: u64,
+    name: &str,
+    status: &str,
+    conclusion: Option<&str>,
+    run_id: u64,
+    job_id: u64,
+) -> GitHubCheckRun {
     GitHubCheckRun {
         id,
         name: name.to_string(),
         status: status.to_string(),
         conclusion: conclusion.map(str::to_string),
-        details_url: Some(format!("https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}")),
-        html_url: Some(format!("https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}")),
+        details_url: Some(format!(
+            "https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}"
+        )),
+        html_url: Some(format!(
+            "https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}"
+        )),
         output: GitHubCheckRunOutput::default(),
     }
 }
@@ -392,7 +431,14 @@ fn watch_handles_startup_grace_etag_304_and_eventual_pass() {
             // Poll 4: passed!
             MockStep {
                 etag: "\"e3\"".to_string(),
-                check_runs: vec![make_check(1, "cargo test", "completed", Some("success"), 500, 701)],
+                check_runs: vec![make_check(
+                    1,
+                    "cargo test",
+                    "completed",
+                    Some("success"),
+                    500,
+                    701,
+                )],
                 workflow_runs: vec![],
                 jobs_by_run: HashMap::new(),
                 pr_head_sha: Some(sha.clone()),
@@ -435,9 +481,22 @@ fn watch_handles_startup_grace_etag_304_and_eventual_pass() {
     assert_eq!(report.checks[0].run_id, Some(500));
 
     let st = server.state.lock().unwrap();
-    assert_eq!(st.not_modified_responses, 1, "expected 304 Not Modified on unchanged ETag");
-    assert!(events.iter().any(|e| matches!(e, CiWatchEvent::WaitingForChecks { .. })));
-    assert!(events.iter().any(|e| matches!(e, CiWatchEvent::Completed { outcome: CiWatchOutcome::Passed, .. })));
+    assert_eq!(
+        st.not_modified_responses, 1,
+        "expected 304 Not Modified on unchanged ETag"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CiWatchEvent::WaitingForChecks { .. }))
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        CiWatchEvent::Completed {
+            outcome: CiWatchOutcome::Passed,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -636,7 +695,14 @@ fn watch_detects_superseded_pr_head_and_supports_job_drilldown_and_filtering() {
             },
             MockStep {
                 etag: "\"s2\"".to_string(),
-                check_runs: vec![make_check(1, "cargo test", "completed", Some("cancelled"), 777, 909)],
+                check_runs: vec![make_check(
+                    1,
+                    "cargo test",
+                    "completed",
+                    Some("cancelled"),
+                    777,
+                    909,
+                )],
                 workflow_runs: vec![GitHubWorkflowRun {
                     id: 778,
                     name: Some("CI".to_string()),
@@ -755,8 +821,11 @@ fn watch_ignores_stale_ancestor_pr_head_and_older_workflow_runs() {
     let (repo_initial, old_sha) = init_test_repo(tmp.path(), "feat/lag-race");
 
     // Push a second commit on top of `old_sha` so `old_sha` is an ancestor of `new_sha`.
-    fs::write(tmp.path().join("lib.rs"), "pub fn ok() -> bool { true }\npub fn v2() {}\n")
-        .expect("write v2");
+    fs::write(
+        tmp.path().join("lib.rs"),
+        "pub fn ok() -> bool { true }\npub fn v2() {}\n",
+    )
+    .expect("write v2");
     let new_commit = commit_changes(
         &repo_initial,
         &CommitOptions {
@@ -951,7 +1020,14 @@ fn watch_ignores_stale_pr_head_after_amend_force_push() {
             // Poll 3: PR API catches up and checks pass!
             MockStep {
                 etag: "\"am3\"".to_string(),
-                check_runs: vec![make_check(1, "ci", "completed", Some("success"), 1002, 2002)],
+                check_runs: vec![make_check(
+                    1,
+                    "ci",
+                    "completed",
+                    Some("success"),
+                    1002,
+                    2002,
+                )],
                 workflow_runs: vec![GitHubWorkflowRun {
                     id: 1002,
                     name: Some("CI".to_string()),

@@ -33,6 +33,7 @@ use oz_oplog::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::io::{BufWriter, Read, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -381,7 +382,11 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
             },
             gix::open::Options::isolated(),
         )
-        .map_err(|err| OzError::Git(format!("failed to initialize destination repository: {err}")))?
+        .map_err(|err| {
+            OzError::Git(format!(
+                "failed to initialize destination repository: {err}"
+            ))
+        })?
         .to_thread_local();
         let _ = init_repo.committer_or_set_fallback("Ozone", "oz@ozone.dev");
 
@@ -669,9 +674,11 @@ fn fetch_remote_blocking(
 
     let git_cfg = repo.load_git_config(&[])?;
     let remote_urls = git_cfg.resolve_remote_urls(remote_arg);
-    let configured_url = remote_urls
-        .fetch_url
-        .or_else(|| read_remote_url_from_gix(&gix_repo, remote_arg, false).ok().flatten());
+    let configured_url = remote_urls.fetch_url.or_else(|| {
+        read_remote_url_from_gix(&gix_repo, remote_arg, false)
+            .ok()
+            .flatten()
+    });
     let (remote_label, raw_url, is_named_remote) = match configured_url {
         Some(url) => (remote_arg.to_string(), url, true),
         None if looks_like_url_or_path(remote_arg) => (
@@ -785,7 +792,9 @@ fn fetch_remote_blocking(
                             "non-fast-forward fetch rejected for '{dst_ref}' (remote '{remote_ref_name}' is at {new_oid}, local is at {old_id})"
                         ),
                         conflicts: Vec::new(),
-                        recovery: vec![format!("oz fetch {remote_label} +{remote_ref_name}:{dst_ref}")],
+                        recovery: vec![format!(
+                            "oz fetch {remote_label} +{remote_ref_name}:{dst_ref}"
+                        )],
                     });
                 }
 
@@ -910,7 +919,13 @@ pub fn push_refs_with_options(
     let opts_cloned = opts.clone();
     let overrides_owned = config_overrides.to_vec();
     run_blocking_safe(move || {
-        push_refs_blocking(&repo_cloned, &opts_cloned, no_verify, &overrides_owned, actor)
+        push_refs_blocking(
+            &repo_cloned,
+            &opts_cloned,
+            no_verify,
+            &overrides_owned,
+            actor,
+        )
     })
 }
 
@@ -943,9 +958,11 @@ fn push_refs_blocking(
         .unwrap_or("origin");
 
     let remote_urls = git_cfg.resolve_remote_urls(remote_arg);
-    let configured_url = remote_urls
-        .push_url
-        .or_else(|| read_remote_url_from_gix(&gix_repo, remote_arg, true).ok().flatten());
+    let configured_url = remote_urls.push_url.or_else(|| {
+        read_remote_url_from_gix(&gix_repo, remote_arg, true)
+            .ok()
+            .flatten()
+    });
     let (remote_label, raw_url, is_named_remote) = match configured_url {
         Some(url) => (remote_arg.to_string(), url, true),
         None if looks_like_url_or_path(remote_arg) => (
@@ -990,14 +1007,15 @@ fn push_refs_blocking(
     let capabilities = {
         let hs = transport
             .handshake(Service::ReceivePack, &[])
-            .map_err(|err| map_transport_error("git-receive-pack handshake", err))?;
+            .map_err(|err| map_transport_error("git-receive-pack handshake", &err))?;
 
         if let Some(mut refs_reader) = hs.refs {
             let mut line = String::new();
-            while refs_reader
-                .readline_str(&mut line)
-                .map_err(|err| OzError::Git(format!("failed reading receive-pack advertised refs: {err}")))?
-                != 0
+            while refs_reader.readline_str(&mut line).map_err(|err| {
+                OzError::Git(format!(
+                    "failed reading receive-pack advertised refs: {err}"
+                ))
+            })? != 0
             {
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if let Some((oid_str, ref_name)) = trimmed.split_once(' ')
@@ -1025,7 +1043,9 @@ fn push_refs_blocking(
     }
     if push_specs.iter().any(|s| s.is_delete) && !capabilities.contains("delete-refs") {
         return Err(OzError::CheckFailed {
-            message: format!("remote '{remote_label}' does not allow deleting references ('delete-refs' missing)"),
+            message: format!(
+                "remote '{remote_label}' does not allow deleting references ('delete-refs' missing)"
+            ),
             recovery: Vec::new(),
         });
     }
@@ -1054,9 +1074,8 @@ fn push_refs_blocking(
             && let Some(old_id) = old_oid
             && old_id != spec.new_oid
         {
-            let allowed_non_ff = opts.force
-                || spec.force_prefix
-                || lease_validated_refs.contains(&spec.remote_ref);
+            let allowed_non_ff =
+                opts.force || spec.force_prefix || lease_validated_refs.contains(&spec.remote_ref);
             if !allowed_non_ff && !is_ancestor_commit(&gix_repo, old_id, spec.new_oid)? {
                 return Err(OzError::Conflict {
                     message: format!(
@@ -1166,7 +1185,7 @@ fn push_refs_blocking(
 
     let req_writer = transport
         .request(WriteMode::Binary, MessageKind::Flush, false)
-        .map_err(|err| map_transport_error("git-receive-pack request", err))?;
+        .map_err(|err| map_transport_error("git-receive-pack request", &err))?;
     let (mut raw_writer, mut response_reader) = req_writer.into_parts();
 
     for (idx, spec) in push_specs.iter().enumerate() {
@@ -1241,7 +1260,10 @@ fn push_refs_blocking(
                     base: None,
                     ours: None,
                     theirs: Some(reason.clone()),
-                    suggested_commands: vec![format!("oz fetch {remote_label}"), "oz sync".to_string()],
+                    suggested_commands: vec![
+                        format!("oz fetch {remote_label}"),
+                        "oz sync".to_string(),
+                    ],
                 })
                 .collect(),
             recovery: vec![format!("oz fetch {remote_label}"), "oz sync".to_string()],
@@ -1310,9 +1332,9 @@ fn push_refs_blocking(
     }
 
     if !tracking_edits.is_empty() {
-        gix_repo
-            .edit_references(tracking_edits)
-            .map_err(|err| OzError::Git(format!("failed updating local remote-tracking refs: {err}")))?;
+        gix_repo.edit_references(tracking_edits).map_err(|err| {
+            OzError::Git(format!("failed updating local remote-tracking refs: {err}"))
+        })?;
     }
 
     let op_entry = tx.finish(repo, None)?;
@@ -1387,8 +1409,7 @@ fn validate_push_leases(
                 }
             }
             None => {
-                if is_named_remote
-                    && let Some(short) = spec.remote_ref.strip_prefix("refs/heads/")
+                if is_named_remote && let Some(short) = spec.remote_ref.strip_prefix("refs/heads/")
                 {
                     let tracking = format!("refs/remotes/{remote_label}/{short}");
                     read_ref_oid(gix_repo, &tracking)?
@@ -1426,10 +1447,7 @@ fn validate_push_leases(
                         "oz sync".to_string(),
                     ],
                 }],
-                recovery: vec![
-                    format!("oz fetch {remote_label}"),
-                    "oz sync".to_string(),
-                ],
+                recovery: vec![format!("oz fetch {remote_label}"), "oz sync".to_string()],
             });
         }
 
@@ -1484,8 +1502,6 @@ fn validate_push_leases(
 #[derive(Debug)]
 struct ReceivePackStatus {
     unpack_status: String,
-    #[allow(dead_code)]
-    accepted_refs: Vec<String>,
     rejected_refs: Vec<(String, String)>,
 }
 
@@ -1507,19 +1523,14 @@ fn parse_receive_pack_report<'a>(
                 }
                 ControlFlow::Continue(())
             })));
-            reader
-                .read_to_end(&mut raw_status_stream)
-                .map_err(|err| {
-                    let errs = remote_errors.lock().unwrap_or_else(|p| p.into_inner());
-                    if !errs.is_empty() {
-                        OzError::Git(format!(
-                            "remote receive-pack error: {}",
-                            errs.join("; ")
-                        ))
-                    } else {
-                        OzError::Git(format!("failed reading receive-pack status stream: {err}"))
-                    }
-                })?;
+            reader.read_to_end(&mut raw_status_stream).map_err(|err| {
+                let errs = remote_errors.lock().unwrap_or_else(|p| p.into_inner());
+                if !errs.is_empty() {
+                    OzError::Git(format!("remote receive-pack error: {}", errs.join("; ")))
+                } else {
+                    OzError::Git(format!("failed reading receive-pack status stream: {err}"))
+                }
+            })?;
         }
         let mut out_lines = Vec::new();
         let mut pkt_iter = gix_packetline::blocking_io::StreamingPeekableIter::new(
@@ -1558,7 +1569,10 @@ fn parse_receive_pack_report<'a>(
         out_lines
     };
 
-    let recorded_errs = remote_errors.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let recorded_errs = remote_errors
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
     if !recorded_errs.is_empty() && lines.is_empty() {
         return Err(OzError::Git(format!(
             "remote receive-pack error: {}",
@@ -1567,15 +1581,12 @@ fn parse_receive_pack_report<'a>(
     }
 
     let mut unpack_status = "ok".to_string();
-    let mut accepted_refs = Vec::new();
     let mut rejected_refs = Vec::new();
 
     for line in lines {
         let cleaned = line.trim_end_matches('\0');
         if let Some(rest) = cleaned.strip_prefix("unpack ") {
             unpack_status = rest.trim().to_string();
-        } else if let Some(rest) = cleaned.strip_prefix("ok ") {
-            accepted_refs.push(rest.trim().to_string());
         } else if let Some(rest) = cleaned.strip_prefix("ng ") {
             let (ref_name, reason) = rest
                 .split_once(' ')
@@ -1587,7 +1598,6 @@ fn parse_receive_pack_report<'a>(
 
     Ok(ReceivePackStatus {
         unpack_status,
-        accepted_refs,
         rejected_refs,
     })
 }
@@ -1609,8 +1619,12 @@ fn build_push_packfile(
         let obj = gix_repo
             .objects
             .try_find(oid, &mut buf)
-            .map_err(|err| OzError::Git(format!("failed reading local object {oid} for push: {err}")))?
-            .ok_or_else(|| OzError::Git(format!("missing required local object {oid} during push")))?;
+            .map_err(|err| {
+                OzError::Git(format!("failed reading local object {oid} for push: {err}"))
+            })?
+            .ok_or_else(|| {
+                OzError::Git(format!("missing required local object {oid} during push"))
+            })?;
         let count = pack_out::Count::from_data(*oid, None);
         let entry = pack_out::Entry::from_data(&count, &obj, Default::default())
             .map_err(|err| OzError::Git(format!("failed compressing pack entry {oid}: {err}")))?;
@@ -1618,17 +1632,19 @@ fn build_push_packfile(
     }
 
     let mut pack_bytes = Vec::new();
-    let chunk_iter: Box<dyn Iterator<Item = std::result::Result<Vec<pack_out::Entry>, gix::error::Error>>> =
-        if entries.is_empty() {
-            Box::new(std::iter::empty())
-        } else {
-            Box::new(std::iter::once(Ok(entries)))
-        };
+    let chunk_iter: Box<
+        dyn Iterator<Item = std::result::Result<Vec<pack_out::Entry>, gix::error::Error>>,
+    > = if entries.is_empty() {
+        Box::new(std::iter::empty())
+    } else {
+        Box::new(std::iter::once(Ok(entries)))
+    };
 
     let pack_writer = pack_out::bytes::FromEntriesIter::new(
         chunk_iter,
         &mut pack_bytes,
-        u32::try_from(num_entries).map_err(|_| OzError::Other("packfile exceeds u32 object limit".to_string()))?,
+        u32::try_from(num_entries)
+            .map_err(|_| OzError::Other("packfile exceeds u32 object limit".to_string()))?,
         gix_pack::data::Version::V2,
         gix_repo.object_hash(),
     );
@@ -1904,7 +1920,10 @@ fn normalize_fetch_refspecs(
                     format!("{plus}{full_src}:{full_dst}")
                 }
             } else {
-                let short = rest.trim().strip_prefix("refs/heads/").unwrap_or(rest.trim());
+                let short = rest
+                    .trim()
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(rest.trim());
                 let full_src = normalize_source_ref_pattern(rest.trim());
                 if is_named_remote && !full_src.starts_with("refs/tags/") && rest.trim() != "HEAD" {
                     format!("{plus}{full_src}:refs/remotes/{remote_label}/{short}")
@@ -1972,7 +1991,7 @@ fn fetch_pack_session(
     let (protocol, capabilities, v1_refs) = {
         let mut hs = transport
             .handshake(Service::UploadPack, &[])
-            .map_err(|err| map_transport_error("git-upload-pack handshake", err))?;
+            .map_err(|err| map_transport_error("git-upload-pack handshake", &err))?;
         let protocol = hs.actual_protocol;
         let capabilities = hs.capabilities.clone();
         let v1_refs = if matches!(protocol, Protocol::V0 | Protocol::V1) {
@@ -2082,7 +2101,7 @@ fn fetch_specific_objects(
     let (protocol, capabilities) = {
         let mut hs = transport
             .handshake(Service::UploadPack, &[])
-            .map_err(|err| map_transport_error("on-demand object fetch handshake", err))?;
+            .map_err(|err| map_transport_error("on-demand object fetch handshake", &err))?;
         let protocol = hs.actual_protocol;
         let capabilities = hs.capabilities.clone();
         if matches!(protocol, Protocol::V0 | Protocol::V1) {
@@ -2136,7 +2155,7 @@ fn invoke_v2_ls_refs(
 
     let mut reader = transport
         .invoke("ls-refs", caps.into_iter(), Some(args.into_iter()), false)
-        .map_err(|err| map_transport_error("protocol v2 ls-refs", err))?;
+        .map_err(|err| map_transport_error("protocol v2 ls-refs", &err))?;
 
     let mut out = Vec::new();
     let mut line = String::new();
@@ -2182,8 +2201,11 @@ fn parse_v2_ref_line(line: &str) -> Result<Option<AdvertisedRef>> {
         }));
     }
 
-    let oid = ObjectId::from_hex(first.as_bytes())
-        .map_err(|err| OzError::Git(format!("invalid OID '{first}' in ls-refs line '{line}': {err}")))?;
+    let oid = ObjectId::from_hex(first.as_bytes()).map_err(|err| {
+        OzError::Git(format!(
+            "invalid OID '{first}' in ls-refs line '{line}': {err}"
+        ))
+    })?;
 
     if let Some(target) = symref_target {
         Ok(Some(AdvertisedRef::Symbolic {
@@ -2326,11 +2348,7 @@ fn invoke_v2_fetch_pack_inner(
         .and_then(|c| c.supports("filter"))
         .unwrap_or(false);
 
-    let mut args: Vec<BString> = vec![
-        "thin-pack".into(),
-        "ofs-delta".into(),
-        "no-progress".into(),
-    ];
+    let mut args: Vec<BString> = vec!["thin-pack".into(), "ofs-delta".into(), "no-progress".into()];
     if include_tags {
         args.push("include-tag".into());
     }
@@ -2357,16 +2375,16 @@ fn invoke_v2_fetch_pack_inner(
 
     let mut reader = transport
         .invoke("fetch", caps.into_iter(), Some(args.into_iter()), false)
-        .map_err(|err| map_transport_error("protocol v2 fetch", err))?;
+        .map_err(|err| map_transport_error("protocol v2 fetch", &err))?;
 
     reader.reset(Protocol::V2);
     let mut line = String::new();
     let mut saw_packfile = false;
     loop {
         line.clear();
-        let n = reader
-            .readline_str(&mut line)
-            .map_err(|err| OzError::Git(format!("failed reading v2 fetch section header: {err}")))?;
+        let n = reader.readline_str(&mut line).map_err(|err| {
+            OzError::Git(format!("failed reading v2 fetch section header: {err}"))
+        })?;
         if n == 0 {
             break;
         }
@@ -2378,9 +2396,9 @@ fn invoke_v2_fetch_pack_inner(
         // Consume non-packfile section (`acknowledgments`, `shallow-info`, `wanted-refs`).
         loop {
             line.clear();
-            let item_len = reader
-                .readline_str(&mut line)
-                .map_err(|err| OzError::Git(format!("failed reading v2 fetch section '{header}': {err}")))?;
+            let item_len = reader.readline_str(&mut line).map_err(|err| {
+                OzError::Git(format!("failed reading v2 fetch section '{header}': {err}"))
+            })?;
             if item_len == 0 {
                 break;
             }
@@ -2413,10 +2431,7 @@ fn invoke_v2_fetch_pack_inner(
     write_res.map_err(|err| {
         let errs = remote_err_msgs.lock().unwrap_or_else(|p| p.into_inner());
         if !errs.is_empty() {
-            OzError::Git(format!(
-                "remote fetch error: {} ({err})",
-                errs.join("; ")
-            ))
+            OzError::Git(format!("remote fetch error: {} ({err})", errs.join("; ")))
         } else {
             err
         }
@@ -2448,7 +2463,7 @@ fn invoke_v1_fetch_pack(
             MessageKind::Text(b"done"),
             false,
         )
-        .map_err(|err| map_transport_error("protocol v1 fetch request", err))?;
+        .map_err(|err| map_transport_error("protocol v1 fetch request", &err))?;
 
     for (idx, want) in wanted_oids.iter().enumerate() {
         let line = if idx == 0 {
@@ -2481,7 +2496,7 @@ fn invoke_v1_fetch_pack(
             };
             let peek_bytes = peek
                 .map_err(OzError::Io)?
-                .map_err(|err| map_transport_error("v1 fetch response", err))?;
+                .map_err(|err| map_transport_error("v1 fetch response", &err))?;
             let text = String::from_utf8_lossy(peek_bytes);
             let is_nak = text.starts_with("NAK");
             (is_nak || text.starts_with("ACK "), is_nak)
@@ -2609,7 +2624,7 @@ fn connect_transport(
                         password: raw_tok.to_string(),
                         oauth_refresh_token: None,
                     })
-                    .map_err(|err| map_transport_error("setting HTTP basic credentials", err))?;
+                    .map_err(|err| map_transport_error("setting HTTP basic credentials", &err))?;
             }
         }
 
@@ -2651,8 +2666,8 @@ fn resolve_transport_url_and_auth(
                 recovery: Vec::new(),
             });
         }
-        let path_bstr = gix::path::into_bstr(git_dir.clone())
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let path_bstr =
+            gix::path::into_bstr(git_dir.clone()).map_err(|err| OzError::Git(err.to_string()))?;
         let gix_url = gix::url::Url::from_parts(
             gix::url::Scheme::File,
             None,
@@ -2662,7 +2677,9 @@ fn resolve_transport_url_and_auth(
             path_bstr.into_owned(),
             false,
         )
-        .map_err(|err| OzError::Git(format!("invalid file URL for {}: {err}", git_dir.display())))?;
+        .map_err(|err| {
+            OzError::Git(format!("invalid file URL for {}: {err}", git_dir.display()))
+        })?;
 
         let persisted = if raw_url.trim().starts_with("file://") {
             raw_url.trim().to_string()
@@ -2672,8 +2689,8 @@ fn resolve_transport_url_and_auth(
         return Ok((gix_url, persisted, None, default_scheme));
     }
 
-    let gix_url = gix::url::parse(parsed.sanitized_url.as_str())
-        .map_err(|err| OzError::InvalidUsage {
+    let gix_url =
+        gix::url::parse(parsed.sanitized_url.as_str()).map_err(|err| OzError::InvalidUsage {
             message: format!("invalid remote URL '{}': {err}", parsed.sanitized_url),
             recovery: Vec::new(),
         })?;
@@ -2712,20 +2729,17 @@ fn select_clone_target(
     adv_refs: &[AdvertisedRef],
     requested_branch: Option<&str>,
 ) -> Result<(Option<String>, Option<ObjectId>, Option<String>)> {
-    let default_remote_branch = adv_refs
-        .iter()
-        .find(|r| r.name() == "HEAD")
-        .and_then(|r| {
-            r.symref_target()
-                .and_then(|t| t.strip_prefix("refs/heads/").map(str::to_string))
-                .or_else(|| {
-                    let head_oid = r.oid()?;
-                    adv_refs.iter().find_map(|cand| {
-                        let br = cand.name().strip_prefix("refs/heads/")?;
-                        (cand.oid() == Some(head_oid)).then(|| br.to_string())
-                    })
+    let default_remote_branch = adv_refs.iter().find(|r| r.name() == "HEAD").and_then(|r| {
+        r.symref_target()
+            .and_then(|t| t.strip_prefix("refs/heads/").map(str::to_string))
+            .or_else(|| {
+                let head_oid = r.oid()?;
+                adv_refs.iter().find_map(|cand| {
+                    let br = cand.name().strip_prefix("refs/heads/")?;
+                    (cand.oid() == Some(head_oid)).then(|| br.to_string())
                 })
-        });
+            })
+    });
 
     if let Some(req) = requested_branch.map(str::trim).filter(|s| !s.is_empty()) {
         let short = req
@@ -2769,10 +2783,11 @@ fn select_clone_target(
         return Ok((Some(def_br.clone()), oid, Some(def_br.clone())));
     }
 
-    if let Some(first_branch) = adv_refs
-        .iter()
-        .find_map(|r| r.name().strip_prefix("refs/heads/").map(|b| (b.to_string(), r.oid())))
-    {
+    if let Some(first_branch) = adv_refs.iter().find_map(|r| {
+        r.name()
+            .strip_prefix("refs/heads/")
+            .map(|b| (b.to_string(), r.oid()))
+    }) {
         return Ok((
             Some(first_branch.0.clone()),
             first_branch.1,
@@ -2807,25 +2822,23 @@ fn write_clone_git_config(
         existing.push('\n');
     }
 
-    existing.push_str(&format!("[remote \"{remote_name}\"]\n"));
-    existing.push_str(&format!(
-        "\turl = {}\n",
-        escape_git_config_value(remote_url)
-    ));
+    let _ = writeln!(existing, "[remote \"{remote_name}\"]");
+    let _ = writeln!(existing, "\turl = {}", escape_git_config_value(remote_url));
     if !bare {
-        existing.push_str(&format!(
-            "\tfetch = +refs/heads/*:refs/remotes/{remote_name}/*\n"
-        ));
+        let _ = writeln!(
+            existing,
+            "\tfetch = +refs/heads/*:refs/remotes/{remote_name}/*"
+        );
     }
     if let Some(spec) = filter_spec {
         existing.push_str("\tpromisor = true\n");
-        existing.push_str(&format!("\tpartialclonefilter = {spec}\n"));
+        let _ = writeln!(existing, "\tpartialclonefilter = {spec}");
     }
 
     if !bare && let Some(br) = branch {
-        existing.push_str(&format!("[branch \"{br}\"]\n"));
-        existing.push_str(&format!("\tremote = {remote_name}\n"));
-        existing.push_str(&format!("\tmerge = refs/heads/{br}\n"));
+        let _ = writeln!(existing, "[branch \"{br}\"]");
+        let _ = writeln!(existing, "\tremote = {remote_name}");
+        let _ = writeln!(existing, "\tmerge = refs/heads/{br}");
     }
 
     std::fs::write(&config_path, existing)?;
@@ -2849,7 +2862,7 @@ fn replace_repository_format_version(config: &str, version: u8) -> String {
             && let Some((k, _)) = trimmed.split_once('=')
             && k.trim().eq_ignore_ascii_case("repositoryformatversion")
         {
-            out.push_str(&format!("\trepositoryformatversion = {version}\n"));
+            let _ = writeln!(out, "\trepositoryformatversion = {version}");
             replaced = true;
             continue;
         }
@@ -2857,7 +2870,7 @@ fn replace_repository_format_version(config: &str, version: u8) -> String {
         out.push('\n');
     }
     if !replaced {
-        out.push_str(&format!("[core]\n\trepositoryformatversion = {version}\n"));
+        let _ = writeln!(out, "[core]\n\trepositoryformatversion = {version}");
     }
     out
 }
@@ -2889,8 +2902,8 @@ fn write_branch_upstream_config(
                     inside_target_branch = true;
                     rewritten.push_str(line);
                     rewritten.push('\n');
-                    rewritten.push_str(&format!("\tremote = {remote_name}\n"));
-                    rewritten.push_str(&format!("\tmerge = {merge_ref}\n"));
+                    let _ = writeln!(rewritten, "\tremote = {remote_name}");
+                    let _ = writeln!(rewritten, "\tmerge = {merge_ref}");
                     continue;
                 }
             }
@@ -2908,9 +2921,10 @@ fn write_branch_upstream_config(
         if !existing.ends_with('\n') && !existing.is_empty() {
             existing.push('\n');
         }
-        existing.push_str(&format!(
-            "{section_header}\n\tremote = {remote_name}\n\tmerge = {merge_ref}\n"
-        ));
+        let _ = writeln!(
+            existing,
+            "{section_header}\n\tremote = {remote_name}\n\tmerge = {merge_ref}"
+        );
     }
     std::fs::write(&config_path, existing)?;
     Ok(())
@@ -2985,7 +2999,9 @@ fn resolve_push_specs(
         }
         let oid = read_ref_oid(gix_repo, &local_ref)?.ok_or_else(|| OzError::InvalidUsage {
             message: format!("current branch '{branch}' has no commits yet"),
-            recovery: vec!["Create an initial commit with `oz commit -m \"...\"` first.".to_string()],
+            recovery: vec![
+                "Create an initial commit with `oz commit -m \"...\"` first.".to_string(),
+            ],
         })?;
         return Ok(vec![ResolvedPushSpec {
             local_ref: Some(local_ref.clone()),
@@ -3112,7 +3128,9 @@ fn resolve_local_push_source(
         .rev_parse_single(src)
         .map_err(|err| OzError::InvalidUsage {
             message: format!("local ref or revision '{src}' does not exist: {err}"),
-            recovery: vec!["Check available branches with `oz status` or `oz stack status`.".to_string()],
+            recovery: vec![
+                "Check available branches with `oz status` or `oz stack status`.".to_string(),
+            ],
         })?
         .detach();
     Ok((None, None, parsed))
@@ -3294,7 +3312,7 @@ const fn protocol_number(p: Protocol) -> u8 {
     }
 }
 
-fn map_transport_error(stage: &str, err: gix_transport::client::Error) -> OzError {
+fn map_transport_error(stage: &str, err: &gix_transport::client::Error) -> OzError {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
     if lower.contains("401")

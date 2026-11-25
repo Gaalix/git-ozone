@@ -14,6 +14,8 @@ use http::StatusCode;
 use oz_core::{OzError, OzoneRepo, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -423,12 +425,43 @@ pub enum ConditionalGet<T> {
     },
 }
 
+/// Drop-safe holder around a lazily initialized [`reqwest::blocking::Client`].
+///
+/// `reqwest::blocking::Client` owns an internal Tokio runtime and panics if its final clone
+/// is dropped inside an active async Tokio runtime context. When dropped on a Tokio thread,
+/// this wrapper offloads the drop onto a short-lived OS thread so shutdown occurs off-runtime.
+#[derive(Debug, Default)]
+struct PooledBlockingClient {
+    client: Option<reqwest::blocking::Client>,
+    #[cfg(test)]
+    init_count: usize,
+}
+
+impl Drop for PooledBlockingClient {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            if let Ok(handle) = std::thread::Builder::new()
+                .name("oz-github-client-drop".to_string())
+                .spawn(move || drop(client))
+            {
+                let _ = handle.join();
+            }
+        } else {
+            drop(client);
+        }
+    }
+}
+
 /// Pure-Rust GitHub API client supporting both blocking and async callers safely.
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
     api_base_url: String,
     token: Option<String>,
     timeout: Duration,
+    http_client: Arc<Mutex<PooledBlockingClient>>,
 }
 
 impl GitHubClient {
@@ -444,8 +477,11 @@ impl GitHubClient {
         };
         Self {
             api_base_url: base,
-            token: token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+            token: token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
             timeout: Duration::from_secs(30),
+            http_client: Arc::new(Mutex::new(PooledBlockingClient::default())),
         }
     }
 
@@ -472,10 +508,7 @@ impl GitHubClient {
             credential_workdir: Some(repo.repo_root.clone()),
             ..Default::default()
         });
-        let client = Self::new(
-            parsed.api_base_url.clone(),
-            discovered.map(|d| d.token),
-        );
+        let client = Self::new(parsed.api_base_url.clone(), discovered.map(|d| d.token));
         Ok((client, parsed))
     }
 
@@ -1039,16 +1072,18 @@ impl GitHubClient {
             .trim_start_matches("./")
             .trim_start_matches('/')
             .to_string();
-        let mut full_url =
-            url::Url::parse(&format!("{}/repos/{owner}/{repo}/contents", self.api_base_url))
-                .map_err(|err| OzError::InvalidUsage {
-                    message: format!("invalid GitHub API URL: {err}"),
-                    recovery: Vec::new(),
-                })?;
+        let mut full_url = url::Url::parse(&format!(
+            "{}/repos/{owner}/{repo}/contents",
+            self.api_base_url
+        ))
+        .map_err(|err| OzError::InvalidUsage {
+            message: format!("invalid GitHub API URL: {err}"),
+            recovery: Vec::new(),
+        })?;
         {
-            let mut segs = full_url.path_segments_mut().map_err(|()| OzError::Other(
-                "failed to encode GitHub contents path".to_string(),
-            ))?;
+            let mut segs = full_url.path_segments_mut().map_err(|()| {
+                OzError::Other("failed to encode GitHub contents path".to_string())
+            })?;
             for seg in trimmed.split('/').filter(|s| !s.is_empty()) {
                 segs.push(seg);
             }
@@ -1059,7 +1094,7 @@ impl GitHubClient {
         let this = self.clone();
 
         run_blocking_safe(move || {
-            let http_client = this.build_blocking_client()?;
+            let http_client = this.blocking_client()?;
             let mut req = http_client
                 .get(&endpoint)
                 .header("Accept", "application/vnd.github.raw+json")
@@ -1068,9 +1103,9 @@ impl GitHubClient {
             if let Some(ref tok) = this.token {
                 req = req.bearer_auth(tok);
             }
-            let resp = req
-                .send()
-                .map_err(|err| OzError::Other(format!("GitHub API request {label} failed: {err}")))?;
+            let resp = req.send().map_err(|err| {
+                OzError::Other(format!("GitHub API request {label} failed: {err}"))
+            })?;
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().unwrap_or_default();
@@ -1084,11 +1119,7 @@ impl GitHubClient {
     }
 
     /// Executes a GraphQL query against `<api_base_url>/graphql` (or GHE `/api/graphql`).
-    pub fn graphql(
-        &self,
-        query: &str,
-        variables: serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    pub fn graphql(&self, query: &str, variables: serde_json::Value) -> Result<serde_json::Value> {
         #[derive(Serialize)]
         struct GraphQlBody<'a> {
             query: &'a str,
@@ -1104,7 +1135,7 @@ impl GitHubClient {
         let body_val = serde_json::to_value(GraphQlBody { query, variables })?;
         let this = self.clone();
         run_blocking_safe(move || {
-            let http_client = this.build_blocking_client()?;
+            let http_client = this.blocking_client()?;
             let mut req = http_client
                 .post(&endpoint)
                 .header("Accept", "application/vnd.github+json")
@@ -1298,16 +1329,14 @@ impl GitHubClient {
 
     /// Downloads raw logs (plain UTF-8 text or PKZIP archive) for a GitHub Actions job
     /// (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs`).
-    pub fn download_job_logs(
-        &self,
-        owner: &str,
-        repo: &str,
-        job_id: u64,
-    ) -> Result<Vec<u8>> {
-        let url = format!("{}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs", self.api_base_url);
+    pub fn download_job_logs(&self, owner: &str, repo: &str, job_id: u64) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
+            self.api_base_url
+        );
         let this = self.clone();
         run_blocking_safe(move || {
-            let http_client = this.build_blocking_client()?;
+            let http_client = this.blocking_client()?;
             let mut req = http_client
                 .get(&url)
                 .header("Accept", "application/vnd.github+json")
@@ -1316,39 +1345,71 @@ impl GitHubClient {
             if let Some(ref tok) = this.token {
                 req = req.bearer_auth(tok);
             }
-            let resp = req
-                .send()
-                .map_err(|err| OzError::Other(format!("failed downloading job {job_id} logs: {err}")))?;
+            let resp = req.send().map_err(|err| {
+                OzError::Other(format!("failed downloading job {job_id} logs: {err}"))
+            })?;
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().unwrap_or_default();
-                return Err(map_http_status_error(status, &format!("GET /actions/jobs/{job_id}/logs"), &body));
+                return Err(map_http_status_error(
+                    status,
+                    &format!("GET /actions/jobs/{job_id}/logs"),
+                    &body,
+                ));
             }
-            let bytes = resp
-                .bytes()
-                .map_err(|err| OzError::Other(format!("failed reading job {job_id} log bytes: {err}")))?;
+            let bytes = resp.bytes().map_err(|err| {
+                OzError::Other(format!("failed reading job {job_id} log bytes: {err}"))
+            })?;
             Ok(bytes.to_vec())
         })
     }
 
-    fn build_blocking_client(&self) -> Result<reqwest::blocking::Client> {
-        reqwest::blocking::Client::builder()
+    /// Returns the shared pooled [`reqwest::blocking::Client`], lazily initialized once
+    /// inside `run_blocking_safe` so root certificates, TLS sessions, and HTTP/2/keep-alive
+    /// connections are reused across calls and clones.
+    fn blocking_client(&self) -> Result<reqwest::blocking::Client> {
+        let mut guard = self
+            .http_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref existing) = guard.client {
+            return Ok(existing.clone());
+        }
+        let built = reqwest::blocking::Client::builder()
             .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
-            .map_err(|err| OzError::Other(format!("failed building rustls HTTP client: {err}")))
+            .map_err(|err| OzError::Other(format!("failed building rustls HTTP client: {err}")))?;
+        guard.client = Some(built.clone());
+        #[cfg(test)]
+        {
+            guard.init_count += 1;
+        }
+        Ok(built)
+    }
+
+    #[cfg(test)]
+    fn cached_client_init_count(&self) -> usize {
+        self.http_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .init_count
     }
 
     fn get_json_with_query<T>(&self, path: &str, query_params: &[(String, String)]) -> Result<T>
     where
         T: DeserializeOwned + Send + 'static,
     {
-        let mut full_url = url::Url::parse(&format!("{}{path}", self.api_base_url)).map_err(|err| {
-            OzError::InvalidUsage {
-                message: format!("invalid GitHub API URL '{}{path}': {err}", self.api_base_url),
-                recovery: Vec::new(),
-            }
-        })?;
+        let mut full_url =
+            url::Url::parse(&format!("{}{path}", self.api_base_url)).map_err(|err| {
+                OzError::InvalidUsage {
+                    message: format!(
+                        "invalid GitHub API URL '{}{path}': {err}",
+                        self.api_base_url
+                    ),
+                    recovery: Vec::new(),
+                }
+            })?;
         if !query_params.is_empty() {
             let mut pairs = full_url.query_pairs_mut();
             for (k, v) in query_params {
@@ -1360,7 +1421,7 @@ impl GitHubClient {
         let this = self.clone();
 
         run_blocking_safe(move || {
-            let http_client = this.build_blocking_client()?;
+            let http_client = this.blocking_client()?;
             let mut req = http_client
                 .get(&endpoint)
                 .header("Accept", "application/vnd.github+json")
@@ -1369,9 +1430,9 @@ impl GitHubClient {
             if let Some(ref tok) = this.token {
                 req = req.bearer_auth(tok);
             }
-            let resp = req
-                .send()
-                .map_err(|err| OzError::Other(format!("GitHub API request {label} failed: {err}")))?;
+            let resp = req.send().map_err(|err| {
+                OzError::Other(format!("GitHub API request {label} failed: {err}"))
+            })?;
             decode_json_response(resp, &label)
         })
     }
@@ -1385,12 +1446,16 @@ impl GitHubClient {
     where
         T: DeserializeOwned + Send + 'static,
     {
-        let mut full_url = url::Url::parse(&format!("{}{path}", self.api_base_url)).map_err(|err| {
-            OzError::InvalidUsage {
-                message: format!("invalid GitHub API URL '{}{path}': {err}", self.api_base_url),
-                recovery: Vec::new(),
-            }
-        })?;
+        let mut full_url =
+            url::Url::parse(&format!("{}{path}", self.api_base_url)).map_err(|err| {
+                OzError::InvalidUsage {
+                    message: format!(
+                        "invalid GitHub API URL '{}{path}': {err}",
+                        self.api_base_url
+                    ),
+                    recovery: Vec::new(),
+                }
+            })?;
         if !query_params.is_empty() {
             let mut pairs = full_url.query_pairs_mut();
             for (k, v) in query_params {
@@ -1406,7 +1471,7 @@ impl GitHubClient {
         let this = self.clone();
 
         run_blocking_safe(move || {
-            let http_client = this.build_blocking_client()?;
+            let http_client = this.blocking_client()?;
             let mut req = http_client
                 .get(&endpoint)
                 .header("Accept", "application/vnd.github+json")
@@ -1418,9 +1483,9 @@ impl GitHubClient {
             if let Some(ref etag) = inm {
                 req = req.header("If-None-Match", etag);
             }
-            let resp = req
-                .send()
-                .map_err(|err| OzError::Other(format!("GitHub API request {label} failed: {err}")))?;
+            let resp = req.send().map_err(|err| {
+                OzError::Other(format!("GitHub API request {label} failed: {err}"))
+            })?;
 
             let status = resp.status();
             let etag = resp
@@ -1494,7 +1559,7 @@ impl GitHubClient {
         let this = self.clone();
 
         run_blocking_safe(move || {
-            let http_client = this.build_blocking_client()?;
+            let http_client = this.blocking_client()?;
             let mut req = http_client
                 .request(method, &endpoint)
                 .header("Accept", "application/vnd.github+json")
@@ -1504,9 +1569,9 @@ impl GitHubClient {
             if let Some(ref tok) = this.token {
                 req = req.bearer_auth(tok);
             }
-            let resp = req
-                .send()
-                .map_err(|err| OzError::Other(format!("GitHub API request {label} failed: {err}")))?;
+            let resp = req.send().map_err(|err| {
+                OzError::Other(format!("GitHub API request {label} failed: {err}"))
+            })?;
             decode_json_response(resp, &label)
         })
     }
@@ -1569,7 +1634,7 @@ fn encode_path_segment(seg: &str) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
@@ -1651,4 +1716,153 @@ fn parse_rate_limit_backoff_secs(headers: &reqwest::header::HeaderMap) -> Option
         return Some(30);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn sample_pr_json(number: u64) -> String {
+        serde_json::json!({
+            "number": number,
+            "html_url": format!("https://github.com/acme/demo/pull/{number}"),
+            "state": "open",
+            "draft": false,
+            "merged": false,
+            "title": format!("PR #{number}"),
+            "head": { "ref": format!("feat/{number}"), "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+            "base": { "ref": "main", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+        })
+        .to_string()
+    }
+
+    fn read_http_request_head(reader: &mut BufReader<&std::net::TcpStream>) -> bool {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return false,
+                Ok(_) => {
+                    if line == "\r\n" || line == "\n" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawns a single-connection HTTP/1.1 keep-alive mock server expecting `requests` calls
+    /// over a single accepted TCP connection, verifying both pooled client reuse and keep-alive.
+    fn spawn_keepalive_pr_server(
+        requests: usize,
+    ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_clone = Arc::clone(&accepted);
+
+        let handle = std::thread::spawn(move || {
+            let mut handled = 0usize;
+            while handled < requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                accepted_clone.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let stream_reader_clone = stream.try_clone().expect("clone stream");
+                let mut reader = BufReader::new(&stream_reader_clone);
+
+                while handled < requests {
+                    if !read_http_request_head(&mut reader) {
+                        break;
+                    }
+                    handled += 1;
+                    let body = sample_pr_json(handled as u64);
+                    let conn_hdr = if handled >= requests {
+                        "close"
+                    } else {
+                        "keep-alive"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {conn_hdr}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if stream.write_all(resp.as_bytes()).is_err() || stream.flush().is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (format!("http://{addr}"), accepted, handle)
+    }
+
+    #[test]
+    fn github_client_pools_and_reuses_blocking_client_across_calls_and_clones() {
+        let (base_url, accepted, server) = spawn_keepalive_pr_server(3);
+        let client = GitHubClient::new(base_url, Some("test-token".to_string()));
+        assert_eq!(client.cached_client_init_count(), 0);
+
+        let pr1 = client.get_pull_request("acme", "demo", 1).expect("pr 1");
+        assert_eq!(pr1.number, 1);
+        assert_eq!(client.cached_client_init_count(), 1);
+
+        let pr2 = client.get_pull_request("acme", "demo", 2).expect("pr 2");
+        assert_eq!(pr2.number, 2);
+        assert_eq!(client.cached_client_init_count(), 1);
+
+        // Clones share the exact same pooled reqwest::blocking::Client instance.
+        let cloned = client.clone();
+        let pr3 = cloned.get_pull_request("acme", "demo", 3).expect("pr 3");
+        assert_eq!(pr3.number, 3);
+        assert_eq!(client.cached_client_init_count(), 1);
+        assert_eq!(cloned.cached_client_init_count(), 1);
+
+        server.join().expect("mock server join");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "pooled client should reuse the keep-alive TCP connection across calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_client_drop_inside_current_thread_async_runtime_does_not_panic() {
+        let (base_url, accepted, server) = spawn_keepalive_pr_server(2);
+        let client = GitHubClient::new(base_url, Some("test-token".to_string()));
+
+        let pr1 = client.get_pull_request("acme", "demo", 1).expect("pr 1");
+        assert_eq!(pr1.number, 1);
+        assert_eq!(client.cached_client_init_count(), 1);
+
+        let pr2 = client.get_pull_request("acme", "demo", 2).expect("pr 2");
+        assert_eq!(pr2.number, 2);
+        assert_eq!(client.cached_client_init_count(), 1);
+
+        // Explicitly drop the final `GitHubClient` handle inside the Tokio async runtime.
+        drop(client);
+
+        server.join().expect("mock server join");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn github_client_drop_inside_multi_thread_async_runtime_does_not_panic() {
+        let (base_url, _accepted, server) = spawn_keepalive_pr_server(1);
+        let client = GitHubClient::new(base_url, Some("test-token".to_string()));
+
+        let pr1 = client.get_pull_request("acme", "demo", 1).expect("pr 1");
+        assert_eq!(pr1.number, 1);
+        assert_eq!(client.cached_client_init_count(), 1);
+
+        drop(client);
+        server.join().expect("mock server join");
+    }
 }

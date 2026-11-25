@@ -8,7 +8,6 @@ description = "Agent harness setup, MCP stdio server, and refs/notes/ai provenan
 [dependencies]
 chrono.workspace = true
 gix.workspace = true
-imara-diff.workspace = true
 oz-core.workspace = true
 oz-cow.workspace = true
 oz-integrate.workspace = true
