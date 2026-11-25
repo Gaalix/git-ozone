@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to package (e.g. v1.0.0); defaults to Cargo.toml workspace version"
+        description: "Release tag to package (e.g. v1.1.0); defaults to Cargo.toml workspace version"
         required: false
         type: string
       publish:
@@ -81,11 +81,13 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Resolved release tag=${tag} version=${version}"
 
-      - name: Validate packaging assets
+      - name: Validate packaging templates (pre-build)
         run: |
           set -euo pipefail
           python3 -c "import yaml" >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-yaml)
-          ./packaging/validate.sh
+          # Checked-in templates still have placeholder SHA256s prior to building archives;
+          # strict checksum verification runs in the `release` job after populate-manifests.py.
+          ./packaging/validate.sh --allow-placeholders
 
   build:
     name: Build & Package (${{ matrix.target }})
@@ -277,6 +279,24 @@ jobs:
           cat SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
 
+      - name: Populate and strictly validate Homebrew & winget manifests
+        shell: bash
+        env:
+          VERSION: ${{ needs.pure-rust-guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-yaml)
+          python3 -B ./packaging/populate-manifests.py \
+            --version "${VERSION}" \
+            --checksums dist/SHA256SUMS.txt \
+            --out-dir dist
+          ./packaging/validate.sh \
+            --strict \
+            --version "${VERSION}" \
+            --homebrew dist/oz.rb \
+            --winget-dir dist/winget \
+            --checksums dist/SHA256SUMS.txt
+
       - name: Install Cosign for keyless OIDC signing
         uses: sigstore/cosign-installer@v3
 
@@ -303,7 +323,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ozone-release-${{ needs.pure-rust-guard.outputs.tag }}
-          path: dist/*
+          path: dist
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -321,3 +341,7 @@ jobs:
             dist/ozone_*.deb
             dist/SHA256SUMS.txt
             dist/SHA256SUMS.txt.sigstore.json
+            dist/oz.rb
+            dist/winget/OzoneVCS.Ozone.yaml
+            dist/winget/OzoneVCS.Ozone.installer.yaml
+            dist/winget/OzoneVCS.Ozone.locale.en-US.yaml

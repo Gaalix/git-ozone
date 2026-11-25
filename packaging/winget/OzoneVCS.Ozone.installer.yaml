@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
-# InstallerSha256 is updated from SHA256SUMS.txt on tag publish.
+# Template manifest: PackageVersion, URL, and InstallerSha256 are populated automatically from SHA256SUMS.txt by .github/workflows/release.yml (packaging/populate-manifests.py) and published as release assets.
 PackageIdentifier: OzoneVCS.Ozone
 PackageVersion: 1.1.0
 InstallerType: zip

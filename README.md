@@ -64,7 +64,9 @@ For self-hosted APT repository instructions, see [`packaging/deb/apt-repo-setup.
 ### macOS & Linux (Homebrew Formula)
 
 ```bash
-brew install --formula https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/homebrew/oz.rb
+# Download the checksum-verified formula published with the latest GitHub Release
+curl -fsSLO https://github.com/Gaalix/git-ozone/releases/latest/download/oz.rb
+brew install --formula ./oz.rb
 ```
 
 ### Windows (`winget`)
@@ -72,6 +74,9 @@ brew install --formula https://raw.githubusercontent.com/Gaalix/git-ozone/main/p
 ```powershell
 winget install OzoneVCS.Ozone
 ```
+
+> [!NOTE]
+> Checksum-populated Homebrew (`oz.rb`) and `winget` (`OzoneVCS.Ozone*.yaml`) manifests are generated automatically from `SHA256SUMS.txt` and attached to every tagged [GitHub Release](https://github.com/Gaalix/git-ozone/releases). The checked-in files under `packaging/homebrew/` and `packaging/winget/` are release templates; before a release is published (or for direct checksum-verified installs), use `packaging/install.sh` / `packaging/install.ps1` or Cargo above.
 
 ### Verify Your Environment
 

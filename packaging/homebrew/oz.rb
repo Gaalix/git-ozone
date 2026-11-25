@@ -1,15 +1,22 @@
 # typed: false
 # frozen_string_literal: true
 
-# Homebrew formula for Ozone (oz / git-ozone / oz-vfsd)
-# Formula usage: brew install --formula https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/homebrew/oz.rb
+# Template Homebrew formula for Ozone (oz / git-ozone / oz-vfsd).
+#
+# Real SHA256 checksums are populated automatically from `SHA256SUMS.txt` by
+# `.github/workflows/release.yml` (`packaging/populate-manifests.py`) and
+# published as the `oz.rb` release asset on every tagged GitHub Release.
+#
+# Install from the latest published GitHub Release:
+#   curl -fsSLO https://github.com/Gaalix/git-ozone/releases/latest/download/oz.rb
+#   brew install --formula ./oz.rb
 class Oz < Formula
   desc "Pure-Rust CoW Git client and multi-agent workspace engine"
   homepage "https://github.com/Gaalix/git-ozone"
   version "1.1.0"
   license any_of: ["MIT", "Apache-2.0"]
 
-  # Release checksums are populated from SHA256SUMS.txt on tag publish.
+  # Template checksums are populated from SHA256SUMS.txt by .github/workflows/release.yml.
   on_macos do
     on_arm do
       url "https://github.com/Gaalix/git-ozone/releases/download/v#{version}/oz-v#{version}-aarch64-apple-darwin.tar.gz"

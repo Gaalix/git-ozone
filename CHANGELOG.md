@@ -2,6 +2,23 @@
 
 All notable changes to Ozone (`oz` / `git-ozone` / `oz-vfsd`) are documented in this file.
 
+## [Unreleased]
+
+### Security & Soundness Hardening
+- **Constant-Time SSH Signing & Secret Zeroization (`oz-core`):** Replaced hand-rolled variable-time Ed25519 and SHA-2 implementations with audited pure-Rust constant-time crates (`ed25519-dalek`, `sha2`, `zeroize`), zeroizing secret key material on drop and removing `Ed25519SigningKey::seed()` from the public API.
+- **Filter Command Injection & Pipe Deadlock Fixes (`oz-core`):** Eliminated Windows `cmd.exe /C` shell interpolation for `.gitattributes` `%f` filters and switched filter stdin writes to concurrent scoped threads so `> 64 KiB` blobs never deadlock.
+- **Hardened `oz-vfsd` IPC & Mount Validation (`oz-vfsd`):** Added per-instance random auth tokens for Windows loopback TCP IPC, fail-closed Unix `peer_cred()` enforcement, owner-verified `0o700` socket parent directories, bounded IPC frame reads (`1 MiB`) and concurrency limits, canonicalized non-symlink + UID-ownership validation for `upper_dir`/`meta_dir`/`baseline_dir`, and `tokio::signal` shutdown handling.
+- **Windows ProjFS FFI & Bounded MCP Framing (`oz-vfsd`, `oz-agent`):** Added compile-time `WinState: Send + Sync` assertions, size-checked `transmute`, buffer bounds checks before `copy_nonoverlapping`, explicit `// SAFETY:` invariants across all `unsafe` blocks, and bounded sync/async MCP header/line/payload framing limits (`4 MiB` line / `16 MiB` message / 32 headers).
+
+### Performance & Concurrency
+- **Lock-Split FUSE3 Overlay (`oz-vfsd`):** Decoupled blocking disk copy-up and directory materialization from short-lived metadata/inode locks and replaced lock-poisoning `.expect()` calls with graceful recovery.
+- **Async MCP & Pooled GitHub HTTP Client (`oz-agent`, `oz-github`):** Offloaded blocking MCP tool dispatch in `serve_async` via `tokio::task::spawn_blocking` and pooled `reqwest::blocking::Client` in `GitHubClient` with async-runtime-safe off-thread drop handling.
+- **Diff & Hot-Path Optimizations (`oz-core`, `oz-integrate`, `oz-agent`, `oz-oplog`):** Unified diffing onto `gix::diff::blob::imara_diff` to remove duplicate dependency trees, avoided unnecessary allocations in `status.rs`/`daily.rs`/`projfs.rs`, and replaced Unix `kill -0` subprocesses in `oz fsck` with direct `libc::kill(pid, 0)`.
+
+### Release Engineering, CI & Packaging
+- **Automated Homebrew & `winget` Release Manifests:** Added `packaging/populate-manifests.py` and wired `.github/workflows/release.yml` to generate, strictly validate against `SHA256SUMS.txt`, and publish populated `oz.rb` and `OzoneVCS.Ozone*.yaml` release assets on every tagged release.
+- **Strict Packaging Validation & CI Hardening:** Added `--strict` / `--allow-placeholders` / `--checksums` checks in `packaging/validate.sh` to reject all-zero placeholder SHA256s in releases, updated `README.md` to reference published release assets, added `cargo fmt --all -- --check` and `-D clippy::undocumented_unsafe_blocks` to `.github/workflows/ci.yml`, expanded `.gitignore`, and synced version/MCP tool documentation.
+
 ## [1.1.0] — 2026-11-24
 
 ### Agent Ergonomics & PR Review Release
@@ -30,5 +47,5 @@ All notable changes to Ozone (`oz` / `git-ozone` / `oz-vfsd`) are documented in 
 - **Stage-Free Working-Tree Commits & Guardrails:** Deterministic `[f1]` / `h1a` IDs (`oz status`, `oz diff`, `oz commit --pick/--exclude`), automatic secret/conflict-marker/large-blob/scope guardrails, `Change-Id:` trailers, and pure-Rust Ed25519 SSH commit/tag signing.
 - **Day-3 Git Compatibility:** `.git/hooks/` and `core.hooksPath` hooks (`--no-verify`), `.gitattributes` (`text`, `eol=lf`/`crlf`, `binary`/`-diff`, clean/smudge/`filter=lfs` safety), `160000` gitlink submodules, layered Git config (`include`/`includeIf`, `url.<base>.insteadOf`), `~/.ssh/config` support, and audited `oz git` shim compatibility.
 - **Everyday Human CLI Ergonomics:** `oz log`, `oz show`, `oz stash` (backed by OpLog undo/redo), `oz cherry-pick`, `oz revert`, `oz tag`, `oz branch`, automatic TTY paging (`$OZ_PAGER` / `$GIT_PAGER` / `delta` / `less -FRX`), `oz completions`, and `.ozone.toml` short aliases (`st`, `ci`, `co`, `lg`, `br`).
-- **Multi-Agent Coordination, GitHub Stacks & MCP:** `oz radar`, in-memory `oz integrate --verify` + `_integrate/` sandbox (`oz resolve`), `oz stack`, `oz pr create|stack`, `oz sync`, `oz ci`, `oz agent setup` (5 harnesses), `oz mcp` (8 tools), and `refs/notes/ai` `oz blame`.
+- **Multi-Agent Coordination, GitHub Stacks & MCP:** `oz radar`, in-memory `oz integrate --verify` + `_integrate/` sandbox (`oz resolve`), `oz stack`, `oz pr create|stack`, `oz sync`, `oz ci`, `oz agent setup` (5 harnesses), `oz mcp` (11 tools), and `refs/notes/ai` `oz blame`.
 - **Safety & Cross-Platform Packaging:** `proptest` safety suites verifying reference `git` tree-OID parity and `git fsck --full`, static release tarballs/zips, `.deb` packaging, Homebrew formula, winget manifests, and Cosign/SLSA release provenance.

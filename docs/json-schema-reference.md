@@ -283,7 +283,7 @@ Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw cr
 ```json
 {
   "invoked_as": "oz",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "non_interactive": true,
   "os": "linux",
   "arch": "x86_64",
@@ -474,7 +474,7 @@ Returns `BlameReport` joining commit history with `refs/notes/ai`:
 
 * **`oz agent setup`:** `{ "repo_root", "harnesses", "check_only", "created", "updated", "unchanged" }`
 * **`oz setup`:** `{ "repo_root", "git_common_dir", "ozone_dir", "recommended_backend", "oz_vfsd_bin", "systemd_unit_path", "projfs_enabled"? }`
-* **`oz --version --json`:** `{ "name": "oz", "invoked_as": "oz", "version": "1.0.0", "os": "linux", "arch": "x86_64", "pure_rust": true, "non_interactive": true }`
+* **`oz --version --json`:** `{ "name": "oz", "invoked_as": "oz", "version": "1.1.0", "os": "linux", "arch": "x86_64", "pure_rust": true, "non_interactive": true }`
 
 ---
 
@@ -488,11 +488,14 @@ Every `tools/call` returns an MCP `CallToolResult`: `{ "content": [{ "type": "te
 
 | Tool Name | Required Args | Optional Args | Description |
 | :--- | :--- | :--- | :--- |
-| `oz_status` | *(none)* | `workspace`, `directory` | Working-tree status with `f1` / `h1a` IDs and `out_of_scope` warnings. |
-| `oz_diff` | *(none)* | `targets[]`, `include_unified` (default `true`), `workspace`, `directory` | Histogram diff + addressable hunks + unified diff text. |
+| `oz_status` | *(none)* | `include_lines` (default `false`), `workspace`, `directory` | Working-tree status with `f1` / `h1a` IDs and `out_of_scope` warnings. |
+| `oz_diff` | *(none)* | `targets[]`, `exclude[]`, `base`, `rev`, `range`, `stat_only`, `line_numbers`, `include_unified` (default `true`), `workspace`, `directory` | Histogram diff + addressable hunks + unified diff text (working tree or revision ranges). |
 | `oz_commit` | `message` | `pick[]`, `exclude[]`, `allow_empty`, `force`, `allow_out_of_scope`, `session_id`, `client`, `model`, `prompt_summary`, `workspace`, `directory` | Stage-free whole or partial hunk commit with OpLog & `refs/notes/ai` provenance. |
 | `oz_ws_spawn` | `name` | `from`, `branch`, `backend`, `scope[]`, `deny[]`, `warm` (default `true`), `directory` | Spawn isolated CoW workspace on a real branch with warm caches. |
 | `oz_radar` | *(none)* | `base`, `include_committed` (default `true`), `workspaces[]`, `directory` | Cross-workspace collision radar. |
 | `oz_checkpoint` | *(none)* | `message`, `workspace`, `directory` | Capture `< 10 ms` MVCC checkpoint in OpLog & `refs/ozone/checkpoints/<ws>`. |
 | `oz_undo` | *(none)* | `op_id`, `steps` (integer >= 1, default `1`), `workspace`, `directory` | Rewind OpLog mutations/checkpoints (`op_id` and `steps` are mutually exclusive). |
 | `oz_ci_logs` | *(none)* | `branch`, `commit_oid`, `pr_number`, `run_id`, `job_id`, `step`, `raw`, `max_excerpt_lines`, `failing_only`, `wait_seconds` (`0..=120`), `fail_fast`, `startup_timeout_seconds`, `check_filter[]`, `ignore_checks[]`, `workspace`, `directory` | Fetch GitHub CI check status, compact failing log excerpts, bounded long-poll watching, or single-job log drill-down. |
+| `oz_log` | *(none)* | `rev`, `limit` (default `10`), `author`, `grep`, `pickaxe`, `grep_diff`, `since`, `oneline` (default `true`), `paths[]`, `workspace`, `directory` | Inspect compact commit history with message, diff, date, and path filters. |
+| `oz_restore` | `targets[]` | `source`, `remove_untracked` (default `false`), `workspace`, `directory` | Selectively restore working-tree paths or file IDs (`f1`) from `HEAD` or `source` (recorded in OpLog for `oz_undo`). |
+| `oz_show` | *(none)* | `rev`, `stat_only`, `include_files`, `start_line`, `end_line`, `workspace`, `directory` | Inspect a commit/tag or read a file blob at any revision (`<rev>:<path>`) without mutating the working tree. |

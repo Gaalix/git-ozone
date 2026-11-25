@@ -4,7 +4,8 @@
 
 | Version | Supported |
 | :--- | :---: |
-| `1.0.x` / `main` | Yes |
+| `1.1.x` / `main` | Yes |
+| `< 1.1.0` | No |
 
 ## Reporting a Vulnerability
 
@@ -30,7 +31,7 @@ You can verify downloaded release artifacts with:
 ```bash
 sha256sum -c SHA256SUMS.txt
 cosign verify-blob --bundle SHA256SUMS.txt.sigstore.json SHA256SUMS.txt
-gh attestation verify oz-v1.0.0-x86_64-unknown-linux-gnu.tar.gz -R Gaalix/git-ozone
+gh attestation verify oz-v1.1.0-x86_64-unknown-linux-gnu.tar.gz -R Gaalix/git-ozone
 ```
 
 ## Pure-Rust Supply-Chain Guarantee

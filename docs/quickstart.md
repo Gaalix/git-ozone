@@ -278,7 +278,7 @@ To bind a repository directory or explicit provenance session ID:
 }
 ```
 
-Exposed MCP tools: `oz_status`, `oz_diff`, `oz_commit`, `oz_ws_spawn`, `oz_radar`, `oz_checkpoint`, `oz_undo`, and `oz_ci_logs`. See the [JSON Schema Reference](json-schema-reference.md#5-oz-mcp-tool-reference) for exact input/output schemas.
+Exposed MCP tools (11): `oz_status`, `oz_diff`, `oz_commit`, `oz_ws_spawn`, `oz_radar`, `oz_checkpoint`, `oz_undo`, `oz_ci_logs`, `oz_log`, `oz_restore`, and `oz_show`. See the [JSON Schema Reference](json-schema-reference.md#5-oz-mcp-tool-reference) for exact input/output schemas.
 
 ---
 

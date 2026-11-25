@@ -47,6 +47,19 @@ jobs:
       - name: Run packaging validation suite
         run: ./packaging/validate.sh
 
+  fmt:
+    name: Format Check (rustfmt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   clippy:
     name: Clippy (Linux)
     runs-on: ubuntu-latest
@@ -60,7 +73,7 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
       - name: Run Clippy lints
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -D clippy::undocumented_unsafe_blocks
 
   test:
     name: Build & Test (${{ matrix.os }})
