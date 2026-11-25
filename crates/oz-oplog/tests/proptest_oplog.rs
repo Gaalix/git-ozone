@@ -910,6 +910,7 @@ proptest! {
         let actor = test_actor(None);
 
         for step in &case.steps {
+            let mut strict_undo_redo_paths: Option<BTreeSet<String>> = None;
             match step {
                 MachineStep::DirtyEdit(op) => {
                     apply_file_edit(&repo_dir, op);
@@ -1066,6 +1067,8 @@ proptest! {
                         undo(&repo, UndoTarget::Steps(1), actor.clone()).expect("undo step");
                         let did = model.undo_step();
                         prop_assert!(did);
+                        strict_undo_redo_paths =
+                            model.redo_stack.last().map(|t| t.changed_paths.clone());
                     }
                 }
                 MachineStep::RedoStep => {
@@ -1076,9 +1079,11 @@ proptest! {
                             "empty redo stack should yield InvalidUsage, got {res:?}"
                         );
                     } else {
+                        let redone_paths = model.redo_stack.last().map(|t| t.changed_paths.clone());
                         redo(&repo, actor.clone()).expect("redo step");
                         let did = model.redo_step();
                         prop_assert!(did);
+                        strict_undo_redo_paths = redone_paths;
                     }
                 }
                 MachineStep::RunGcCompact { age_days } => {
@@ -1142,15 +1147,8 @@ proptest! {
             // Also verify `.git/index` never caches a matching non-zero stat for a dirty file
             // paired with HEAD's blob OID:
             // - For any step, non-racy index entries must never falsely match a dirty disk file.
-            // - Immediately after `UndoStep` / `RedoStep`, touched dirty paths must NEVER have
-            //   a matching stat even within the same second (sync_git_index_diff must zero it).
-            let check_strict_undo_redo =
-                matches!(step, MachineStep::UndoStep | MachineStep::RedoStep);
-            let strict_paths: Option<&BTreeSet<String>> = match step {
-                MachineStep::UndoStep => model.redo_stack.last().map(|t| &t.changed_paths),
-                MachineStep::RedoStep => model.active.last().map(|t| &t.changed_paths),
-                _ => None,
-            };
+            // - Immediately after an executed `UndoStep` / `RedoStep`, touched dirty paths must
+            //   NEVER have a matching stat even within the same second (sync_git_index_diff zeroes it).
             let gix_check = gix::open(&repo_dir).expect("open gix check");
             if gix_check.index_path().is_file() {
                 use gix::bstr::ByteSlice as _;
@@ -1169,8 +1167,8 @@ proptest! {
                             gix::index::fs::Metadata::from_path_no_follow(&repo_dir.join(dirty_path))
                         && let Ok(disk_stat) = gix::index::entry::Stat::from_fs(&fs_meta)
                     {
-                        let touched_by_undo_redo = check_strict_undo_redo
-                            && strict_paths.is_some_and(|p| p.contains(dirty_path));
+                        let touched_by_undo_redo =
+                            strict_undo_redo_paths.as_ref().is_some_and(|p| p.contains(dirty_path));
                         if touched_by_undo_redo || !idx_entry.stat.is_racy(idx_ts, stat_opts) {
                             prop_assert!(
                                 !idx_entry.stat.matches(&disk_stat, stat_opts),
