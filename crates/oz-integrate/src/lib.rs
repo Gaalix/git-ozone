@@ -16,8 +16,8 @@ pub use guardrails::{
     check_workspace_scope_for_integration,
 };
 pub use merge::{
-    IntegrateOptions, IntegrateOutcome, continue_integration, continue_integration_with_verify,
-    integrate,
+    IntegrateOptions, IntegrateOutcome, MergeFastForwardMode, continue_integration,
+    continue_integration_with_verify, integrate,
 };
 pub use radar::{RadarOptions, RadarReport, scan_radar};
 pub use resolve::{

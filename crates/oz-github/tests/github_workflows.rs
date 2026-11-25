@@ -1055,6 +1055,7 @@ async fn end_to_end_pr_create_3_branch_pr_stack_sync_retarget_gc_rebase_and_ci_l
             status: "completed".to_string(),
             conclusion: Some("failure".to_string()),
             html_url: None,
+            ..Default::default()
         });
         guard.jobs_by_run.insert(
             500,

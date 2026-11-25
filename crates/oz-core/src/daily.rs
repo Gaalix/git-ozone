@@ -4208,16 +4208,28 @@ pub fn tag_verify(repo: &OzoneRepo, name: &str) -> Result<TagVerifyOutcome> {
 // 6. `oz branch` (`list` / `create` / `rename` / `delete`)
 // ============================================================================
 
-/// Summary entry for a single local branch.
+/// Summary entry for a single local or remote-tracking branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchInfo {
     pub name: String,
     pub is_current: bool,
+    #[serde(default)]
+    pub is_remote: bool,
     pub head_oid: String,
     pub short_oid: String,
     pub subject: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+}
+
+/// Options controlling [`branch_list_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct BranchListOptions {
+    pub pattern: Option<String>,
+    /// Include remote-tracking branches alongside local branches (`-a` / `--all`).
+    pub include_remotes: bool,
+    /// List only remote-tracking branches (`-r` / `--remotes`).
+    pub remotes_only: bool,
 }
 
 /// Outcome returned by [`branch_list`].
@@ -4293,10 +4305,27 @@ fn map_workspace_branches(repo: &OzoneRepo) -> HashMap<String, String> {
 
 /// Lists local branches (`refs/heads/*`) with current-branch indicator and latest commit subject.
 pub fn branch_list(repo: &OzoneRepo, pattern: Option<&str>) -> Result<BranchListReport> {
+    branch_list_with_options(
+        repo,
+        &BranchListOptions {
+            pattern: pattern.map(str::to_string),
+            include_remotes: false,
+            remotes_only: false,
+        },
+    )
+}
+
+/// Lists local and/or remote-tracking branches (`-a` / `-r`) with full SHAs and commit subjects.
+pub fn branch_list_with_options(
+    repo: &OzoneRepo,
+    opts: &BranchListOptions,
+) -> Result<BranchListReport> {
     let gix_repo = open_gix_for_workspace(repo)?;
     let head = resolve_workspace_head(repo, &gix_repo)?;
     let ws_by_branch = map_workspace_branches(repo);
-    let glob_matcher = pattern
+    let glob_matcher = opts
+        .pattern
+        .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(|p| {
@@ -4318,42 +4347,335 @@ pub fn branch_list(repo: &OzoneRepo, pattern: Option<&str>) -> Result<BranchList
         .references()
         .map_err(|err| OzError::Git(err.to_string()))?;
     let mut branches = Vec::new();
-    for item in platform
-        .local_branches()
-        .map_err(|err| OzError::Git(err.to_string()))?
-    {
-        let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
-        let name = r.name().shorten().to_str_lossy().into_owned();
-        if let Some(ref matcher) = glob_matcher
-            && !matcher.is_match(&name)
+
+    if !opts.remotes_only {
+        for item in platform
+            .local_branches()
+            .map_err(|err| OzError::Git(err.to_string()))?
         {
-            continue;
+            let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+            let name = r.name().shorten().to_str_lossy().into_owned();
+            if let Some(ref matcher) = glob_matcher
+                && !matcher.is_match(&name)
+            {
+                continue;
+            }
+            let commit = r
+                .peel_to_commit()
+                .map_err(|err| OzError::Git(err.to_string()))?;
+            let oid_hex = commit.id.to_hex().to_string();
+            let short_oid = oid_hex[..oid_hex.len().min(7)].to_string();
+            let subject = commit
+                .decode()
+                .ok()
+                .map(|d| split_subject_and_body(&d.message.to_str_lossy()).0)
+                .unwrap_or_default();
+            let is_current = head.branch.as_deref() == Some(name.as_str());
+            branches.push(BranchInfo {
+                workspace: ws_by_branch.get(&name).cloned(),
+                name,
+                is_current,
+                is_remote: false,
+                head_oid: oid_hex,
+                short_oid,
+                subject,
+            });
         }
-        let commit = r
-            .peel_to_commit()
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let oid_hex = commit.id.to_hex().to_string();
-        let short_oid = oid_hex[..oid_hex.len().min(7)].to_string();
-        let subject = commit
-            .decode()
-            .ok()
-            .map(|d| split_subject_and_body(&d.message.to_str_lossy()).0)
-            .unwrap_or_default();
-        let is_current = head.branch.as_deref() == Some(name.as_str());
-        branches.push(BranchInfo {
-            workspace: ws_by_branch.get(&name).cloned(),
-            name,
-            is_current,
-            head_oid: oid_hex,
-            short_oid,
-            subject,
-        });
     }
-    branches.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if opts.include_remotes || opts.remotes_only {
+        for item in platform
+            .remote_branches()
+            .map_err(|err| OzError::Git(err.to_string()))?
+        {
+            let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+            if matches!(r.target(), gix::refs::TargetRef::Symbolic(_)) {
+                continue;
+            }
+            let name = r.name().shorten().to_str_lossy().into_owned();
+            if let Some(ref matcher) = glob_matcher
+                && !matcher.is_match(&name)
+            {
+                continue;
+            }
+            let Ok(commit) = r.peel_to_commit() else {
+                continue;
+            };
+            let oid_hex = commit.id.to_hex().to_string();
+            let short_oid = oid_hex[..oid_hex.len().min(7)].to_string();
+            let subject = commit
+                .decode()
+                .ok()
+                .map(|d| split_subject_and_body(&d.message.to_str_lossy()).0)
+                .unwrap_or_default();
+            branches.push(BranchInfo {
+                workspace: None,
+                name,
+                is_current: false,
+                is_remote: true,
+                head_oid: oid_hex,
+                short_oid,
+                subject,
+            });
+        }
+    }
+
+    branches.sort_by(|a, b| a.is_remote.cmp(&b.is_remote).then_with(|| a.name.cmp(&b.name)));
     Ok(BranchListReport {
         current_branch: head.branch,
         count: branches.len(),
         branches,
+    })
+}
+
+// ============================================================================
+// 8. `oz grep` (Working-Tree & Revision-Scoped Pure-Rust Tree Grep)
+// ============================================================================
+
+/// Options controlling [`grep_repo`] (`oz grep <pattern> [<rev>] [-- <paths...>]`).
+#[derive(Debug, Clone, Default)]
+pub struct GrepOptions {
+    pub pattern: String,
+    /// Optional commit, branch, or remote-tracking ref (e.g. `origin/main`) to search without checking out.
+    pub rev: Option<String>,
+    /// Optional path prefixes, exact file paths, or globs to scope the search.
+    pub paths: Vec<String>,
+    /// Case-insensitive matching (`-i` / `--ignore-case`).
+    pub ignore_case: bool,
+    /// Interpret `pattern` as a literal substring instead of a regular expression (`-F` / `--fixed-strings`).
+    pub fixed_strings: bool,
+    /// Only return matching file paths without individual line entries (`-l` / `--files-with-matches`).
+    pub files_with_matches: bool,
+    /// Optional cap on total returned line matches.
+    pub max_matches: Option<usize>,
+}
+
+/// Single matching line returned by [`grep_repo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrepMatch {
+    pub path: String,
+    pub line_number: usize,
+    pub line: String,
+}
+
+/// Structured grep result returned by [`grep_repo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrepReport {
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_oid: Option<String>,
+    pub total_matches: usize,
+    pub matched_files: Vec<String>,
+    pub matches: Vec<GrepMatch>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Searches tracked working-tree files or a committed Git revision's tree (`origin/main`, `HEAD`, etc.)
+/// without mutating the working tree.
+pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
+    if opts.pattern.is_empty() {
+        return Err(OzError::InvalidUsage {
+            message: "grep pattern cannot be empty".to_string(),
+            recovery: vec!["oz grep <pattern> [<rev>] [-- <paths...>]".to_string()],
+        });
+    }
+
+    let regex = if opts.fixed_strings {
+        None
+    } else {
+        Some(SimpleRegex::compile(&opts.pattern, opts.ignore_case)?)
+    };
+    let needle_lower = opts.ignore_case.then(|| opts.pattern.to_lowercase());
+
+    let line_matches = |line: &str| -> bool {
+        if let Some(ref re) = regex {
+            re.is_match(line)
+        } else if let Some(ref lower) = needle_lower {
+            line.to_lowercase().contains(lower)
+        } else {
+            line.contains(&opts.pattern)
+        }
+    };
+
+    let normalized_paths: Vec<String> = opts
+        .paths
+        .iter()
+        .map(|p| {
+            p.trim()
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    let glob_matchers: Vec<globset::GlobMatcher> = normalized_paths
+        .iter()
+        .filter(|p| p.contains('*') || p.contains('?') || p.contains('['))
+        .filter_map(|p| globset::Glob::new(p).ok().map(|g| g.compile_matcher()))
+        .collect();
+
+    let path_included = |rel: &str| -> bool {
+        if normalized_paths.is_empty() {
+            return true;
+        }
+        if normalized_paths.iter().any(|p| {
+            rel == p
+                || (rel.len() > p.len()
+                    && rel.starts_with(p.as_str())
+                    && rel.as_bytes()[p.len()] == b'/')
+        }) {
+            return true;
+        }
+        glob_matchers.iter().any(|m| m.is_match(rel))
+    };
+
+    let dir_could_match = |dir_prefix: &str| -> bool {
+        if normalized_paths.is_empty() || !glob_matchers.is_empty() {
+            return true;
+        }
+        normalized_paths.iter().any(|p| {
+            dir_prefix == p
+                || (p.len() > dir_prefix.len()
+                    && p.starts_with(dir_prefix)
+                    && p.as_bytes()[dir_prefix.len()] == b'/')
+                || (dir_prefix.len() > p.len()
+                    && dir_prefix.starts_with(p.as_str())
+                    && dir_prefix.as_bytes()[p.len()] == b'/')
+        })
+    };
+
+    let mut matches: Vec<GrepMatch> = Vec::new();
+    let mut matched_files: Vec<String> = Vec::new();
+    let mut truncated = false;
+    let max_matches = opts.max_matches.unwrap_or(usize::MAX);
+
+    let mut scan_bytes = |rel_path: &str, bytes: &[u8]| -> bool {
+        if truncated || is_binary_bytes(bytes) {
+            return truncated;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let mut file_hit = false;
+        for (idx, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim_end_matches('\r');
+            if line_matches(line) {
+                if !file_hit {
+                    file_hit = true;
+                    matched_files.push(rel_path.to_string());
+                    if opts.files_with_matches {
+                        return false;
+                    }
+                }
+                if matches.len() >= max_matches {
+                    truncated = true;
+                    return true;
+                }
+                matches.push(GrepMatch {
+                    path: rel_path.to_string(),
+                    line_number: idx + 1,
+                    line: line.to_string(),
+                });
+            }
+        }
+        false
+    };
+
+    let commit_oid = if let Some(ref rev_spec) = opts.rev {
+        let gix_repo = open_gix_for_workspace(repo)?;
+        let cid = resolve_commit_oid(&gix_repo, rev_spec)?;
+        let tree_id = commit_tree_id(&gix_repo, cid)?;
+        let mut stack: Vec<(String, ObjectId)> = vec![(String::new(), tree_id)];
+        let mut stop = false;
+        while let Some((prefix, tid)) = stack.pop() {
+            if stop {
+                break;
+            }
+            let tree = gix_repo
+                .find_tree(tid)
+                .map_err(|err| OzError::Git(err.to_string()))?;
+            let mut subtrees = Vec::new();
+            let mut blobs = Vec::new();
+            for entry in tree.iter() {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                let name = entry.filename().to_str_lossy().into_owned();
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.mode().is_tree() {
+                    if dir_could_match(&rel) {
+                        subtrees.push((rel, entry.oid().to_owned()));
+                    }
+                } else if entry.mode().kind() != EntryKind::Commit && path_included(&rel) {
+                    blobs.push((rel, entry.oid().to_owned()));
+                }
+            }
+            blobs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (rel, oid) in blobs {
+                if let Ok(bytes) = read_blob_bytes(&gix_repo, oid)
+                    && scan_bytes(&rel, &bytes)
+                {
+                    stop = true;
+                    break;
+                }
+            }
+            subtrees.sort_by(|a, b| b.0.cmp(&a.0));
+            stack.extend(subtrees);
+        }
+        Some(cid.to_hex().to_string())
+    } else {
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        let walker = ignore::WalkBuilder::new(&repo.workdir_path)
+            .hidden(false)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .filter_entry(|e| e.file_name() != ".git")
+            .build();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let Ok(rel_os) = entry.path().strip_prefix(&repo.workdir_path) else {
+                continue;
+            };
+            let rel = rel_os.to_string_lossy().replace('\\', "/");
+            if path_included(&rel) {
+                files.push((rel, entry.into_path()));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        for (rel, abs) in files {
+            if let Ok(bytes) = fs::read(&abs)
+                && scan_bytes(&rel, &bytes)
+            {
+                break;
+            }
+        }
+        None
+    };
+
+    let total_matches = if opts.files_with_matches {
+        matched_files.len()
+    } else {
+        matches.len()
+    };
+
+    Ok(GrepReport {
+        pattern: opts.pattern.clone(),
+        rev: opts.rev.clone(),
+        commit_oid,
+        total_matches,
+        matched_files,
+        matches,
+        truncated,
     })
 }
 

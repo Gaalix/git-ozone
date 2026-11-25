@@ -3305,6 +3305,7 @@ pub fn handle_git_merge(parsed: &ParsedGitGlobals) -> ExitCode {
                 allow_out_of_scope,
                 force,
                 message,
+                fast_forward: oz_integrate::MergeFastForwardMode::NoFf,
             };
             let res = integrate(&repo, &opts, actor)
                 .map(|out| wrap_integrate_envelope(out, repo.workspace.clone()));

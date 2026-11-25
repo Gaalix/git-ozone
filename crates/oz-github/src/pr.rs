@@ -7,8 +7,9 @@
 
 use crate::PullRequestSpec;
 use crate::api::{
-    CreatePullRequestReviewPayload, GitHubClient, GitHubPullRequest, GitHubPullRequestFile,
-    GitHubPullRequestReview, GitHubReviewCommentPayload, UpdatePullRequest,
+    CreatePullRequestReviewPayload, GitHubClient, GitHubIssueComment, GitHubPullRequest,
+    GitHubPullRequestComment, GitHubPullRequestFile, GitHubPullRequestReview,
+    GitHubReviewCommentPayload, GitHubReviewThreadMeta, UpdatePullRequest,
 };
 use crate::wire::{
     HttpAuthScheme, PushOptions, is_ancestor_commit, open_gix_unrestricted, push_refs, read_ref_oid,
@@ -903,6 +904,8 @@ pub(crate) fn normalize_short_branch(raw: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct PrViewOptions {
     pub number: u64,
+    /// When `true`, also fetches inline review threads and PR conversation comments (`--comments`).
+    pub include_comments: bool,
     pub remote: Option<String>,
     pub auth_token: Option<String>,
     pub api_url: Option<String>,
@@ -920,7 +923,7 @@ pub struct PrViewFileSummary {
     pub deletions: u32,
 }
 
-/// Compact review summary inside [`PrViewOutcome`].
+/// Compact review summary inside [`PrViewOutcome`] and [`PrCommentsOutcome`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrViewReviewSummary {
     pub id: u64,
@@ -933,6 +936,90 @@ pub struct PrViewReviewSummary {
     pub body: Option<String>,
 }
 
+/// Single comment inside an inline PR review thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrReviewThreadComment {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+/// Inline review comment thread grouped by `path:line` with resolved/outdated status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrReviewThread {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub root_comment_id: u64,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    pub side: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_resolved: Option<bool>,
+    pub is_outdated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_hunk: Option<String>,
+    pub comments: Vec<PrReviewThreadComment>,
+}
+
+/// Top-level conversation comment on a pull request or issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrConversationComment {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+/// Options controlling [`pr_comments`] (`oz pr comments <number>`).
+#[derive(Debug, Clone, Default)]
+pub struct PrCommentsOptions {
+    pub number: u64,
+    /// When `true`, filters inline threads to exclude resolved threads (`--unresolved`).
+    pub unresolved_only: bool,
+    pub remote: Option<String>,
+    pub auth_token: Option<String>,
+    pub api_url: Option<String>,
+}
+
+/// Structured PR reviews, inline review threads (grouped by `path:line`), and conversation comments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrCommentsOutcome {
+    pub owner: String,
+    pub repo: String,
+    pub pr_number: u64,
+    pub title: String,
+    pub state: String,
+    pub head_sha: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub html_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_decision: Option<String>,
+    pub total_reviews: usize,
+    pub total_threads: usize,
+    pub unresolved_threads: usize,
+    pub outdated_threads: usize,
+    pub total_issue_comments: usize,
+    pub reviews: Vec<PrViewReviewSummary>,
+    pub threads: Vec<PrReviewThread>,
+    pub issue_comments: Vec<PrConversationComment>,
+}
+
 /// Result returned by [`pr_view`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrViewOutcome {
@@ -941,6 +1028,12 @@ pub struct PrViewOutcome {
     pub pull_request: GitHubPullRequest,
     pub files: Vec<PrViewFileSummary>,
     pub reviews: Vec<PrViewReviewSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<PrReviewThread>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_comments: Vec<PrConversationComment>,
     pub total_additions: u32,
     pub total_deletions: u32,
 }
@@ -1518,7 +1611,8 @@ fn resolve_github_pr_client(
     Ok((client, owner, repo_name))
 }
 
-/// Fetches PR metadata, changed-file summary, and review states (`oz pr view <number>`).
+/// Fetches PR metadata, changed-file summary, review states, and optionally inline review threads
+/// and conversation comments (`oz pr view <number> [--comments]`).
 pub fn pr_view(repo: &OzoneRepo, opts: &PrViewOptions) -> Result<PrViewOutcome> {
     let (client, owner, repo_name) = resolve_github_pr_client(
         repo,
@@ -1548,7 +1642,104 @@ pub fn pr_view(repo: &OzoneRepo, opts: &PrViewOptions) -> Result<PrViewOutcome> 
         })
         .collect();
 
-    let reviews = pr_reviews
+    let reviews = summarize_pr_reviews(pr_reviews);
+    let review_decision = derive_review_decision(&reviews);
+
+    let (threads, issue_comments) = if opts.include_comments {
+        let raw_inline = client
+            .list_pull_request_comments(&owner, &repo_name, opts.number)
+            .unwrap_or_default();
+        let gql_meta = client
+            .list_pull_request_review_threads_graphql(&owner, &repo_name, opts.number)
+            .unwrap_or_default();
+        let raw_issue = client
+            .list_issue_comments(&owner, &repo_name, opts.number)
+            .unwrap_or_default();
+        (
+            group_review_threads(&raw_inline, &gql_meta),
+            map_issue_comments(raw_issue),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ok(PrViewOutcome {
+        owner,
+        repo: repo_name,
+        pull_request,
+        files,
+        reviews,
+        review_decision,
+        threads,
+        issue_comments,
+        total_additions,
+        total_deletions,
+    })
+}
+
+/// Fetches structured PR reviews, inline review threads grouped by `path:line` with resolved/outdated
+/// metadata, and top-level conversation comments (`oz pr comments <number>`).
+pub fn pr_comments(repo: &OzoneRepo, opts: &PrCommentsOptions) -> Result<PrCommentsOutcome> {
+    let (client, owner, repo_name) = resolve_github_pr_client(
+        repo,
+        opts.remote.as_deref(),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+    let pr = client.get_pull_request(&owner, &repo_name, opts.number)?;
+    let pr_reviews = client
+        .list_pull_request_reviews(&owner, &repo_name, opts.number)
+        .unwrap_or_default();
+    let raw_inline = client
+        .list_pull_request_comments(&owner, &repo_name, opts.number)
+        .unwrap_or_default();
+    let gql_meta = client
+        .list_pull_request_review_threads_graphql(&owner, &repo_name, opts.number)
+        .unwrap_or_default();
+    let raw_issue = client
+        .list_issue_comments(&owner, &repo_name, opts.number)
+        .unwrap_or_default();
+
+    let reviews = summarize_pr_reviews(pr_reviews);
+    let review_decision = derive_review_decision(&reviews);
+    let mut threads = group_review_threads(&raw_inline, &gql_meta);
+    if opts.unresolved_only {
+        threads.retain(|t| t.is_resolved != Some(true));
+    }
+    let issue_comments = map_issue_comments(raw_issue);
+
+    let total_reviews = reviews.len();
+    let total_threads = threads.len();
+    let unresolved_threads = threads
+        .iter()
+        .filter(|t| t.is_resolved != Some(true))
+        .count();
+    let outdated_threads = threads.iter().filter(|t| t.is_outdated).count();
+    let total_issue_comments = issue_comments.len();
+
+    let state = format_pr_status(&pr);
+    Ok(PrCommentsOutcome {
+        owner,
+        repo: repo_name,
+        pr_number: pr.number,
+        title: pr.title,
+        state,
+        head_sha: pr.head.sha,
+        html_url: pr.html_url,
+        review_decision,
+        total_reviews,
+        total_threads,
+        unresolved_threads,
+        outdated_threads,
+        total_issue_comments,
+        reviews,
+        threads,
+        issue_comments,
+    })
+}
+
+fn summarize_pr_reviews(pr_reviews: Vec<GitHubPullRequestReview>) -> Vec<PrViewReviewSummary> {
+    pr_reviews
         .into_iter()
         .map(|r| PrViewReviewSummary {
             id: r.id,
@@ -1557,17 +1748,141 @@ pub fn pr_view(repo: &OzoneRepo, opts: &PrViewOptions) -> Result<PrViewOutcome> 
             submitted_at: r.submitted_at,
             body: r.body.filter(|b| !b.trim().is_empty()),
         })
-        .collect();
+        .collect()
+}
 
-    Ok(PrViewOutcome {
-        owner,
-        repo: repo_name,
-        pull_request,
-        files,
-        reviews,
-        total_additions,
-        total_deletions,
-    })
+pub(crate) fn derive_review_decision(reviews: &[PrViewReviewSummary]) -> Option<String> {
+    let mut latest_by_author: HashMap<&str, &str> = HashMap::new();
+    for r in reviews {
+        let state = r.state.as_str();
+        if matches!(state, "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED") {
+            let author = r.author.as_deref().unwrap_or("");
+            latest_by_author.insert(author, state);
+        }
+    }
+    if latest_by_author.values().any(|&s| s == "CHANGES_REQUESTED") {
+        Some("CHANGES_REQUESTED".to_string())
+    } else if latest_by_author.values().any(|&s| s == "APPROVED") {
+        Some("APPROVED".to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn map_issue_comments(raw: Vec<GitHubIssueComment>) -> Vec<PrConversationComment> {
+    raw.into_iter()
+        .map(|c| PrConversationComment {
+            id: c.id,
+            author: c.user.map(|u| u.login),
+            body: c.body,
+            created_at: c.created_at,
+            html_url: c.html_url,
+        })
+        .collect()
+}
+
+/// Groups flat REST PR review comments into `path:line` threads and enriches with optional GraphQL
+/// `isResolved`/`isOutdated` metadata.
+#[must_use]
+pub fn group_review_threads(
+    raw_comments: &[GitHubPullRequestComment],
+    graphql_threads: &[GitHubReviewThreadMeta],
+) -> Vec<PrReviewThread> {
+    let mut parent_map: HashMap<u64, u64> = HashMap::new();
+    for c in raw_comments {
+        if let Some(parent_id) = c.in_reply_to_id {
+            parent_map.insert(c.id, parent_id);
+        }
+    }
+
+    let resolve_root = |mut id: u64| -> u64 {
+        let mut hops = 0usize;
+        while let Some(&parent) = parent_map.get(&id) {
+            if parent == id || hops >= 64 {
+                break;
+            }
+            id = parent;
+            hops += 1;
+        }
+        id
+    };
+
+    let mut meta_by_comment: HashMap<u64, &GitHubReviewThreadMeta> = HashMap::new();
+    for meta in graphql_threads {
+        for &cid in &meta.comment_ids {
+            meta_by_comment.insert(cid, meta);
+        }
+    }
+
+    let mut grouped: HashMap<u64, Vec<&GitHubPullRequestComment>> = HashMap::new();
+    for c in raw_comments {
+        let root_id = resolve_root(c.id);
+        grouped.entry(root_id).or_default().push(c);
+    }
+
+    let mut threads: Vec<PrReviewThread> = Vec::with_capacity(grouped.len());
+    for (root_id, mut items) in grouped {
+        items.sort_by(|a, b| {
+            a.created_at
+                .as_deref()
+                .cmp(&b.created_at.as_deref())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let root = items
+            .iter()
+            .copied()
+            .find(|c| c.id == root_id)
+            .unwrap_or(items[0]);
+
+        let gql_meta = items
+            .iter()
+            .find_map(|c| meta_by_comment.get(&c.id).copied());
+        let is_outdated = gql_meta
+            .map(|m| m.is_outdated)
+            .unwrap_or_else(|| root.line.is_none() && root.position.is_none());
+
+        let thread_comments = items
+            .into_iter()
+            .map(|c| PrReviewThreadComment {
+                id: c.id,
+                review_id: c.pull_request_review_id,
+                author: c.user.as_ref().map(|u| u.login.clone()),
+                body: c.body.clone(),
+                created_at: c.created_at.clone(),
+                html_url: c.html_url.clone(),
+            })
+            .collect();
+
+        threads.push(PrReviewThread {
+            thread_id: gql_meta.map(|m| m.thread_id.clone()),
+            root_comment_id: root.id,
+            path: root.path.clone(),
+            line: root.line,
+            original_line: root.original_line,
+            start_line: root.start_line.or(root.original_start_line),
+            side: root
+                .side
+                .clone()
+                .unwrap_or_else(|| "RIGHT".to_string()),
+            is_resolved: gql_meta.map(|m| m.is_resolved),
+            is_outdated,
+            diff_hunk: root.diff_hunk.clone(),
+            comments: thread_comments,
+        });
+    }
+
+    threads.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| {
+                a.line
+                    .or(a.original_line)
+                    .unwrap_or(u32::MAX)
+                    .cmp(&b.line.or(b.original_line).unwrap_or(u32::MAX))
+            })
+            .then_with(|| a.root_comment_id.cmp(&b.root_comment_id))
+    });
+    threads
 }
 
 /// Fetches a PR's diff with deterministic file/hunk IDs and exact `old_line`/`new_line`

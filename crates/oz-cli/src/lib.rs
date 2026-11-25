@@ -15,18 +15,18 @@ use clap::{CommandFactory, Parser, Subcommand};
 pub use commands::build_mcp_server;
 use commands::{
     AgentCommand, BlameArgs, CheckpointArgs, CiArgs, CloneArgs, CommitArgs, DiffArgs, FetchArgs,
-    IntegrateArgs, McpArgs, PrCommand, PullArgs, PushArgs, RadarArgs, ResolveArgs, SetupArgs,
-    StackCommand, StatusArgs, SyncArgs, UndoArgs, WsCommand, handle_agent, handle_blame,
-    handle_checkpoint, handle_ci, handle_clone, handle_commit, handle_diff, handle_fetch,
-    handle_integrate, handle_mcp, handle_pr, handle_pull, handle_push, handle_radar, handle_redo,
-    handle_resolve, handle_setup, handle_stack, handle_status, handle_sync, handle_undo, handle_ws,
-    print_json_envelope, write_stdout_line,
+    IntegrateArgs, IssueCommand, McpArgs, MergeArgs, PrCommand, PullArgs, PushArgs, RadarArgs,
+    ResolveArgs, SetupArgs, StackCommand, StatusArgs, SyncArgs, UndoArgs, WsCommand, handle_agent,
+    handle_blame, handle_checkpoint, handle_ci, handle_clone, handle_commit, handle_diff,
+    handle_fetch, handle_integrate, handle_issue, handle_mcp, handle_merge, handle_pr, handle_pull,
+    handle_push, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
+    handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope, write_stdout_line,
 };
 use daily::{
-    BranchArgs, CherryPickArgs, CompletionsArgs, LogArgs, RestoreArgs, RevParseArgs, RevertArgs,
-    ShowArgs, StashArgs, SwitchArgs, TagArgs, handle_branch, handle_cherry_pick,
-    handle_completions, handle_diff_paged, handle_log, handle_restore, handle_rev_parse,
-    handle_revert, handle_show, handle_stash, handle_switch, handle_tag,
+    BranchArgs, CherryPickArgs, CompletionsArgs, GrepArgs, LogArgs, RestoreArgs, RevParseArgs,
+    RevertArgs, ShowArgs, StashArgs, SwitchArgs, TagArgs, handle_branch, handle_cherry_pick,
+    handle_completions, handle_diff_paged, handle_grep, handle_log, handle_restore,
+    handle_rev_parse, handle_revert, handle_show, handle_stash, handle_switch, handle_tag,
 };
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, FilesystemKind, InteractionMode, MountHealth,
@@ -89,6 +89,8 @@ pub enum Commands {
     Redo,
     /// Detect overlapping hunks, shared-file edits, and out-of-scope changes across workspaces.
     Radar(RadarArgs),
+    /// Merge revision(s) (e.g. `origin/main`) into the current branch in memory (OpLog-reversible via `oz undo`).
+    Merge(MergeArgs),
     /// Atomically integrate workspaces or branches in memory with `--verify` and conflict sandbox.
     Integrate(IntegrateArgs),
     /// Resolve conflicts inside `../<repo>.oz/_integrate` (`--take ours|theirs|base`).
@@ -104,12 +106,15 @@ pub enum Commands {
     Pull(PullArgs),
     /// Push refs over pure-Rust smart `git-receive-pack` (`--atomic`, `--force-with-lease`).
     Push(PushArgs),
-    /// Inspect, diff, read, review, create, and orchestrate GitHub Pull Requests (`view`, `diff`, `read`, `review`, `create`, `stack`).
+    /// Inspect, comment-read, diff, read, review, create, and orchestrate GitHub Pull Requests (`view`, `comments`, `diff`, `read`, `review`, `create`, `stack`).
     #[command(subcommand)]
     Pr(PrCommand),
+    /// Inspect GitHub Issues via REST (`view`, avoiding deprecated classic GraphQL fields).
+    #[command(subcommand)]
+    Issue(IssueCommand),
     /// Sync with remote: fetch, fast-forward base, retarget stacked PRs, rebase, and GC merged workspaces.
     Sync(SyncArgs),
-    /// Inspect GitHub Check Runs and Actions failing job log excerpts for self-healing loops.
+    /// Inspect GitHub Check Runs, multi-PR checks (`--pr 1,2,3`), Actions workflows (`--workflow`), and failing job log excerpts.
     Ci(CiArgs),
     /// Configure coding agent harnesses (`setup` for Claude Code, Cursor, Codex CLI, Windsurf, Antigravity).
     #[command(subcommand)]
@@ -133,8 +138,10 @@ pub enum Commands {
     Revert(RevertArgs),
     /// Create, list, delete, and SSH-sign tags (recorded in OpLog).
     Tag(TagArgs),
-    /// List, create, rename, and delete local branches (recorded in OpLog).
+    /// List, create, rename, and delete local or remote-tracking branches (`-a`, `-r`, recorded in OpLog).
     Branch(BranchArgs),
+    /// Search working-tree files or any Git revision's tree (`oz grep <pat> [<rev>] [-- <paths...>]`).
+    Grep(GrepArgs),
     /// Switch branches or detach `HEAD` via native `gix` tree-delta checkout (recorded in OpLog).
     Switch(SwitchArgs),
     /// Restore working-tree files from HEAD or `--source <REV>` (recorded in OpLog for `oz undo`).
@@ -405,6 +412,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Undo(args)) => handle_undo(&args, cli.directory.as_deref(), mode),
         Some(Commands::Redo) => handle_redo(cli.directory.as_deref(), mode),
         Some(Commands::Radar(args)) => handle_radar(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Merge(args)) => handle_merge(&args, cli.directory.as_deref(), mode),
         Some(Commands::Integrate(args)) => handle_integrate(&args, cli.directory.as_deref(), mode),
         Some(Commands::Resolve(args)) => handle_resolve(&args, cli.directory.as_deref(), mode),
         Some(Commands::Stack(stack_cmd)) => {
@@ -415,6 +423,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Pull(args)) => handle_pull(&args, cli.directory.as_deref(), mode),
         Some(Commands::Push(args)) => handle_push(&args, cli.directory.as_deref(), mode),
         Some(Commands::Pr(pr_cmd)) => handle_pr(pr_cmd, cli.directory.as_deref(), mode),
+        Some(Commands::Issue(issue_cmd)) => handle_issue(issue_cmd, cli.directory.as_deref(), mode),
         Some(Commands::Sync(args)) => handle_sync(&args, cli.directory.as_deref(), mode),
         Some(Commands::Ci(args)) => handle_ci(&args, cli.directory.as_deref(), mode),
         Some(Commands::Agent(agent_cmd)) => handle_agent(agent_cmd, cli.directory.as_deref(), mode),
@@ -428,6 +437,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Revert(args)) => handle_revert(&args, cli.directory.as_deref(), mode),
         Some(Commands::Tag(args)) => handle_tag(&args, cli.directory.as_deref(), mode),
         Some(Commands::Branch(args)) => handle_branch(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Grep(args)) => handle_grep(&args, cli.directory.as_deref(), mode),
         Some(Commands::Switch(args)) => handle_switch(&args, cli.directory.as_deref(), mode),
         Some(Commands::Restore(args)) => handle_restore(&args, cli.directory.as_deref(), mode),
         Some(Commands::Completions(args)) => handle_completions(&args, Cli::command(), mode),

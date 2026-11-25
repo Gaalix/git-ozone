@@ -645,6 +645,7 @@ fn watch_detects_superseded_pr_head_and_supports_job_drilldown_and_filtering() {
                     status: "in_progress".to_string(),
                     conclusion: None,
                     html_url: None,
+                    ..Default::default()
                 }],
                 jobs_by_run: HashMap::new(),
                 pr_head_sha: Some(newer_sha.clone()),
@@ -746,4 +747,251 @@ fn watch_returns_no_checks_timed_out_when_no_checks_register() {
     let w = report.watch.expect("watch meta");
     assert_eq!(w.outcome, CiWatchOutcome::NoChecksTimedOut);
     assert_eq!(w.recommended_poll_secs, Some(10));
+}
+
+#[test]
+fn watch_ignores_stale_ancestor_pr_head_and_older_workflow_runs() {
+    let tmp = TempDir::new().expect("tmp");
+    let (repo_initial, old_sha) = init_test_repo(tmp.path(), "feat/lag-race");
+
+    // Push a second commit on top of `old_sha` so `old_sha` is an ancestor of `new_sha`.
+    fs::write(tmp.path().join("lib.rs"), "pub fn ok() -> bool { true }\npub fn v2() {}\n")
+        .expect("write v2");
+    let new_commit = commit_changes(
+        &repo_initial,
+        &CommitOptions {
+            message: "feat: second commit".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("commit v2");
+    let new_sha = new_commit.commit_oid;
+    let repo = OzoneRepo::discover(Some(tmp.path())).expect("rediscover");
+
+    let server = MockServer::start(MockState {
+        steps: vec![
+            // Poll 1: New run (45398395423) for `new_sha` is running AND older run for `old_sha` is still in list;
+            // GitHub's PR API (`pulls/{n}.head.sha`) still lags behind at `old_sha`!
+            MockStep {
+                etag: "\"lag1\"".to_string(),
+                check_runs: vec![make_check(
+                    1,
+                    "lint-tests-types",
+                    "in_progress",
+                    None,
+                    45398395423,
+                    901,
+                )],
+                workflow_runs: vec![
+                    GitHubWorkflowRun {
+                        id: 45398395423,
+                        name: Some("CI".to_string()),
+                        head_branch: Some("feat/lag-race".to_string()),
+                        head_sha: new_sha.clone(),
+                        status: "in_progress".to_string(),
+                        conclusion: None,
+                        ..Default::default()
+                    },
+                    GitHubWorkflowRun {
+                        id: 45398000000,
+                        name: Some("CI".to_string()),
+                        head_branch: Some("feat/lag-race".to_string()),
+                        head_sha: old_sha.clone(),
+                        status: "completed".to_string(),
+                        conclusion: Some("failure".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                jobs_by_run: HashMap::new(),
+                pr_head_sha: Some(old_sha.clone()),
+            },
+            // Poll 2: PR API STILL lags at `old_sha` (ancestor of `new_sha`) — must NOT false-supersede!
+            MockStep {
+                etag: "\"lag2\"".to_string(),
+                check_runs: vec![make_check(
+                    1,
+                    "lint-tests-types",
+                    "in_progress",
+                    None,
+                    45398395423,
+                    901,
+                )],
+                workflow_runs: vec![
+                    GitHubWorkflowRun {
+                        id: 45398395423,
+                        name: Some("CI".to_string()),
+                        head_branch: Some("feat/lag-race".to_string()),
+                        head_sha: new_sha.clone(),
+                        status: "in_progress".to_string(),
+                        conclusion: None,
+                        ..Default::default()
+                    },
+                    GitHubWorkflowRun {
+                        id: 45398000000,
+                        name: Some("CI".to_string()),
+                        head_branch: Some("feat/lag-race".to_string()),
+                        head_sha: old_sha.clone(),
+                        status: "completed".to_string(),
+                        conclusion: Some("failure".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                jobs_by_run: HashMap::new(),
+                pr_head_sha: Some(old_sha.clone()),
+            },
+            // Poll 3: PR API catches up to `new_sha` and checks pass!
+            MockStep {
+                etag: "\"lag3\"".to_string(),
+                check_runs: vec![make_check(
+                    1,
+                    "lint-tests-types",
+                    "completed",
+                    Some("success"),
+                    45398395423,
+                    901,
+                )],
+                workflow_runs: vec![GitHubWorkflowRun {
+                    id: 45398395423,
+                    name: Some("CI".to_string()),
+                    head_branch: Some("feat/lag-race".to_string()),
+                    head_sha: new_sha.clone(),
+                    status: "completed".to_string(),
+                    conclusion: Some("success".to_string()),
+                    ..Default::default()
+                }],
+                jobs_by_run: HashMap::new(),
+                pr_head_sha: Some(new_sha.clone()),
+            },
+        ],
+        check_runs_calls: 0,
+        not_modified_responses: 0,
+        job_log_downloads: HashMap::new(),
+        job_logs: HashMap::new(),
+        jobs_by_id: HashMap::new(),
+        pr_number: 3320,
+        pr_branch: "feat/lag-race".to_string(),
+    });
+
+    let report = watch_ci_status(
+        &repo,
+        &CiWatchOptions {
+            query: CiQueryOptions {
+                auth_token: Some("tok".to_string()),
+                api_url: Some(server.base_url()),
+                ..Default::default()
+            },
+            fail_fast: true,
+            timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(5),
+            poll_interval: Some(Duration::from_millis(15)),
+        },
+        |_| {},
+    )
+    .expect("watch must survive PR API lag");
+
+    assert!(report.all_passed, "expected passing report, got {report:?}");
+    let w = report.watch.expect("watch meta");
+    assert_eq!(w.outcome, CiWatchOutcome::Passed);
+    assert_eq!(w.superseded_by_sha, None);
+    assert_eq!(w.polls, 3);
+}
+
+#[test]
+fn watch_ignores_stale_pr_head_after_amend_force_push() {
+    let tmp = TempDir::new().expect("tmp");
+    let (repo, new_sha) = init_test_repo(tmp.path(), "feat/amend-lag");
+    // Unrelated SHA representing pre-amend commit (NOT an ancestor of `new_sha`).
+    let pre_amend_sha = "c".repeat(40);
+
+    let server = MockServer::start(MockState {
+        steps: vec![
+            // Poll 1: PR API still returns `pre_amend_sha`, workflow list still has pre-amend run only.
+            MockStep {
+                etag: "\"am1\"".to_string(),
+                check_runs: vec![],
+                workflow_runs: vec![GitHubWorkflowRun {
+                    id: 1001,
+                    name: Some("CI".to_string()),
+                    head_branch: Some("feat/amend-lag".to_string()),
+                    head_sha: pre_amend_sha.clone(),
+                    status: "completed".to_string(),
+                    conclusion: Some("failure".to_string()),
+                    ..Default::default()
+                }],
+                jobs_by_run: HashMap::new(),
+                pr_head_sha: Some(pre_amend_sha.clone()),
+            },
+            // Poll 2: Checks started for `new_sha`, but PR API still lags at `pre_amend_sha`.
+            MockStep {
+                etag: "\"am2\"".to_string(),
+                check_runs: vec![make_check(1, "ci", "in_progress", None, 1002, 2002)],
+                workflow_runs: vec![
+                    GitHubWorkflowRun {
+                        id: 1002,
+                        name: Some("CI".to_string()),
+                        head_branch: Some("feat/amend-lag".to_string()),
+                        head_sha: new_sha.clone(),
+                        status: "in_progress".to_string(),
+                        conclusion: None,
+                        ..Default::default()
+                    },
+                    GitHubWorkflowRun {
+                        id: 1001,
+                        name: Some("CI".to_string()),
+                        head_branch: Some("feat/amend-lag".to_string()),
+                        head_sha: pre_amend_sha.clone(),
+                        status: "completed".to_string(),
+                        conclusion: Some("failure".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                jobs_by_run: HashMap::new(),
+                pr_head_sha: Some(pre_amend_sha.clone()),
+            },
+            // Poll 3: PR API catches up and checks pass!
+            MockStep {
+                etag: "\"am3\"".to_string(),
+                check_runs: vec![make_check(1, "ci", "completed", Some("success"), 1002, 2002)],
+                workflow_runs: vec![GitHubWorkflowRun {
+                    id: 1002,
+                    name: Some("CI".to_string()),
+                    head_branch: Some("feat/amend-lag".to_string()),
+                    head_sha: new_sha.clone(),
+                    status: "completed".to_string(),
+                    conclusion: Some("success".to_string()),
+                    ..Default::default()
+                }],
+                jobs_by_run: HashMap::new(),
+                pr_head_sha: Some(new_sha.clone()),
+            },
+        ],
+        check_runs_calls: 0,
+        not_modified_responses: 0,
+        job_log_downloads: HashMap::new(),
+        job_logs: HashMap::new(),
+        jobs_by_id: HashMap::new(),
+        pr_number: 3321,
+        pr_branch: "feat/amend-lag".to_string(),
+    });
+
+    let report = watch_ci_status(
+        &repo,
+        &CiWatchOptions {
+            query: CiQueryOptions {
+                auth_token: Some("tok".to_string()),
+                api_url: Some(server.base_url()),
+                ..Default::default()
+            },
+            fail_fast: true,
+            timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(5),
+            poll_interval: Some(Duration::from_millis(15)),
+        },
+        |_| {},
+    )
+    .expect("watch must survive amend force-push lag");
+
+    assert!(report.all_passed);
+    let w = report.watch.expect("watch meta");
+    assert_eq!(w.outcome, CiWatchOutcome::Passed);
 }

@@ -731,6 +731,7 @@ proptest! {
                 allow_out_of_scope: true,
                 force: true,
                 message: Some("merge feat/agent".to_string()),
+                ..Default::default()
             },
             test_actor(),
         )
@@ -878,6 +879,7 @@ proptest! {
                 allow_out_of_scope: true,
                 force: true,
                 message: Some("resolved merge".to_string()),
+                ..Default::default()
             },
             test_actor(),
         )
@@ -1006,6 +1008,7 @@ proptest! {
                 allow_out_of_scope: true,
                 force: true,
                 message: None,
+                ..Default::default()
             },
             test_actor(),
         )

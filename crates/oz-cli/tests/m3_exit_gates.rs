@@ -2437,6 +2437,7 @@ async fn gate2_e2e_signed_stacked_pr_ci_self_healing_and_sync_loop() {
             status: "completed".to_string(),
             conclusion: Some("failure".to_string()),
             html_url: None,
+            ..Default::default()
         });
         guard.jobs_by_run.insert(
             800,

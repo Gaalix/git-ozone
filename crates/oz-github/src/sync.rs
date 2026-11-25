@@ -922,6 +922,7 @@ pub fn pull_current_branch(
             allow_out_of_scope: true,
             force: true,
             message: Some(format!("Merge '{tracking_short}' into {current_branch}")),
+            ..Default::default()
         },
         actor,
     )?;

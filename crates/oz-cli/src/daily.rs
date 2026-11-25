@@ -15,14 +15,15 @@ use oz_agent::{
     record_commit_provenance,
 };
 use oz_core::{
-    BranchCreateOutcome, BranchDeleteOutcome, BranchListReport, BranchRenameOutcome,
-    CherryPickOptions, CherryPickOutcome, Envelope, ExitCode, InteractionMode, LogCommitEntry,
-    LogOptions, OZ_STASH_REF, OzError, OzoneRepo, Result, RestoreOptions, RestoreOutcome,
-    RevParseOptions, RevParseReport, RevertOptions, RevertOutcome, ShowBlobOptions, ShowBlobReport,
-    ShowOptions, ShowReport, StashDropOutcome, StashListReport, StashPopOutcome, StashPushOutcome,
-    SwitchOptions, SwitchOutcome, TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport,
-    TagVerifyOutcome, apply_stash_pop, branch_create, branch_delete, branch_list, branch_rename,
-    cherry_pick_commit, compute_status, format_numbered_blob_lines, log_commits, parse_line_range,
+    BranchCreateOutcome, BranchDeleteOutcome, BranchListOptions, BranchListReport,
+    BranchRenameOutcome, CherryPickOptions, CherryPickOutcome, Envelope, ExitCode, GrepOptions,
+    GrepReport, InteractionMode, LogCommitEntry, LogOptions, OZ_STASH_REF, OzError, OzoneRepo,
+    Result, RestoreOptions, RestoreOutcome, RevParseOptions, RevParseReport, RevertOptions,
+    RevertOutcome, ShowBlobOptions, ShowBlobReport, ShowOptions, ShowReport, StashDropOutcome,
+    StashListReport, StashPopOutcome, StashPushOutcome, SwitchOptions, SwitchOutcome,
+    TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome, apply_stash_pop,
+    branch_create, branch_delete, branch_list_with_options, branch_rename, cherry_pick_commit,
+    compute_status, format_numbered_blob_lines, grep_repo, log_commits, parse_line_range,
     parse_rev_path_spec, prepare_stash_pop, restore_paths, rev_parse, revert_commit, show_blob,
     show_commit, stash_drop, stash_list, stash_push, switch_branch, tag_create, tag_delete,
     tag_list, tag_verify,
@@ -1293,6 +1294,12 @@ pub struct BranchArgs {
     /// List local branches (default when no positional args are passed).
     #[arg(short = 'l', long = "list")]
     pub list: bool,
+    /// List both local and remote-tracking branches (`-a` / `--all`).
+    #[arg(short = 'a', long = "all", conflicts_with = "remotes")]
+    pub all: bool,
+    /// List only remote-tracking branches (`-r` / `--remotes`).
+    #[arg(short = 'r', long = "remotes", conflicts_with = "all")]
+    pub remotes: bool,
     /// Delete a merged branch.
     #[arg(short = 'd', long = "delete")]
     pub delete: bool,
@@ -1412,11 +1419,18 @@ pub(crate) fn handle_branch(
         });
     }
 
-    if args.list || args.args.is_empty() {
+    if args.list || args.all || args.remotes || args.args.is_empty() {
         let res = (|| -> Result<Envelope<BranchListReport>> {
             let repo = discover_and_recover_repo(directory, false)?;
-            let pattern = args.args.first().map(String::as_str);
-            let report = branch_list(&repo, pattern)?;
+            let pattern = args.args.first().cloned();
+            let report = branch_list_with_options(
+                &repo,
+                &BranchListOptions {
+                    pattern,
+                    include_remotes: args.all,
+                    remotes_only: args.remotes,
+                },
+            )?;
             Ok(Envelope::success(report)
                 .with_workspace(repo.workspace)
                 .with_branch(repo.branch)
@@ -1426,6 +1440,7 @@ pub(crate) fn handle_branch(
             let mut out = String::new();
             for b in &env.data.branches {
                 let marker = if b.is_current { "* " } else { "  " };
+                let remote_prefix = if b.is_remote { "remotes/" } else { "" };
                 let ws_suffix = b
                     .workspace
                     .as_ref()
@@ -1433,7 +1448,7 @@ pub(crate) fn handle_branch(
                     .unwrap_or_default();
                 let _ = writeln!(
                     out,
-                    "{marker}{} ({}){} {}",
+                    "{marker}{remote_prefix}{} ({}){} {}",
                     b.name, b.short_oid, ws_suffix, b.subject
                 );
             }
@@ -1684,6 +1699,83 @@ pub(crate) fn handle_switch(
             }
         } else if let Some(ref oid) = d.head_oid {
             println!("HEAD is now at {}", &oid[..oid.len().min(7)]);
+        }
+        Ok(())
+    })
+}
+
+// ============================================================================
+// 10. `oz grep` (working-tree & rev-scoped tree grep)
+// ============================================================================
+
+#[derive(Debug, Args)]
+pub struct GrepArgs {
+    /// Regex (or literal with `-F`) pattern to search for.
+    pub pattern: String,
+    /// Optional revision, branch, or remote-tracking ref (e.g. `origin/main`) to search without checking out.
+    pub rev: Option<String>,
+    /// Case-insensitive matching (`-i` / `--ignore-case`).
+    #[arg(short = 'i', long = "ignore-case")]
+    pub ignore_case: bool,
+    /// Match pattern as a literal substring instead of a regular expression (`-F` / `--fixed-strings`).
+    #[arg(short = 'F', long = "fixed-strings")]
+    pub fixed_strings: bool,
+    /// Only output matching file paths (`-l` / `--files-with-matches`).
+    #[arg(short = 'l', long = "files-with-matches")]
+    pub files_with_matches: bool,
+    /// Cap total returned line matches.
+    #[arg(long = "max-matches", value_name = "N")]
+    pub max_matches: Option<usize>,
+    /// Optional path prefixes, file paths, or globs after `--` (e.g. `oz grep foo origin/main -- tvva-ui/`).
+    #[arg(last = true, value_name = "PATH")]
+    pub paths: Vec<String>,
+}
+
+pub(crate) fn handle_grep(
+    args: &GrepArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<GrepReport>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let report = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: args.pattern.clone(),
+                rev: args.rev.clone(),
+                paths: args.paths.clone(),
+                ignore_case: args.ignore_case,
+                fixed_strings: args.fixed_strings,
+                files_with_matches: args.files_with_matches,
+                max_matches: args.max_matches,
+            },
+        )?;
+        let head_oid = report.commit_oid.clone().or(repo.head_oid);
+        Ok(Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(head_oid))
+    })();
+
+    render_daily_result(mode, res, |env| {
+        let d = &env.data;
+        let mut out = String::new();
+        let prefix = d
+            .rev
+            .as_deref()
+            .map(|r| format!("{r}:"))
+            .unwrap_or_default();
+        if args.files_with_matches {
+            for f in &d.matched_files {
+                let _ = writeln!(out, "{prefix}{f}");
+            }
+        } else {
+            for m in &d.matches {
+                let _ = writeln!(out, "{prefix}{}:{}:{}", m.path, m.line_number, m.line);
+            }
+        }
+        if !out.is_empty() {
+            emit_paged_output(mode, &out)?;
         }
         Ok(())
     })

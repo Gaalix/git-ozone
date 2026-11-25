@@ -24,22 +24,25 @@ use oz_cow::{
 };
 use oz_github::{
     CiJobLogOptions, CiJobLogReport, CiQueryOptions, CiReport, CiWatchEvent, CiWatchOptions,
-    CiWatchOutcome, CloneOptions, CloneOutcome, DEFAULT_MAX_EXCERPT_LINES,
-    DEFAULT_WATCH_STARTUP_TIMEOUT_SECS, DEFAULT_WATCH_TIMEOUT_SECS, FetchOptions, FetchOutcome,
-    ForceLeaseSpec, HttpAuthScheme, MAX_MCP_WAIT_SECONDS, PrCreateOptions, PrCreateOutcome,
-    PrDiffOptions, PrDiffOutcome, PrInlineCommentInput, PrReadOptions, PrReadOutcome,
-    PrReviewEvent, PrReviewOptions, PrReviewOutcome, PrStackOptions, PrStackOutcome,
-    PrViewOptions, PrViewOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
-    SyncOptions, SyncOutcome, clone_repo, fetch_remote, parse_inline_comment_spec, pr_create,
-    pr_diff, pr_read, pr_review, pr_stack, pr_view, pull_current_branch, push_refs_with_options,
-    query_ci_job_log, query_ci_status, sync_repo, watch_ci_status,
+    CiWatchOutcome, CiWorkflowOptions, CiWorkflowReport, CloneOptions, CloneOutcome,
+    DEFAULT_MAX_EXCERPT_LINES, DEFAULT_WATCH_STARTUP_TIMEOUT_SECS, DEFAULT_WATCH_TIMEOUT_SECS,
+    DEFAULT_WORKFLOW_RUN_LIMIT, FetchOptions, FetchOutcome, ForceLeaseSpec, HttpAuthScheme,
+    IssueViewOptions, IssueViewOutcome, MAX_MCP_WAIT_SECONDS, MultiPrCiReport, PrCommentsOptions,
+    PrCommentsOutcome, PrCreateOptions, PrCreateOutcome, PrDiffOptions, PrDiffOutcome,
+    PrInlineCommentInput, PrReadOptions, PrReadOutcome, PrReviewEvent, PrReviewOptions,
+    PrReviewOutcome, PrReviewThread, PrStackOptions, PrStackOutcome, PrViewOptions, PrViewOutcome,
+    PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, SyncOptions, SyncOutcome,
+    clone_repo, fetch_remote, issue_view, parse_inline_comment_spec, parse_issue_target,
+    pr_comments, pr_create, pr_diff, pr_read, pr_review, pr_stack, pr_view, pull_current_branch,
+    push_refs_with_options, query_ci_job_log, query_ci_status, query_multi_pr_ci_status,
+    query_workflow_ci_status, sync_repo, watch_ci_status, watch_workflow_ci_status,
 };
 use oz_integrate::{
     AbortOutcome, CollisionSeverity, ContinueOutcome, IntegrateOptions, IntegrateOutcome,
-    IntegrationMode, RadarOptions, RadarReport, ResolveOptions, ResolveOutcome, StackRebaseOptions,
-    StackRebaseOutcome, StackStatusReport, TakeSide, abort_integration,
-    continue_integration_with_verify, continue_stack_rebase, integrate, resolve_conflict,
-    scan_radar, stack_rebase, stack_status,
+    IntegrationMode, MergeFastForwardMode, RadarOptions, RadarReport, ResolveOptions,
+    ResolveOutcome, StackRebaseOptions, StackRebaseOutcome, StackStatusReport, TakeSide,
+    abort_integration, continue_integration_with_verify, continue_stack_rebase, integrate,
+    resolve_conflict, scan_radar, stack_rebase, stack_status,
 };
 use oz_oplog::{
     ActorInfo, ActorKind, CheckpointOutcome, MutationTransaction, RedoOutcome, UndoOutcome,
@@ -218,6 +221,36 @@ pub struct RadarArgs {
     /// Exclude branch-diverged commits and scan only uncommitted working-tree edits.
     #[arg(long)]
     pub no_committed: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MergeArgs {
+    /// Revision(s), branch(es), or remote-tracking refs (e.g. `origin/main`) to merge into the current branch.
+    pub sources: Vec<String>,
+    /// Always create a merge commit even when the current branch can fast-forward (`--no-ff`).
+    #[arg(long = "no-ff", conflicts_with = "ff_only")]
+    pub no_ff: bool,
+    /// Refuse to merge and exit with conflict if the current branch cannot fast-forward (`--ff-only`).
+    #[arg(long = "ff-only", conflicts_with = "no_ff")]
+    pub ff_only: bool,
+    /// Optional custom merge commit message.
+    #[arg(short = 'm', long = "message", value_name = "MSG")]
+    pub message: Option<String>,
+    /// Verification shell command executed inside `../<repo>.oz/_integrate` before advancing the branch.
+    #[arg(long, value_name = "CMD")]
+    pub verify: Option<String>,
+    /// Override `--scope` and `--deny` path guardrails.
+    #[arg(long)]
+    pub allow_out_of_scope: bool,
+    /// Override content guardrails (secrets, conflict markers, oversized blobs).
+    #[arg(long)]
+    pub force: bool,
+    /// Resume an active merge conflict session after resolving `_integrate/`.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+    /// Abort an active merge conflict session and remove `_integrate/`.
+    #[arg(long)]
+    pub abort: bool,
 }
 
 #[derive(Debug, Args)]
@@ -444,8 +477,10 @@ pub enum PrCommand {
     Create(PrCreateArgs),
     /// Push stacked branches atomically and create/update cross-linked stacked PRs.
     Stack(PrStackArgs),
-    /// Inspect PR metadata, full head/base SHAs, changed files, and review states.
+    /// Inspect PR metadata, full head/base SHAs, changed files, review states, and optionally comments.
     View(PrViewArgs),
+    /// Fetch PR reviews, inline review threads grouped by `path:line` (with resolved/outdated state), and conversation comments.
+    Comments(PrCommentsArgs),
     /// Show a line-numbered PR diff with deterministic `[f1]` / `[h1a]` IDs (`--stat`, `--exclude`).
     Diff(PrDiffArgs),
     /// Read a file at the exact PR head commit without mutating the local working tree.
@@ -458,6 +493,40 @@ pub enum PrCommand {
 pub struct PrViewArgs {
     /// Pull request number.
     pub number: u64,
+    /// Include inline review comment threads and conversation comments.
+    #[arg(long = "comments")]
+    pub comments: bool,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PrCommentsArgs {
+    /// Pull request number.
+    pub number: u64,
+    /// Only include inline review threads that are not marked resolved.
+    #[arg(long = "unresolved")]
+    pub unresolved: bool,
+    /// Remote name (defaults to `origin`).
+    #[arg(long = "remote", value_name = "REMOTE")]
+    pub remote: Option<String>,
+}
+
+/// GitHub Issue subcommands (`oz issue ...`).
+#[derive(Debug, Subcommand)]
+pub enum IssueCommand {
+    /// Inspect a GitHub Issue via REST (`oz issue view <number|url>`) without deprecated GraphQL fields.
+    View(IssueViewArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct IssueViewArgs {
+    /// Issue number (`3311`, `#3311`) or full GitHub issue URL.
+    pub target: String,
+    /// Include issue conversation comments.
+    #[arg(long = "comments")]
+    pub comments: bool,
     /// Remote name (defaults to `origin`).
     #[arg(long = "remote", value_name = "REMOTE")]
     pub remote: Option<String>,
@@ -609,9 +678,24 @@ pub struct CiArgs {
     /// Target branch name to inspect.
     #[arg(long = "branch", value_name = "BRANCH")]
     pub branch: Option<String>,
-    /// Pull request number to inspect.
-    #[arg(long = "pr", value_name = "NUMBER")]
-    pub pr: Option<u64>,
+    /// Pull request number(s) to inspect (comma-separated or repeatable, e.g. `--pr 3320,3321,3322`).
+    #[arg(
+        long = "pr",
+        value_name = "NUMBER",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    pub pr: Vec<u64>,
+    /// GitHub Actions workflow filename, path, ID, or display name to inspect (e.g. `sentry-release.yaml`).
+    #[arg(long = "workflow", value_name = "WORKFLOW")]
+    pub workflow: Option<String>,
+    /// Maximum recent workflow runs to return with `--workflow` (default: 5).
+    #[arg(
+        long = "limit",
+        default_value_t = DEFAULT_WORKFLOW_RUN_LIMIT,
+        value_name = "N"
+    )]
+    pub limit: usize,
     /// Maximum lines per failing check log excerpt (default: 40).
     #[arg(
         long = "max-excerpt-lines",
@@ -1906,6 +1990,7 @@ pub(crate) fn handle_integrate(
             allow_out_of_scope: args.allow_out_of_scope,
             force: args.force,
             message: args.message.clone(),
+            fast_forward: MergeFastForwardMode::NoFf,
         };
         let outcome = integrate(&repo, &opts, actor)?;
         let wrapped = wrap_integrate_envelope(outcome, repo.workspace);
@@ -1914,6 +1999,116 @@ pub(crate) fn handle_integrate(
 
     render_command_result(mode, res, |env| match &env.data {
         IntegrateCliData::Integrated(out) => print_integrate_human(out),
+        IntegrateCliData::Aborted(out) => print_abort_human(out),
+    })
+}
+
+pub(crate) fn handle_merge(
+    args: &MergeArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<IntegrateCliData>> {
+        if args.continue_session && args.abort {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass both `--continue` and `--abort` to `oz merge`".to_string(),
+                recovery: vec![
+                    "oz merge --continue".to_string(),
+                    "oz merge --abort".to_string(),
+                ],
+            });
+        }
+        if (args.continue_session || args.abort) && !args.sources.is_empty() {
+            return Err(OzError::InvalidUsage {
+                message: "cannot pass revisions alongside `--continue` or `--abort`".to_string(),
+                recovery: vec![
+                    "oz merge --continue".to_string(),
+                    "oz merge --abort".to_string(),
+                ],
+            });
+        }
+
+        let repo = discover_and_recover_repo(directory, true)?;
+        let actor = actor_from_mode(mode, &repo);
+
+        if args.abort {
+            let outcome = abort_integration(&repo)?;
+            return Ok(Envelope::success(IntegrateCliData::Aborted(outcome))
+                .with_workspace(repo.workspace)
+                .with_branch(repo.branch)
+                .with_head_oid(repo.head_oid));
+        }
+
+        if args.continue_session {
+            let outcome =
+                continue_integration_with_verify(&repo, args.verify.as_deref(), actor)?;
+            let wrapped = wrap_integrate_envelope(outcome, repo.workspace);
+            return Ok(map_envelope_data(wrapped, IntegrateCliData::Integrated));
+        }
+
+        if args.sources.is_empty() {
+            return Err(OzError::InvalidUsage {
+                message: "missing revision(s) to merge (e.g. `oz merge origin/main`)".to_string(),
+                recovery: vec![
+                    "oz merge origin/main".to_string(),
+                    "oz merge --no-ff origin/main".to_string(),
+                    "oz merge --continue".to_string(),
+                    "oz merge --abort".to_string(),
+                ],
+            });
+        }
+
+        let current_branch = repo.branch.clone().ok_or_else(|| OzError::InvalidUsage {
+            message: "cannot run `oz merge` on detached HEAD; switch to a branch first".to_string(),
+            recovery: vec!["oz switch <branch>".to_string()],
+        })?;
+
+        let fast_forward = if args.no_ff {
+            MergeFastForwardMode::NoFf
+        } else if args.ff_only {
+            MergeFastForwardMode::FfOnly
+        } else {
+            MergeFastForwardMode::AllowFf
+        };
+
+        let opts = IntegrateOptions {
+            sources: args.sources.clone(),
+            into: Some(current_branch),
+            verify_cmd: args.verify.clone(),
+            allow_out_of_scope: args.allow_out_of_scope,
+            force: args.force,
+            message: args.message.clone(),
+            fast_forward,
+        };
+        let outcome = integrate(&repo, &opts, actor)?;
+        let wrapped = wrap_integrate_envelope(outcome, repo.workspace);
+        Ok(map_envelope_data(wrapped, IntegrateCliData::Integrated))
+    })();
+
+    render_command_result(mode, res, |env| match &env.data {
+        IntegrateCliData::Integrated(out) => {
+            if out.merged_sources.is_empty() {
+                println!(
+                    "Already up to date on {} ({})",
+                    out.into_branch,
+                    &out.commit_oid[..out.commit_oid.len().min(12)]
+                );
+            } else if out.fast_forwarded {
+                println!(
+                    "Fast-forwarded {} to [{}] ({})",
+                    out.into_branch,
+                    out.merged_sources.join(", "),
+                    &out.commit_oid[..out.commit_oid.len().min(12)]
+                );
+            } else {
+                println!(
+                    "Merged [{}] into {} ({})",
+                    out.merged_sources.join(", "),
+                    out.into_branch,
+                    &out.commit_oid[..out.commit_oid.len().min(12)]
+                );
+            }
+        }
         IntegrateCliData::Aborted(out) => print_abort_human(out),
     })
 }
@@ -2552,10 +2747,202 @@ pub(crate) fn handle_pr(
         PrCommand::Create(args) => handle_pr_create(&args, directory, mode),
         PrCommand::Stack(args) => handle_pr_stack(&args, directory, mode),
         PrCommand::View(args) => handle_pr_view(&args, directory, mode),
+        PrCommand::Comments(args) => handle_pr_comments(&args, directory, mode),
         PrCommand::Diff(args) => handle_pr_diff(&args, directory, mode),
         PrCommand::Read(args) => handle_pr_read(&args, directory, mode),
         PrCommand::Review(args) => handle_pr_review(&args, directory, mode),
     }
+}
+
+pub(crate) fn handle_issue(
+    cmd: IssueCommand,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    match cmd {
+        IssueCommand::View(args) => handle_issue_view(&args, directory, mode),
+    }
+}
+
+fn handle_issue_view(
+    args: &IssueViewArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<IssueViewOutcome>> {
+        let parsed = parse_issue_target(&args.target)?;
+        let repo = discover_and_recover_repo(directory, false)?;
+        let outcome = issue_view(
+            &repo,
+            &IssueViewOptions {
+                number: parsed.number,
+                owner_override: parsed.owner,
+                repo_override: parsed.repo,
+                include_comments: args.comments,
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            },
+        )?;
+        Ok(Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        let issue = &d.issue;
+        let kind_label = if d.is_pull_request { "PR/Issue" } else { "Issue" };
+        let author = issue
+            .user
+            .as_ref()
+            .map(|u| u.login.as_str())
+            .unwrap_or("unknown");
+        println!(
+            "{kind_label} #{} [{}] {}",
+            issue.number,
+            issue.state.to_ascii_uppercase(),
+            issue.title
+        );
+        let mut meta = vec![format!("author={author}")];
+        if !issue.labels.is_empty() {
+            let lbls: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+            meta.push(format!("labels={}", lbls.join(",")));
+        }
+        if !issue.assignees.is_empty() {
+            let people: Vec<&str> = issue.assignees.iter().map(|u| u.login.as_str()).collect();
+            meta.push(format!("assignees={}", people.join(",")));
+        }
+        if let Some(ref ms) = issue.milestone {
+            meta.push(format!("milestone={}", ms.title));
+        }
+        meta.push(format!("comments={}", issue.comments));
+        println!("  {}", meta.join("  "));
+        if !issue.html_url.is_empty() {
+            println!("  url={}", issue.html_url);
+        }
+        if let Some(ref body) = issue.body
+            && !body.trim().is_empty()
+        {
+            println!("\n{}", body.trim());
+        }
+        if !d.comments.is_empty() {
+            println!("\nComments ({}):", d.comments.len());
+            for c in &d.comments {
+                let who = c.author.as_deref().unwrap_or("unknown");
+                let when = c.created_at.as_deref().unwrap_or("");
+                if when.is_empty() {
+                    println!("  @{who}:");
+                } else {
+                    println!("  @{who} ({when}):");
+                }
+                for line in c.body.trim().lines() {
+                    println!("    {line}");
+                }
+            }
+        }
+    })
+}
+
+fn render_pr_review_threads_human(threads: &[PrReviewThread]) {
+    if threads.is_empty() {
+        return;
+    }
+    println!("\nInline Review Threads ({}):", threads.len());
+    for t in threads {
+        let loc = match (t.start_line, t.line.or(t.original_line)) {
+            (Some(s), Some(e)) if s != e => format!("{}:{s}-{e}", t.path),
+            (_, Some(l)) => format!("{}:{l}", t.path),
+            _ => t.path.clone(),
+        };
+        let mut tags = Vec::new();
+        match t.is_resolved {
+            Some(true) => tags.push("resolved"),
+            Some(false) => tags.push("unresolved"),
+            None => {}
+        }
+        if t.is_outdated {
+            tags.push("outdated");
+        }
+        let tag_suffix = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", tags.join(", "))
+        };
+        println!("  {loc} ({}){tag_suffix}", t.side);
+        for c in &t.comments {
+            let who = c.author.as_deref().unwrap_or("unknown");
+            println!("    @{who}:");
+            for line in c.body.trim().lines() {
+                println!("      {line}");
+            }
+        }
+    }
+}
+
+fn handle_pr_comments(
+    args: &PrCommentsArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<PrCommentsOutcome>> {
+        let repo = discover_and_recover_repo(directory, false)?;
+        let outcome = pr_comments(
+            &repo,
+            &PrCommentsOptions {
+                number: args.number,
+                unresolved_only: args.unresolved,
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            },
+        )?;
+        Ok(Envelope::success(outcome)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        let decision = d.review_decision.as_deref().unwrap_or("PENDING");
+        println!(
+            "PR #{} [{} | verdict: {}] {}",
+            d.pr_number, d.state, decision, d.title
+        );
+        println!(
+            "  reviews={}  threads={} (unresolved={}, outdated={})  conversation_comments={}",
+            d.total_reviews,
+            d.total_threads,
+            d.unresolved_threads,
+            d.outdated_threads,
+            d.total_issue_comments
+        );
+        if !d.reviews.is_empty() {
+            println!("\nReviews:");
+            for r in &d.reviews {
+                let who = r.author.as_deref().unwrap_or("unknown");
+                println!("  @{} [{}]", who, r.state);
+                if let Some(ref body) = r.body {
+                    for line in body.trim().lines() {
+                        println!("    {line}");
+                    }
+                }
+            }
+        }
+        render_pr_review_threads_human(&d.threads);
+        if !d.issue_comments.is_empty() {
+            println!("\nConversation Comments ({}):", d.issue_comments.len());
+            for c in &d.issue_comments {
+                let who = c.author.as_deref().unwrap_or("unknown");
+                println!("  @{who}:");
+                for line in c.body.trim().lines() {
+                    println!("    {line}");
+                }
+            }
+        }
+    })
 }
 
 fn handle_pr_view(
@@ -2569,6 +2956,7 @@ fn handle_pr_view(
             &repo,
             &PrViewOptions {
                 number: args.number,
+                include_comments: args.comments,
                 remote: args.remote.clone(),
                 auth_token: None,
                 api_url: None,
@@ -2635,6 +3023,17 @@ fn handle_pr_view(
                     "  [{}] {}  {} (+{}/-{})",
                     f.id, f.status, f.path, f.additions, f.deletions
                 );
+            }
+        }
+        render_pr_review_threads_human(&d.threads);
+        if !d.issue_comments.is_empty() {
+            println!("\nConversation Comments ({}):", d.issue_comments.len());
+            for c in &d.issue_comments {
+                let who = c.author.as_deref().unwrap_or("unknown");
+                println!("  @{who}:");
+                for line in c.body.trim().lines() {
+                    println!("    {line}");
+                }
             }
         }
     })
@@ -3015,6 +3414,27 @@ pub(crate) fn handle_ci(
         };
         return render_command_result::<CiReport, _>(mode, Err(err), |_| {});
     }
+    if args.workflow.is_some() && !args.pr.is_empty() {
+        let err = OzError::InvalidUsage {
+            message: "cannot combine `--workflow` with `--pr` on `oz ci`".to_string(),
+            recovery: vec![
+                "oz ci --workflow <file> --json".to_string(),
+                "oz ci --pr 3320,3321 --json".to_string(),
+            ],
+        };
+        return render_command_result::<CiReport, _>(mode, Err(err), |_| {});
+    }
+    if args.pr.len() > 1 && args.watch {
+        let err = OzError::InvalidUsage {
+            message: "`--watch` supports a single `--pr` at a time; run snapshot mode without `--watch` for multiple PRs"
+                .to_string(),
+            recovery: vec![
+                "oz ci --pr 3320,3321 --json".to_string(),
+                "oz ci --pr 3320 --watch --json".to_string(),
+            ],
+        };
+        return render_command_result::<CiReport, _>(mode, Err(err), |_| {});
+    }
 
     // Direct single-job log drill-down (`oz ci --job <id>`).
     if let Some(job_id) = args.job {
@@ -3051,11 +3471,148 @@ pub(crate) fn handle_ci(
         });
     }
 
+    // Workflow-level CI lookup (`oz ci --workflow <file-or-name> [--watch]`).
+    if let Some(ref workflow) = args.workflow {
+        let wf_res = (|| -> Result<(OzoneRepo, CiWorkflowReport)> {
+            let repo = discover_and_recover_repo(directory, false)?;
+            let wf_opts = CiWorkflowOptions {
+                workflow: workflow.clone(),
+                branch: args.branch.clone().or_else(|| args.target_ref.clone()),
+                limit: args.limit,
+                max_excerpt_lines: args.max_excerpt_lines,
+                include_checks: args.checks.clone(),
+                ignore_checks: args.ignore_checks.clone(),
+                remote: args.remote.clone(),
+                auth_token: None,
+                api_url: None,
+            };
+            let report = if args.watch {
+                let emit_progress =
+                    args.progress || (mode.stdout_is_tty && !mode.json && !mode.non_interactive);
+                let watch_opts = CiWatchOptions {
+                    query: CiQueryOptions::default(),
+                    fail_fast: !args.wait_all,
+                    timeout: Duration::from_secs(args.timeout),
+                    startup_timeout: Duration::from_secs(args.startup_timeout),
+                    poll_interval: resolve_ci_poll_interval(args.interval),
+                };
+                watch_workflow_ci_status(&repo, &wf_opts, &watch_opts, |ev| {
+                    if emit_progress {
+                        render_watch_progress_event(&ev);
+                    }
+                })?
+            } else {
+                query_workflow_ci_status(&repo, &wf_opts)?
+            };
+            Ok((repo, report))
+        })();
+
+        let (repo, report) = match wf_res {
+            Ok(pair) => pair,
+            Err(err) => return render_command_result::<CiWorkflowReport, _>(mode, Err(err), |_| {}),
+        };
+
+        let report_snapshot = report.clone();
+        let mut env = Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid);
+        let exit_code = apply_workflow_report_to_envelope(&mut env, &report_snapshot);
+
+        if mode.json {
+            print_json_envelope(&env);
+        } else {
+            render_workflow_report_human(&env.data);
+        }
+        return exit_code;
+    }
+
+    // Multi-PR CI snapshot (`oz ci --pr 3320,3321,3322`).
+    if args.pr.len() > 1 {
+        let multi_res = (|| -> Result<(OzoneRepo, MultiPrCiReport)> {
+            let repo = discover_and_recover_repo(directory, false)?;
+            let base_opts = CiQueryOptions {
+                target_ref: None,
+                pr_number: None,
+                remote: args.remote.clone(),
+                max_excerpt_lines: args.max_excerpt_lines,
+                include_checks: args.checks.clone(),
+                ignore_checks: args.ignore_checks.clone(),
+                auth_token: None,
+                api_url: None,
+            };
+            let report = query_multi_pr_ci_status(&repo, &args.pr, &base_opts)?;
+            Ok((repo, report))
+        })();
+
+        let (repo, report) = match multi_res {
+            Ok(pair) => pair,
+            Err(err) => return render_command_result::<MultiPrCiReport, _>(mode, Err(err), |_| {}),
+        };
+
+        let failing_prs = report.failing_prs;
+        let pr_count = report.pr_count;
+        let mut env = Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid);
+        let exit_code = if failing_prs > 0 {
+            let code = ExitCode::ConflictOrCheckFail;
+            env.ok = false;
+            env.error = Some(EnvelopeError {
+                code: "check_failed".to_string(),
+                exit_code: code.as_i32(),
+                message: format!("{failing_prs} of {pr_count} PR(s) have failing CI checks"),
+            });
+            code
+        } else {
+            ExitCode::Success
+        };
+
+        if mode.json {
+            print_json_envelope(&env);
+        } else {
+            let d = &env.data;
+            println!(
+                "Multi-PR CI: {} ({} PR(s): {} passing, {} failing, {} pending)",
+                d.overall_status, d.pr_count, d.passing_prs, d.failing_prs, d.pending_prs
+            );
+            for r in &d.reports {
+                let pr_tag = r
+                    .pr_number
+                    .map(|n| format!("PR #{n}"))
+                    .unwrap_or_else(|| r.ref_name.clone());
+                let short_sha = &r.commit_sha[..r.commit_sha.len().min(10)];
+                println!(
+                    "\n{pr_tag} ({} @ {short_sha}): {} ({} total, {} failing, {} pending)",
+                    r.ref_name, r.overall_status, r.total_count, r.failing_count, r.pending_count
+                );
+                for check in &r.checks {
+                    let conc = check.conclusion.as_deref().unwrap_or(&check.status);
+                    if let Some(jid) = check.job_id {
+                        println!("  [{}] {} (job {})", conc, check.name, jid);
+                    } else {
+                        println!("  [{}] {}", conc, check.name);
+                    }
+                    if let Some(ref step) = check.failing_step {
+                        println!("    failing step: {step}");
+                    }
+                    if let Some(ref excerpt) = check.log_excerpt {
+                        for line in excerpt.lines() {
+                            println!("      {line}");
+                        }
+                    }
+                }
+            }
+        }
+        return exit_code;
+    }
+
     let query_res = (|| -> Result<(OzoneRepo, CiReport)> {
         let repo = discover_and_recover_repo(directory, false)?;
         let query_opts = CiQueryOptions {
             target_ref: args.target_ref.clone().or_else(|| args.branch.clone()),
-            pr_number: args.pr,
+            pr_number: args.pr.first().copied(),
             remote: args.remote.clone(),
             max_excerpt_lines: args.max_excerpt_lines,
             include_checks: args.checks.clone(),
@@ -3285,6 +3842,118 @@ fn render_watch_progress_event(event: &CiWatchEvent) {
                 failing_count,
                 pending_count
             );
+        }
+    }
+}
+
+fn apply_workflow_report_to_envelope<T>(
+    env: &mut Envelope<T>,
+    report: &CiWorkflowReport,
+) -> ExitCode {
+    if let Some(ref watch) = report.watch {
+        match watch.outcome {
+            CiWatchOutcome::Passed => return ExitCode::Success,
+            CiWatchOutcome::FailedFast | CiWatchOutcome::Failed => {
+                let code = ExitCode::ConflictOrCheckFail;
+                env.ok = false;
+                env.error = Some(EnvelopeError {
+                    code: "check_failed".to_string(),
+                    exit_code: code.as_i32(),
+                    message: format!("workflow '{}' failed", report.workflow),
+                });
+                return code;
+            }
+            CiWatchOutcome::TimedOut => {
+                let code = ExitCode::ConflictOrCheckFail;
+                env.ok = false;
+                env.error = Some(EnvelopeError {
+                    code: "watch_timed_out".to_string(),
+                    exit_code: code.as_i32(),
+                    message: format!(
+                        "workflow '{}' watch timed out after {}s",
+                        report.workflow, watch.elapsed_secs
+                    ),
+                });
+                return code;
+            }
+            CiWatchOutcome::NoChecksTimedOut => {
+                let code = ExitCode::ConflictOrCheckFail;
+                env.ok = false;
+                env.error = Some(EnvelopeError {
+                    code: "no_checks_timed_out".to_string(),
+                    exit_code: code.as_i32(),
+                    message: format!(
+                        "no runs found for workflow '{}' after {}s",
+                        report.workflow, watch.elapsed_secs
+                    ),
+                });
+                return code;
+            }
+            CiWatchOutcome::Superseded => return ExitCode::ConflictOrCheckFail,
+        }
+    }
+
+    if report.failing_count > 0 {
+        let code = ExitCode::ConflictOrCheckFail;
+        env.ok = false;
+        env.error = Some(EnvelopeError {
+            code: "check_failed".to_string(),
+            exit_code: code.as_i32(),
+            message: format!("latest run of workflow '{}' failed", report.workflow),
+        });
+        if let Some(job_id) = report
+            .runs
+            .first()
+            .and_then(|r| {
+                r.jobs
+                    .iter()
+                    .find(|j| j.log_excerpt.is_some() || j.failing_step.is_some())
+                    .and_then(|j| j.job_id)
+            })
+        {
+            env.recovery_commands
+                .push(format!("oz ci --job {job_id} --max-excerpt-lines 150 --json"));
+        }
+        code
+    } else {
+        ExitCode::Success
+    }
+}
+
+fn render_workflow_report_human(d: &CiWorkflowReport) {
+    let branch_suffix = d
+        .branch_filter
+        .as_deref()
+        .map(|b| format!(" (branch: {b})"))
+        .unwrap_or_default();
+    println!(
+        "Workflow '{}'{} : {} ({} run(s))",
+        d.workflow, branch_suffix, d.overall_status, d.total_runs
+    );
+    for run in &d.runs {
+        let conc = run.conclusion.as_deref().unwrap_or(&run.status);
+        let short_sha = &run.commit_sha[..run.commit_sha.len().min(10)];
+        let br = run.branch.as_deref().unwrap_or("-");
+        let ev = run.event.as_deref().unwrap_or("-");
+        println!(
+            "  run {} [{}] branch={} sha={} event={}",
+            run.run_id, conc, br, short_sha, ev
+        );
+        for job in &run.jobs {
+            let jconc = job.conclusion.as_deref().unwrap_or(&job.status);
+            if let Some(jid) = job.job_id {
+                println!("    [{}] {} (job {})", jconc, job.name, jid);
+            } else {
+                println!("    [{}] {}", jconc, job.name);
+            }
+            if let Some(ref step) = job.failing_step {
+                println!("      failing step: {step}");
+            }
+            if let Some(ref excerpt) = job.log_excerpt {
+                for line in excerpt.lines() {
+                    println!("        {line}");
+                }
+            }
         }
     }
 }

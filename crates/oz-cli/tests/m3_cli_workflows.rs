@@ -1167,6 +1167,7 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
             status: "completed".into(),
             conclusion: Some("failure".into()),
             html_url: None,
+            ..Default::default()
         });
         guard.jobs_by_run.insert(
             900,
@@ -1551,6 +1552,7 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
             status: "completed".into(),
             conclusion: Some("failure".into()),
             html_url: None,
+            ..Default::default()
         });
         guard.jobs_by_run.insert(
             910,

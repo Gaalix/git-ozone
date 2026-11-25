@@ -111,6 +111,145 @@ pub struct GitHubPullRequestReview {
     pub user: Option<GitHubUser>,
 }
 
+/// Pull request review comment from `GET /repos/{owner}/{repo}/pulls/{number}/comments`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubPullRequestComment {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_review_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to_id: Option<u64>,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_hunk: Option<String>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<GitHubUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+/// Top-level issue or pull request conversation comment from `GET /repos/{owner}/{repo}/issues/{number}/comments`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIssueComment {
+    pub id: u64,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<GitHubUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+/// GraphQL review thread resolution/outdated metadata keyed by REST comment `databaseId`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubReviewThreadMeta {
+    pub thread_id: String,
+    pub is_resolved: bool,
+    pub is_outdated: bool,
+    #[serde(default)]
+    pub comment_ids: Vec<u64>,
+}
+
+/// Label attached to a GitHub issue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubLabel {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Milestone attached to a GitHub issue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubMilestone {
+    pub number: u64,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// Marker object present on `GitHubIssue` when the issue number refers to a pull request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIssuePullRequestRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+/// GitHub Issue returned by `GET /repos/{owner}/{repo}/issues/{number}` (REST, avoids deprecated GraphQL `projectCards`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIssue {
+    pub number: u64,
+    #[serde(default)]
+    pub html_url: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_reason: Option<String>,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<GitHubUser>,
+    #[serde(default)]
+    pub labels: Vec<GitHubLabel>,
+    #[serde(default)]
+    pub assignees: Vec<GitHubUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<GitHubMilestone>,
+    #[serde(default)]
+    pub comments: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<GitHubIssuePullRequestRef>,
+}
+
+/// GitHub Actions workflow definition from `GET /repos/{owner}/{repo}/actions/workflows`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubWorkflow {
+    pub id: u64,
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowsEnvelope {
+    #[serde(default)]
+    workflows: Vec<GitHubWorkflow>,
+}
+
 /// Single inline comment entry inside [`CreatePullRequestReviewPayload`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubReviewCommentPayload {
@@ -190,7 +329,7 @@ struct CheckRunsEnvelope {
 }
 
 /// GitHub Actions workflow run summary from `GET /repos/{owner}/{repo}/actions/runs`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubWorkflowRun {
     pub id: u64,
     #[serde(default)]
@@ -203,6 +342,14 @@ pub struct GitHubWorkflowRun {
     pub conclusion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub html_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,7 +625,8 @@ impl GitHubClient {
         Ok(all)
     }
 
-    /// Lists reviews on a pull request (`GET /repos/{owner}/{repo}/pulls/{number}/reviews`).
+    /// Lists reviews on a pull request (`GET /repos/{owner}/{repo}/pulls/{number}/reviews`),
+    /// paginating automatically.
     pub fn list_pull_request_reviews(
         &self,
         owner: &str,
@@ -486,7 +634,181 @@ impl GitHubClient {
         number: u64,
     ) -> Result<Vec<GitHubPullRequestReview>> {
         let path = format!("/repos/{owner}/{repo}/pulls/{number}/reviews");
-        self.get_json_with_query(&path, &[("per_page".to_string(), "100".to_string())])
+        let mut all = Vec::new();
+        for page in 1u32..=10 {
+            let batch: Vec<GitHubPullRequestReview> = self.get_json_with_query(
+                &path,
+                &[
+                    ("per_page".to_string(), "100".to_string()),
+                    ("page".to_string(), page.to_string()),
+                ],
+            )?;
+            let count = batch.len();
+            all.extend(batch);
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Lists inline review comments on a pull request (`GET /repos/{owner}/{repo}/pulls/{number}/comments`),
+    /// paginating automatically.
+    pub fn list_pull_request_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GitHubPullRequestComment>> {
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}/comments");
+        let mut all = Vec::new();
+        for page in 1u32..=10 {
+            let batch: Vec<GitHubPullRequestComment> = self.get_json_with_query(
+                &path,
+                &[
+                    ("per_page".to_string(), "100".to_string()),
+                    ("page".to_string(), page.to_string()),
+                ],
+            )?;
+            let count = batch.len();
+            all.extend(batch);
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Lists top-level issue / PR conversation comments (`GET /repos/{owner}/{repo}/issues/{number}/comments`),
+    /// paginating automatically.
+    pub fn list_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GitHubIssueComment>> {
+        let path = format!("/repos/{owner}/{repo}/issues/{number}/comments");
+        let mut all = Vec::new();
+        for page in 1u32..=10 {
+            let batch: Vec<GitHubIssueComment> = self.get_json_with_query(
+                &path,
+                &[
+                    ("per_page".to_string(), "100".to_string()),
+                    ("page".to_string(), page.to_string()),
+                ],
+            )?;
+            let count = batch.len();
+            all.extend(batch);
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Fetches a single GitHub issue via REST (`GET /repos/{owner}/{repo}/issues/{number}`),
+    /// avoiding deprecated classic GraphQL `projectCards` fields.
+    pub fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GitHubIssue> {
+        let path = format!("/repos/{owner}/{repo}/issues/{number}");
+        self.get_json_with_query(&path, &[])
+    }
+
+    /// Best-effort GraphQL lookup for PR `reviewThreads` (`isResolved`, `isOutdated`, thread IDs).
+    pub fn list_pull_request_review_threads_graphql(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GitHubReviewThreadMeta>> {
+        const QUERY: &str = r#"
+            query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  reviewThreads(first: 100, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      id
+                      isResolved
+                      isOutdated
+                      comments(first: 50) {
+                        nodes { databaseId }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+
+        let mut threads = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..5 {
+            let vars = serde_json::json!({
+                "owner": owner,
+                "repo": repo,
+                "number": number,
+                "after": cursor,
+            });
+            let resp = self.graphql(QUERY, vars)?;
+            let Some(rt) = resp
+                .get("data")
+                .and_then(|d| d.get("repository"))
+                .and_then(|r| r.get("pullRequest"))
+                .and_then(|p| p.get("reviewThreads"))
+            else {
+                break;
+            };
+            if let Some(nodes) = rt.get("nodes").and_then(|n| n.as_array()) {
+                for node in nodes {
+                    let Some(thread_id) = node.get("id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let is_resolved = node
+                        .get("isResolved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let is_outdated = node
+                        .get("isOutdated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let comment_ids = node
+                        .get("comments")
+                        .and_then(|c| c.get("nodes"))
+                        .and_then(|n| n.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| item.get("databaseId").and_then(|v| v.as_u64()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    threads.push(GitHubReviewThreadMeta {
+                        thread_id: thread_id.to_string(),
+                        is_resolved,
+                        is_outdated,
+                        comment_ids,
+                    });
+                }
+            }
+            let has_next = rt
+                .get("pageInfo")
+                .and_then(|p| p.get("hasNextPage"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !has_next {
+                break;
+            }
+            cursor = rt
+                .get("pageInfo")
+                .and_then(|p| p.get("endCursor"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(threads)
     }
 
     /// Submits a pull request review (`POST /repos/{owner}/{repo}/pulls/{number}/reviews`).
@@ -665,6 +987,55 @@ impl GitHubClient {
             params.push(("head_sha".to_string(), sha.to_string()));
         }
         let path = format!("/repos/{owner}/{repo}/actions/runs");
+        Ok(map_conditional(
+            self.get_json_conditional::<WorkflowRunsEnvelope>(&path, &params, if_none_match)?,
+            |env| env.workflow_runs,
+        ))
+    }
+
+    /// Lists GitHub Actions workflows (`GET /repos/{owner}/{repo}/actions/workflows`).
+    pub fn list_workflows(&self, owner: &str, repo: &str) -> Result<Vec<GitHubWorkflow>> {
+        let path = format!("/repos/{owner}/{repo}/actions/workflows");
+        let params = vec![("per_page".to_string(), "100".to_string())];
+        let env: WorkflowsEnvelope = self.get_json_with_query(&path, &params)?;
+        Ok(env.workflows)
+    }
+
+    /// Lists runs for a specific GitHub Actions workflow (`GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs`).
+    pub fn list_workflow_runs_for_workflow(
+        &self,
+        owner: &str,
+        repo: &str,
+        workflow_id: &str,
+        branch: Option<&str>,
+        per_page: usize,
+    ) -> Result<Vec<GitHubWorkflowRun>> {
+        let encoded = encode_path_segment(workflow_id);
+        let path = format!("/repos/{owner}/{repo}/actions/workflows/{encoded}/runs");
+        let mut params = vec![("per_page".to_string(), per_page.clamp(1, 100).to_string())];
+        if let Some(br) = branch {
+            params.push(("branch".to_string(), br.to_string()));
+        }
+        let env: WorkflowRunsEnvelope = self.get_json_with_query(&path, &params)?;
+        Ok(env.workflow_runs)
+    }
+
+    /// Conditionally lists runs for a specific GitHub Actions workflow with `ETag` support.
+    pub fn list_workflow_runs_for_workflow_conditional(
+        &self,
+        owner: &str,
+        repo: &str,
+        workflow_id: &str,
+        branch: Option<&str>,
+        per_page: usize,
+        if_none_match: Option<&str>,
+    ) -> Result<ConditionalGet<Vec<GitHubWorkflowRun>>> {
+        let encoded = encode_path_segment(workflow_id);
+        let path = format!("/repos/{owner}/{repo}/actions/workflows/{encoded}/runs");
+        let mut params = vec![("per_page".to_string(), per_page.clamp(1, 100).to_string())];
+        if let Some(br) = branch {
+            params.push(("branch".to_string(), br.to_string()));
+        }
         Ok(map_conditional(
             self.get_json_conditional::<WorkflowRunsEnvelope>(&path, &params, if_none_match)?,
             |env| env.workflow_runs,

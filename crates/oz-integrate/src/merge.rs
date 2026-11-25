@@ -32,6 +32,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Fast-forward policy for [`integrate`] / `oz merge`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeFastForwardMode {
+    /// Always create a merge commit even when the target branch is an ancestor of the source (`oz integrate` / `--no-ff`).
+    #[default]
+    NoFf,
+    /// Fast-forward when target is strictly an ancestor of source; otherwise create a 2-parent merge commit (default for `oz merge`).
+    AllowFf,
+    /// Only allow fast-forward updates; fail with conflict if branches have diverged (`--ff-only`).
+    FfOnly,
+}
+
 /// Options controlling [`integrate`].
 #[derive(Debug, Clone, Default)]
 pub struct IntegrateOptions {
@@ -47,6 +60,8 @@ pub struct IntegrateOptions {
     pub force: bool,
     /// Optional custom merge commit message.
     pub message: Option<String>,
+    /// Fast-forward handling (`NoFf` default for `oz integrate`; `AllowFf` / `FfOnly` for `oz merge`).
+    pub fast_forward: MergeFastForwardMode,
 }
 
 /// Summary returned after [`integrate`] or [`continue_integration`] succeeds.
@@ -59,6 +74,8 @@ pub struct IntegrateOutcome {
     pub merged_sources: Vec<String>,
     #[serde(default)]
     pub already_integrated: Vec<String>,
+    #[serde(default)]
+    pub fast_forwarded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub op_id: Option<String>,
     pub main_worktree_synced: bool,
@@ -119,6 +136,7 @@ pub fn integrate(
         allow_out_of_scope: opts.allow_out_of_scope,
         force: opts.force,
         message: opts.message.clone(),
+        fast_forward: opts.fast_forward,
     };
 
     run_merge_pipeline(
@@ -195,6 +213,7 @@ pub fn continue_integration_with_verify(
         allow_out_of_scope: state.allow_out_of_scope,
         force: state.force,
         message: state.message.clone(),
+        fast_forward: MergeFastForwardMode::NoFf,
     };
 
     run_merge_pipeline(
@@ -219,6 +238,7 @@ struct IntegrateExecutionCtx {
     allow_out_of_scope: bool,
     force: bool,
     message: Option<String>,
+    fast_forward: MergeFastForwardMode,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -234,12 +254,38 @@ fn run_merge_pipeline(
     existing_sandbox: Option<(&Path, ObjectId)>,
     actor: ActorInfo,
 ) -> Result<IntegrateOutcome> {
+    let mut all_fast_forwarded = !sources.is_empty();
     for (idx, src) in sources.iter().enumerate() {
         let src_oid = parse_oid(&src.commit_oid)?;
         if is_ancestor(gix_repo, src_oid, current_tip_oid)? {
             already_integrated.push(src.name.clone());
             continue;
         }
+
+        if matches!(
+            ctx.fast_forward,
+            MergeFastForwardMode::AllowFf | MergeFastForwardMode::FfOnly
+        ) {
+            if is_ancestor(gix_repo, current_tip_oid, src_oid)? {
+                current_tip_oid = src_oid;
+                merged_sources.push(src.name.clone());
+                continue;
+            }
+            if ctx.fast_forward == MergeFastForwardMode::FfOnly {
+                return Err(OzError::Conflict {
+                    message: format!(
+                        "cannot fast-forward '{}' to '{}': branches have diverged",
+                        ctx.into_branch, src.name
+                    ),
+                    conflicts: Vec::new(),
+                    recovery: vec![
+                        format!("oz merge {}", src.name),
+                        format!("oz merge --no-ff {}", src.name),
+                    ],
+                });
+            }
+        }
+        all_fast_forwarded = false;
 
         let merge_opts: gix::merge::commit::Options = gix_repo
             .tree_merge_options()
@@ -354,11 +400,13 @@ fn run_merge_pipeline(
             tree_oid: ctx.original_into_tree.to_hex().to_string(),
             merged_sources,
             already_integrated,
+            fast_forwarded: false,
             op_id: None,
             main_worktree_synced: false,
         });
     }
 
+    let fast_forwarded = all_fast_forwarded && existing_sandbox.is_none();
     finalize_integration(
         caller_repo,
         main_repo,
@@ -367,6 +415,7 @@ fn run_merge_pipeline(
         current_tip_oid,
         merged_sources,
         already_integrated,
+        fast_forwarded,
         existing_sandbox,
         actor,
     )
@@ -381,6 +430,7 @@ fn finalize_integration(
     final_commit_oid: ObjectId,
     merged_sources: Vec<String>,
     already_integrated: Vec<String>,
+    fast_forwarded: bool,
     existing_sandbox: Option<(&Path, ObjectId)>,
     actor: ActorInfo,
 ) -> Result<IntegrateOutcome> {
@@ -494,8 +544,40 @@ fn finalize_integration(
         ws_updates.push((ws, summary.mount_health));
     }
 
+    // Also check if caller is a plain linked Git worktree (`git worktree add`) on `ctx.into_branch`
+    // that isn't already covered by Ozone's registered `ws_updates`.
+    let caller_already_in_ws_updates = ws_updates.iter().any(|(ws, _)| {
+        ws.worktree_path == caller_repo.workdir_path
+            || caller_repo.workspace.as_deref() == Some(ws.name.as_str())
+    });
+    let caller_is_plain_linked_wt = caller_repo.is_linked_worktree
+        && !caller_already_in_ws_updates
+        && caller_repo.branch.as_deref() == Some(ctx.into_branch.as_str());
+    let mut caller_linked_wt_dirty = None;
+    if caller_is_plain_linked_wt && let Ok(st) = compute_status(caller_repo) {
+        let conflicts = conflicting_dirty_paths(&st, &delta);
+        if !conflicts.is_empty() {
+            if created_temp_sandbox {
+                let _ = cleanup_session_and_sandbox(main_repo, Some(&sandbox_dir));
+            }
+            return Err(OzError::Conflict {
+                message: format!(
+                    "linked worktree on '{}' has conflicting uncommitted changes in: {}",
+                    ctx.into_branch,
+                    conflicts.join(", ")
+                ),
+                conflicts: Vec::new(),
+                recovery: vec![format!(
+                    "oz -C {} commit -m \"save local edits\"",
+                    caller_repo.workdir_path.display()
+                )],
+            });
+        }
+        caller_linked_wt_dirty = Some(st.changes);
+    }
+
     let use_caller_ws_tx = !main_on_into
-        && caller_repo.workspace.is_some()
+        && (caller_repo.workspace.is_some() || caller_is_plain_linked_wt)
         && caller_repo.branch.as_deref() == Some(ctx.into_branch.as_str());
     let tx_repo = if use_caller_ws_tx {
         caller_repo
@@ -503,7 +585,9 @@ fn finalize_integration(
         main_repo
     };
     let tx_dirty_override = if use_caller_ws_tx {
-        caller_ws_dirty.as_deref()
+        caller_ws_dirty
+            .as_deref()
+            .or(caller_linked_wt_dirty.as_deref())
     } else {
         main_status.as_ref().map(|s| s.changes.as_slice())
     };
@@ -587,6 +671,22 @@ fn finalize_integration(
         write_workspace_state_atomic(&main_repo.layout.workspace_state_path(&ws.name), &ws)?;
     }
 
+    if caller_is_plain_linked_wt && caller_repo.workdir_path.is_dir() {
+        apply_tree_delta_with_cleanup(
+            gix_repo,
+            ctx.original_into_tree,
+            final_tree_id,
+            &caller_repo.workdir_path,
+        )?;
+        sync_git_index_for_delta(
+            &caller_repo.git_dir,
+            &caller_repo.workdir_path,
+            ctx.original_into_tree,
+            final_tree_id,
+            &delta,
+        )?;
+    }
+
     let _ = cleanup_session_and_sandbox(
         main_repo,
         existing_sandbox.map(|(p, _)| p).or(Some(&sandbox_dir)),
@@ -601,8 +701,9 @@ fn finalize_integration(
         tree_oid: final_tree_id.to_hex().to_string(),
         merged_sources,
         already_integrated,
+        fast_forwarded,
         op_id: Some(op_entry.op_id),
-        main_worktree_synced: main_on_into,
+        main_worktree_synced: main_on_into || caller_is_plain_linked_wt,
     })
 }
 
