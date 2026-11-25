@@ -98,12 +98,24 @@ fn projfs_layer_engine_resolves_layers_hides_markers_and_supports_repo_fallback(
         .expect("exists");
     assert_eq!(shared.layer, LayerKind::Seed);
     assert_eq!(shared.file_size, 9);
-    assert!(engine
-        .placeholder_info("seed_deleted.txt")
-        .expect("ph")
-        .is_none());
-    assert!(engine.placeholder_info("stray.oz_wh").expect("ph").is_none());
-    assert!(engine.placeholder_info("stray.oz_opq").expect("ph").is_none());
+    assert!(
+        engine
+            .placeholder_info("seed_deleted.txt")
+            .expect("ph")
+            .is_none()
+    );
+    assert!(
+        engine
+            .placeholder_info("stray.oz_wh")
+            .expect("ph")
+            .is_none()
+    );
+    assert!(
+        engine
+            .placeholder_info("stray.oz_opq")
+            .expect("ph")
+            .is_none()
+    );
 
     // Without seed or baseline, engine falls back to repo_root while hiding `.git/`.
     let dir2 = TempDir::new().expect("tempdir2");
@@ -114,7 +126,12 @@ fn projfs_layer_engine_resolves_layers_hides_markers_and_supports_repo_fallback(
     let root2 = engine2.enumerate_dir("", None).expect("enum fallback");
     assert_eq!(root2.len(), 1);
     assert_eq!(root2[0].name, "README.md");
-    assert!(engine2.placeholder_info(".git").expect("git hidden").is_none());
+    assert!(
+        engine2
+            .placeholder_info(".git")
+            .expect("git hidden")
+            .is_none()
+    );
     assert!(
         engine2
             .placeholder_info(".git/HEAD")
@@ -314,7 +331,11 @@ fn projfs_cow_persistence_produces_identical_scan_dirty_paths_to_fuse3() {
     engine
         .record_deleted_path("to_delete.txt")
         .expect("delete to_delete");
-    assert!(spec.meta_dir.join("whiteouts/to_delete.txt.oz_wh").is_file());
+    assert!(
+        spec.meta_dir
+            .join("whiteouts/to_delete.txt.oz_wh")
+            .is_file()
+    );
 
     // 3. Delete directory pkg then recreate pkg -> opaque marker hides lower files.
     engine.record_deleted_path("pkg").expect("delete pkg");
@@ -341,7 +362,8 @@ fn projfs_cow_persistence_produces_identical_scan_dirty_paths_to_fuse3() {
         .expect("rename dir");
     assert!(!spec.upper_dir.join("mv_dir").exists());
     assert_eq!(
-        std::fs::read_to_string(spec.upper_dir.join("moved_dir/base_item.txt")).expect("moved base"),
+        std::fs::read_to_string(spec.upper_dir.join("moved_dir/base_item.txt"))
+            .expect("moved base"),
         "mv-base"
     );
     assert_eq!(
@@ -395,8 +417,7 @@ fn projfs_cow_persistence_produces_identical_scan_dirty_paths_to_fuse3() {
     assert!(!spec.upper_dir.join("notif_renamed.txt").exists());
 
     let dirty = scan_dirty_paths(&cfg).expect("scan_dirty_paths");
-    let summary: Vec<(String, ChangeKind)> =
-        dirty.into_iter().map(|d| (d.path, d.kind)).collect();
+    let summary: Vec<(String, ChangeKind)> = dirty.into_iter().map(|d| (d.path, d.kind)).collect();
     assert_eq!(
         summary,
         vec![
@@ -449,10 +470,11 @@ fn projfs_guid_and_windows_setup_helpers_behave_deterministically() {
     })
     .expect_err("must fail without admin");
     assert!(matches!(err, OzError::CheckFailed { .. }));
-    assert!(err
-        .recovery_commands()
-        .iter()
-        .any(|r| r.contains(PROJFS_ENABLE_POWERSHELL_CMD)));
+    assert!(
+        err.recovery_commands()
+            .iter()
+            .any(|r| r.contains(PROJFS_ENABLE_POWERSHELL_CMD))
+    );
 }
 
 #[test]
@@ -483,9 +505,30 @@ fn tcp_loopback_daemon_round_trips_ipc_and_cleans_up_endpoint_on_shutdown() {
 
     let endpoint = std::fs::read_to_string(&sock_path).expect("read endpoint");
     assert!(
-        endpoint.starts_with("tcp://127.0.0.1:") && endpoint.ends_with('\n'),
+        endpoint.starts_with("tcp://127.0.0.1:")
+            && endpoint.contains("\ntoken=")
+            && endpoint.ends_with('\n'),
         "unexpected endpoint file content: {endpoint:?}"
     );
+
+    // Unauthenticated raw TCP requests must be rejected before executing commands.
+    {
+        use std::io::{BufRead, BufReader, Write};
+        let parsed = oz_vfsd::protocol::parse_tcp_endpoint(&endpoint).expect("parse endpoint");
+        let mut raw_stream = std::net::TcpStream::connect(parsed.addr).expect("raw connect");
+        raw_stream
+            .write_all(b"{\"op\":\"shutdown\"}\n")
+            .expect("write unauth shutdown");
+        raw_stream.flush().expect("flush");
+        let mut reader = BufReader::new(raw_stream);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).expect("read response");
+        let resp: VfsResponse = serde_json::from_str(resp_line.trim()).expect("parse resp");
+        assert!(
+            matches!(resp, VfsResponse::Error { ref code, .. } if code == "unauthorized"),
+            "expected unauthorized for unauthenticated TCP shutdown, got {resp:?}"
+        );
+    }
 
     match send_tcp_request(&sock_path, &VfsRequest::Ping).expect("ping") {
         VfsResponse::Pong { pid, .. } => assert_eq!(pid, std::process::id()),

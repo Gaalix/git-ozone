@@ -5,7 +5,10 @@
 
 use crate::lookup::find_oz_vfsd_bin;
 use crate::overlay::lazy_unmount_fuse;
-use crate::protocol::{DirtyPathEntry, MountInfo, MountSpec, VfsRequest, VfsResponse, encode_line};
+use crate::protocol::{
+    AuthenticatedRequest, DirtyPathEntry, MountInfo, MountSpec, VfsRequest, VfsResponse,
+    encode_line, parse_tcp_endpoint,
+};
 use oz_core::{MountRecord, OzError, OzoneLayout, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -43,6 +46,7 @@ pub fn global_daemon_socket_path() -> Option<PathBuf> {
         {
             return Some(PathBuf::from(xdg).join("oz-vfsd.sock"));
         }
+        // SAFETY: `libc::geteuid()` is always safe to call and has no preconditions.
         let uid = unsafe { libc::geteuid() };
         Some(PathBuf::from(format!("/tmp/oz-vfsd-{uid}/vfsd.sock")))
     }
@@ -88,14 +92,161 @@ pub fn is_any_daemon_running(git_dir: Option<&Path>) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn verify_socket_parent_owner_if_exists(socket_path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(parent) = socket_path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let meta = match std::fs::symlink_metadata(parent) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(OzError::Io(err)),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(OzError::GuardrailViolation {
+            kind: "ipc_security".to_string(),
+            message: format!(
+                "refusing oz-vfsd IPC socket '{}': parent '{}' is not a real directory",
+                socket_path.display(),
+                parent.display()
+            ),
+            recovery: Vec::new(),
+        });
+    }
+    // SAFETY: `libc::geteuid()` is always safe to call and has no preconditions.
+    let my_uid = unsafe { libc::geteuid() };
+    if meta.uid() != my_uid {
+        return Err(OzError::GuardrailViolation {
+            kind: "ipc_security".to_string(),
+            message: format!(
+                "refusing oz-vfsd IPC socket '{}': parent '{}' is owned by uid {} (expected {my_uid})",
+                socket_path.display(),
+                parent.display(),
+                meta.uid()
+            ),
+            recovery: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_socket_endpoint_owner(socket_path: &Path, is_tcp_file: bool) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: `libc::geteuid()` is always safe to call and has no preconditions.
+    let my_uid = unsafe { libc::geteuid() };
+
+    if let Some(parent) = socket_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let parent_meta = std::fs::symlink_metadata(parent)?;
+        if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+            return Err(OzError::GuardrailViolation {
+                kind: "ipc_security".to_string(),
+                message: format!(
+                    "refusing oz-vfsd IPC socket '{}': parent '{}' is not a real directory",
+                    socket_path.display(),
+                    parent.display()
+                ),
+                recovery: Vec::new(),
+            });
+        }
+        if parent_meta.uid() != my_uid {
+            return Err(OzError::GuardrailViolation {
+                kind: "ipc_security".to_string(),
+                message: format!(
+                    "refusing oz-vfsd IPC socket '{}': parent '{}' is owned by uid {} (expected {my_uid})",
+                    socket_path.display(),
+                    parent.display(),
+                    parent_meta.uid()
+                ),
+                recovery: Vec::new(),
+            });
+        }
+    }
+
+    let sock_meta = std::fs::symlink_metadata(socket_path)?;
+    if sock_meta.file_type().is_symlink() {
+        return Err(OzError::GuardrailViolation {
+            kind: "ipc_security".to_string(),
+            message: format!(
+                "refusing oz-vfsd IPC endpoint '{}': symlink endpoints are not permitted",
+                socket_path.display()
+            ),
+            recovery: Vec::new(),
+        });
+    }
+    if is_tcp_file && !sock_meta.is_file() {
+        return Err(OzError::GuardrailViolation {
+            kind: "ipc_security".to_string(),
+            message: format!(
+                "refusing oz-vfsd TCP endpoint '{}': expected a regular file",
+                socket_path.display()
+            ),
+            recovery: Vec::new(),
+        });
+    }
+    if sock_meta.uid() != my_uid {
+        return Err(OzError::GuardrailViolation {
+            kind: "ipc_security".to_string(),
+            message: format!(
+                "refusing oz-vfsd IPC endpoint '{}': owned by uid {} (expected {my_uid})",
+                socket_path.display(),
+                sock_meta.uid()
+            ),
+            recovery: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_socket_endpoint_owner(socket_path: &Path, is_tcp_file: bool) -> Result<()> {
+    let sock_meta = std::fs::symlink_metadata(socket_path)?;
+    if sock_meta.file_type().is_symlink() {
+        return Err(OzError::GuardrailViolation {
+            kind: "ipc_security".to_string(),
+            message: format!(
+                "refusing oz-vfsd IPC endpoint '{}': symlink endpoints are not permitted",
+                socket_path.display()
+            ),
+            recovery: Vec::new(),
+        });
+    }
+    if is_tcp_file && !sock_meta.is_file() {
+        return Err(OzError::GuardrailViolation {
+            kind: "ipc_security".to_string(),
+            message: format!(
+                "refusing oz-vfsd TCP endpoint '{}': expected a regular file",
+                socket_path.display()
+            ),
+            recovery: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
 fn exchange_ipc_line<S: std::io::Read + std::io::Write>(
     mut stream: S,
     socket_path: &Path,
     req: &VfsRequest,
+    auth_token: Option<&str>,
 ) -> Result<VfsResponse> {
     use std::io::{BufRead, BufReader};
 
-    let encoded = encode_line(req)?;
+    let encoded = match auth_token {
+        Some(tok) => encode_line(&AuthenticatedRequest::with_token(
+            req.clone(),
+            tok.to_string(),
+        ))?,
+        None => encode_line(req)?,
+    };
     stream.write_all(encoded.as_bytes())?;
     stream.flush()?;
 
@@ -112,34 +263,19 @@ fn exchange_ipc_line<S: std::io::Read + std::io::Write>(
     Ok(resp)
 }
 
-/// Sends a single [`VfsRequest`] over loopback TCP using the `"tcp://127.0.0.1:<port>"`
-/// endpoint stored inside `socket_path`.
+/// Sends a single authenticated [`VfsRequest`] over loopback TCP using the endpoint metadata
+/// (`tcp://127.0.0.1:<port>\ntoken=<hex>\n`) stored inside `socket_path`.
 pub fn send_tcp_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsResponse> {
+    verify_socket_endpoint_owner(socket_path, true)?;
     let raw = std::fs::read_to_string(socket_path)?;
-    let addr_raw = raw.trim().strip_prefix("tcp://").ok_or_else(|| {
-        OzError::Other(format!(
-            "invalid oz-vfsd TCP endpoint in {} (expected 'tcp://127.0.0.1:<port>')",
-            socket_path.display()
-        ))
-    })?;
-    let addr: std::net::SocketAddr = addr_raw.parse().map_err(|err| {
-        OzError::Other(format!(
-            "invalid oz-vfsd TCP socket address '{addr_raw}' in {}: {err}",
-            socket_path.display()
-        ))
-    })?;
-    if !addr.ip().is_loopback() {
-        return Err(OzError::Other(format!(
-            "refusing non-loopback oz-vfsd IPC address {addr} in {}",
-            socket_path.display()
-        )));
-    }
+    let endpoint = parse_tcp_endpoint(&raw)
+        .map_err(|msg| OzError::Other(format!("{msg} (in {})", socket_path.display())))?;
 
-    let stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    let stream = std::net::TcpStream::connect_timeout(&endpoint.addr, Duration::from_secs(2))?;
     let timeout = Some(Duration::from_secs(10));
     let _ = stream.set_read_timeout(timeout);
     let _ = stream.set_write_timeout(timeout);
-    exchange_ipc_line(stream, socket_path, req)
+    exchange_ipc_line(stream, socket_path, req, Some(&endpoint.auth_token))
 }
 
 /// Sends a single [`VfsRequest`] over `socket_path` and parses the JSON line [`VfsResponse`].
@@ -147,11 +283,12 @@ pub fn send_tcp_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsRespo
 pub fn send_request(socket_path: &Path, req: &VfsRequest) -> Result<VfsResponse> {
     use std::os::unix::net::UnixStream;
 
+    verify_socket_endpoint_owner(socket_path, false)?;
     let stream = UnixStream::connect(socket_path)?;
     let timeout = Some(Duration::from_secs(10));
     let _ = stream.set_read_timeout(timeout);
     let _ = stream.set_write_timeout(timeout);
-    exchange_ipc_line(stream, socket_path, req)
+    exchange_ipc_line(stream, socket_path, req, None)
 }
 
 /// Sends a single [`VfsRequest`] over loopback TCP using the endpoint stored in `socket_path`.
@@ -225,6 +362,9 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
         }
     }
 
+    #[cfg(unix)]
+    verify_socket_parent_owner_if_exists(&sock)?;
+
     if std::fs::symlink_metadata(&sock).is_ok() {
         let _ = std::fs::remove_file(&sock);
     }
@@ -246,6 +386,8 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // SAFETY: The `pre_exec` closure captures no state, performs no heap allocations,
+        // and calls only `libc::setsid()` (which is async-signal-safe per POSIX.1).
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -608,14 +750,19 @@ mod win_no_inherit {
             let lock = GUARD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
             let mut saved = Vec::with_capacity(3);
             for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // SAFETY: `GetStdHandle` is safe to call with standard Win32 `STD_*_HANDLE` IDs.
                 let handle = unsafe { GetStdHandle(std_id) };
                 if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                     continue;
                 }
                 let mut flags = 0u32;
+                // SAFETY: `handle` is non-null and not `INVALID_HANDLE_VALUE`, and `&mut flags`
+                // points to valid writable stack memory while `GUARD_LOCK` serializes access.
                 if unsafe { GetHandleInformation(handle, &mut flags) } != 0
                     && (flags & HANDLE_FLAG_INHERIT) != 0
                 {
+                    // SAFETY: `handle` is a valid standard handle owned by the process and
+                    // `GUARD_LOCK` serializes toggling `HANDLE_FLAG_INHERIT` across spawns.
                     let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
                     saved.push((handle, flags));
                 }
@@ -627,8 +774,14 @@ mod win_no_inherit {
     impl Drop for StdioNoInheritGuard {
         fn drop(&mut self) {
             for (handle, orig_flags) in self.saved.drain(..) {
+                // SAFETY: `handle` was captured from `GetStdHandle` in `acquire` while holding
+                // `GUARD_LOCK` (still held until after `drop` finishes), restoring its prior flag.
                 let _ = unsafe {
-                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, orig_flags & HANDLE_FLAG_INHERIT)
+                    SetHandleInformation(
+                        handle,
+                        HANDLE_FLAG_INHERIT,
+                        orig_flags & HANDLE_FLAG_INHERIT,
+                    )
                 };
             }
         }
@@ -657,5 +810,56 @@ fn read_log_tail(log_path: &Path) -> String {
     } else {
         let joined: Vec<&str> = tail.into_iter().rev().collect();
         format!(" (log: {})", joined.join(" | "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn send_tcp_request_rejects_missing_token_and_non_loopback() {
+        let dir = TempDir::new().expect("tempdir");
+        let missing_tok = dir.path().join("no_token.sock");
+        std::fs::write(&missing_tok, "tcp://127.0.0.1:12345\n").expect("write");
+        assert!(send_tcp_request(&missing_tok, &VfsRequest::Ping).is_err());
+
+        let non_loopback = dir.path().join("remote.sock");
+        std::fs::write(&non_loopback, "tcp://10.0.0.1:12345\ntoken=abcdef\n").expect("write");
+        assert!(send_tcp_request(&non_loopback, &VfsRequest::Ping).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_verifies_socket_parent_and_rejects_symlink_endpoints() {
+        let dir = TempDir::new().expect("tempdir");
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir_all(&real_parent).expect("mkdir");
+        let real_file = real_parent.join("vfsd.sock");
+        std::fs::write(&real_file, "tcp://127.0.0.1:12345\ntoken=abc\n").expect("write");
+
+        // Symlinked endpoint file must be rejected before connecting/reading.
+        let link_file = real_parent.join("link.sock");
+        std::os::unix::fs::symlink(&real_file, &link_file).expect("symlink file");
+        assert!(verify_socket_endpoint_owner(&link_file, true).is_err());
+        assert!(verify_socket_endpoint_owner(&link_file, false).is_err());
+
+        // Symlinked parent directory must be rejected.
+        let link_parent = dir.path().join("link_parent");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).expect("symlink parent");
+        assert!(verify_socket_endpoint_owner(&link_parent.join("vfsd.sock"), true).is_err());
+        assert!(verify_socket_parent_owner_if_exists(&link_parent.join("vfsd.sock")).is_err());
+
+        // Non-UID-owned parent directory (e.g. root-owned `/tmp`) must be rejected when non-root.
+        // SAFETY: `libc::geteuid()` is always safe to call and has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            let root_parent_sock = Path::new("/tmp/oz-vfsd-unowned-test.sock");
+            assert!(verify_socket_parent_owner_if_exists(root_parent_sock).is_err());
+            assert!(send_request(root_parent_sock, &VfsRequest::Ping).is_err());
+        }
+
+        // Owned real directory and regular file passes.
+        verify_socket_endpoint_owner(&real_file, true).expect("valid owned tcp endpoint");
     }
 }

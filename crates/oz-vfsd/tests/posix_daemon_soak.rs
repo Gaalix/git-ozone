@@ -130,11 +130,13 @@ fn posix_flock_and_fcntl_advisory_lock_soak_including_cross_process() {
             .open(&fcntl_file)
             .expect("open fcntl file");
 
+        // SAFETY: `libc::flock` is a plain C struct for which all-zeroes is a valid initial state.
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
         fl.l_type = libc::F_WRLCK as libc::c_short;
         fl.l_whence = libc::SEEK_SET as libc::c_short;
         fl.l_start = 0;
         fl.l_len = 64;
+        // SAFETY: `f.as_raw_fd()` is an open writable file descriptor and `&fl` is a valid `libc::flock`.
         assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
 
         let probe_out = Command::new("python3")
@@ -154,6 +156,7 @@ fn posix_flock_and_fcntl_advisory_lock_soak_including_cross_process() {
         );
 
         fl.l_type = libc::F_UNLCK as libc::c_short;
+        // SAFETY: `f.as_raw_fd()` is still open and `&fl` is a valid initialized `libc::flock`.
         assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
 
         let after_unlock = Command::new("python3")
@@ -193,6 +196,8 @@ fn posix_mmap_msync_atomic_rename_and_fsync_soak_with_dirty_scan() {
         .expect("open mmap");
     f.set_len(4096).expect("set_len");
 
+    // SAFETY: `f` is an open 4096-byte read/write file descriptor; passing a null address lets
+    // the kernel pick a valid page-aligned mapping of length 4096.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -204,6 +209,8 @@ fn posix_mmap_msync_atomic_rename_and_fsync_soak_with_dirty_scan() {
         )
     };
     assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+    // SAFETY: `ptr` is a valid non-`MAP_FAILED` 4096-byte writable mapping exclusively accessed
+    // by this thread until `munmap` releases it below.
     unsafe {
         let slice = std::slice::from_raw_parts_mut(ptr.cast::<u8>(), 4096);
         slice[..11].copy_from_slice(b"MMAP_SOAK_!");
@@ -214,6 +221,7 @@ fn posix_mmap_msync_atomic_rename_and_fsync_soak_with_dirty_scan() {
     drop(f);
 
     let dir_fd = File::open(&cfg.upper_dir).expect("open upper dir");
+    // SAFETY: `dir_fd.as_raw_fd()` is an open directory file descriptor.
     assert_eq!(unsafe { libc::fsync(dir_fd.as_raw_fd()) }, 0);
     drop(dir_fd);
 

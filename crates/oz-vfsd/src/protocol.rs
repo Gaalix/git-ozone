@@ -5,7 +5,11 @@
 
 use oz_core::ChangeKind;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+
+/// Maximum size in bytes of a single newline-delimited JSON IPC request frame (1 MiB).
+pub const MAX_IPC_LINE_BYTES: usize = 1024 * 1024;
 
 /// Mount configuration sent to `oz-vfsd` to materialize a VFS workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +129,87 @@ pub enum VfsResponse {
     },
 }
 
+/// Wire-level IPC request envelope carrying an optional per-instance authentication token
+/// alongside the flattened [`VfsRequest`] payload.
+///
+/// Unix domain socket connections authenticate peers via kernel `SO_PEERCRED` and may omit
+/// `auth_token` (remaining wire-compatible with bare [`VfsRequest`] JSON objects).
+/// Loopback TCP connections require `auth_token` on every request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    #[serde(flatten)]
+    pub request: VfsRequest,
+}
+
+impl AuthenticatedRequest {
+    /// Wraps `request` without an auth token (for peer-credentialed Unix sockets).
+    #[must_use]
+    pub const fn unauthenticated(request: VfsRequest) -> Self {
+        Self {
+            auth_token: None,
+            request,
+        }
+    }
+
+    /// Wraps `request` with a per-instance loopback TCP authentication token.
+    #[must_use]
+    pub const fn with_token(request: VfsRequest, auth_token: String) -> Self {
+        Self {
+            auth_token: Some(auth_token),
+            request,
+        }
+    }
+}
+
+/// Parsed loopback TCP IPC endpoint metadata stored in a daemon endpoint file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpEndpointInfo {
+    pub addr: SocketAddr,
+    pub auth_token: String,
+}
+
+/// Formats loopback TCP endpoint metadata (`tcp://127.0.0.1:<port>\ntoken=<hex>\n`).
+#[must_use]
+pub fn format_tcp_endpoint(port: u16, auth_token: &str) -> String {
+    format!("tcp://127.0.0.1:{port}\ntoken={auth_token}\n")
+}
+
+/// Parses loopback TCP endpoint metadata written by `run_tcp_daemon`.
+///
+/// Enforces that line 1 is a loopback `tcp://<ip>:<port>` address and that a non-empty
+/// `token=<value>` line is present (fail-closed if absent).
+pub fn parse_tcp_endpoint(raw: &str) -> std::result::Result<TcpEndpointInfo, String> {
+    let mut lines = raw.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().ok_or_else(|| {
+        "empty oz-vfsd TCP endpoint file (expected 'tcp://127.0.0.1:<port>')".to_string()
+    })?;
+    let addr_raw = first.strip_prefix("tcp://").ok_or_else(|| {
+        "invalid oz-vfsd TCP endpoint (expected 'tcp://127.0.0.1:<port>')".to_string()
+    })?;
+    let addr: SocketAddr = addr_raw
+        .parse()
+        .map_err(|err| format!("invalid oz-vfsd TCP socket address '{addr_raw}': {err}"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!("refusing non-loopback oz-vfsd IPC address {addr}"));
+    }
+
+    let mut auth_token: Option<String> = None;
+    for line in lines {
+        if let Some(tok) = line.strip_prefix("token=") {
+            let tok = tok.trim();
+            if !tok.is_empty() {
+                auth_token = Some(tok.to_string());
+            }
+        }
+    }
+    let auth_token = auth_token
+        .ok_or_else(|| "missing authentication token in oz-vfsd TCP endpoint file".to_string())?;
+
+    Ok(TcpEndpointInfo { addr, auth_token })
+}
+
 /// Encodes any IPC request/response as a single newline-terminated JSON line.
 pub fn encode_line<T: Serialize>(msg: &T) -> serde_json::Result<String> {
     let mut line = serde_json::to_string(msg)?;
@@ -159,6 +244,47 @@ mod tests {
         let decoded: VfsRequest = serde_json::from_str(encoded.trim()).expect("decode req");
         assert_eq!(decoded, req);
 
+        // Bare VfsRequest JSON also decodes cleanly as an unauthenticated AuthenticatedRequest.
+        let bare_env: AuthenticatedRequest =
+            serde_json::from_str(encoded.trim()).expect("decode bare req into envelope");
+        assert_eq!(bare_env.auth_token, None);
+        assert_eq!(bare_env.request, req);
+
+        // AuthenticatedRequest with token round-trips across all request variants.
+        let token = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string();
+        for variant in [
+            VfsRequest::Ping,
+            VfsRequest::Status,
+            req.clone(),
+            VfsRequest::Unmount {
+                workspace: "agent-auth".to_string(),
+                force: true,
+                git_dir: Some(PathBuf::from("/repo/.git")),
+            },
+            VfsRequest::DirtyPaths {
+                workspace: "agent-auth".to_string(),
+                git_dir: None,
+            },
+            VfsRequest::ListMounts,
+            VfsRequest::Shutdown,
+        ] {
+            let env = AuthenticatedRequest::with_token(variant.clone(), token.clone());
+            let line = encode_line(&env).expect("encode auth envelope");
+            assert!(line.contains("\"auth_token\""));
+            let decoded_env: AuthenticatedRequest =
+                serde_json::from_str(line.trim()).expect("decode auth envelope");
+            assert_eq!(decoded_env.auth_token.as_deref(), Some(token.as_str()));
+            assert_eq!(decoded_env.request, variant);
+
+            let unauth = AuthenticatedRequest::unauthenticated(variant.clone());
+            let unauth_line = encode_line(&unauth).expect("encode unauth envelope");
+            assert!(!unauth_line.contains("auth_token"));
+            let decoded_unauth: AuthenticatedRequest =
+                serde_json::from_str(unauth_line.trim()).expect("decode unauth envelope");
+            assert_eq!(decoded_unauth.auth_token, None);
+            assert_eq!(decoded_unauth.request, variant);
+        }
+
         let resp = VfsResponse::DirtySet {
             workspace: "agent-auth".to_string(),
             paths: vec![DirtyPathEntry {
@@ -171,5 +297,27 @@ mod tests {
         let decoded_resp: VfsResponse =
             serde_json::from_str(encoded_resp.trim()).expect("decode resp");
         assert_eq!(decoded_resp, resp);
+    }
+
+    #[test]
+    fn tcp_endpoint_metadata_formats_and_validates_fail_closed() {
+        let tok = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let formatted = format_tcp_endpoint(45123, tok);
+        assert!(formatted.starts_with("tcp://127.0.0.1:45123\n"));
+        assert!(formatted.ends_with('\n'));
+        let parsed = parse_tcp_endpoint(&formatted).expect("parse valid endpoint");
+        assert_eq!(parsed.addr.port(), 45123);
+        assert!(parsed.addr.ip().is_loopback());
+        assert_eq!(parsed.auth_token, tok);
+
+        // Missing token must fail closed.
+        assert!(parse_tcp_endpoint("tcp://127.0.0.1:45123\n").is_err());
+        assert!(parse_tcp_endpoint("tcp://127.0.0.1:45123\ntoken=\n").is_err());
+        // Non-loopback address must be rejected.
+        assert!(parse_tcp_endpoint(&format!("tcp://0.0.0.0:45123\ntoken={tok}\n")).is_err());
+        assert!(parse_tcp_endpoint(&format!("tcp://192.168.1.5:45123\ntoken={tok}\n")).is_err());
+        // Invalid scheme / empty content must be rejected.
+        assert!(parse_tcp_endpoint("").is_err());
+        assert!(parse_tcp_endpoint("http://127.0.0.1:45123\ntoken=abc\n").is_err());
     }
 }

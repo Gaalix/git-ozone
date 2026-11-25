@@ -8,8 +8,9 @@
 use oz_core::{ChangeKind, MountHealth, MountRecord, OzoneLayout, OzoneRepo, is_enotconn};
 use oz_vfsd::{
     MountInfo, MountSpec, VfsRequest, VfsResponse, dirty_paths_via_daemon,
-    ensure_daemon_and_mounts, lazy_unmount_fuse, mount_overlay, mount_via_daemon, ping_daemon,
-    send_request, shutdown_daemon, socket_path_for_git_dir, unmount_via_daemon,
+    ensure_daemon_and_mounts, global_daemon_socket_path, lazy_unmount_fuse, mount_overlay,
+    mount_via_daemon, mount_via_daemon_with_auto_start, ping_daemon, send_request, shutdown_daemon,
+    socket_path_for_git_dir, unmount_via_daemon,
 };
 use std::fs::{FileTimes, OpenOptions, Permissions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -19,33 +20,110 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
+/// Returns `true` when the current Linux process has `NoNewPrivs: 1` in `/proc/self/status`,
+/// which prevents invoking setuid `fusermount3` directly from this process or its children.
+fn has_no_new_privs() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    status.lines().any(|line| {
+        line.strip_prefix("NoNewPrivs:")
+            .is_some_and(|val| val.trim() == "1")
+    })
+}
+
+fn dev_fuse_accessible() -> bool {
+    std::fs::metadata("/dev/fuse").is_ok()
+}
+
+fn global_daemon_is_reachable() -> bool {
+    global_daemon_socket_path().is_some_and(|sock| ping_daemon(&sock).is_ok())
+}
+
+fn require_direct_per_repo_fuse(test_name: &str) -> bool {
+    if !dev_fuse_accessible() {
+        eprintln!("SKIP {test_name}: /dev/fuse is not accessible in this environment");
+        return false;
+    }
+    if has_no_new_privs() {
+        eprintln!(
+            "SKIP {test_name}: Linux NoNewPrivs=1 blocks per-repo daemon FUSE3 mounting and direct fusermount3 -u (cannot SIGKILL an external user-wide oz-vfsd daemon)"
+        );
+        return false;
+    }
+    if global_daemon_is_reachable() {
+        eprintln!(
+            "SKIP {test_name}: an external user-wide oz-vfsd daemon is active; skipping destructive per-repo daemon SIGKILL/SIGTERM test"
+        );
+        return false;
+    }
+    true
+}
+
+enum OverlayBackend {
+    Direct(oz_vfsd::MountedOverlay),
+    ExternalDaemon { git_dir: PathBuf, workspace: String },
+}
+
 struct OverlayGuard {
-    mounted: Option<oz_vfsd::MountedOverlay>,
+    backend: Option<OverlayBackend>,
     mount_point: PathBuf,
 }
 
 impl OverlayGuard {
-    fn new(spec: &MountSpec) -> Self {
-        let mounted = mount_overlay(spec).expect("mount live fuse overlay");
-        Self {
-            mounted: Some(mounted),
-            mount_point: spec.mount_point.clone(),
+    /// Mounts the overlay directly via `mount_overlay` when direct FUSE3 mounting is permitted,
+    /// delegates to an active external user-wide `oz-vfsd` daemon when `NoNewPrivs: 1` blocks
+    /// setuid `fusermount3` in-process, or returns `None` (printing a clear skip note) when
+    /// `NoNewPrivs: 1` is active without a reachable external daemon (or `/dev/fuse` is absent).
+    fn try_new(test_name: &str, spec: &MountSpec) -> Option<Self> {
+        if !dev_fuse_accessible() {
+            eprintln!("SKIP {test_name}: /dev/fuse is not accessible in this environment");
+            return None;
         }
+        if !has_no_new_privs() {
+            let mounted = mount_overlay(spec).expect("mount live fuse overlay");
+            return Some(Self {
+                backend: Some(OverlayBackend::Direct(mounted)),
+                mount_point: spec.mount_point.clone(),
+            });
+        }
+        if !global_daemon_is_reachable() {
+            eprintln!(
+                "SKIP {test_name}: Linux NoNewPrivs=1 blocks setuid fusermount3 and no live user-wide oz-vfsd socket is reachable"
+            );
+            return None;
+        }
+        mount_via_daemon_with_auto_start(&spec.git_dir, spec, false)
+            .expect("mount live fuse overlay via active external oz-vfsd daemon");
+        Some(Self {
+            backend: Some(OverlayBackend::ExternalDaemon {
+                git_dir: spec.git_dir.clone(),
+                workspace: spec.workspace.clone(),
+            }),
+            mount_point: spec.mount_point.clone(),
+        })
     }
 }
 
 impl Drop for OverlayGuard {
     fn drop(&mut self) {
-        if let Some(m) = self.mounted.take() {
-            let _ = m.unmount(true);
-        } else {
-            let _ = lazy_unmount_fuse(&self.mount_point);
+        match self.backend.take() {
+            Some(OverlayBackend::Direct(m)) => {
+                let _ = m.unmount(true);
+            }
+            Some(OverlayBackend::ExternalDaemon { git_dir, workspace }) => {
+                let _ = unmount_via_daemon(&git_dir, &workspace, true);
+            }
+            None => {
+                let _ = lazy_unmount_fuse(&self.mount_point);
+            }
         }
     }
 }
 
 struct DaemonGuard {
     git_dirs: Vec<PathBuf>,
+    workspaces: Vec<(PathBuf, String)>,
     mount_points: Vec<PathBuf>,
     reap_pids: Vec<u32>,
 }
@@ -54,6 +132,7 @@ impl DaemonGuard {
     fn new() -> Self {
         Self {
             git_dirs: Vec::new(),
+            workspaces: Vec::new(),
             mount_points: Vec::new(),
             reap_pids: Vec::new(),
         }
@@ -64,6 +143,10 @@ impl DaemonGuard {
         self.mount_points.extend(mount_points);
     }
 
+    fn track_workspace(&mut self, git_dir: PathBuf, workspace: impl Into<String>) {
+        self.workspaces.push((git_dir, workspace.into()));
+    }
+
     fn track_pid(&mut self, pid: u32) {
         self.reap_pids.push(pid);
     }
@@ -71,6 +154,9 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
+        for (git_dir, workspace) in &self.workspaces {
+            let _ = unmount_via_daemon(git_dir, workspace, true);
+        }
         for git_dir in &self.git_dirs {
             let sock = socket_path_for_git_dir(git_dir);
             if let Ok(pong) = ping_daemon(&sock) {
@@ -94,6 +180,8 @@ impl Drop for DaemonGuard {
         }
         for pid in &self.reap_pids {
             let mut status: libc::c_int = 0;
+            // SAFETY: Non-blocking `waitpid` with a valid stack `&mut status` reaps child PIDs
+            // tracked by this test guard; `ECHILD` is safely ignored.
             unsafe {
                 let _ = libc::waitpid(*pid as libc::pid_t, &mut status, libc::WNOHANG);
             }
@@ -102,13 +190,18 @@ impl Drop for DaemonGuard {
 }
 
 fn make_spec(root: &Path, ws: &str, with_seed: bool, with_base: bool) -> MountSpec {
-    let git_dir = root.join("repo/.git");
+    let repo_root = root.join("repo");
+    let git_dir = repo_root.join(".git");
     let ws_meta_parent = git_dir.join("ozone/ws").join(ws);
     let upper_dir = ws_meta_parent.join("upper");
     let meta_dir = ws_meta_parent.join("meta");
     let mount_point = root.join("repo.oz").join(ws);
     let baseline_dir = with_base.then(|| git_dir.join("ozone/baselines/base1/root"));
 
+    std::fs::create_dir_all(git_dir.join("objects")).expect("mkdir git objects");
+    if !git_dir.join("HEAD").exists() {
+        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("write HEAD");
+    }
     std::fs::create_dir_all(&upper_dir).expect("mkdir upper");
     std::fs::create_dir_all(meta_dir.join("whiteouts")).expect("mkdir whiteouts");
     std::fs::create_dir_all(meta_dir.join("opaque")).expect("mkdir opaque");
@@ -124,7 +217,7 @@ fn make_spec(root: &Path, ws: &str, with_seed: bool, with_base: bool) -> MountSp
     MountSpec {
         workspace: ws.to_string(),
         branch: format!("feat/{ws}"),
-        repo_root: root.join("repo"),
+        repo_root,
         git_dir,
         mount_point,
         upper_dir,
@@ -162,7 +255,11 @@ fn live_fuse_three_layer_read_through_and_cow_writes() {
     )
     .expect("write seed_whiteout");
 
-    let _guard = OverlayGuard::new(&spec);
+    let Some(_guard) =
+        OverlayGuard::try_new("live_fuse_three_layer_read_through_and_cow_writes", &spec)
+    else {
+        return;
+    };
     let mnt = &spec.mount_point;
 
     assert_eq!(
@@ -308,7 +405,12 @@ fn live_fuse_unlink_rmdir_opaque_rename_link_readdir_and_open_unlinked() {
     std::fs::create_dir_all(seed.join("pkg")).expect("mkdir seed pkg");
     std::fs::write(seed.join("pkg/c.txt"), b"c").expect("write c");
 
-    let _guard = OverlayGuard::new(&spec);
+    let Some(_guard) = OverlayGuard::try_new(
+        "live_fuse_unlink_rmdir_opaque_rename_link_readdir_and_open_unlinked",
+        &spec,
+    ) else {
+        return;
+    };
     let mnt = &spec.mount_point;
 
     // Merged readdir deduplicates across layers.
@@ -402,16 +504,15 @@ fn live_fuse_unlink_rmdir_opaque_rename_link_readdir_and_open_unlinked() {
 
     // statfs + lchown (current uid/gid) + rename overwriting existing target.
     let c_mnt = std::ffi::CString::new(mnt.to_string_lossy().as_bytes()).expect("cstr");
+    // SAFETY: `libc::statvfs` is a plain C struct for which all-zeroes is valid initial storage.
     let mut svfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_mnt` is a valid NUL-terminated path and `&mut svfs` is valid writable storage.
     assert_eq!(unsafe { libc::statvfs(c_mnt.as_ptr(), &mut svfs) }, 0);
     assert!(svfs.f_namemax > 0 && svfs.f_bsize > 0);
 
-    std::os::unix::fs::lchown(
-        mnt.join("renamed_fresh.txt"),
-        Some(unsafe { libc::geteuid() }),
-        Some(unsafe { libc::getegid() }),
-    )
-    .expect("lchown");
+    // SAFETY: `libc::geteuid()` and `libc::getegid()` are always safe to call.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    std::os::unix::fs::lchown(mnt.join("renamed_fresh.txt"), Some(uid), Some(gid)).expect("lchown");
 
     std::fs::write(mnt.join("overwrite_src.txt"), b"new-body").expect("write src");
     std::fs::rename(mnt.join("overwrite_src.txt"), mnt.join("renamed_fresh.txt"))
@@ -449,7 +550,12 @@ fn live_fuse_host_side_undo_restores_are_visible_immediately() {
     let base = spec.baseline_dir.as_ref().expect("base");
     std::fs::write(base.join("doc.txt"), b"v1").expect("write v1");
 
-    let _guard = OverlayGuard::new(&spec);
+    let Some(_guard) = OverlayGuard::try_new(
+        "live_fuse_host_side_undo_restores_are_visible_immediately",
+        &spec,
+    ) else {
+        return;
+    };
     let mnt = &spec.mount_point;
 
     assert_eq!(
@@ -544,6 +650,9 @@ fn init_real_git_repo(repo_root: &Path) -> String {
 
 #[test]
 fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
+    if !require_direct_per_repo_fuse("live_daemon_multi_mount_dirty_paths_and_sigkill_recovery") {
+        return;
+    }
     let dir = TempDir::new().expect("tempdir");
     let repo_root = dir.path().join("repo");
     let head_oid = init_real_git_repo(&repo_root);
@@ -570,6 +679,8 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
         git_dir.clone(),
         vec![spec1.mount_point.clone(), spec2.mount_point.clone()],
     );
+    guard.track_workspace(git_dir.clone(), "ws1");
+    guard.track_workspace(git_dir.clone(), "ws2");
 
     let info1: MountInfo = mount_via_daemon(&git_dir, &spec1).expect("mount ws1");
     let info2: MountInfo = mount_via_daemon(&git_dir, &spec2).expect("mount ws2");
@@ -639,9 +750,11 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
     );
 
     // SIGKILL oz-vfsd directly while open_mid is still open!
+    // SAFETY: `first_pong.pid` is the per-repo `oz-vfsd` child spawned by this test.
     let kill_rc = unsafe { libc::kill(first_pong.pid as libc::pid_t, libc::SIGKILL) };
     assert_eq!(kill_rc, 0, "SIGKILL failed");
     let mut status: libc::c_int = 0;
+    // SAFETY: `first_pong.pid` is a child process and `&mut status` is valid stack storage.
     let waited = unsafe { libc::waitpid(first_pong.pid as libc::pid_t, &mut status, 0) };
     assert_eq!(waited, first_pong.pid as libc::pid_t);
     assert!(libc::WIFSIGNALED(status));
@@ -695,9 +808,11 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
 
     // SIGTERM cleanly unmounts while keeping mount.json mounted: true, so re-running
     // ensure_daemon_and_mounts restores active workspaces again.
+    // SAFETY: `second_pong.pid` is the recovered per-repo `oz-vfsd` child spawned by this test.
     let term_rc = unsafe { libc::kill(second_pong.pid as libc::pid_t, libc::SIGTERM) };
     assert_eq!(term_rc, 0, "SIGTERM failed");
     let mut term_status: libc::c_int = 0;
+    // SAFETY: `second_pong.pid` is a child process and `&mut term_status` is valid stack storage.
     let waited_term = unsafe { libc::waitpid(second_pong.pid as libc::pid_t, &mut term_status, 0) };
     assert_eq!(waited_term, second_pong.pid as libc::pid_t);
     assert!(libc::WIFEXITED(term_status) && libc::WEXITSTATUS(term_status) == 0);
@@ -721,6 +836,7 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
 
     shutdown_daemon(&git_dir).expect("shutdown daemon");
     let mut status2: libc::c_int = 0;
+    // SAFETY: `third_pong.pid` is a child process and `&mut status2` is valid stack storage.
     let _ = unsafe { libc::waitpid(third_pong.pid as libc::pid_t, &mut status2, 0) };
     // Verify ws1 mountpoint is cleanly unmounted (not ENOTCONN).
     assert!(std::fs::symlink_metadata(&spec1.mount_point).is_ok());
@@ -761,7 +877,11 @@ fn live_fuse_advisory_locks_flock_and_fcntl_soak() {
     std::fs::create_dir_all(base.join("target")).expect("mkdir base target");
     std::fs::write(base.join("target/.cargo-lock"), b"").expect("write base cargo-lock");
 
-    let _guard = OverlayGuard::new(&spec);
+    let Some(_guard) =
+        OverlayGuard::try_new("live_fuse_advisory_locks_flock_and_fcntl_soak", &spec)
+    else {
+        return;
+    };
     let mnt = &spec.mount_point;
     let lock_path = mnt.join("target/.cargo-lock");
 
@@ -818,11 +938,13 @@ fn live_fuse_advisory_locks_flock_and_fcntl_soak() {
         .truncate(false)
         .open(&fcntl_path)
         .expect("open fcntl lock");
+    // SAFETY: `libc::flock` is a plain C struct for which all-zeroes is a valid initial state.
     let mut fl: libc::flock = unsafe { std::mem::zeroed() };
     fl.l_type = libc::F_WRLCK as libc::c_short;
     fl.l_whence = libc::SEEK_SET as libc::c_short;
     fl.l_start = 0;
     fl.l_len = 64;
+    // SAFETY: `f.as_raw_fd()` is an open writable file descriptor and `&fl` is a valid `libc::flock`.
     assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
 
     if Command::new("python3")
@@ -844,6 +966,7 @@ fn live_fuse_advisory_locks_flock_and_fcntl_soak() {
     }
 
     fl.l_type = libc::F_UNLCK as libc::c_short;
+    // SAFETY: `f.as_raw_fd()` is still open and `&fl` is a valid initialized `libc::flock`.
     assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
 }
 
@@ -859,7 +982,12 @@ fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
     std::fs::set_permissions(base.join("tool.sh"), Permissions::from_mode(0o755)).expect("chmod");
     std::fs::write(base.join("ro_map.bin"), b"BASELINE_MMAP_PAYLOAD").expect("write ro_map");
 
-    let _guard = OverlayGuard::new(&spec);
+    let Some(_guard) = OverlayGuard::try_new(
+        "live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak",
+        &spec,
+    ) else {
+        return;
+    };
     let mnt = &spec.mount_point;
 
     // 1. O_CREAT | O_WRONLY | O_TRUNC on baseline 0755 file must preserve 0755 mode.
@@ -899,6 +1027,8 @@ fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
 
     // 3. MAP_PRIVATE on baseline file + MAP_SHARED PROT_READ|PROT_WRITE + msync + fsync + fsyncdir.
     let ro_f = std::fs::File::open(mnt.join("ro_map.bin")).expect("open ro_map");
+    // SAFETY: `ro_f` is an open 21-byte file descriptor; mapping 21 bytes read-only with a null
+    // address lets the kernel choose a valid page-aligned mapping.
     let ro_ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -910,8 +1040,10 @@ fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
         )
     };
     assert_ne!(ro_ptr, libc::MAP_FAILED);
+    // SAFETY: `ro_ptr` is a valid non-`MAP_FAILED` 21-byte read-only mapping alive until `munmap`.
     let ro_slice = unsafe { std::slice::from_raw_parts(ro_ptr.cast::<u8>(), 21) };
     assert_eq!(ro_slice, b"BASELINE_MMAP_PAYLOAD");
+    // SAFETY: `ro_ptr` was returned by `mmap` with length 21 and `ro_slice` is no longer used.
     unsafe { assert_eq!(libc::munmap(ro_ptr, 21), 0) };
     drop(ro_f);
 
@@ -924,6 +1056,7 @@ fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
         .open(&rw_path)
         .expect("open rw_map");
     rw_f.set_len(4096).expect("set_len");
+    // SAFETY: `rw_f` is an open 4096-byte read/write file descriptor; kernel selects mapping address.
     let rw_ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -935,6 +1068,8 @@ fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
         )
     };
     assert_ne!(rw_ptr, libc::MAP_FAILED);
+    // SAFETY: `rw_ptr` is a valid non-`MAP_FAILED` 4096-byte writable mapping exclusively accessed
+    // by this thread until `munmap` releases it below.
     unsafe {
         let s = std::slice::from_raw_parts_mut(rw_ptr.cast::<u8>(), 4096);
         s[..10].copy_from_slice(b"FUSE_MMAP!");
@@ -945,6 +1080,7 @@ fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
     drop(rw_f);
 
     let dir_f = std::fs::File::open(mnt).expect("open mount dir");
+    // SAFETY: `dir_f.as_raw_fd()` is an open directory file descriptor.
     assert_eq!(unsafe { libc::fsync(dir_f.as_raw_fd()) }, 0);
     drop(dir_f);
     assert_eq!(
@@ -1014,7 +1150,9 @@ fn live_fuse_concurrent_cargo_build_soak() {
         String::from_utf8_lossy(&pre.stderr)
     );
 
-    let _guard = OverlayGuard::new(&spec);
+    let Some(_guard) = OverlayGuard::try_new("live_fuse_concurrent_cargo_build_soak", &spec) else {
+        return;
+    };
     let mnt = &spec.mount_point;
 
     // Modify source inside FUSE3 mount and launch two concurrent `cargo test --offline` builds
@@ -1064,6 +1202,9 @@ fn live_fuse_concurrent_cargo_build_soak() {
 
 #[test]
 fn live_fuse_stale_endpoint_recovery_without_hanging_ls_or_df() {
+    if !require_direct_per_repo_fuse("live_fuse_stale_endpoint_recovery_without_hanging_ls_or_df") {
+        return;
+    }
     let dir = TempDir::new().expect("tempdir");
     let repo_root = dir.path().join("repo");
     let head_oid = init_real_git_repo(&repo_root);
@@ -1079,17 +1220,18 @@ fn live_fuse_stale_endpoint_recovery_without_hanging_ls_or_df() {
 
     let mut guard = DaemonGuard::new();
     guard.track(git_dir.clone(), vec![spec.mount_point.clone()]);
+    guard.track_workspace(git_dir.clone(), "ws-stale");
     mount_via_daemon(&git_dir, &spec).expect("mount ws-stale");
     let sock = socket_path_for_git_dir(&git_dir);
     let pong1 = ping_daemon(&sock).expect("ping1");
     guard.track_pid(pong1.pid);
 
     // 1. SIGKILL daemon -> verify `ls` and `df` return quickly (never hang on dead FUSE).
-    assert_eq!(
-        unsafe { libc::kill(pong1.pid as libc::pid_t, libc::SIGKILL) },
-        0
-    );
+    // SAFETY: `pong1.pid` is the per-repo `oz-vfsd` child spawned by this test.
+    let kill_rc = unsafe { libc::kill(pong1.pid as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(kill_rc, 0);
     let mut st: libc::c_int = 0;
+    // SAFETY: `pong1.pid` is a child process and `&mut st` is valid stack storage.
     let _ = unsafe { libc::waitpid(pong1.pid as libc::pid_t, &mut st, 0) };
 
     let mut ls_dead = Command::new("ls");
