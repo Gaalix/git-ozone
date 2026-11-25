@@ -78,6 +78,14 @@ pub enum OzError {
     #[error("git error: {0}")]
     Git(String),
 
+    /// Structured Git / `gix` error that preserves the underlying causal error chain.
+    #[error("{}", format_git_source(context.as_deref(), source.as_ref()))]
+    GitSource {
+        context: Option<String>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// Filesystem I/O failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -89,9 +97,85 @@ pub enum OzError {
     /// Generic backend or internal error.
     #[error("{0}")]
     Other(String),
+
+    /// Structured backend or internal error that preserves the underlying causal error chain.
+    #[error("{}", format_other_source(context.as_deref(), source.as_ref()))]
+    OtherSource {
+        context: Option<String>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+fn format_git_source(
+    context: Option<&str>,
+    source: &(dyn std::error::Error + Send + Sync),
+) -> String {
+    match context {
+        Some(ctx) if !ctx.is_empty() => format!("git error: {ctx}: {source}"),
+        _ => format!("git error: {source}"),
+    }
+}
+
+fn format_other_source(
+    context: Option<&str>,
+    source: &(dyn std::error::Error + Send + Sync),
+) -> String {
+    match context {
+        Some(ctx) if !ctx.is_empty() => format!("{ctx}: {source}"),
+        _ => source.to_string(),
+    }
 }
 
 impl OzError {
+    /// Wraps a typed Git / `gix` error while preserving its [`std::error::Error::source`] chain.
+    #[must_use]
+    pub fn git_source<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::GitSource {
+            context: None,
+            source: Box::new(source),
+        }
+    }
+
+    /// Wraps a typed Git / `gix` error with context while preserving its [`std::error::Error::source`] chain.
+    #[must_use]
+    pub fn git_context<E>(context: impl Into<String>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::GitSource {
+            context: Some(context.into()),
+            source: Box::new(source),
+        }
+    }
+
+    /// Wraps a backend or internal error while preserving its [`std::error::Error::source`] chain.
+    #[must_use]
+    pub fn other_source<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::OtherSource {
+            context: None,
+            source: Box::new(source),
+        }
+    }
+
+    /// Wraps a backend or internal error with context while preserving its [`std::error::Error::source`] chain.
+    #[must_use]
+    pub fn other_context<E>(context: impl Into<String>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::OtherSource {
+            context: Some(context.into()),
+            source: Box::new(source),
+        }
+    }
+
     /// Maps this error to the canonical Ozone CLI exit code taxonomy:
     /// - `1` for conflicts or check failures
     /// - `2` for usage, repository, config, guardrail, or runtime errors
@@ -109,9 +193,11 @@ impl OzError {
             | Self::WorkspaceNotFound { .. }
             | Self::BinaryNotFound { .. }
             | Self::Git(_)
+            | Self::GitSource { .. }
             | Self::Io(_)
             | Self::Json(_)
-            | Self::Other(_) => ExitCode::UsageOrGuardrail,
+            | Self::Other(_)
+            | Self::OtherSource { .. } => ExitCode::UsageOrGuardrail,
         }
     }
 
@@ -128,10 +214,10 @@ impl OzError {
             Self::MountUnavailable { .. } => "mount_unavailable",
             Self::WorkspaceNotFound { .. } => "workspace_not_found",
             Self::BinaryNotFound { .. } => "binary_not_found",
-            Self::Git(_) => "git_error",
+            Self::Git(_) | Self::GitSource { .. } => "git_error",
             Self::Io(_) => "io_error",
             Self::Json(_) => "json_error",
-            Self::Other(_) => "internal_error",
+            Self::Other(_) | Self::OtherSource { .. } => "internal_error",
         }
     }
 
@@ -160,3 +246,48 @@ impl OzError {
 
 /// Convenience result alias using [`OzError`].
 pub type Result<T> = std::result::Result<T, OzError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::Envelope;
+    use std::error::Error as _;
+
+    #[test]
+    fn structured_git_and_other_sources_preserve_causal_chains_and_codes() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "locked ref");
+        let git_err = OzError::git_source(io_err);
+        assert_eq!(git_err.error_code(), "git_error");
+        assert_eq!(git_err.exit_code(), ExitCode::UsageOrGuardrail);
+        assert_eq!(git_err.to_string(), "git error: locked ref");
+        let src = git_err
+            .source()
+            .expect("git_source preserves Error::source");
+        let downcast = src
+            .downcast_ref::<std::io::Error>()
+            .expect("source downcasts to io::Error");
+        assert_eq!(downcast.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let ctx_git = OzError::git_context(
+            "opening repo",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "missing HEAD"),
+        );
+        assert_eq!(ctx_git.error_code(), "git_error");
+        assert_eq!(ctx_git.to_string(), "git error: opening repo: missing HEAD");
+        assert!(ctx_git.source().is_some());
+
+        let env = Envelope::from_error(&ctx_git);
+        let env_err = env.error.expect("envelope error");
+        assert_eq!(env_err.code, "git_error");
+        assert_eq!(env_err.message, "git error: opening repo: missing HEAD");
+
+        let other_err = OzError::other_context(
+            "directory walk failed",
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "walk aborted"),
+        );
+        assert_eq!(other_err.error_code(), "internal_error");
+        assert_eq!(other_err.exit_code(), ExitCode::UsageOrGuardrail);
+        assert_eq!(other_err.to_string(), "directory walk failed: walk aborted");
+        assert!(other_err.source().is_some());
+    }
+}

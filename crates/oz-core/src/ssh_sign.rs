@@ -1,19 +1,23 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Pure-Rust Ed25519 (RFC 8032), SHA-512 / SHA-256 (FIPS 180-4), Base64 (RFC 4648),
-//! OpenSSH key parsing (`openssh-key-v1` & `ssh-ed25519`), OpenSSH `SSHSIG` v1 signing
-//! and verification (`namespace = "git"`), and SSH signing readiness diagnostics.
+//! Pure-Rust constant-time Ed25519 (RFC 8032 via `ed25519-dalek`), SHA-512 / SHA-256
+//! (FIPS 180-4 via `sha2`), Base64 (RFC 4648), OpenSSH key parsing (`openssh-key-v1` &
+//! `ssh-ed25519`), OpenSSH `SSHSIG` v1 signing and verification (`namespace = "git"`),
+//! and SSH signing readiness diagnostics.
 //!
 //! Zero C or OpenSSL dependencies are used anywhere in this module.
 
 use crate::error::{OzError, Result};
 use crate::repo::OzoneRepo;
 use crate::status::open_gix_for_workspace;
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256, Sha512};
 use std::fs;
 use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// OpenSSH signature armor begin marker.
 pub const SSHSIG_ARMOR_HEADER: &str = "-----BEGIN SSH SIGNATURE-----";
@@ -31,283 +35,26 @@ const SSHSIG_WRAP_COLUMNS: usize = 70;
 const ALG_ED25519: &str = "ssh-ed25519";
 
 // ============================================================================
-// FIPS 180-4 SHA-256 & SHA-512
+// FIPS 180-4 SHA-256 & SHA-512 (via audited `sha2`)
 // ============================================================================
-
-const K256: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-const K512: [u64; 80] = [
-    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
-    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
-    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
-    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
-    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
-    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
-    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
-    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
-    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
-    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
-    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
-    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
-    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
-    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
-    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
-    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
-    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
-    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
-    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
-    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
-];
 
 /// Computes the FIPS 180-4 SHA-256 digest of `data`.
 #[must_use]
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
-
-    let (blocks, rem) = data.as_chunks::<64>();
-    for block in blocks {
-        sha256_compress(&mut state, block);
-    }
-
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut tail = [0u8; 128];
-    tail[..rem.len()].copy_from_slice(rem);
-    tail[rem.len()] = 0x80;
-
-    if rem.len() < 56 {
-        tail[56..64].copy_from_slice(&bit_len.to_be_bytes());
-        let mut blk = [0u8; 64];
-        blk.copy_from_slice(&tail[..64]);
-        sha256_compress(&mut state, &blk);
-    } else {
-        tail[120..128].copy_from_slice(&bit_len.to_be_bytes());
-        let mut blk0 = [0u8; 64];
-        let mut blk1 = [0u8; 64];
-        blk0.copy_from_slice(&tail[..64]);
-        blk1.copy_from_slice(&tail[64..128]);
-        sha256_compress(&mut state, &blk0);
-        sha256_compress(&mut state, &blk1);
-    }
-
-    let mut out = [0u8; 32];
-    for (i, word) in state.iter().enumerate() {
-        out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
-}
-
-fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
-    let mut w = [0u32; 64];
-    for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
-        w[i] = u32::from_be_bytes(*chunk);
-    }
-    for i in 16..64 {
-        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16]
-            .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
-            .wrapping_add(s1);
-    }
-
-    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
-    for i in 0..64 {
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ ((!e) & g);
-        let temp1 = h
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(K256[i])
-            .wrapping_add(w[i]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let temp2 = s0.wrapping_add(maj);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(temp1);
-        d = c;
-        c = b;
-        b = a;
-        a = temp1.wrapping_add(temp2);
-    }
-
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
-    state[5] = state[5].wrapping_add(f);
-    state[6] = state[6].wrapping_add(g);
-    state[7] = state[7].wrapping_add(h);
-}
-
-/// Streaming FIPS 180-4 SHA-512 hasher.
-#[derive(Clone)]
-pub struct Sha512 {
-    state: [u64; 8],
-    buf: [u8; 128],
-    buf_len: usize,
-    total_bytes: u128,
-}
-
-impl Default for Sha512 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Sha512 {
-    /// Creates a new SHA-512 hasher initialized to the standard IV.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667f3bcc908,
-                0xbb67ae8584caa73b,
-                0x3c6ef372fe94f82b,
-                0xa54ff53a5f1d36f1,
-                0x510e527fade682d1,
-                0x9b05688c2b3e6c1f,
-                0x1f83d9abfb41bd6b,
-                0x5be0cd19137e2179,
-            ],
-            buf: [0u8; 128],
-            buf_len: 0,
-            total_bytes: 0,
-        }
-    }
-
-    /// Feeds bytes into the SHA-512 state.
-    pub fn update(&mut self, mut data: &[u8]) {
-        self.total_bytes = self.total_bytes.wrapping_add(data.len() as u128);
-
-        if self.buf_len > 0 {
-            let needed = 128 - self.buf_len;
-            if data.len() < needed {
-                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
-                self.buf_len += data.len();
-                return;
-            }
-            self.buf[self.buf_len..128].copy_from_slice(&data[..needed]);
-            let block = self.buf;
-            sha512_compress(&mut self.state, &block);
-            self.buf_len = 0;
-            data = &data[needed..];
-        }
-
-        let (blocks, rem) = data.as_chunks::<128>();
-        for block in blocks {
-            sha512_compress(&mut self.state, block);
-        }
-
-        if !rem.is_empty() {
-            self.buf[..rem.len()].copy_from_slice(rem);
-            self.buf_len = rem.len();
-        }
-    }
-
-    /// Finalizes the SHA-512 calculation and returns the 64-byte digest.
-    #[must_use]
-    pub fn finalize(mut self) -> [u8; 64] {
-        let bit_len = self.total_bytes.wrapping_mul(8);
-        self.buf[self.buf_len] = 0x80;
-        for b in &mut self.buf[self.buf_len + 1..] {
-            *b = 0;
-        }
-
-        if self.buf_len >= 112 {
-            let block = self.buf;
-            sha512_compress(&mut self.state, &block);
-            self.buf = [0u8; 128];
-        }
-
-        self.buf[112..128].copy_from_slice(&bit_len.to_be_bytes());
-        let final_block = self.buf;
-        sha512_compress(&mut self.state, &final_block);
-
-        let mut out = [0u8; 64];
-        for (i, word) in self.state.iter().enumerate() {
-            out[i * 8..(i + 1) * 8].copy_from_slice(&word.to_be_bytes());
-        }
-        out
-    }
+fn sha256(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
 }
 
 /// Computes the FIPS 180-4 SHA-512 digest of `data`.
 #[must_use]
-pub fn sha512(data: &[u8]) -> [u8; 64] {
-    let mut h = Sha512::new();
-    h.update(data);
-    h.finalize()
-}
-
-fn sha512_compress(state: &mut [u64; 8], block: &[u8; 128]) {
-    let mut w = [0u64; 80];
-    for (i, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
-        w[i] = u64::from_be_bytes(*chunk);
-    }
-    for i in 16..80 {
-        let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
-        let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
-        w[i] = w[i - 16]
-            .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
-            .wrapping_add(s1);
-    }
-
-    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
-    for i in 0..80 {
-        let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
-        let ch = (e & f) ^ ((!e) & g);
-        let temp1 = h
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(K512[i])
-            .wrapping_add(w[i]);
-        let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let temp2 = s0.wrapping_add(maj);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(temp1);
-        d = c;
-        c = b;
-        b = a;
-        a = temp1.wrapping_add(temp2);
-    }
-
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
-    state[5] = state[5].wrapping_add(f);
-    state[6] = state[6].wrapping_add(g);
-    state[7] = state[7].wrapping_add(h);
+fn sha512(data: &[u8]) -> [u8; 64] {
+    Sha512::digest(data).into()
 }
 
 // ============================================================================
 // RFC 4648 Base64 Encode & Decode
 // ============================================================================
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encodes `data` as standard RFC 4648 Base64 with `=` padding.
 #[must_use]
@@ -318,7 +65,7 @@ pub fn base64_encode(data: &[u8]) -> String {
 /// Encodes `data` as standard RFC 4648 Base64 without trailing `=` padding
 /// (used for OpenSSH `SHA256:<fingerprint>` strings).
 #[must_use]
-pub fn base64_encode_no_pad(data: &[u8]) -> String {
+fn base64_encode_no_pad(data: &[u8]) -> String {
     base64_encode_inner(data, false)
 }
 
@@ -357,11 +104,13 @@ fn base64_encode_inner(data: &[u8], pad: bool) -> String {
 }
 
 /// Decodes standard Base64 input, ignoring ASCII whitespace (`' '`, `'\t'`, `'\r'`, `'\n'`).
-pub fn base64_decode(input: &str) -> Result<Vec<u8>> {
-    let clean: Vec<u8> = input
-        .bytes()
-        .filter(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-        .collect();
+fn base64_decode(input: &str) -> Result<Vec<u8>> {
+    let clean = Zeroizing::new(
+        input
+            .bytes()
+            .filter(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .collect::<Vec<u8>>(),
+    );
 
     if clean.is_empty() {
         return Ok(Vec::new());
@@ -378,12 +127,14 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>> {
         let is_last = (chunk_idx + 1) * 4 == clean.len();
         let pad_count = quad.iter().rev().take_while(|&&b| b == b'=').count();
         if pad_count > 2 || (pad_count > 0 && !is_last) {
+            out.zeroize();
             return Err(OzError::InvalidUsage {
                 message: "invalid base64 padding".to_string(),
                 recovery: Vec::new(),
             });
         }
         if quad[..4 - pad_count].contains(&b'=') {
+            out.zeroize();
             return Err(OzError::InvalidUsage {
                 message: "unexpected '=' inside base64 quantum".to_string(),
                 recovery: Vec::new(),
@@ -404,10 +155,42 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>> {
             }
         };
 
-        let s0 = decode_sextet(quad[0])?;
-        let s1 = decode_sextet(quad[1])?;
-        let s2 = if pad_count >= 2 { 0 } else { decode_sextet(quad[2])? };
-        let s3 = if pad_count >= 1 { 0 } else { decode_sextet(quad[3])? };
+        let s0 = match decode_sextet(quad[0]) {
+            Ok(v) => v,
+            Err(e) => {
+                out.zeroize();
+                return Err(e);
+            }
+        };
+        let s1 = match decode_sextet(quad[1]) {
+            Ok(v) => v,
+            Err(e) => {
+                out.zeroize();
+                return Err(e);
+            }
+        };
+        let s2 = if pad_count >= 2 {
+            0
+        } else {
+            match decode_sextet(quad[2]) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.zeroize();
+                    return Err(e);
+                }
+            }
+        };
+        let s3 = if pad_count >= 1 {
+            0
+        } else {
+            match decode_sextet(quad[3]) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.zeroize();
+                    return Err(e);
+                }
+            }
+        };
 
         let triple = (s0 << 18) | (s1 << 12) | (s2 << 6) | s3;
         out.push(((triple >> 16) & 0xff) as u8);
@@ -422,522 +205,48 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decodes standard Base64 input into a [`Zeroizing`] buffer for secret key material.
+fn base64_decode_zeroizing(input: &str) -> Result<Zeroizing<Vec<u8>>> {
+    base64_decode(input).map(Zeroizing::new)
+}
+
 // ============================================================================
-// Pure-Rust RFC 8032 Ed25519
+// Constant-Time RFC 8032 Ed25519 (via audited `ed25519-dalek` + `zeroize`)
 // ============================================================================
 
-const MASK51: u64 = (1u64 << 51) - 1;
-
-/// Element of GF(2^255 - 19) represented in radix 2^51.
-#[derive(Clone, Copy, Debug)]
-struct Fe([u64; 5]);
-
-impl Fe {
-    const ZERO: Self = Self([0, 0, 0, 0, 0]);
-    const ONE: Self = Self([1, 0, 0, 0, 0]);
-
-    const fn from_u64(v: u64) -> Self {
-        Self([v & MASK51, v >> 51, 0, 0, 0])
+/// Checks that the 255-bit little-endian y-coordinate is strictly canonical (`< 2^255 - 19`).
+fn is_canonical_ed25519_y(bytes: &[u8; 32]) -> bool {
+    let top = bytes[31] & 0x7f;
+    if top < 0x7f {
+        return true;
     }
-
-    /// Decodes a 255-bit integer from 32 little-endian bytes (ignoring bit 255).
-    fn from_bytes_unchecked(s: &[u8; 32]) -> Self {
-        let load8 = |offset: usize| -> u64 {
-            u64::from_le_bytes([
-                s[offset],
-                s[offset + 1],
-                s[offset + 2],
-                s[offset + 3],
-                s[offset + 4],
-                s[offset + 5],
-                s[offset + 6],
-                s[offset + 7],
-            ])
-        };
-        let l0 = load8(0) & MASK51;
-        let l1 = (load8(6) >> 3) & MASK51;
-        let l2 = (load8(12) >> 6) & MASK51;
-        let l3 = (load8(19) >> 1) & MASK51;
-        let l4 = (load8(24) >> 12) & MASK51;
-        Self([l0, l1, l2, l3, l4])
+    if bytes[1..31].iter().any(|&b| b != 0xff) {
+        return true;
     }
-
-    /// Strictly decodes a canonical field element `< p` (with top sign bit masked by caller).
-    fn from_bytes_canonical(s_masked: &[u8; 32]) -> Option<Self> {
-        let fe = Self::from_bytes_unchecked(s_masked);
-        if &fe.to_bytes() == s_masked {
-            Some(fe)
-        } else {
-            None
-        }
-    }
-
-    /// Reduces modulo `p = 2^255 - 19` to canonical 32 little-endian bytes.
-    fn to_bytes(self) -> [u8; 32] {
-        let mut l = self.0;
-        for _ in 0..2 {
-            let c0 = l[0] >> 51;
-            l[0] &= MASK51;
-            l[1] += c0;
-            let c1 = l[1] >> 51;
-            l[1] &= MASK51;
-            l[2] += c1;
-            let c2 = l[2] >> 51;
-            l[2] &= MASK51;
-            l[3] += c2;
-            let c3 = l[3] >> 51;
-            l[3] &= MASK51;
-            l[4] += c3;
-            let c4 = l[4] >> 51;
-            l[4] &= MASK51;
-            l[0] += c4 * 19;
-        }
-
-        // Compute q = 1 iff value >= 2^255 - 19, else 0.
-        let mut q = (l[0] + 19) >> 51;
-        q = (l[1] + q) >> 51;
-        q = (l[2] + q) >> 51;
-        q = (l[3] + q) >> 51;
-        q = (l[4] + q) >> 51;
-
-        l[0] += 19 * q;
-        let c0 = l[0] >> 51;
-        l[0] &= MASK51;
-        l[1] += c0;
-        let c1 = l[1] >> 51;
-        l[1] &= MASK51;
-        l[2] += c1;
-        let c2 = l[2] >> 51;
-        l[2] &= MASK51;
-        l[3] += c2;
-        let c3 = l[3] >> 51;
-        l[3] &= MASK51;
-        l[4] = (l[4] + c3) & MASK51;
-
-        // Pack 5 x 51-bit limbs into 32 little-endian bytes.
-        let mut out = [0u8; 32];
-        let mut acc: u128 = 0;
-        let mut bits: usize = 0;
-        let mut limb_idx = 0;
-        for out_byte in &mut out {
-            if bits < 8 && limb_idx < 5 {
-                acc |= (l[limb_idx] as u128) << bits;
-                bits += 51;
-                limb_idx += 1;
-            }
-            *out_byte = (acc & 0xff) as u8;
-            acc >>= 8;
-            bits = bits.saturating_sub(8);
-        }
-        out
-    }
-
-    fn carry_reduce(mut l: [u64; 5]) -> Self {
-        let c0 = l[0] >> 51;
-        l[0] &= MASK51;
-        l[1] += c0;
-        let c1 = l[1] >> 51;
-        l[1] &= MASK51;
-        l[2] += c1;
-        let c2 = l[2] >> 51;
-        l[2] &= MASK51;
-        l[3] += c2;
-        let c3 = l[3] >> 51;
-        l[3] &= MASK51;
-        l[4] += c3;
-        let c4 = l[4] >> 51;
-        l[4] &= MASK51;
-        l[0] += c4 * 19;
-        Self(l)
-    }
-
-    fn add(&self, rhs: &Self) -> Self {
-        Self::carry_reduce([
-            self.0[0] + rhs.0[0],
-            self.0[1] + rhs.0[1],
-            self.0[2] + rhs.0[2],
-            self.0[3] + rhs.0[3],
-            self.0[4] + rhs.0[4],
-        ])
-    }
-
-    fn sub(&self, rhs: &Self) -> Self {
-        // Add 4*p before subtracting so limbs never underflow even on unreduced inputs.
-        const FOUR_P0: u64 = 4 * ((1u64 << 51) - 19);
-        const FOUR_PN: u64 = 4 * ((1u64 << 51) - 1);
-        let mut l = [
-            (self.0[0] + FOUR_P0) - rhs.0[0],
-            (self.0[1] + FOUR_PN) - rhs.0[1],
-            (self.0[2] + FOUR_PN) - rhs.0[2],
-            (self.0[3] + FOUR_PN) - rhs.0[3],
-            (self.0[4] + FOUR_PN) - rhs.0[4],
-        ];
-        let c0 = l[0] >> 51;
-        l[0] &= MASK51;
-        l[1] += c0;
-        let c1 = l[1] >> 51;
-        l[1] &= MASK51;
-        l[2] += c1;
-        let c2 = l[2] >> 51;
-        l[2] &= MASK51;
-        l[3] += c2;
-        let c3 = l[3] >> 51;
-        l[3] &= MASK51;
-        l[4] += c3;
-        let c4 = l[4] >> 51;
-        l[4] &= MASK51;
-        l[0] += c4 * 19;
-        Self(l)
-    }
-
-    fn neg(&self) -> Self {
-        Self::ZERO.sub(self)
-    }
-
-    fn mul(&self, rhs: &Self) -> Self {
-        let a = &self.0;
-        let b = &rhs.0;
-        let a0 = a[0] as u128;
-        let a1 = a[1] as u128;
-        let a2 = a[2] as u128;
-        let a3 = a[3] as u128;
-        let a4 = a[4] as u128;
-
-        let b0 = b[0] as u128;
-        let b1 = b[1] as u128;
-        let b2 = b[2] as u128;
-        let b3 = b[3] as u128;
-        let b4 = b[4] as u128;
-
-        let b1_19 = 19 * b1;
-        let b2_19 = 19 * b2;
-        let b3_19 = 19 * b3;
-        let b4_19 = 19 * b4;
-
-        let mut t0 = a0 * b0 + a1 * b4_19 + a2 * b3_19 + a3 * b2_19 + a4 * b1_19;
-        let mut t1 = a0 * b1 + a1 * b0 + a2 * b4_19 + a3 * b3_19 + a4 * b2_19;
-        let mut t2 = a0 * b2 + a1 * b1 + a2 * b0 + a3 * b4_19 + a4 * b3_19;
-        let mut t3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + a4 * b4_19;
-        let mut t4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0;
-
-        let mask = MASK51 as u128;
-        let c0 = t0 >> 51;
-        t0 &= mask;
-        t1 += c0;
-        let c1 = t1 >> 51;
-        t1 &= mask;
-        t2 += c1;
-        let c2 = t2 >> 51;
-        t2 &= mask;
-        t3 += c2;
-        let c3 = t3 >> 51;
-        t3 &= mask;
-        t4 += c3;
-        let c4 = t4 >> 51;
-        t4 &= mask;
-        t0 += c4 * 19;
-        let c0b = t0 >> 51;
-        t0 &= mask;
-        t1 += c0b;
-
-        Self([t0 as u64, t1 as u64, t2 as u64, t3 as u64, t4 as u64])
-    }
-
-    fn sq(&self) -> Self {
-        self.mul(self)
-    }
-
-    fn pow_le(&self, exp_le: &[u8; 32]) -> Self {
-        let mut res = Self::ONE;
-        for byte_idx in (0..32).rev() {
-            let byte = exp_le[byte_idx];
-            for bit in (0..8).rev() {
-                res = res.sq();
-                if ((byte >> bit) & 1) == 1 {
-                    res = res.mul(self);
-                }
-            }
-        }
-        res
-    }
-
-    /// Computes `self^(p - 2) mod p`.
-    fn inv(&self) -> Self {
-        let mut exp = [0xffu8; 32];
-        exp[0] = 0xeb; // 2^255 - 21
-        exp[31] = 0x7f;
-        self.pow_le(&exp)
-    }
-
-    /// Computes `self^((p - 5) / 8) mod p = self^(2^252 - 3) mod p`.
-    fn pow_p_minus_5_div_8(&self) -> Self {
-        let mut exp = [0xffu8; 32];
-        exp[0] = 0xfd;
-        exp[31] = 0x0f;
-        self.pow_le(&exp)
-    }
-
-    /// Computes `sqrt(-1) = 2^((p - 1) / 4) mod p = 2^(2^253 - 5) mod p`.
-    fn sqrt_m1() -> Self {
-        let mut exp = [0xffu8; 32];
-        exp[0] = 0xfb;
-        exp[31] = 0x1f;
-        Self::from_u64(2).pow_le(&exp)
-    }
-
-    /// Curve constant `d = -121665 / 121666 mod p`.
-    fn edwards_d() -> Self {
-        Self::from_u64(121_665)
-            .neg()
-            .mul(&Self::from_u64(121_666).inv())
-    }
+    bytes[0] < 0xed
 }
 
-impl PartialEq for Fe {
-    fn eq(&self, other: &Self) -> bool {
-        self.to_bytes() == other.to_bytes()
-    }
-}
-impl Eq for Fe {}
-
-/// Point on the Ed25519 twisted Edwards curve in extended coordinates `(X : Y : Z : T)`.
-#[derive(Clone, Copy, Debug)]
-struct EdwardsPoint {
-    x: Fe,
-    y: Fe,
-    z: Fe,
-    t: Fe,
-}
-
-impl EdwardsPoint {
-    const IDENTITY: Self = Self {
-        x: Fe::ZERO,
-        y: Fe::ONE,
-        z: Fe::ONE,
-        t: Fe::ZERO,
-    };
-
-    fn basepoint() -> Self {
-        // B_y = 4 / 5 mod p, x_0 = 0 (positive/even x) per RFC 8032 §5.1.
-        let by = Fe::from_u64(4).mul(&Fe::from_u64(5).inv());
-        let compressed = by.to_bytes();
-        Self::decompress(&compressed).expect("RFC 8032 Ed25519 basepoint must decompress")
-    }
-
-    /// Decompresses a canonical 32-byte Ed25519 point encoding per RFC 8032 §5.1.3.
-    fn decompress(bytes: &[u8; 32]) -> Option<Self> {
-        let x_sign = (bytes[31] >> 7) & 1;
-        let mut y_bytes = *bytes;
-        y_bytes[31] &= 0x7f;
-
-        let y = Fe::from_bytes_canonical(&y_bytes)?;
-        let d = Fe::edwards_d();
-        let y2 = y.sq();
-        let u = y2.sub(&Fe::ONE);
-        let v = d.mul(&y2).add(&Fe::ONE);
-
-        // Candidate root x = u * v^3 * (u * v^7)^((p - 5)/8) mod p
-        let v2 = v.sq();
-        let v3 = v2.mul(&v);
-        let v7 = v3.sq().mul(&v);
-        let uv7 = u.mul(&v7);
-        let mut x = u.mul(&v3).mul(&uv7.pow_p_minus_5_div_8());
-
-        let vx2 = v.mul(&x.sq());
-        if vx2 != u {
-            if vx2 == u.neg() {
-                x = x.mul(&Fe::sqrt_m1());
-            } else {
-                return None;
-            }
-        }
-
-        let x_bytes = x.to_bytes();
-        if x_bytes == [0u8; 32] && x_sign == 1 {
-            return None;
-        }
-        if (x_bytes[0] & 1) != x_sign {
-            x = x.neg();
-        }
-
-        let t = x.mul(&y);
-        Some(Self {
-            x,
-            y,
-            z: Fe::ONE,
-            t,
-        })
-    }
-
-    /// Compresses this point to 32 bytes per RFC 8032 §5.1.2.
-    fn compress(&self) -> [u8; 32] {
-        let z_inv = self.z.inv();
-        let x = self.x.mul(&z_inv).to_bytes();
-        let mut y = self.y.mul(&z_inv).to_bytes();
-        y[31] |= (x[0] & 1) << 7;
-        y
-    }
-
-    /// Complete extended twisted Edwards addition per RFC 8032 §5.1.4.
-    fn add(&self, rhs: &Self, two_d: &Fe) -> Self {
-        let a = self.y.sub(&self.x).mul(&rhs.y.sub(&rhs.x));
-        let b = self.y.add(&self.x).mul(&rhs.y.add(&rhs.x));
-        let c = self.t.mul(two_d).mul(&rhs.t);
-        let d = self.z.add(&self.z).mul(&rhs.z);
-        let e = b.sub(&a);
-        let f = d.sub(&c);
-        let g = d.add(&c);
-        let h = b.add(&a);
-        Self {
-            x: e.mul(&f),
-            y: g.mul(&h),
-            t: e.mul(&h),
-            z: f.mul(&g),
-        }
-    }
-
-    fn scalar_mul(&self, scalar_le: &[u8; 32]) -> Self {
-        let d = Fe::edwards_d();
-        let two_d = d.add(&d);
-        let mut acc = Self::IDENTITY;
-        for byte_idx in (0..32).rev() {
-            let byte = scalar_le[byte_idx];
-            for bit in (0..8).rev() {
-                acc = acc.add(&acc, &two_d);
-                if ((byte >> bit) & 1) == 1 {
-                    acc = acc.add(self, &two_d);
-                }
-            }
-        }
-        acc
-    }
-}
-
-impl PartialEq for EdwardsPoint {
-    fn eq(&self, other: &Self) -> bool {
-        // X1 * Z2 == X2 * Z1 && Y1 * Z2 == Y2 * Z1
-        self.x.mul(&other.z) == other.x.mul(&self.z)
-            && self.y.mul(&other.z) == other.y.mul(&self.z)
-    }
-}
-impl Eq for EdwardsPoint {}
-
-// Group order L = 2^252 + 27742317777372353535851937790883648493.
-const L_LOW: u128 = 27_742_317_777_372_353_535_851_937_790_883_648_493_u128;
-const L_WORDS: [u64; 4] = [
-    L_LOW as u64,
-    (L_LOW >> 64) as u64,
-    0,
-    1u64 << 60,
-];
-
-fn words_ge_l(a: &[u64; 4]) -> bool {
-    for i in (0..4).rev() {
-        if a[i] != L_WORDS[i] {
-            return a[i] > L_WORDS[i];
-        }
-    }
-    true
-}
-
-fn sub_l_in_place(a: &mut [u64; 4]) {
-    let mut borrow: u128 = 0;
-    for i in 0..4 {
-        let sub = (L_WORDS[i] as u128) + borrow;
-        if (a[i] as u128) >= sub {
-            a[i] = ((a[i] as u128) - sub) as u64;
-            borrow = 0;
-        } else {
-            a[i] = (((1u128 << 64) + (a[i] as u128)) - sub) as u64;
-            borrow = 1;
-        }
-    }
-}
-
-/// Checks whether a 32-byte little-endian scalar is strictly canonical (`< L`).
-#[must_use]
-fn is_canonical_scalar(s: &[u8; 32]) -> bool {
-    let mut w = [0u64; 4];
-    for (i, chunk) in s.as_chunks::<8>().0.iter().enumerate() {
-        w[i] = u64::from_le_bytes(*chunk);
-    }
-    !words_ge_l(&w)
-}
-
-/// Reduces an arbitrary-length little-endian unsigned integer modulo `L` into 32 LE bytes.
-fn reduce_mod_l(le_bytes: &[u8]) -> [u8; 32] {
-    let mut acc = [0u64; 4];
-    for &byte in le_bytes.iter().rev() {
-        for bit in (0..8).rev() {
-            let mut carry = ((byte >> bit) & 1) as u64;
-            for word in &mut acc {
-                let next_carry = *word >> 63;
-                *word = (*word << 1) | carry;
-                carry = next_carry;
-            }
-            if carry != 0 || words_ge_l(&acc) {
-                sub_l_in_place(&mut acc);
-            }
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, word) in acc.iter().enumerate() {
-        out[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
-    }
-    out
-}
-
-/// Computes `(r + k * s) mod L` in little-endian 32-byte representation.
-fn scalar_mul_add_mod_l(r: &[u8; 32], k: &[u8; 32], s: &[u8; 32]) -> [u8; 32] {
-    let mut rw = [0u64; 4];
-    let mut kw = [0u64; 4];
-    let mut sw = [0u64; 4];
-    for i in 0..4 {
-        let sl = i * 8;
-        rw[i] = u64::from_le_bytes(r[sl..sl + 8].try_into().expect("8 bytes"));
-        kw[i] = u64::from_le_bytes(k[sl..sl + 8].try_into().expect("8 bytes"));
-        sw[i] = u64::from_le_bytes(s[sl..sl + 8].try_into().expect("8 bytes"));
-    }
-
-    let mut prod = [0u64; 8];
-    prod[..4].copy_from_slice(&rw);
-
-    for i in 0..4 {
-        let mut carry: u128 = 0;
-        for j in 0..4 {
-            let cur = (prod[i + j] as u128) + (kw[i] as u128) * (sw[j] as u128) + carry;
-            prod[i + j] = cur as u64;
-            carry = cur >> 64;
-        }
-        let mut idx = i + 4;
-        while carry > 0 && idx < 8 {
-            let cur = (prod[idx] as u128) + carry;
-            prod[idx] = cur as u64;
-            carry = cur >> 64;
-            idx += 1;
-        }
-    }
-
-    let mut prod_le = [0u8; 64];
-    for (i, word) in prod.iter().enumerate() {
-        prod_le[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
-    }
-    reduce_mod_l(&prod_le)
-}
-
-/// Pure-Rust RFC 8032 Ed25519 signing key derived from a 32-byte secret seed.
-#[derive(Clone)]
+/// Pure-Rust constant-time RFC 8032 Ed25519 signing key backed by `ed25519-dalek`.
+///
+/// Secret key material is zeroized automatically on [`Drop`].
 pub struct Ed25519SigningKey {
-    seed: [u8; 32],
-    clamped_scalar: [u8; 32],
-    nonce_prefix: [u8; 32],
-    public_key: [u8; 32],
+    inner: SigningKey,
+}
+
+impl ZeroizeOnDrop for Ed25519SigningKey {}
+
+impl Drop for Ed25519SigningKey {
+    fn drop(&mut self) {
+        // `ed25519_dalek::SigningKey` (compiled with the `zeroize` feature) zeroes its
+        // secret key material inside its own `Drop` implementation immediately after
+        // this destructor returns.
+    }
 }
 
 impl std::fmt::Debug for Ed25519SigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ed25519SigningKey")
-            .field("public_key", &self.public_key)
+            .field("public_key", &self.verifying_key_bytes())
             .finish_non_exhaustive()
     }
 }
@@ -945,136 +254,87 @@ impl std::fmt::Debug for Ed25519SigningKey {
 impl Ed25519SigningKey {
     /// Derives an Ed25519 keypair from a 32-byte secret seed per RFC 8032 §5.1.5.
     #[must_use]
-    pub fn from_seed(seed: [u8; 32]) -> Self {
-        let digest = sha512(&seed);
-        let mut clamped_scalar = [0u8; 32];
-        clamped_scalar.copy_from_slice(&digest[..32]);
-        clamped_scalar[0] &= 248;
-        clamped_scalar[31] &= 127;
-        clamped_scalar[31] |= 64;
+    pub fn from_seed(mut seed: [u8; 32]) -> Self {
+        let inner = SigningKey::from_bytes(&seed);
+        seed.zeroize();
+        Self { inner }
+    }
 
-        let mut nonce_prefix = [0u8; 32];
-        nonce_prefix.copy_from_slice(&digest[32..64]);
-
-        let base = EdwardsPoint::basepoint();
-        let public_key = base.scalar_mul(&clamped_scalar).compress();
-
+    /// Derives an Ed25519 keypair from a borrowed 32-byte seed without creating an
+    /// unzeroized stack copy.
+    #[must_use]
+    fn from_seed_ref(seed: &[u8; 32]) -> Self {
         Self {
-            seed,
-            clamped_scalar,
-            nonce_prefix,
-            public_key,
+            inner: SigningKey::from_bytes(seed),
         }
     }
 
-    /// Returns the 32-byte secret seed.
+    /// Returns a zeroizing copy of the 32-byte secret seed for internal OpenSSH PEM encoding.
     #[must_use]
-    pub const fn seed(&self) -> &[u8; 32] {
-        &self.seed
+    fn seed_zeroizing(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.inner.to_bytes())
     }
 
     /// Returns the 32-byte compressed Ed25519 public key.
     #[must_use]
-    pub const fn verifying_key_bytes(&self) -> [u8; 32] {
-        self.public_key
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.inner.verifying_key().to_bytes()
     }
 
     /// Returns the corresponding [`Ed25519VerifyingKey`].
     #[must_use]
     pub fn verifying_key(&self) -> Ed25519VerifyingKey {
-        Ed25519VerifyingKey::from_bytes(self.public_key)
-            .expect("derived Ed25519 public key is always canonical")
+        Ed25519VerifyingKey {
+            inner: self.inner.verifying_key(),
+        }
     }
 
     /// Deterministically signs `message` per RFC 8032 §5.1.6, returning a 64-byte signature.
     #[must_use]
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        let mut r_hasher = Sha512::new();
-        r_hasher.update(&self.nonce_prefix);
-        r_hasher.update(message);
-        let r = reduce_mod_l(&r_hasher.finalize());
-
-        let base = EdwardsPoint::basepoint();
-        let cap_r = base.scalar_mul(&r).compress();
-
-        let mut k_hasher = Sha512::new();
-        k_hasher.update(&cap_r);
-        k_hasher.update(&self.public_key);
-        k_hasher.update(message);
-        let k = reduce_mod_l(&k_hasher.finalize());
-
-        let cap_s = scalar_mul_add_mod_l(&r, &k, &self.clamped_scalar);
-
-        let mut sig = [0u8; 64];
-        sig[..32].copy_from_slice(&cap_r);
-        sig[32..64].copy_from_slice(&cap_s);
-        sig
+        self.inner.sign(message).to_bytes()
     }
 }
 
-/// Pure-Rust RFC 8032 Ed25519 public verifying key.
+/// Pure-Rust RFC 8032 Ed25519 public verifying key backed by `ed25519-dalek`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ed25519VerifyingKey {
-    bytes: [u8; 32],
-    point: EdwardsPoint,
+    inner: VerifyingKey,
 }
 
 impl Ed25519VerifyingKey {
     /// Parses and validates a canonical 32-byte Ed25519 public key.
     pub fn from_bytes(bytes: [u8; 32]) -> Result<Self> {
-        let point = EdwardsPoint::decompress(&bytes).ok_or_else(|| OzError::InvalidUsage {
+        if !is_canonical_ed25519_y(&bytes) {
+            return Err(OzError::InvalidUsage {
+                message: "invalid Ed25519 public key (non-canonical field element)".to_string(),
+                recovery: Vec::new(),
+            });
+        }
+        let inner = VerifyingKey::from_bytes(&bytes).map_err(|_| OzError::InvalidUsage {
             message: "invalid Ed25519 public key (point decompression failed)".to_string(),
             recovery: Vec::new(),
         })?;
-        Ok(Self { bytes, point })
+        Ok(Self { inner })
     }
 
     /// Returns the 32-byte compressed public key encoding.
     #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.bytes
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.inner.as_bytes()
     }
 
-    /// Verifies a 64-byte Ed25519 `signature` over `message` per RFC 8032 §5.1.7.
+    /// Verifies a 64-byte Ed25519 `signature` over `message` per RFC 8032 §5.1.7 using
+    /// strict verification (rejecting non-canonical `S >= L`, non-canonical `R`, and
+    /// small-order public keys/commitments).
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> Result<()> {
-        let mut r_bytes = [0u8; 32];
-        let mut s_bytes = [0u8; 32];
-        r_bytes.copy_from_slice(&signature[..32]);
-        s_bytes.copy_from_slice(&signature[32..64]);
-
-        if !is_canonical_scalar(&s_bytes) {
-            return Err(OzError::CheckFailed {
-                message: "invalid Ed25519 signature (scalar S >= L)".to_string(),
-                recovery: Vec::new(),
-            });
-        }
-
-        let Some(r_point) = EdwardsPoint::decompress(&r_bytes) else {
-            return Err(OzError::CheckFailed {
-                message: "invalid Ed25519 signature (point R decompression failed)".to_string(),
-                recovery: Vec::new(),
-            });
-        };
-
-        let mut k_hasher = Sha512::new();
-        k_hasher.update(&r_bytes);
-        k_hasher.update(&self.bytes);
-        k_hasher.update(message);
-        let k = reduce_mod_l(&k_hasher.finalize());
-
-        let d = Fe::edwards_d();
-        let two_d = d.add(&d);
-        let lhs = EdwardsPoint::basepoint().scalar_mul(&s_bytes);
-        let rhs = r_point.add(&self.point.scalar_mul(&k), &two_d);
-
-        if lhs == rhs {
-            Ok(())
-        } else {
-            Err(OzError::CheckFailed {
-                message: "Ed25519 signature verification equation failed".to_string(),
+        let sig = Signature::from_bytes(signature);
+        self.inner
+            .verify_strict(message, &sig)
+            .map_err(|err| OzError::CheckFailed {
+                message: format!("Ed25519 signature verification failed: {err}"),
                 recovery: Vec::new(),
             })
-        }
     }
 }
 
@@ -1257,11 +517,15 @@ impl OpenSshPublicKey {
 }
 
 /// Parsed unencrypted OpenSSH `openssh-key-v1` Ed25519 private key.
-#[derive(Clone, Debug)]
+///
+/// Secret key material is zeroized automatically when dropped.
+#[derive(Debug)]
 pub struct OpenSshPrivateKey {
     signing_key: Ed25519SigningKey,
     comment: Option<String>,
 }
+
+impl ZeroizeOnDrop for OpenSshPrivateKey {}
 
 impl OpenSshPrivateKey {
     /// Wraps an [`Ed25519SigningKey`] with an optional OpenSSH key comment.
@@ -1279,9 +543,7 @@ impl OpenSshPrivateKey {
     /// (`cipher != "none"` / `kdf != "none"`) or uses a non-Ed25519 algorithm.
     pub fn parse_openssh(pem_text: &str) -> Result<Self> {
         let trimmed = pem_text.trim();
-        if trimmed.contains("ENCRYPTED")
-            && !trimmed.contains(PRIVKEY_ARMOR_HEADER)
-        {
+        if trimmed.contains("ENCRYPTED") && !trimmed.contains(PRIVKEY_ARMOR_HEADER) {
             return Err(OzError::InvalidUsage {
                 message: "SSH private key is encrypted; pure-Rust commit signing requires an unencrypted OpenSSH Ed25519 key".to_string(),
                 recovery: vec![
@@ -1297,13 +559,13 @@ impl OpenSshPrivateKey {
             return Err(unsupported_algorithm_error("ecdsa"));
         }
 
-        let body_b64 = extract_armor_body(
+        let body_b64 = Zeroizing::new(extract_armor_body(
             trimmed,
             PRIVKEY_ARMOR_HEADER,
             PRIVKEY_ARMOR_FOOTER,
             "OpenSSH private key",
-        )?;
-        let raw = base64_decode(&body_b64)?;
+        )?);
+        let raw = base64_decode_zeroizing(&body_b64)?;
         let mut reader = SshReader::new(&raw);
 
         let magic = reader.read_exact(OPENSSH_KEY_V1_MAGIC.len(), "openssh-key-v1 magic")?;
@@ -1315,7 +577,8 @@ impl OpenSshPrivateKey {
             });
         }
 
-        let ciphername = String::from_utf8_lossy(reader.read_ssh_string("ciphername")?).into_owned();
+        let ciphername =
+            String::from_utf8_lossy(reader.read_ssh_string("ciphername")?).into_owned();
         let kdfname = String::from_utf8_lossy(reader.read_ssh_string("kdfname")?).into_owned();
         let _kdfoptions = reader.read_ssh_string("kdfoptions")?;
         let num_keys = reader.read_u32("number of keys")?;
@@ -1397,9 +660,9 @@ impl OpenSshPrivateKey {
             });
         }
 
-        let mut seed = [0u8; 32];
+        let mut seed = Zeroizing::new([0u8; 32]);
         seed.copy_from_slice(&priv_bytes[..32]);
-        let signing_key = Ed25519SigningKey::from_seed(seed);
+        let signing_key = Ed25519SigningKey::from_seed_ref(&seed);
         if signing_key.verifying_key_bytes().as_slice() != pub_bytes {
             return Err(OzError::InvalidUsage {
                 message: "derived Ed25519 public key does not match stored public key".to_string(),
@@ -1418,16 +681,22 @@ impl OpenSshPrivateKey {
 
     /// Loads and parses an OpenSSH Ed25519 private key from disk.
     pub fn from_file(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path).map_err(|err| OzError::InvalidUsage {
-            message: format!(
-                "failed to read SSH signing key at {}: {err}",
-                path.display()
-            ),
-            recovery: vec![
-                "ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519".to_string(),
-                format!("Verify signing key permissions and path: {}", path.display()),
-            ],
-        })?;
+        let raw =
+            Zeroizing::new(
+                fs::read_to_string(path).map_err(|err| OzError::InvalidUsage {
+                    message: format!(
+                        "failed to read SSH signing key at {}: {err}",
+                        path.display()
+                    ),
+                    recovery: vec![
+                        "ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519".to_string(),
+                        format!(
+                            "Verify signing key permissions and path: {}",
+                            path.display()
+                        ),
+                    ],
+                })?,
+            );
         Self::parse_openssh(&raw)
     }
 
@@ -1436,18 +705,20 @@ impl OpenSshPrivateKey {
     pub fn to_openssh_pem(&self) -> String {
         let pub_key = self.public_key();
         let pub_blob = pub_key.to_wire_blob();
+        let pub_bytes = self.signing_key.verifying_key_bytes();
 
-        let mut priv_sec = Vec::with_capacity(160);
+        let mut priv_sec = Zeroizing::new(Vec::with_capacity(160));
         let checkint: u32 = 0x5a5a_a5a5;
         put_u32(&mut priv_sec, checkint);
         put_u32(&mut priv_sec, checkint);
         put_ssh_string(&mut priv_sec, ALG_ED25519.as_bytes());
-        put_ssh_string(&mut priv_sec, &self.signing_key.verifying_key_bytes());
+        put_ssh_string(&mut priv_sec, &pub_bytes);
 
-        let mut seed_and_pub = [0u8; 64];
-        seed_and_pub[..32].copy_from_slice(self.signing_key.seed());
-        seed_and_pub[32..64].copy_from_slice(&self.signing_key.verifying_key_bytes());
-        put_ssh_string(&mut priv_sec, &seed_and_pub);
+        let seed = self.signing_key.seed_zeroizing();
+        let mut seed_and_pub = Zeroizing::new([0u8; 64]);
+        seed_and_pub[..32].copy_from_slice(&*seed);
+        seed_and_pub[32..64].copy_from_slice(&pub_bytes);
+        put_ssh_string(&mut priv_sec, &*seed_and_pub);
 
         let comment_bytes = self.comment.as_deref().unwrap_or("").as_bytes();
         put_ssh_string(&mut priv_sec, comment_bytes);
@@ -1457,7 +728,7 @@ impl OpenSshPrivateKey {
             priv_sec.push(i as u8);
         }
 
-        let mut outer = Vec::with_capacity(256);
+        let mut outer = Zeroizing::new(Vec::with_capacity(256));
         outer.extend_from_slice(OPENSSH_KEY_V1_MAGIC);
         put_ssh_string(&mut outer, b"none");
         put_ssh_string(&mut outer, b"none");
@@ -1466,7 +737,8 @@ impl OpenSshPrivateKey {
         put_ssh_string(&mut outer, &pub_blob);
         put_ssh_string(&mut outer, &priv_sec);
 
-        wrap_armor(PRIVKEY_ARMOR_HEADER, PRIVKEY_ARMOR_FOOTER, &base64_encode(&outer), 70)
+        let outer_b64 = Zeroizing::new(base64_encode(&outer));
+        wrap_armor(PRIVKEY_ARMOR_HEADER, PRIVKEY_ARMOR_FOOTER, &outer_b64, 70)
     }
 
     /// Returns the corresponding [`OpenSshPublicKey`].
@@ -1514,7 +786,16 @@ fn build_sshsig_signed_data(
     hash_algorithm: &str,
     message_digest: &[u8],
 ) -> Vec<u8> {
-    let mut signed_data = Vec::with_capacity(6 + 4 + namespace.len() + 4 + reserved.len() + 4 + hash_algorithm.len() + 4 + message_digest.len());
+    let mut signed_data = Vec::with_capacity(
+        6 + 4
+            + namespace.len()
+            + 4
+            + reserved.len()
+            + 4
+            + hash_algorithm.len()
+            + 4
+            + message_digest.len(),
+    );
     signed_data.extend_from_slice(SSHSIG_MAGIC_PREAMBLE);
     put_ssh_string(&mut signed_data, namespace.as_bytes());
     put_ssh_string(&mut signed_data, reserved);
@@ -1603,10 +884,12 @@ pub fn verify_sshsig(
         });
     }
 
-    let version = reader.read_u32("SSHSIG version").map_err(|err| OzError::CheckFailed {
-        message: err.to_string(),
-        recovery: Vec::new(),
-    })?;
+    let version = reader
+        .read_u32("SSHSIG version")
+        .map_err(|err| OzError::CheckFailed {
+            message: err.to_string(),
+            recovery: Vec::new(),
+        })?;
     if version != SSHSIG_VERSION_V1 {
         return Err(OzError::CheckFailed {
             message: format!("unsupported SSHSIG version {version} (expected 1)"),
@@ -1614,24 +897,26 @@ pub fn verify_sshsig(
         });
     }
 
-    let pubkey_blob = reader
-        .read_ssh_string("SSHSIG public key")
-        .map_err(|err| OzError::CheckFailed {
-            message: err.to_string(),
-            recovery: Vec::new(),
-        })?;
+    let pubkey_blob =
+        reader
+            .read_ssh_string("SSHSIG public key")
+            .map_err(|err| OzError::CheckFailed {
+                message: err.to_string(),
+                recovery: Vec::new(),
+            })?;
     let public_key =
         OpenSshPublicKey::from_wire_blob(pubkey_blob).map_err(|err| OzError::CheckFailed {
             message: format!("invalid public key in SSH signature: {err}"),
             recovery: Vec::new(),
         })?;
 
-    let namespace_bytes = reader
-        .read_ssh_string("SSHSIG namespace")
-        .map_err(|err| OzError::CheckFailed {
-            message: err.to_string(),
-            recovery: Vec::new(),
-        })?;
+    let namespace_bytes =
+        reader
+            .read_ssh_string("SSHSIG namespace")
+            .map_err(|err| OzError::CheckFailed {
+                message: err.to_string(),
+                recovery: Vec::new(),
+            })?;
     let namespace = std::str::from_utf8(namespace_bytes)
         .map_err(|_| OzError::CheckFailed {
             message: "non-UTF-8 namespace in SSH signature".to_string(),
@@ -1755,12 +1040,7 @@ fn wrap_armor(header: &str, footer: &str, b64: &str, cols: usize) -> String {
     out
 }
 
-fn extract_armor_body(
-    input: &str,
-    header: &str,
-    footer: &str,
-    label: &str,
-) -> Result<String> {
+fn extract_armor_body(input: &str, header: &str, footer: &str, label: &str) -> Result<String> {
     let Some(start) = input.find(header) else {
         return Err(OzError::InvalidUsage {
             message: format!("missing '{header}' in {label}"),
@@ -1838,7 +1118,11 @@ pub fn resolve_signing_private_key(
     }
 
     // Inline public key (`key::ssh-ed25519 ...` or `ssh-ed25519 AAAA...`).
-    if trimmed.starts_with("key::") || trimmed.starts_with("ssh-") || trimmed.starts_with("ecdsa-") || trimmed.starts_with("sk-") {
+    if trimmed.starts_with("key::")
+        || trimmed.starts_with("ssh-")
+        || trimmed.starts_with("ecdsa-")
+        || trimmed.starts_with("sk-")
+    {
         let wanted_pub = OpenSshPublicKey::parse_openssh(trimmed)?;
         let default_priv = default_ed25519_key_path();
         if default_priv.is_file()
@@ -1879,17 +1163,24 @@ pub fn resolve_signing_private_key(
         });
     }
 
-    let content = fs::read_to_string(&path).map_err(|err| OzError::InvalidUsage {
-        message: format!("failed to read SSH signing key at {}: {err}", path.display()),
-        recovery: Vec::new(),
-    })?;
+    let content =
+        Zeroizing::new(
+            fs::read_to_string(&path).map_err(|err| OzError::InvalidUsage {
+                message: format!(
+                    "failed to read SSH signing key at {}: {err}",
+                    path.display()
+                ),
+                recovery: Vec::new(),
+            })?,
+        );
     let content_trimmed = content.trim();
 
     // If `user.signingkey` points to `<name>.pub`, parse the `.pub` file and load sibling `<name>`.
     if content_trimmed.starts_with("ssh-")
         || content_trimmed.starts_with("ecdsa-")
         || content_trimmed.starts_with("sk-")
-        || path.extension().and_then(|e| e.to_str()) == Some("pub") && !content_trimmed.contains("-----BEGIN ")
+        || path.extension().and_then(|e| e.to_str()) == Some("pub")
+            && !content_trimmed.contains("-----BEGIN ")
     {
         let wanted_pub = OpenSshPublicKey::parse_openssh(content_trimmed)?;
         let priv_candidate = path.with_extension("");
@@ -1946,7 +1237,12 @@ pub fn match_allowed_signers_file(
         // Locate the key type token (`ssh-ed25519`, `ssh-rsa`, etc.).
         let Some(kt_idx) = tokens[1..]
             .iter()
-            .position(|t| *t == ALG_ED25519 || t.starts_with("ssh-") || t.starts_with("ecdsa-") || t.starts_with("sk-"))
+            .position(|t| {
+                *t == ALG_ED25519
+                    || t.starts_with("ssh-")
+                    || t.starts_with("ecdsa-")
+                    || t.starts_with("sk-")
+            })
             .map(|p| p + 1)
         else {
             continue;
@@ -2204,10 +1500,7 @@ mod tests {
     use super::*;
 
     fn hex_decode(hex: &str) -> Vec<u8> {
-        let clean: Vec<u8> = hex
-            .bytes()
-            .filter(|b| !b.is_ascii_whitespace())
-            .collect();
+        let clean: Vec<u8> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
         assert!(clean.len().is_multiple_of(2), "hex length must be even");
         clean
             .as_chunks::<2>()
@@ -2268,7 +1561,8 @@ mod tests {
         for chunk in big.chunks(13) {
             streaming.update(chunk);
         }
-        assert_eq!(streaming.finalize(), sha512(&big));
+        let streaming_digest: [u8; 64] = streaming.finalize().into();
+        assert_eq!(streaming_digest, sha512(&big));
     }
 
     #[test]
@@ -2298,15 +1592,18 @@ mod tests {
 
     #[test]
     fn rfc_8032_ed25519_standard_test_vectors_and_malleability_guards() {
-        // Group order sanity check: [L] * B == Identity
+        // Compile-time check that secret key types implement ZeroizeOnDrop.
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Ed25519SigningKey>();
+        assert_zeroize_on_drop::<OpenSshPrivateKey>();
+
+        // Group order L = 2^252 + 27742317777372353535851937790883648493 in 32 LE bytes.
+        let l_low: u128 = 27_742_317_777_372_353_535_851_937_790_883_648_493_u128;
+        let l_words: [u64; 4] = [l_low as u64, (l_low >> 64) as u64, 0, 1u64 << 60];
         let mut l_le = [0u8; 32];
-        for (i, w) in L_WORDS.iter().enumerate() {
+        for (i, w) in l_words.iter().enumerate() {
             l_le[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
         }
-        assert_eq!(
-            EdwardsPoint::basepoint().scalar_mul(&l_le),
-            EdwardsPoint::IDENTITY
-        );
 
         // RFC 8032 §7.1 TEST 1 (empty message), TEST 2 (0x72), TEST 3 (0xaf82)
         let vectors: &[(&str, &str, &[u8], &str)] = &[
@@ -2342,7 +1639,8 @@ mod tests {
             assert_eq!(sig, expected_sig);
 
             let vk = sk.verifying_key();
-            vk.verify(msg, &sig).expect("RFC 8032 signature must verify");
+            vk.verify(msg, &sig)
+                .expect("RFC 8032 signature must verify");
 
             // Tampered message must fail
             assert!(vk.verify(b"tampered", &sig).is_err());
@@ -2354,16 +1652,14 @@ mod tests {
         }
 
         // RFC 8032 §7.1 SHA(abc) test vector
-        let seed_sha: [u8; 32] = hex_decode(
-            "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42",
-        )
-        .try_into()
-        .unwrap();
-        let pub_sha: [u8; 32] = hex_decode(
-            "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
-        )
-        .try_into()
-        .unwrap();
+        let seed_sha: [u8; 32] =
+            hex_decode("833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42")
+                .try_into()
+                .unwrap();
+        let pub_sha: [u8; 32] =
+            hex_decode("ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf")
+                .try_into()
+                .unwrap();
         let msg_sha = hex_decode(
             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
         );
@@ -2380,13 +1676,27 @@ mod tests {
         // Reject non-canonical S >= L (set S = L)
         let mut non_canonical_sig = sig_sha;
         non_canonical_sig[32..64].copy_from_slice(&l_le);
-        assert!(sk_sha.verifying_key().verify(&msg_sha, &non_canonical_sig).is_err());
+        assert!(
+            sk_sha
+                .verifying_key()
+                .verify(&msg_sha, &non_canonical_sig)
+                .is_err()
+        );
 
         // Reject non-canonical public key y = p (0x7fff...ffed)
         let mut p_bytes = [0xffu8; 32];
         p_bytes[0] = 0xed;
         p_bytes[31] = 0x7f;
         assert!(Ed25519VerifyingKey::from_bytes(p_bytes).is_err());
+
+        // Reject weak small-order public key (identity point) during strict verification
+        let mut identity_bytes = [0u8; 32];
+        identity_bytes[0] = 1;
+        if let Ok(weak_vk) = Ed25519VerifyingKey::from_bytes(identity_bytes) {
+            let mut weak_sig = [0u8; 64];
+            weak_sig[0] = 1;
+            assert!(weak_vk.verify(b"anything", &weak_sig).is_err());
+        }
     }
 
     #[test]

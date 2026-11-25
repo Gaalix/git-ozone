@@ -8,17 +8,19 @@ description = "Core repository discovery, oz.v1 envelope, configuration, and dom
 [dependencies]
 blake3.workspace = true
 chrono.workspace = true
+ed25519-dalek.workspace = true
 gix.workspace = true
 globset.workspace = true
 ignore.workspace = true
-imara-diff.workspace = true
 libc.workspace = true
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 ulid.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

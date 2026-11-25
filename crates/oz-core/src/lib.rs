@@ -7,25 +7,25 @@
 //! configuration parsing, canonical `oz.v1` JSON envelope formatting, non-interactive
 //! detection, exit codes, and shared domain types.
 
-pub mod attributes;
-pub mod checkout;
-pub mod commit;
-pub mod config;
-pub mod daily;
-pub mod diff;
-pub mod envelope;
-pub mod error;
-pub mod git_config;
-pub mod guardrails;
-pub mod hooks;
-pub mod repo;
-pub mod ssh_sign;
-pub mod status;
-pub mod types;
+mod attributes;
+mod checkout;
+mod commit;
+mod config;
+mod daily;
+mod diff;
+mod envelope;
+mod error;
+mod git_config;
+mod guardrails;
+mod hooks;
+mod repo;
+mod ssh_sign;
+mod status;
+mod types;
 
 pub use attributes::{
-    AttrState, AttributeResolver, ResolvedAttrs, clean_blob_bytes, clean_eol_bytes,
-    is_lfs_pointer, smudge_blob_bytes, smudge_eol_bytes,
+    AttrState, AttributeResolver, ResolvedAttrs, clean_blob_bytes, clean_eol_bytes, is_lfs_pointer,
+    smudge_blob_bytes, smudge_eol_bytes,
 };
 pub use checkout::{
     CheckoutPathsOptions, CheckoutPathsOutcome, PathspecMatcher, SwitchOptions, SwitchOutcome,
@@ -77,8 +77,8 @@ pub use git_config::{
 };
 pub use guardrails::{
     GuardrailFinding, GuardrailKind, GuardrailOptions, GuardrailTarget, check_guardrails,
-    check_workspace_guardrails, detect_secret_in_line, inspect_guardrails,
-    is_conflict_marker_line, is_unignored_env_filename,
+    check_workspace_guardrails, detect_secret_in_line, inspect_guardrails, is_conflict_marker_line,
+    is_unignored_env_filename,
 };
 pub use hooks::{
     CommitHookEnv, HookRunOutcome, PrePushRefLine, find_executable_hook, resolve_hooks_dir,
@@ -88,13 +88,13 @@ pub use repo::{
     CliInvocation, MountHealth, OzoneLayout, OzoneRepo, SiblingOzPath, find_git_ozone_on_path,
     is_enotconn, parse_oz_workspace_path, probe_mount_health_os,
 };
+#[doc(hidden)]
+pub use ssh_sign::base64_encode;
 pub use ssh_sign::{
     CommitSignatureVerification, Ed25519SigningKey, Ed25519VerifyingKey, GIT_SSHSIG_NAMESPACE,
     OpenSshPrivateKey, OpenSshPublicKey, ParsedSshSignature, SSHSIG_ARMOR_FOOTER,
-    SSHSIG_ARMOR_HEADER, Sha512, SshSigningReport, base64_decode, base64_encode,
-    base64_encode_no_pad, expand_tilde_path, inspect_ssh_signing_config,
-    match_allowed_signers_file, resolve_signing_private_key, sha256, sha512, sign_sshsig,
-    verify_sshsig,
+    SSHSIG_ARMOR_HEADER, SshSigningReport, expand_tilde_path, inspect_ssh_signing_config,
+    match_allowed_signers_file, resolve_signing_private_key, sign_sshsig, verify_sshsig,
 };
 pub use status::{
     ScopePolicy, StatusReport, compute_status, compute_status_with_overrides,

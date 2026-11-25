@@ -145,17 +145,10 @@ fn fuse_fast_path_o_dirty_ignores_clean_upper_and_handles_whiteouts_and_opaque()
     .expect("modify upper file");
     fs::write(upper_dir.join("tracked.log"), "tracked log v2\n").expect("modify tracked.log");
     fs::create_dir_all(upper_dir.join("crates")).expect("mkdir crates");
-    fs::write(
-        upper_dir.join("crates/new_pkce.rs"),
-        "pub fn verify() {}\n",
-    )
-    .expect("add file");
+    fs::write(upper_dir.join("crates/new_pkce.rs"), "pub fn verify() {}\n").expect("add file");
     fs::create_dir_all(meta_dir.join("whiteouts/pkg_03/src")).expect("mkdir wh parent");
-    fs::write(
-        meta_dir.join("whiteouts/pkg_03/src/mod_0300.rs.oz_wh"),
-        b"",
-    )
-    .expect("write whiteout");
+    fs::write(meta_dir.join("whiteouts/pkg_03/src/mod_0300.rs.oz_wh"), b"")
+        .expect("write whiteout");
     fs::write(meta_dir.join("opaque/old_dir.oz_opaque"), b"").expect("write opaque");
     fs::create_dir_all(upper_dir.join("old_dir")).expect("mkdir upper old_dir");
     fs::write(upper_dir.join("old_dir/keep.txt"), "keep v1\n").expect("recreate keep.txt");
@@ -282,7 +275,11 @@ fn partial_commit_pick_f2_h1a_and_exclude_leaves_unselected_hunks_and_files_unto
     let edited_a_str = edited_a.concat();
 
     fs::write(repo_root.join("a_token.rs"), &edited_a_str).expect("edit a_token");
-    fs::write(repo_root.join("b_pkce.rs"), "pub fn pkce() -> bool { true }\n").expect("add b_pkce");
+    fs::write(
+        repo_root.join("b_pkce.rs"),
+        "pub fn pkce() -> bool { true }\n",
+    )
+    .expect("add b_pkce");
     fs::write(
         repo_root.join("c_debug.rs"),
         "pub fn debug() { println!(\"dbg\"); }\n",
@@ -382,10 +379,17 @@ fn unborn_head_commit_pinned_paths_and_change_id_trailer() {
         .expect("commit on unborn HEAD");
     assert!(out.parent_oid.is_none());
     assert_eq!(out.branch.as_deref(), Some("main"));
-    assert!(out.message.contains(&format!("Change-Id: {}", out.change_id)));
+    assert!(
+        out.message
+            .contains(&format!("Change-Id: {}", out.change_id))
+    );
 
     // C git should see a clean working tree on main with the Change-Id trailer.
-    assert!(git(&repo_root, &["status", "--porcelain"]).trim().is_empty());
+    assert!(
+        git(&repo_root, &["status", "--porcelain"])
+            .trim()
+            .is_empty()
+    );
     let log_msg = git(&repo_root, &["log", "-1", "--pretty=%B"]);
     assert!(log_msg.contains(&format!("Change-Id: {}", out.change_id)));
 
@@ -467,7 +471,11 @@ fn guardrails_block_secrets_conflicts_oversized_blobs_and_scope_deny() {
         .expect_err(".env must be blocked");
     assert_eq!(err.exit_code(), ExitCode::UsageOrGuardrail);
     assert!(matches!(err, OzError::GuardrailViolation { .. }));
-    assert!(err.recovery_commands().iter().any(|r| r.contains("--force")));
+    assert!(
+        err.recovery_commands()
+            .iter()
+            .any(|r| r.contains("--force"))
+    );
     fs::remove_file(repo_root.join(".env")).expect("rm .env");
 
     // 2. Secret token in code
@@ -491,7 +499,9 @@ fn guardrails_block_secrets_conflicts_oversized_blobs_and_scope_deny() {
     .expect("write conflict");
     let err = commit_changes(&repo, &CommitOptions::new("oops conflict"))
         .expect_err("conflict marker must be blocked");
-    assert!(matches!(err, OzError::GuardrailViolation { ref kind, .. } if kind == "conflict_marker"));
+    assert!(
+        matches!(err, OzError::GuardrailViolation { ref kind, .. } if kind == "conflict_marker")
+    );
     fs::write(repo_root.join("crates/auth/lib.rs"), "pub fn clean() {}\n").expect("fix conflict");
     commit_changes(&repo, &CommitOptions::new("clean fix")).expect("clean commit");
 
@@ -505,7 +515,9 @@ fn guardrails_block_secrets_conflicts_oversized_blobs_and_scope_deny() {
     }
     let err = commit_changes(&repo, &CommitOptions::new("oops >50MB"))
         .expect_err(">50MB blob must be blocked");
-    assert!(matches!(err, OzError::GuardrailViolation { ref kind, .. } if kind == "oversized_blob"));
+    assert!(
+        matches!(err, OzError::GuardrailViolation { ref kind, .. } if kind == "oversized_blob")
+    );
     assert_eq!(err.exit_code(), ExitCode::UsageOrGuardrail);
     fs::remove_file(repo_root.join("huge.bin")).expect("rm huge.bin");
 
@@ -516,8 +528,11 @@ fn guardrails_block_secrets_conflicts_oversized_blobs_and_scope_deny() {
     fs::write(ws_path.join(".env.example"), "PORT=8080\n").expect("copy env example");
     fs::write(ws_path.join("crates/auth/lib.rs"), "pub fn clean() {}\n").expect("copy auth");
     fs::write(ws_path.join("Cargo.lock"), "# modified lock\n").expect("modify lock");
-    fs::write(ws_path.join("crates/billing/invoice.rs"), "pub fn inv() {}\n")
-        .expect("out of scope file");
+    fs::write(
+        ws_path.join("crates/billing/invoice.rs"),
+        "pub fn inv() {}\n",
+    )
+    .expect("out of scope file");
 
     let layout = OzoneLayout::from_git_common_dir(repo_root.join(".git"));
     layout.ensure_initialized().expect("init ozone");
@@ -559,7 +574,9 @@ fn guardrails_block_secrets_conflicts_oversized_blobs_and_scope_deny() {
 
     let scope_err = commit_changes(&ws_repo, &CommitOptions::new("blocked out of scope"))
         .expect_err("scope/deny must block");
-    assert!(matches!(scope_err, OzError::GuardrailViolation { ref kind, .. } if kind == "out_of_scope"));
+    assert!(
+        matches!(scope_err, OzError::GuardrailViolation { ref kind, .. } if kind == "out_of_scope")
+    );
     assert!(
         scope_err
             .recovery_commands()
@@ -603,7 +620,11 @@ fn tracks_executable_mode_and_symlinks_accurately() {
     assert_eq!(status.changes[1].kind, ChangeKind::Modified);
 
     commit_changes(&repo, &CommitOptions::new("chmod and symlink")).expect("commit modes");
-    assert!(git(&repo_root, &["status", "--porcelain"]).trim().is_empty());
+    assert!(
+        git(&repo_root, &["status", "--porcelain"])
+            .trim()
+            .is_empty()
+    );
 
     let ls_tree = git(&repo_root, &["ls-tree", "HEAD"]);
     assert!(ls_tree.contains("100755 blob"));
@@ -727,7 +748,11 @@ fn linked_worktree_fuse_partial_commit_and_dir_whiteout_and_all_guardrails() {
     }
     check_guardrails(
         &repo,
-        &[GuardrailTarget::new(".env.local", ChangeKind::Added, b"K=1\n")],
+        &[GuardrailTarget::new(
+            ".env.local",
+            ChangeKind::Added,
+            b"K=1\n",
+        )],
         &GuardrailOptions::default(),
     )
     .expect_err(".env.local blocked");
@@ -738,7 +763,11 @@ fn linked_worktree_fuse_partial_commit_and_dir_whiteout_and_all_guardrails() {
     for secret in [ghp, fg_pat, priv_key] {
         let err = check_guardrails(
             &repo,
-            &[GuardrailTarget::new("cfg.txt", ChangeKind::Added, secret.as_bytes())],
+            &[GuardrailTarget::new(
+                "cfg.txt",
+                ChangeKind::Added,
+                secret.as_bytes(),
+            )],
             &GuardrailOptions::default(),
         )
         .expect_err("secret pattern blocked");
@@ -792,7 +821,8 @@ fn main_repo_pinned_main_json_and_windows_projfs_fast_path_and_switch() {
     // Unpin c.rs, then commit -> commits ONLY a.rs!
     let rem = remove_pinned_paths(&repo, ["c.rs"]).expect("remove c.rs");
     assert_eq!(rem.len(), 1);
-    let out1 = commit_changes(&repo, &CommitOptions::new("feat: commit pinned a.rs")).expect("commit a");
+    let out1 =
+        commit_changes(&repo, &CommitOptions::new("feat: commit pinned a.rs")).expect("commit a");
     assert_eq!(out1.committed_paths, vec!["a.rs"]);
     assert_eq!(out1.remaining_dirty_count, 2);
     assert!(read_pinned_paths(&repo).expect("read pinned").is_empty());
@@ -864,7 +894,8 @@ fn main_repo_pinned_main_json_and_windows_projfs_fast_path_and_switch() {
     .expect("switch -c");
     assert_eq!(sw1.branch.as_deref(), Some("feat/sw"));
     fs::write(repo_root.join("a.rs"), "pub fn a() -> i32 { 77 }\n").expect("edit a on feat/sw");
-    commit_changes(&repo, &CommitOptions::new("feat: change a on feat/sw")).expect("commit feat/sw");
+    commit_changes(&repo, &CommitOptions::new("feat: change a on feat/sw"))
+        .expect("commit feat/sw");
 
     fs::write(repo_root.join("a.rs"), "dirty conflict\n").expect("dirty a");
     let err = switch_branch(
@@ -909,10 +940,17 @@ fn status_hardening_spaces_unicode_empty_dirs_anchored_gitignore_racy_index_and_
 
     // Tracked files with spaces, unicode, and 1,500 files across 30 subdirs (parallel walk + stat cache).
     fs::create_dir_all(repo_root.join("docs/my folder")).expect("mkdir spaces");
-    fs::write(repo_root.join("docs/my folder/report (v1).txt"), "hello spaces\n").expect("write spaces");
+    fs::write(
+        repo_root.join("docs/my folder/report (v1).txt"),
+        "hello spaces\n",
+    )
+    .expect("write spaces");
     fs::create_dir_all(repo_root.join("café")).expect("mkdir unicode");
-    fs::write(repo_root.join("café/日本語.rs"), "pub fn greet() -> &'static str { \"こんにちは\" }\n")
-        .expect("write unicode");
+    fs::write(
+        repo_root.join("café/日本語.rs"),
+        "pub fn greet() -> &'static str { \"こんにちは\" }\n",
+    )
+    .expect("write unicode");
     fs::write(repo_root.join("same_len.txt"), "AAAA\n").expect("write same_len");
 
     for d in 0..30 {
@@ -942,14 +980,18 @@ fn status_hardening_spaces_unicode_empty_dirs_anchored_gitignore_racy_index_and_
         use std::os::unix::ffi::OsStrExt;
         let fifo_path = repo_root.join("live.fifo");
         let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("cstr");
+        // SAFETY: `c_fifo` is a valid NUL-terminated `CString` pointing to an owned path inside the test `TempDir`.
         assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
     }
 
     // 3. Anchored `.gitignore` verification on general workdir:
     fs::write(repo_root.join("root_only.tmp"), "ignored at root\n").expect("write root_only");
     fs::create_dir_all(repo_root.join("nested")).expect("mkdir nested");
-    fs::write(repo_root.join("nested/root_only.tmp"), "tracked candidate in nested\n")
-        .expect("write nested root_only");
+    fs::write(
+        repo_root.join("nested/root_only.tmp"),
+        "tracked candidate in nested\n",
+    )
+    .expect("write nested root_only");
     fs::write(repo_root.join("noise.log"), "ignored\n").expect("write noise.log");
     fs::write(repo_root.join("keep.log"), "whitelisted\n").expect("write keep.log");
 
@@ -957,10 +999,16 @@ fn status_hardening_spaces_unicode_empty_dirs_anchored_gitignore_racy_index_and_
     //    `compute_status` MUST still compare against HEAD even when `.git/index` matches disk!
     fs::write(repo_root.join("same_len.txt"), "BBBB\n").expect("modify same_len");
     git(&repo_root, &["add", "same_len.txt"]);
-    fs::write(repo_root.join("docs/my folder/report (v1).txt"), "hello spaces v2\n")
-        .expect("edit spaces");
-    fs::write(repo_root.join("café/日本語.rs"), "pub fn greet() -> &'static str { \"やあ\" }\n")
-        .expect("edit unicode");
+    fs::write(
+        repo_root.join("docs/my folder/report (v1).txt"),
+        "hello spaces v2\n",
+    )
+    .expect("edit spaces");
+    fs::write(
+        repo_root.join("café/日本語.rs"),
+        "pub fn greet() -> &'static str { \"やあ\" }\n",
+    )
+    .expect("edit unicode");
     fs::remove_file(repo_root.join("pkg_05/src/mod_10.rs")).expect("delete tracked");
 
     let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover");
@@ -1043,8 +1091,11 @@ fn status_hardening_spaces_unicode_empty_dirs_anchored_gitignore_racy_index_and_
     fs::write(upper_dir.join("noise.log"), "ignored\n").expect("write noise");
     fs::write(upper_dir.join("keep.log"), "kept\n").expect("write keep");
     fs::create_dir_all(upper_dir.join("café")).expect("mkdir upper unicode");
-    fs::write(upper_dir.join("café/日本語.rs"), "pub fn greet() -> &'static str { \"edited\" }\n")
-        .expect("write upper unicode");
+    fs::write(
+        upper_dir.join("café/日本語.rs"),
+        "pub fn greet() -> &'static str { \"edited\" }\n",
+    )
+    .expect("write upper unicode");
 
     #[cfg(unix)]
     {
@@ -1052,6 +1103,7 @@ fn status_hardening_spaces_unicode_empty_dirs_anchored_gitignore_racy_index_and_
         use std::os::unix::ffi::OsStrExt;
         let fifo_path = upper_dir.join("upper.fifo");
         let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("cstr");
+        // SAFETY: `c_fifo` is a valid NUL-terminated `CString` pointing to an owned path inside the test `TempDir`.
         assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
     }
 
@@ -1072,6 +1124,3 @@ fn status_hardening_spaces_unicode_empty_dirs_anchored_gitignore_racy_index_and_
         ]
     );
 }
-
-
-

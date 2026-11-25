@@ -280,8 +280,7 @@ impl OzoneRepo {
 
     /// Opens the underlying repository on real host disk using `gix`.
     pub fn open_gix(&self) -> Result<gix::Repository> {
-        let mut gix_repo =
-            gix::open(&self.repo_root).map_err(|err| OzError::Git(err.to_string()))?;
+        let mut gix_repo = gix::open(&self.repo_root).map_err(OzError::git_source)?;
         let _ = gix_repo.committer_or_set_fallback("Ozone", "oz@ozone.dev");
         Ok(gix_repo)
     }
@@ -766,8 +765,8 @@ pub fn is_enotconn(err: &std::io::Error) -> bool {
 
 #[cfg(unix)]
 fn short_unix_socket_path(git_common_dir: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(git_common_dir)
-        .unwrap_or_else(|_| normalize_lexical(git_common_dir));
+    let canonical =
+        std::fs::canonicalize(git_common_dir).unwrap_or_else(|_| normalize_lexical(git_common_dir));
     let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
     let hex = digest.to_hex();
     let short_hash = &hex.as_str()[..16];
@@ -782,6 +781,7 @@ fn short_unix_socket_path(git_common_dir: &Path) -> PathBuf {
         }
     }
 
+    // SAFETY: `libc::geteuid()` is an infallible POSIX syscall with no pointer arguments or preconditions.
     let uid = unsafe { libc::geteuid() };
     let tmp_dir = PathBuf::from(format!("/tmp/oz-{uid}"));
     let cand = tmp_dir.join(&file_name);
@@ -897,7 +897,8 @@ mod tests {
         let found_common = std::fs::canonicalize(&found.git_common_dir)
             .unwrap_or_else(|_| found.git_common_dir.clone());
         let canon_root = std::fs::canonicalize(&repo_root).expect("canon repo_root");
-        let canon_common = std::fs::canonicalize(repo_root.join(".git")).expect("canon git_common_dir");
+        let canon_common =
+            std::fs::canonicalize(repo_root.join(".git")).expect("canon git_common_dir");
         assert_eq!(found_root, canon_root);
         assert_eq!(found_common, canon_common);
         assert!(found.is_linked_worktree);
@@ -1064,7 +1065,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let short_git = dir.path().join("r/.git");
         let short_layout = OzoneLayout::from_git_common_dir(&short_git);
-        assert_eq!(short_layout.vfsd_socket_path(), short_git.join("ozone/vfsd.sock"));
+        assert_eq!(
+            short_layout.vfsd_socket_path(),
+            short_git.join("ozone/vfsd.sock")
+        );
 
         // Construct a deeply nested path whose `.git/ozone/vfsd.sock` exceeds Unix SUN_LEN (~108B).
         let deep_git = dir
@@ -1080,7 +1084,11 @@ mod tests {
             "hashed socket path '{}' exceeds 100 bytes",
             sock.display()
         );
-        assert_eq!(sock, deep_layout.vfsd_socket_path(), "hash must be deterministic");
+        assert_eq!(
+            sock,
+            deep_layout.vfsd_socket_path(),
+            "hash must be deterministic"
+        );
 
         // Verify a real UnixListener can bind to the shortened socket path without EINVAL/SUN_LEN.
         if let Some(parent) = sock.parent() {

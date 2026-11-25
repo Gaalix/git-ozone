@@ -251,7 +251,7 @@ impl Envelope<Value> {
     pub fn from_error(err: &crate::error::OzError) -> Self {
         let mut env = Self::failure(err.error_code(), err.exit_code(), err.to_string());
         if let crate::error::OzError::Conflict { conflicts, .. } = err {
-            env.conflicts = conflicts.clone();
+            env.conflicts.clone_from(conflicts);
         }
         env.recovery_commands = err.recovery_commands();
         env

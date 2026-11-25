@@ -8,8 +8,8 @@ use crate::error::{OzError, Result};
 use crate::repo::OzoneRepo;
 use crate::status::{compute_status, compute_status_with_overrides};
 use crate::types::{ChangeKind, DiffHunk, DiffLine, DiffLineKind, FileChange};
+use gix::diff::blob::{Algorithm, Diff, Hunk, InternedInput, sources};
 use globset::{GlobBuilder, GlobMatcher};
-use imara_diff::{Algorithm, Diff, InternedInput, sources};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -80,7 +80,10 @@ pub fn hunk_suffix(mut index: usize) -> String {
 /// (e.g., `(1, 0) -> "h1a"`, `(1, 26) -> "h1aa"`, `(2, 0) -> "h2a"`).
 #[must_use]
 pub fn hunk_id(file_num_one_based: usize, hunk_index_zero_based: usize) -> String {
-    format!("h{file_num_one_based}{}", hunk_suffix(hunk_index_zero_based))
+    format!(
+        "h{file_num_one_based}{}",
+        hunk_suffix(hunk_index_zero_based)
+    )
 }
 
 /// Formats a deterministic file ID from a 1-based file index (`1 -> "f1"`).
@@ -152,7 +155,7 @@ pub(crate) fn compute_file_diff(
 
     let additions = diff.count_additions();
     let deletions = diff.count_removals();
-    let raw_hunks: Vec<imara_diff::Hunk> = diff.hunks().collect();
+    let raw_hunks: Vec<Hunk> = diff.hunks().collect();
     if raw_hunks.is_empty() {
         return ComputedFileDiff {
             is_binary: false,
@@ -163,8 +166,8 @@ pub(crate) fn compute_file_diff(
         };
     }
 
-    let mut groups: Vec<Vec<imara_diff::Hunk>> = Vec::new();
-    let mut current_group: Vec<imara_diff::Hunk> = Vec::new();
+    let mut groups: Vec<Vec<Hunk>> = Vec::new();
+    let mut current_group: Vec<Hunk> = Vec::new();
     for rh in raw_hunks {
         if let Some(prev) = current_group.last()
             && rh.before.start.saturating_sub(prev.before.end) > 2 * DEFAULT_CONTEXT_LINES
@@ -652,7 +655,11 @@ pub fn render_file_unified_diff_numbered(file: &FileChange) -> String {
 
 fn render_file_unified_diff_impl(file: &FileChange, numbered: bool) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "diff --ozone [{}] a/{} b/{}", file.id, file.path, file.path);
+    let _ = writeln!(
+        out,
+        "diff --ozone [{}] a/{} b/{}",
+        file.id, file.path, file.path
+    );
     match file.kind {
         ChangeKind::Added | ChangeKind::Untracked => {
             let _ = writeln!(out, "--- /dev/null");
@@ -669,7 +676,11 @@ fn render_file_unified_diff_impl(file: &FileChange, numbered: bool) -> String {
     }
 
     if file.is_binary {
-        let _ = writeln!(out, "Binary files a/{} and b/{} differ", file.path, file.path);
+        let _ = writeln!(
+            out,
+            "Binary files a/{} and b/{} differ",
+            file.path, file.path
+        );
         return out;
     }
 
@@ -777,7 +788,8 @@ mod tests {
         after_lines[25] = "line 26 edited B\n".to_string();
         let after: String = after_lines.concat();
 
-        let computed = compute_file_diff("f1", 1, "src/lib.rs", before.as_bytes(), after.as_bytes());
+        let computed =
+            compute_file_diff("f1", 1, "src/lib.rs", before.as_bytes(), after.as_bytes());
         assert_eq!(computed.hunks.len(), 2);
         assert_eq!(computed.hunks[0].id, "h1a");
         assert_eq!(computed.hunks[1].id, "h1b");
@@ -857,12 +869,9 @@ mod tests {
         assert!(filtered.iter().all(|f| f.path != "pnpm-lock.yaml"));
 
         // Explicit --exclude with glob
-        let filtered_glob = filter_changes_by_targets_and_excludes(
-            &changes,
-            &[],
-            &["*.yaml".to_string()],
-        )
-        .expect("glob exclude");
+        let filtered_glob =
+            filter_changes_by_targets_and_excludes(&changes, &[], &["*.yaml".to_string()])
+                .expect("glob exclude");
         assert_eq!(filtered_glob.len(), 2);
 
         // :(exclude) syntax

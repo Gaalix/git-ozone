@@ -159,7 +159,7 @@ impl AttributeResolver {
     /// Builds a resolver from preloaded `(rel_dir, content)` `.gitattributes` blobs
     /// (for ODB tree materialization or FUSE3 overlay inspection without touching FUSE mount).
     pub fn from_preloaded_files(
-        per_dir_contents: HashMap<String, String>,
+        mut per_dir_contents: HashMap<String, String>,
         git_common_dir: &Path,
         cfg: &GitConfig,
     ) -> Result<Self> {
@@ -168,17 +168,15 @@ impl AttributeResolver {
 
         let mut dir_cache = HashMap::new();
         // Parse root first so `[attr]` macros apply cleanly.
-        if let Some(root_raw) = per_dir_contents.get("") {
-            let rules = parse_attributes_str(root_raw, true, &mut macros);
+        if let Some(root_raw) = per_dir_contents.remove("") {
+            let rules = parse_attributes_str(&root_raw, true, &mut macros);
             dir_cache.insert(String::new(), rules);
         }
-        let mut dirs: Vec<&String> = per_dir_contents.keys().filter(|d| !d.is_empty()).collect();
-        dirs.sort();
-        for dir in dirs {
-            if let Some(raw) = per_dir_contents.get(dir) {
-                let rules = parse_attributes_str(raw, false, &mut macros);
-                dir_cache.insert(dir.clone(), rules);
-            }
+        let mut entries: Vec<(String, String)> = per_dir_contents.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (dir, raw) in entries {
+            let rules = parse_attributes_str(&raw, false, &mut macros);
+            dir_cache.insert(dir, rules);
         }
         let info_rules = load_info_attributes(git_common_dir, &mut macros)?;
 
@@ -200,14 +198,12 @@ impl AttributeResolver {
     ) -> Result<Self> {
         let mut per_dir = HashMap::new();
         if let Some(tid) = tree_id {
-            let tree = gix_repo
-                .find_tree(tid)
-                .map_err(|e| OzError::Git(e.to_string()))?;
+            let tree = gix_repo.find_tree(tid).map_err(OzError::git_source)?;
             let entries = tree
                 .traverse()
                 .breadthfirst
                 .files()
-                .map_err(|e| OzError::Git(e.to_string()))?;
+                .map_err(OzError::git_source)?;
             for entry in entries {
                 if !entry.mode.is_blob() {
                     continue;
@@ -219,9 +215,7 @@ impl AttributeResolver {
                         .strip_suffix("/.gitattributes")
                         .unwrap_or("")
                         .to_string();
-                    let blob = gix_repo
-                        .find_blob(entry.oid)
-                        .map_err(|e| OzError::Git(e.to_string()))?;
+                    let blob = gix_repo.find_blob(entry.oid).map_err(OzError::git_source)?;
                     per_dir.insert(dir, String::from_utf8_lossy(&blob.data).into_owned());
                 }
             }
@@ -273,7 +267,11 @@ impl AttributeResolver {
     /// Returns the newest modified timestamp across `<git_common_dir>/info/attributes` and root
     /// `.gitattributes`, used for status index-stat cache invalidation.
     #[must_use]
-    pub fn max_attributes_mtime(&self, workdir_path: &Path, git_common_dir: &Path) -> Option<std::time::SystemTime> {
+    pub fn max_attributes_mtime(
+        &self,
+        workdir_path: &Path,
+        git_common_dir: &Path,
+    ) -> Option<std::time::SystemTime> {
         let candidates = [
             workdir_path.join(".gitattributes"),
             git_common_dir.join("info").join("attributes"),
@@ -335,15 +333,14 @@ impl AttributeResolver {
         let macros_guard = self.macros.read().ok();
 
         for rule in rules {
-            let target = if rule.basename_only { basename } else { sub_rel };
+            let target = if rule.basename_only {
+                basename
+            } else {
+                sub_rel
+            };
             if rule.matcher.is_match(target) {
                 for assign in &rule.assignments {
-                    apply_assignment_recursive(
-                        assign,
-                        macros_guard.as_deref(),
-                        out,
-                        0,
-                    );
+                    apply_assignment_recursive(assign, macros_guard.as_deref(), out, 0);
                 }
             }
         }
@@ -377,7 +374,8 @@ fn apply_assignment_recursive(
             out.attrs.remove(name);
         }
         AttrAssignment::Value(name, val) => {
-            out.attrs.insert(name.clone(), AttrState::Value(val.clone()));
+            out.attrs
+                .insert(name.clone(), AttrState::Value(val.clone()));
         }
     }
 }
@@ -387,7 +385,9 @@ fn apply_assignment_recursive(
 pub fn is_lfs_pointer(bytes: &[u8]) -> bool {
     bytes.len() <= 1024
         && bytes.starts_with(GIT_LFS_POINTER_PREFIX)
-        && bytes.windows(b"oid sha256:".len()).any(|w| w == b"oid sha256:")
+        && bytes
+            .windows(b"oid sha256:".len())
+            .any(|w| w == b"oid sha256:")
 }
 
 /// Applies clean (checkin) EOL normalization according to `.gitattributes` and `GitConfig`.
@@ -561,8 +561,9 @@ pub fn smudge_blob_bytes<'a>(
     let after_filter: Cow<'a, [u8]> = if let Some(driver) = effective_driver {
         let fcfg = cfg.filter_driver(driver);
         let smudge_cmd = fcfg.as_ref().and_then(|c| c.smudge.as_deref());
-        let is_required =
-            fcfg.as_ref().is_some_and(|c| c.required) || driver == "lfs" || is_lfs_pointer(blob_bytes);
+        let is_required = fcfg.as_ref().is_some_and(|c| c.required)
+            || driver == "lfs"
+            || is_lfs_pointer(blob_bytes);
 
         match smudge_cmd {
             Some(cmd_template) => {
@@ -623,10 +624,7 @@ fn find_windows_sh() -> Option<std::path::PathBuf> {
         }
         for dir in std::env::split_paths(&path_env) {
             if dir.join("git.exe").is_file() {
-                for root in [Some(dir.as_path()), dir.parent()]
-                    .into_iter()
-                    .flatten()
-                {
+                for root in [Some(dir.as_path()), dir.parent()].into_iter().flatten() {
                     for rel in ["usr\\bin\\sh.exe", "bin\\sh.exe"] {
                         let cand = root.join(rel);
                         if cand.is_file() {
@@ -649,6 +647,156 @@ fn find_windows_sh() -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_CMD_FORBIDDEN_CHARS: &[char] = &[
+    '%', '&', '|', '^', '<', '>', '(', ')', '"', '\n', '\r', '!', ';', '\0',
+];
+
+/// Validates a repository path before substituting `%f` on Windows when `sh.exe` is unavailable.
+///
+/// Rejects all `cmd.exe` shell metacharacters, control/newline separators, NUL bytes, and
+/// trailing backslashes (which would escape closing quotes in Windows CRT argv parsing).
+#[cfg(any(windows, test))]
+fn validate_windows_filter_path(rel_path: &str) -> std::result::Result<(), String> {
+    if let Some(bad) = rel_path
+        .chars()
+        .find(|ch| WINDOWS_CMD_FORBIDDEN_CHARS.contains(ch))
+    {
+        return Err(format!(
+            "refusing to substitute filter path '{rel_path}' containing forbidden Windows shell metacharacter {bad:?}"
+        ));
+    }
+    if rel_path.ends_with('\\') {
+        return Err(format!(
+            "refusing to substitute filter path '{rel_path}' ending with a backslash"
+        ));
+    }
+    Ok(())
+}
+
+/// Execution plan for running a Git clean/smudge filter on Windows when POSIX `sh.exe` is absent.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsFilterPlan {
+    /// Direct `CreateProcessW` execution without invoking `cmd.exe`.
+    Direct { program: String, args: Vec<String> },
+    /// Restricted `cmd.exe /D /C` fallback for filter templates that themselves use shell operators,
+    /// after strictly validating that `rel_path` contains zero shell metacharacters.
+    CmdFallback { command_line: String },
+}
+
+/// Attempts to parse a simple filter template (such as `git-lfs clean -- %f`) into direct argv
+/// without shell operators so Windows can spawn the executable directly without `cmd.exe`.
+#[cfg(any(windows, test))]
+fn parse_direct_filter_argv(cmd_template: &str, rel_path: &str) -> Option<(String, Vec<String>)> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = cmd_template.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    in_token = true;
+                }
+                c if c.is_ascii_whitespace() => {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                }
+                // Shell operators or variable expansion require a shell rather than direct argv.
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '^' | '!' | '`' | '$' | '\n' | '\r' => {
+                    return None;
+                }
+                '%' => {
+                    if chars.peek() == Some(&'f') {
+                        chars.next();
+                        current.push_str(rel_path);
+                        in_token = true;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                    in_token = true;
+                }
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if in_token {
+        tokens.push(current);
+    }
+
+    // Also substitute `%f` inside quoted tokens (e.g. `my-filter "%f"`), while refusing
+    // arbitrary `%VAR%` environment interpolation inside quotes.
+    let mut expanded_tokens = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        let mut out = String::with_capacity(tok.len());
+        let mut tchars = tok.chars().peekable();
+        while let Some(ch) = tchars.next() {
+            if ch == '%' {
+                if tchars.peek() == Some(&'f') {
+                    tchars.next();
+                    out.push_str(rel_path);
+                } else {
+                    return None;
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        expanded_tokens.push(out);
+    }
+
+    let mut iter = expanded_tokens.into_iter();
+    let program = iter.next()?;
+    let args: Vec<String> = iter.collect();
+    Some((program, args))
+}
+
+#[cfg(any(windows, test))]
+fn plan_windows_no_sh_filter(
+    cmd_template: &str,
+    rel_path: &str,
+) -> std::result::Result<WindowsFilterPlan, String> {
+    let uses_path = cmd_template.contains("%f");
+    if uses_path {
+        // Always reject Windows cmd.exe metacharacters in `rel_path` even for direct argv,
+        // because Windows `CreateProcessW` implicitly invokes `cmd.exe` for `.bat`/`.cmd` shims.
+        validate_windows_filter_path(rel_path)?;
+    }
+
+    if let Some((program, args)) = parse_direct_filter_argv(cmd_template, rel_path) {
+        return Ok(WindowsFilterPlan::Direct { program, args });
+    }
+
+    // Shell pipeline/operator template without `sh.exe`: `rel_path` was already validated to
+    // contain zero shell metacharacters, double quotes, newlines, or trailing backslashes.
+    let quoted_rel = format!("\"{rel_path}\"");
+    let win_expanded = cmd_template
+        .replace("\"%f\"", &quoted_rel)
+        .replace("%f", &quoted_rel);
+    Ok(WindowsFilterPlan::CmdFallback {
+        command_line: win_expanded,
+    })
+}
+
 fn run_filter_command(
     cmd_template: &str,
     rel_path: &str,
@@ -656,6 +804,9 @@ fn run_filter_command(
     workdir: &Path,
     git_dir: &Path,
 ) -> std::result::Result<Vec<u8>, String> {
+    if rel_path.contains('\0') {
+        return Err("refusing to run filter on path containing NUL byte".to_string());
+    }
     let quoted_path = shell_quote_single(rel_path);
     let expanded = cmd_template.replace("%f", &quoted_path);
     #[cfg(unix)]
@@ -671,13 +822,21 @@ fn run_filter_command(
             c.args(["-c", &expanded]);
             c
         } else {
-            use std::os::windows::process::CommandExt as _;
-            let win_quoted = format!("\"{}\"", rel_path.replace('"', "\\\""));
-            let win_expanded = cmd_template.replace("%f", &win_quoted);
-            let mut c = Command::new("cmd.exe");
-            c.raw_arg("/C");
-            c.raw_arg(format!("\"{win_expanded}\""));
-            c
+            match plan_windows_no_sh_filter(cmd_template, rel_path)? {
+                WindowsFilterPlan::Direct { program, args } => {
+                    let mut c = Command::new(program);
+                    c.args(args);
+                    c
+                }
+                WindowsFilterPlan::CmdFallback { command_line } => {
+                    use std::os::windows::process::CommandExt as _;
+                    let mut c = Command::new("cmd.exe");
+                    c.raw_arg("/D");
+                    c.raw_arg("/C");
+                    c.raw_arg(format!("\"{command_line}\""));
+                    c
+                }
+            }
         }
     };
     if workdir.is_dir() {
@@ -691,14 +850,29 @@ fn run_filter_command(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed spawning '{expanded}': {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input)
-            .map_err(|e| format!("failed writing stdin to '{expanded}': {e}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("failed waiting on '{expanded}': {e}"))?;
+    let stdin = child.stdin.take();
+
+    // Feed `stdin` on a scoped worker thread concurrently with `wait_with_output()` draining
+    // stdout/stderr so streaming filters on payloads larger than the OS pipe buffer (>64 KiB)
+    // never deadlock.
+    let (write_res, wait_res) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> std::io::Result<()> {
+            if let Some(mut stdin) = stdin {
+                stdin.write_all(input)?;
+                drop(stdin);
+            }
+            Ok(())
+        });
+
+        let wait_res = child.wait_with_output();
+        let write_res = match writer.join() {
+            Ok(res) => res,
+            Err(_) => Err(std::io::Error::other("filter stdin writer thread panicked")),
+        };
+        (write_res, wait_res)
+    });
+
+    let output = wait_res.map_err(|e| format!("failed waiting on '{expanded}': {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let code = output
@@ -710,6 +884,11 @@ fn run_filter_command(
         } else {
             format!("command `{expanded}` exited with status {code}: {stderr}")
         });
+    }
+    if let Err(err) = write_res
+        && err.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(format!("failed writing stdin to '{expanded}': {err}"));
     }
     Ok(output.stdout)
 }
@@ -767,9 +946,12 @@ fn resolve_global_attributes_path(cfg: &GitConfig) -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(xdg).join("git").join("attributes"));
     }
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(|h| PathBuf::from(h).join(".config").join("git").join("attributes"))
+    std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| {
+        PathBuf::from(h)
+            .join(".config")
+            .join("git")
+            .join("attributes")
+    })
 }
 
 fn load_info_attributes(
@@ -833,8 +1015,9 @@ fn parse_attributes_str(
         if pattern.starts_with('!') || pattern.is_empty() {
             continue;
         }
-        let assignments: Vec<AttrAssignment> =
-            split_attr_tokens(rest).filter_map(parse_attr_token).collect();
+        let assignments: Vec<AttrAssignment> = split_attr_tokens(rest)
+            .filter_map(parse_attr_token)
+            .collect();
         if assignments.is_empty() {
             continue;
         }
@@ -994,11 +1177,7 @@ mod tests {
             "* text=auto\n*.sh eol=lf\n*.png binary\n[attr]lock -diff -text\nCargo.lock lock\n",
         )
         .unwrap();
-        fs::write(
-            workdir.join("docs/.gitattributes"),
-            "*.md text eol=crlf\n",
-        )
-        .unwrap();
+        fs::write(workdir.join("docs/.gitattributes"), "*.md text eol=crlf\n").unwrap();
         fs::write(
             git_common.join("info/attributes"),
             "docs/generated/*.md -text -diff\n",
@@ -1100,17 +1279,129 @@ mod tests {
         .unwrap_err();
         assert_eq!(err_clean.error_code(), "check_failed");
 
-        let ptr = b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef\nsize 123\n";
+        let ptr =
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef\nsize 123\n";
         assert!(is_lfs_pointer(ptr));
-        let err_smudge = smudge_blob_bytes(
-            "weights.bin",
-            ptr,
-            &attrs,
-            &empty_cfg,
-            tmp.path(),
-            &git_dir,
-        )
-        .unwrap_err();
+        let err_smudge =
+            smudge_blob_bytes("weights.bin", ptr, &attrs, &empty_cfg, tmp.path(), &git_dir)
+                .unwrap_err();
         assert_eq!(err_smudge.error_code(), "check_failed");
+    }
+
+    #[test]
+    fn windows_filter_plan_rejects_cmd_metacharacters_and_uses_direct_argv() {
+        // Direct filter command avoids cmd.exe altogether, even with spaces in path.
+        let plan = plan_windows_no_sh_filter("git-lfs clean -- %f", "docs/my report.bin")
+            .expect("safe path succeeds");
+        assert_eq!(
+            plan,
+            WindowsFilterPlan::Direct {
+                program: "git-lfs".to_string(),
+                args: vec![
+                    "clean".to_string(),
+                    "--".to_string(),
+                    "docs/my report.bin".to_string(),
+                ],
+            }
+        );
+
+        let quoted_prog = plan_windows_no_sh_filter(
+            r#""C:\Program Files\Git LFS\git-lfs.exe" clean -- "%f""#,
+            "assets/model.bin",
+        )
+        .expect("quoted program path succeeds");
+        assert_eq!(
+            quoted_prog,
+            WindowsFilterPlan::Direct {
+                program: r"C:\Program Files\Git LFS\git-lfs.exe".to_string(),
+                args: vec![
+                    "clean".to_string(),
+                    "--".to_string(),
+                    "assets/model.bin".to_string(),
+                ],
+            }
+        );
+
+        // Shell pipeline falls back cleanly for safe paths.
+        let pipe_plan = plan_windows_no_sh_filter("filter-a %f | filter-b", "src/data.txt")
+            .expect("safe pipeline succeeds");
+        assert_eq!(
+            pipe_plan,
+            WindowsFilterPlan::CmdFallback {
+                command_line: "filter-a \"src/data.txt\" | filter-b".to_string(),
+            }
+        );
+
+        // Every Windows cmd.exe metacharacter injection vector must be rejected.
+        let malicious_paths = [
+            "a%PATH%b",
+            "a&calc.exe",
+            "a|calc.exe",
+            "a^&calc.exe",
+            "a<in.txt",
+            "a>out.txt",
+            "a(b)",
+            "a\" & calc.exe & \"",
+            "a\ncalc.exe",
+            "a\rcalc.exe",
+            "a!DELAYED!",
+            "a;calc.exe",
+            "a\0b",
+            "trailing\\",
+        ];
+        for bad in malicious_paths {
+            assert!(
+                plan_windows_no_sh_filter("git-lfs clean -- %f", bad).is_err(),
+                "direct plan must reject malicious path {bad:?}"
+            );
+            assert!(
+                plan_windows_no_sh_filter("filter-a %f | filter-b", bad).is_err(),
+                "cmd fallback plan must reject malicious path {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_filter_handles_over_128kib_payload_without_pipe_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+
+        // 256 KiB payload (> 4x typical 64 KiB OS pipe buffer) to prove concurrent stdin/stdout I/O.
+        let payload: Vec<u8> = (0..(256 * 1024usize))
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+
+        // NUL byte in filename is rejected before spawn on all platforms.
+        assert!(run_filter_command("cat", "bad\0name", b"hi", tmp.path(), &git_dir).is_err());
+
+        #[cfg(unix)]
+        {
+            let out = run_filter_command("cat", "large/blob.dat", &payload, tmp.path(), &git_dir)
+                .expect("256 KiB streaming filter must complete without deadlocking");
+            assert_eq!(out.len(), payload.len());
+            assert_eq!(out, payload);
+
+            // Also verify metacharacter-laden repository filenames cannot inject commands via `%f`.
+            let marker = tmp.path().join("pwned_marker");
+            let injected_rel = format!("evil'; touch {}; '.txt", marker.display());
+            let echoed =
+                run_filter_command("printf '%s' %f", &injected_rel, b"", tmp.path(), &git_dir)
+                    .expect("POSIX single-quoted path runs safely");
+            assert_eq!(echoed, injected_rel.as_bytes());
+            assert!(
+                !marker.exists(),
+                "shell command injection occurred via %f filename!"
+            );
+        }
+        #[cfg(windows)]
+        {
+            if find_windows_sh().is_some() {
+                let out =
+                    run_filter_command("cat", "large/blob.dat", &payload, tmp.path(), &git_dir)
+                        .expect("256 KiB streaming filter must complete without deadlocking");
+                assert_eq!(out, payload);
+            }
+        }
     }
 }
