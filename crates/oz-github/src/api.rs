@@ -234,6 +234,17 @@ pub struct GitHubIssue {
     pub pull_request: Option<GitHubIssuePullRequestRef>,
 }
 
+/// Response from GitHub REST Search Issues/PRs (`GET /search/issues`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubSearchIssuesResponse {
+    #[serde(default)]
+    pub total_count: u64,
+    #[serde(default)]
+    pub incomplete_results: bool,
+    #[serde(default)]
+    pub items: Vec<GitHubIssue>,
+}
+
 /// GitHub Actions workflow definition from `GET /repos/{owner}/{repo}/actions/workflows`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubWorkflow {
@@ -503,7 +514,20 @@ impl GitHubClient {
         head: Option<&str>,
         base: Option<&str>,
     ) -> Result<Vec<GitHubPullRequest>> {
-        let mut params = vec![("per_page".to_string(), "100".to_string())];
+        self.list_pull_requests_limited(owner, repo, state, head, base, 100)
+    }
+
+    /// Lists pull requests with an explicit `per_page` cap (`GET /repos/{owner}/{repo}/pulls`).
+    pub fn list_pull_requests_limited(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: Option<&str>,
+        head: Option<&str>,
+        base: Option<&str>,
+        per_page: usize,
+    ) -> Result<Vec<GitHubPullRequest>> {
+        let mut params = vec![("per_page".to_string(), per_page.clamp(1, 100).to_string())];
         if let Some(st) = state {
             params.push(("state".to_string(), st.to_string()));
         }
@@ -711,6 +735,184 @@ impl GitHubClient {
     pub fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GitHubIssue> {
         let path = format!("/repos/{owner}/{repo}/issues/{number}");
         self.get_json_with_query(&path, &[])
+    }
+
+    /// Lists repository issues via REST (`GET /repos/{owner}/{repo}/issues`).
+    pub fn list_issues(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: Option<&str>,
+        labels: &[String],
+        assignee: Option<&str>,
+        per_page: usize,
+    ) -> Result<Vec<GitHubIssue>> {
+        let mut params = vec![("per_page".to_string(), per_page.clamp(1, 100).to_string())];
+        if let Some(st) = state {
+            params.push(("state".to_string(), st.to_string()));
+        }
+        if !labels.is_empty() {
+            params.push(("labels".to_string(), labels.join(",")));
+        }
+        if let Some(asg) = assignee {
+            params.push(("assignee".to_string(), asg.to_string()));
+        }
+        let path = format!("/repos/{owner}/{repo}/issues");
+        self.get_json_with_query(&path, &params)
+    }
+
+    /// Searches issues and pull requests via REST (`GET /search/issues?q=...`).
+    pub fn search_issues_and_prs(
+        &self,
+        query: &str,
+        per_page: usize,
+    ) -> Result<GitHubSearchIssuesResponse> {
+        let params = vec![
+            ("q".to_string(), query.to_string()),
+            ("per_page".to_string(), per_page.clamp(1, 100).to_string()),
+            ("sort".to_string(), "updated".to_string()),
+            ("order".to_string(), "desc".to_string()),
+        ];
+        self.get_json_with_query("/search/issues", &params)
+    }
+
+    /// Posts a conversation comment on an issue or PR (`POST /repos/{owner}/{repo}/issues/{number}/comments`).
+    pub fn create_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<GitHubIssueComment> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            body: &'a str,
+        }
+        let path = format!("/repos/{owner}/{repo}/issues/{number}/comments");
+        self.send_json(http::Method::POST, &path, &Body { body })
+    }
+
+    /// Replies to an inline pull request review comment thread
+    /// (`POST /repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies`).
+    pub fn reply_to_pull_request_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<GitHubPullRequestComment> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            body: &'a str,
+        }
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies");
+        self.send_json(http::Method::POST, &path, &Body { body })
+    }
+
+    /// Resolves or unresolves a GraphQL pull request review thread (`resolveReviewThread` / `unresolveReviewThread`).
+    pub fn set_pull_request_review_thread_resolved_graphql(
+        &self,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<bool> {
+        let (mutation, field) = if resolved {
+            (
+                r#"mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }"#,
+                "resolveReviewThread",
+            )
+        } else {
+            (
+                r#"mutation($threadId: ID!) { unresolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }"#,
+                "unresolveReviewThread",
+            )
+        };
+        let resp = self.graphql(mutation, serde_json::json!({ "threadId": thread_id }))?;
+        if let Some(errors) = resp.get("errors").and_then(|e| e.as_array())
+            && !errors.is_empty()
+        {
+            let msg = errors
+                .first()
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("GraphQL review thread mutation failed");
+            return Err(OzError::CheckFailed {
+                message: format!("GitHub GraphQL {field} failed: {msg}"),
+                recovery: Vec::new(),
+            });
+        }
+        let is_resolved = resp
+            .get("data")
+            .and_then(|d| d.get(field))
+            .and_then(|r| r.get("thread"))
+            .and_then(|t| t.get("isResolved"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(resolved);
+        Ok(is_resolved)
+    }
+
+    /// Converts a pull request to draft or marks it ready for review via GraphQL.
+    pub fn set_pull_request_draft_graphql(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        draft: bool,
+    ) -> Result<bool> {
+        const ID_QUERY: &str = r#"
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) { id isDraft }
+              }
+            }
+        "#;
+        let id_resp = self.graphql(
+            ID_QUERY,
+            serde_json::json!({ "owner": owner, "repo": repo, "number": number }),
+        )?;
+        let pr_node_id = id_resp
+            .get("data")
+            .and_then(|d| d.get("repository"))
+            .and_then(|r| r.get("pullRequest"))
+            .and_then(|p| p.get("id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OzError::CheckFailed {
+                message: format!("could not resolve GraphQL node ID for PR #{number}"),
+                recovery: Vec::new(),
+            })?;
+
+        let (mutation, field) = if draft {
+            (
+                r#"mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } } }"#,
+                "convertPullRequestToDraft",
+            )
+        } else {
+            (
+                r#"mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }"#,
+                "markPullRequestReadyForReview",
+            )
+        };
+        let resp = self.graphql(mutation, serde_json::json!({ "id": pr_node_id }))?;
+        if let Some(errors) = resp.get("errors").and_then(|e| e.as_array())
+            && !errors.is_empty()
+        {
+            let msg = errors
+                .first()
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("GraphQL draft state update failed");
+            return Err(OzError::CheckFailed {
+                message: format!("GitHub GraphQL {field} failed: {msg}"),
+                recovery: Vec::new(),
+            });
+        }
+        Ok(resp
+            .get("data")
+            .and_then(|d| d.get(field))
+            .and_then(|r| r.get("pullRequest"))
+            .and_then(|p| p.get("isDraft"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(draft))
     }
 
     /// Best-effort GraphQL lookup for PR `reviewThreads` (`isResolved`, `isOutdated`, thread IDs).
@@ -958,7 +1160,19 @@ impl GitHubClient {
         branch: Option<&str>,
         head_sha: Option<&str>,
     ) -> Result<Vec<GitHubWorkflowRun>> {
-        let mut params = vec![("per_page".to_string(), "30".to_string())];
+        self.list_workflow_runs_limited(owner, repo, branch, head_sha, 30)
+    }
+
+    /// Lists GitHub Actions workflow runs with an explicit `per_page` limit (`GET /repos/{owner}/{repo}/actions/runs`).
+    pub fn list_workflow_runs_limited(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: Option<&str>,
+        head_sha: Option<&str>,
+        per_page: usize,
+    ) -> Result<Vec<GitHubWorkflowRun>> {
+        let mut params = vec![("per_page".to_string(), per_page.clamp(1, 100).to_string())];
         if let Some(br) = branch {
             params.push(("branch".to_string(), br.to_string()));
         }

@@ -638,13 +638,17 @@ pub fn materialize_cas_workspace(
                     created_dirs.insert(parent.to_path_buf());
                 }
                 let meta = std::fs::symlink_metadata(entry.path())?;
-                dep_jobs.push((
-                    rel.to_string_lossy().into_owned(),
-                    entry.path().to_path_buf(),
-                    dst,
-                    entry.path_is_symlink(),
-                    meta,
-                ));
+                if !entry.path_is_symlink() && is_mutable_warm_metadata_file(rel) {
+                    source_jobs.push((entry.path().to_path_buf(), dst, false, meta));
+                } else {
+                    dep_jobs.push((
+                        rel.to_string_lossy().into_owned(),
+                        entry.path().to_path_buf(),
+                        dst,
+                        entry.path_is_symlink(),
+                        meta,
+                    ));
+                }
             }
         }
     } else {
@@ -672,7 +676,7 @@ pub fn materialize_cas_workspace(
                 created_dirs.insert(parent.to_path_buf());
             }
             let meta = std::fs::symlink_metadata(entry.path())?;
-            if is_warm_dep {
+            if is_warm_dep && (entry.path_is_symlink() || !is_mutable_warm_metadata_file(rel)) {
                 dep_jobs.push((
                     rel.to_string_lossy().into_owned(),
                     entry.path().to_path_buf(),
@@ -696,7 +700,7 @@ pub fn materialize_cas_workspace(
             }
             if meta.is_file() {
                 std::fs::copy(src, dst)?;
-                std::fs::set_permissions(dst, meta.permissions())?;
+                set_writable_permissions(dst, meta)?;
                 let ft = metadata_modified_filetime(meta);
                 let _ = set_file_mtime_compat(dst, ft);
             }
@@ -842,6 +846,63 @@ fn collect_warm_root_names(req: &SpawnRequest, git_common_dir: &Path) -> HashSet
         roots.insert(known.to_string());
     }
     roots
+}
+
+/// Returns `true` for package-manager / build-tool metadata and shim files inside warm cache
+/// directories (such as `node_modules/.modules.yaml`, `.pnpm-workspace-state-v1.json`,
+/// `node_modules/.bin/*`, `node_modules/.cache/*`, etc.) that MUST be copied writable (unique
+/// inode per workspace) rather than read-only (`0444`) CAS hardlinked.
+#[must_use]
+pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
+    let rel_posix = rel.to_string_lossy().replace('\\', "/");
+    let file_name = rel
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    if matches!(
+        file_name,
+        ".modules.yaml"
+            | ".package-lock.json"
+            | ".yarn-state.yml"
+            | ".yarn-integrity"
+            | ".pnpm-debug.log"
+            | "pyvenv.cfg"
+    ) {
+        return true;
+    }
+    if file_name.starts_with(".pnpm-workspace-state") && file_name.ends_with(".json") {
+        return true;
+    }
+    if file_name.ends_with(".tsbuildinfo") || file_name.ends_with(".pth") {
+        return true;
+    }
+    if rel_posix.ends_with(".pnpm/lock.yaml")
+        || rel_posix.ends_with(".vite/deps/_metadata.json")
+        || rel_posix.contains("node_modules/.bin/")
+        || rel_posix.contains("node_modules/.cache/")
+        || rel_posix.contains(".venv/bin/")
+    {
+        return true;
+    }
+    false
+}
+
+fn set_writable_permissions(path: &Path, src_meta: &Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = src_meta.permissions().mode() | 0o200;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut perms = src_meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 fn is_under_warm_root(rel: &Path, warm_roots: &HashSet<String>) -> bool {

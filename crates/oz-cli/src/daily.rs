@@ -113,12 +113,14 @@ where
 // 1. `oz log`
 // ============================================================================
 
+/// Show commit history (`[AI:...]` badges are rendered from local `refs/notes/ai` git notes,
+/// never stored in commit messages; pass `--no-notes` to hide them or `--format fuller` for full author/committer headers).
 #[derive(Debug, Args)]
 pub struct LogArgs {
-    /// Optional starting revision, branch, tag, or `A..B` range (defaults to `HEAD`).
-    pub rev: Option<String>,
+    /// Optional starting revision(s), branches, tags, `A..B`, or `A...B` symmetric ranges (defaults to `HEAD`).
+    pub revs: Vec<String>,
     /// Optional starting revision passed as a named flag (alias for positional `[REV]`).
-    #[arg(long = "rev", value_name = "REV", conflicts_with = "rev")]
+    #[arg(long = "rev", value_name = "REV")]
     pub rev_flag: Option<String>,
     /// Include commits reachable from all local branches and tags.
     #[arg(long)]
@@ -126,6 +128,15 @@ pub struct LogArgs {
     /// Show compact single-line format per commit.
     #[arg(long)]
     pub oneline: bool,
+    /// Output format (`oneline`, `medium`, `full`, `fuller`).
+    #[arg(long = "format", alias = "pretty", value_name = "FORMAT")]
+    pub format: Option<String>,
+    /// Hide local `refs/notes/ai` provenance badges (`[AI:...]`) from log output.
+    #[arg(long = "no-notes")]
+    pub no_notes: bool,
+    /// Mark which side of a symmetric difference (`A...B`) each commit belongs to (`<` left / `>` right).
+    #[arg(long = "left-right")]
+    pub left_right: bool,
     /// Limit the number of commits output.
     #[arg(short = 'n', long = "max-count", alias = "limit", value_name = "N")]
     pub limit: Option<usize>,
@@ -135,6 +146,9 @@ pub struct LogArgs {
     /// Filter commits whose message matches `<PATTERN>`.
     #[arg(long, value_name = "PATTERN")]
     pub grep: Option<String>,
+    /// Match `--grep`, `--author`, and `-G` patterns case-insensitively (`-i` / `--regexp-ignore-case`).
+    #[arg(short = 'i', long = "regexp-ignore-case", alias = "ignore-case")]
+    pub ignore_case: bool,
     /// Pickaxe search: match commits that change occurrences of `<STRING>` in file diffs.
     #[arg(short = 'S', long = "pickaxe", value_name = "STRING")]
     pub search_string: Option<String>,
@@ -198,14 +212,34 @@ pub(crate) fn handle_log(
     directory: Option<&Path>,
     mode: InteractionMode,
 ) -> ExitCode {
+    let format_mode = args
+        .format
+        .as_deref()
+        .map(|f| f.trim().to_ascii_lowercase());
+    let is_oneline = args.oneline || format_mode.as_deref() == Some("oneline");
+    let is_fuller = matches!(format_mode.as_deref(), Some("full" | "fuller"));
+
     let res = (|| -> Result<Envelope<LogCliData>> {
+        if let Some(ref fmt) = format_mode
+            && !matches!(fmt.as_str(), "oneline" | "medium" | "full" | "fuller")
+        {
+            return Err(OzError::InvalidUsage {
+                message: format!(
+                    "unsupported `--format` '{fmt}': expected oneline, medium, full, or fuller"
+                ),
+                recovery: vec!["oz log --format fuller -n 5".to_string()],
+            });
+        }
         let repo = discover_and_recover_repo(directory, false)?;
         let opts = LogOptions {
-            rev: args.rev_flag.clone().or_else(|| args.rev.clone()),
+            rev: args.rev_flag.clone(),
+            revs: args.revs.clone(),
             all: args.all,
             limit: args.limit,
             author: args.author.clone(),
             grep: args.grep.clone(),
+            ignore_case: args.ignore_case,
+            left_right: args.left_right,
             search_string: args.search_string.clone(),
             search_diff_regex: args.search_diff_regex.clone(),
             since: args.since.clone(),
@@ -213,14 +247,21 @@ pub(crate) fn handle_log(
             paths: args.paths.clone(),
         };
         let report = log_commits(&repo, &opts)?;
-        let notes: BTreeMap<String, AiProvenanceNote> =
-            list_provenance_notes(&repo).unwrap_or_default();
+        let notes: BTreeMap<String, AiProvenanceNote> = if args.no_notes {
+            BTreeMap::new()
+        } else {
+            list_provenance_notes(&repo).unwrap_or_default()
+        };
 
         let commits = report
             .commits
             .into_iter()
             .map(|entry| {
-                let ai_provenance = notes.get(&entry.oid).map(AiBadgeSummary::from);
+                let ai_provenance = if args.no_notes {
+                    None
+                } else {
+                    notes.get(&entry.oid).map(AiBadgeSummary::from)
+                };
                 LogCliCommit {
                     entry,
                     ai_provenance,
@@ -241,12 +282,26 @@ pub(crate) fn handle_log(
 
     render_daily_result(mode, res, |env| {
         let use_color = args.color.enabled(mode);
-        let rendered = format_log_human(&env.data, args.oneline, use_color);
+        let rendered = format_log_human(
+            &env.data,
+            is_oneline,
+            is_fuller,
+            args.no_notes,
+            args.left_right,
+            use_color,
+        );
         emit_paged_output(mode, &rendered)
     })
 }
 
-fn format_log_human(data: &LogCliData, oneline: bool, color: bool) -> String {
+fn format_log_human(
+    data: &LogCliData,
+    oneline: bool,
+    fuller: bool,
+    no_notes: bool,
+    left_right: bool,
+    color: bool,
+) -> String {
     if data.unborn {
         return "repository has no commits yet (unborn HEAD)\n".to_string();
     }
@@ -268,35 +323,70 @@ fn format_log_human(data: &LogCliData, oneline: bool, color: bool) -> String {
         } else {
             format!(" {c_green}({}){c_reset}", c.refs.join(", "))
         };
-        let ai_badge = item
-            .ai_provenance
-            .as_ref()
-            .map(|ai| format!(" {c_magenta}[AI:{}]{c_reset}", ai.client))
-            .unwrap_or_default();
+        let ai_badge = if no_notes || fuller {
+            String::new()
+        } else {
+            item.ai_provenance
+                .as_ref()
+                .map(|ai| format!(" {c_magenta}[AI:{}]{c_reset}", ai.client))
+                .unwrap_or_default()
+        };
+        let lr_prefix = if left_right {
+            match c.side.as_deref() {
+                Some("left") => "<",
+                Some("right") => ">",
+                _ => "",
+            }
+        } else {
+            ""
+        };
 
         if oneline {
             let _ = writeln!(
                 out,
-                "{}{}{c_yellow}{}{c_reset}{}{ai_badge} {}",
+                "{}{}{lr_prefix}{c_yellow}{}{c_reset}{}{ai_badge} {}",
                 c.graph_prefix, c_reset, c.short_oid, refs_str, c.subject
             );
         } else {
             let _ = writeln!(
                 out,
-                "{}{c_yellow}commit {}{c_reset}{}{ai_badge}",
+                "{}{c_yellow}commit {lr_prefix}{}{c_reset}{}{ai_badge}",
                 c.graph_prefix, c.oid, refs_str
             );
             let cont_pad = continuation_prefix(&c.graph_prefix);
-            let _ = writeln!(
-                out,
-                "{cont_pad}Author: {} <{}>",
-                c.author_name, c.author_email
-            );
-            let _ = writeln!(
-                out,
-                "{cont_pad}Date:   {}",
-                c.author_time.format("%Y-%m-%d %H:%M:%S UTC")
-            );
+            if fuller {
+                let _ = writeln!(
+                    out,
+                    "{cont_pad}Author:     {} <{}>",
+                    c.author_name, c.author_email
+                );
+                let _ = writeln!(
+                    out,
+                    "{cont_pad}AuthorDate: {}",
+                    c.author_time.format("%Y-%m-%d %H:%M:%S UTC")
+                );
+                let _ = writeln!(
+                    out,
+                    "{cont_pad}Commit:     {} <{}>",
+                    c.committer_name, c.committer_email
+                );
+                let _ = writeln!(
+                    out,
+                    "{cont_pad}CommitDate: {}",
+                    c.committer_time.format("%Y-%m-%d %H:%M:%S UTC")
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{cont_pad}Author: {} <{}>",
+                    c.author_name, c.author_email
+                );
+                let _ = writeln!(
+                    out,
+                    "{cont_pad}Date:   {}",
+                    c.author_time.format("%Y-%m-%d %H:%M:%S UTC")
+                );
+            }
             if let Some(ref cid) = c.change_id {
                 let _ = writeln!(out, "{cont_pad}{c_cyan}Change-Id: {cid}{c_reset}");
             }
@@ -1708,9 +1798,10 @@ pub(crate) fn handle_switch(
 // 10. `oz grep` (working-tree & rev-scoped tree grep)
 // ============================================================================
 
+/// Search working-tree files or any committed revision (`origin/main`) using Rust/ERE regex (`a|b`, NOT Git BRE `a\|b`).
 #[derive(Debug, Args)]
 pub struct GrepArgs {
-    /// Regex (or literal with `-F`) pattern to search for.
+    /// Rust/ERE regex (e.g. `foo|bar`, not `foo\|bar`) or literal string with `-F`.
     pub pattern: String,
     /// Optional revision, branch, or remote-tracking ref (e.g. `origin/main`) to search without checking out.
     pub rev: Option<String>,
@@ -1720,13 +1811,22 @@ pub struct GrepArgs {
     /// Match pattern as a literal substring instead of a regular expression (`-F` / `--fixed-strings`).
     #[arg(short = 'F', long = "fixed-strings")]
     pub fixed_strings: bool,
+    /// Show 1-based line numbers (always enabled by default; accepted for `git grep` / `rg` parity).
+    #[arg(short = 'n', long = "line-number")]
+    pub line_number: bool,
     /// Only output matching file paths (`-l` / `--files-with-matches`).
     #[arg(short = 'l', long = "files-with-matches")]
     pub files_with_matches: bool,
+    /// Exclude matching file paths, directory prefixes, or globs (repeatable, e.g. `--exclude '*.json' --exclude snapshots/`).
+    #[arg(long = "exclude", num_args = 1.., action = clap::ArgAction::Append, value_name = "PATTERN")]
+    pub exclude: Vec<String>,
     /// Cap total returned line matches.
     #[arg(long = "max-matches", value_name = "N")]
     pub max_matches: Option<usize>,
-    /// Optional path prefixes, file paths, or globs after `--` (e.g. `oz grep foo origin/main -- tvva-ui/`).
+    /// Truncate individual matched lines longer than `<N>` characters (default: 400; pass `0` to disable).
+    #[arg(long = "max-line-len", default_value_t = 400, value_name = "N")]
+    pub max_line_len: usize,
+    /// Optional path prefixes, file paths, globs, or `:!<path>` exclusions after `--` (e.g. `oz grep foo origin/main -- tvva-ui/`).
     #[arg(last = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }
@@ -1736,6 +1836,7 @@ pub(crate) fn handle_grep(
     directory: Option<&Path>,
     mode: InteractionMode,
 ) -> ExitCode {
+    let bre_alternation_hint = !args.fixed_strings && args.pattern.contains(r"\|");
     let res = (|| -> Result<Envelope<GrepReport>> {
         let repo = discover_and_recover_repo(directory, false)?;
         let report = grep_repo(
@@ -1744,17 +1845,26 @@ pub(crate) fn handle_grep(
                 pattern: args.pattern.clone(),
                 rev: args.rev.clone(),
                 paths: args.paths.clone(),
+                excludes: args.exclude.clone(),
                 ignore_case: args.ignore_case,
                 fixed_strings: args.fixed_strings,
                 files_with_matches: args.files_with_matches,
                 max_matches: args.max_matches,
+                max_line_len: (args.max_line_len > 0).then_some(args.max_line_len),
             },
         )?;
         let head_oid = report.commit_oid.clone().or(repo.head_oid);
-        Ok(Envelope::success(report)
+        let no_hits = report.total_matches == 0;
+        let mut env = Envelope::success(report)
             .with_workspace(repo.workspace)
             .with_branch(repo.branch)
-            .with_head_oid(head_oid))
+            .with_head_oid(head_oid);
+        if no_hits && bre_alternation_hint {
+            env = env.with_warning(
+                "0 matches: `oz grep` uses Rust/ERE regex (`a|b`), not Git BRE (`a\\|b`); retry with `|` or pass `-F` for literal matching",
+            );
+        }
+        Ok(env)
     })();
 
     render_daily_result(mode, res, |env| {
@@ -1776,6 +1886,10 @@ pub(crate) fn handle_grep(
         }
         if !out.is_empty() {
             emit_paged_output(mode, &out)?;
+        } else if bre_alternation_hint {
+            eprintln!(
+                "hint: `oz grep` uses Rust/ERE regex (`a|b`), not Git BRE (`a\\|b`); retry with `|` or pass `-F` for literal matching"
+            );
         }
         Ok(())
     })

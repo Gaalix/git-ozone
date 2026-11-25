@@ -147,6 +147,7 @@ impl OzError {
             Self::NotARepository { .. } => vec!["git init -b main".to_string()],
             Self::MountUnavailable { workspace, .. } => {
                 vec![
+                    format!("oz ws spawn {workspace} --backend cas_hardlink"),
                     "oz doctor --json".to_string(),
                     format!("oz ws list --json # workspace: {workspace}"),
                 ]

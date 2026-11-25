@@ -427,7 +427,7 @@ fn spawn_daemon_vfs_workspace(
     let seed_whiteouts_dir = meta_dir.join("seed_whiteouts");
     let seed_dir = ws_dir.join("seed");
     let mount_json_path = layout.ws_mount_record_path(&req.workspace_name);
-    let sock_path = layout.vfsd_socket_path();
+    let sock_path = oz_vfsd::resolve_active_daemon_socket(&git_common_dir);
 
     for dir in [
         &ws_dir,

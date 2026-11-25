@@ -897,6 +897,11 @@ fn evaluate_doctor_checks(
             if fuse.fusermount3_path.is_none() {
                 rem.push("sudo apt-get install -y fuse3".to_string());
             }
+            if fuse.no_new_privs && !fuse.daemon_running {
+                rem.push(
+                    "oz setup --systemd-user  # run once from a regular shell so oz-vfsd mounts FUSE3 natively even when agents run under NoNewPrivs".to_string(),
+                );
+            }
             if probe.reflink_supported {
                 checks.push(DoctorCheck {
                     id: "linux_fuse",
@@ -909,10 +914,16 @@ fn evaluate_doctor_checks(
                     remediation: Vec::new(),
                 });
             } else {
-                warnings.push(
+                let warn_msg = if fuse.no_new_privs
+                    && !fuse.daemon_running
+                    && fuse.dev_fuse_rw
+                    && fuse.fusermount3_path.is_some()
+                {
+                    "Linux NoNewPrivs=1 blocks setuid fusermount3 in this process and oz-vfsd is not running; run `oz setup --systemd-user` once from a regular shell for native FUSE3, or use cas_hardlink"
+                } else {
                     "Linux FUSE3 readiness incomplete (/dev/fuse rw or fusermount3 missing); will fall back to cas_hardlink"
-                        .to_string(),
-                );
+                };
+                warnings.push(warn_msg.to_string());
                 for r in &rem {
                     push_unique(&mut recovery_commands, r.clone());
                     push_unique(&mut remediation_hints, r.clone());
@@ -922,10 +933,12 @@ fn evaluate_doctor_checks(
                     category: "platform",
                     status: DoctorCheckStatus::Warn,
                     summary: format!(
-                        "Linux FUSE3 incomplete (dev_fuse_exists={}, dev_fuse_rw={}, fusermount3={}); falling back to cas_hardlink",
+                        "Linux FUSE3 incomplete (dev_fuse_exists={}, dev_fuse_rw={}, fusermount3={}, no_new_privs={}, daemon_running={}); falling back to cas_hardlink",
                         fuse.dev_fuse_exists,
                         fuse.dev_fuse_rw,
-                        fuse.fusermount3_path.is_some()
+                        fuse.fusermount3_path.is_some(),
+                        fuse.no_new_privs,
+                        fuse.daemon_running
                     ),
                     remediation: rem,
                 });
@@ -1841,6 +1854,8 @@ mod tests {
                 fusermount3_path: None,
                 fusermount3_version: None,
                 user_allow_other_enabled: false,
+                no_new_privs: false,
+                daemon_running: false,
                 ready: false,
             }),
             projfs_ready: None,

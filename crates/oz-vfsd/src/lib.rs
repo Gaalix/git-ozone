@@ -19,9 +19,10 @@ pub mod systemd;
 pub mod windows_setup;
 
 pub use client::{
-    DaemonPong, dirty_paths_via_daemon, ensure_daemon_and_mounts, mount_via_daemon,
-    mount_via_daemon_with_auto_start, ping_daemon, send_request, send_tcp_request, shutdown_daemon,
-    socket_path_for_git_dir, unmount_via_daemon,
+    DaemonPong, OZ_VFSD_GLOBAL_SOCKET_ENV, dirty_paths_via_daemon, ensure_daemon_and_mounts,
+    global_daemon_socket_path, is_any_daemon_running, mount_via_daemon,
+    mount_via_daemon_with_auto_start, ping_daemon, resolve_active_daemon_socket, send_request,
+    send_tcp_request, shutdown_daemon, socket_path_for_git_dir, unmount_via_daemon,
 };
 pub use lookup::{OZ_VFSD_BIN_ENV, find_oz_vfsd_bin, resolve_oz_vfsd_bin_with, vfsd_binary_name};
 #[cfg(unix)]
@@ -37,10 +38,12 @@ pub use projfs::{
     system_time_to_filetime, unix_to_filetime,
 };
 pub use protocol::{DirtyPathEntry, MountInfo, MountSpec, VfsRequest, VfsResponse, encode_line};
-pub use server::{VfsDaemon, run_daemon, run_tcp_daemon};
+pub use server::{VfsDaemon, run_daemon, run_global_daemon, run_tcp_daemon, validate_global_mount_spec};
 pub use systemd::{
-    generate_systemd_user_unit, install_systemd_user_unit, install_systemd_user_unit_in,
-    systemd_user_unit_dir, systemd_user_unit_name,
+    GLOBAL_SYSTEMD_UNIT_NAME, generate_global_systemd_user_unit, generate_systemd_user_unit,
+    install_global_systemd_user_unit, install_global_systemd_user_unit_in,
+    install_systemd_user_unit, install_systemd_user_unit_in, systemd_user_unit_dir,
+    systemd_user_unit_name,
 };
 pub use windows_setup::{
     PROJFS_ENABLE_POWERSHELL_CMD, enable_windows_projfs, enable_windows_projfs_with,

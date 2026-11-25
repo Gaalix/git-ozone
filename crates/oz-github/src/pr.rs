@@ -954,6 +954,9 @@ pub struct PrReviewThreadComment {
 /// Inline review comment thread grouped by `path:line` with resolved/outdated status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrReviewThread {
+    /// Short deterministic handle (`t1`, `t2`, ...) usable with `oz pr reply` and `oz pr resolve`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub root_comment_id: u64,
@@ -1854,6 +1857,7 @@ pub fn group_review_threads(
             .collect();
 
         threads.push(PrReviewThread {
+            id: String::new(),
             thread_id: gql_meta.map(|m| m.thread_id.clone()),
             root_comment_id: root.id,
             path: root.path.clone(),
@@ -1882,6 +1886,9 @@ pub fn group_review_threads(
             })
             .then_with(|| a.root_comment_id.cmp(&b.root_comment_id))
     });
+    for (idx, t) in threads.iter_mut().enumerate() {
+        t.id = format!("t{}", idx + 1);
+    }
     threads
 }
 
@@ -2080,6 +2087,748 @@ pub fn pr_review(repo: &OzoneRepo, opts: &PrReviewOptions) -> Result<PrReviewOut
         dry_run: false,
         validated_comments,
         review: Some(review),
+    })
+}
+
+// ============================================================================
+// PR List, Edit, Reply, Resolve & Multi-PR Status
+// ============================================================================
+
+/// Options controlling [`pr_list`] (`oz pr list`).
+#[derive(Debug, Clone)]
+pub struct PrListOptions {
+    /// PR state filter (`open`, `closed`, `merged`, `all`; defaults to `open`).
+    pub state: Option<String>,
+    /// Optional GitHub search query text (`--search`).
+    pub search: Option<String>,
+    /// Optional author login filter (`--author`).
+    pub author: Option<String>,
+    /// Optional base branch filter (`--base`).
+    pub base: Option<String>,
+    /// Optional head branch filter (`--head`).
+    pub head: Option<String>,
+    /// Optional label filters (`--label`).
+    pub labels: Vec<String>,
+    /// Maximum number of pull requests to return (defaults to `20`).
+    pub limit: usize,
+    pub remote: Option<String>,
+    pub auth_token: Option<String>,
+    pub api_url: Option<String>,
+}
+
+impl Default for PrListOptions {
+    fn default() -> Self {
+        Self {
+            state: None,
+            search: None,
+            author: None,
+            base: None,
+            head: None,
+            labels: Vec::new(),
+            limit: 20,
+            remote: None,
+            auth_token: None,
+            api_url: None,
+        }
+    }
+}
+
+/// Compact pull request summary returned by [`pr_list`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrListItem {
+    pub number: u64,
+    pub state: String,
+    #[serde(default)]
+    pub draft: bool,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub html_url: String,
+}
+
+/// Result returned by [`pr_list`] (`oz pr list`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrListOutcome {
+    pub owner: String,
+    pub repo: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    pub total_returned: usize,
+    pub pull_requests: Vec<PrListItem>,
+}
+
+/// Lists or searches GitHub pull requests via REST (`oz pr list`).
+pub fn pr_list(repo: &OzoneRepo, opts: &PrListOptions) -> Result<PrListOutcome> {
+    let (client, owner, repo_name) = resolve_github_pr_client(
+        repo,
+        opts.remote.as_deref(),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+    let state = opts
+        .state
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "open".to_string());
+    if !matches!(state.as_str(), "open" | "closed" | "merged" | "all") {
+        return Err(OzError::InvalidUsage {
+            message: format!("invalid PR state '{state}': expected open, closed, merged, or all"),
+            recovery: vec!["oz pr list --state open".to_string()],
+        });
+    }
+    let limit = if opts.limit == 0 { 20 } else { opts.limit.min(100) };
+
+    let use_search = opts
+        .search
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || opts
+            .author
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        || !opts.labels.is_empty()
+        || state == "merged";
+
+    let pull_requests: Vec<PrListItem> = if use_search {
+        let mut q_parts = vec![format!("repo:{owner}/{repo_name}"), "is:pr".to_string()];
+        match state.as_str() {
+            "open" => q_parts.push("is:open".to_string()),
+            "closed" => q_parts.push("is:closed".to_string()),
+            "merged" => q_parts.push("is:merged".to_string()),
+            _ => {}
+        }
+        if let Some(ref author) = opts.author {
+            let trimmed = author.trim().trim_start_matches('@');
+            if !trimmed.is_empty() {
+                q_parts.push(format!("author:{trimmed}"));
+            }
+        }
+        if let Some(ref base) = opts.base {
+            let trimmed = normalize_short_branch(base);
+            if !trimmed.is_empty() {
+                q_parts.push(format!("base:{trimmed}"));
+            }
+        }
+        if let Some(ref head) = opts.head {
+            let trimmed = normalize_short_branch(head);
+            if !trimmed.is_empty() {
+                q_parts.push(format!("head:{trimmed}"));
+            }
+        }
+        for label in &opts.labels {
+            let trimmed = label.trim();
+            if !trimmed.is_empty() {
+                if trimmed.contains(' ') {
+                    q_parts.push(format!("label:\"{trimmed}\""));
+                } else {
+                    q_parts.push(format!("label:{trimmed}"));
+                }
+            }
+        }
+        if let Some(ref search) = opts.search {
+            let trimmed = search.trim();
+            if !trimmed.is_empty() {
+                q_parts.push(trimmed.to_string());
+            }
+        }
+        let resp = client.search_issues_and_prs(&q_parts.join(" "), limit)?;
+        resp.items
+            .into_iter()
+            .take(limit)
+            .map(|item| {
+                let pr_state = if state == "merged" {
+                    "MERGED".to_string()
+                } else {
+                    item.state.to_ascii_uppercase()
+                };
+                PrListItem {
+                    number: item.number,
+                    state: pr_state,
+                    draft: false,
+                    title: item.title,
+                    author: item.user.map(|u| u.login),
+                    head_branch: None,
+                    base_branch: None,
+                    head_sha: None,
+                    merge_commit_sha: None,
+                    labels: item.labels.into_iter().map(|l| l.name).collect(),
+                    updated_at: item.updated_at,
+                    html_url: item.html_url,
+                }
+            })
+            .collect()
+    } else {
+        let head_param = opts.head.as_deref().map(|h| {
+            let trimmed = normalize_short_branch(h);
+            if trimmed.contains(':') {
+                trimmed
+            } else {
+                format!("{owner}:{trimmed}")
+            }
+        });
+        let base_param = opts.base.as_deref().map(normalize_short_branch);
+        let raw = client.list_pull_requests_limited(
+            &owner,
+            &repo_name,
+            Some(&state),
+            head_param.as_deref(),
+            base_param.as_deref(),
+            limit,
+        )?;
+        raw.into_iter()
+            .take(limit)
+            .map(|pr| PrListItem {
+                number: pr.number,
+                state: format_pr_status(&pr),
+                draft: pr.draft,
+                title: pr.title,
+                author: pr.user.map(|u| u.login),
+                head_branch: Some(pr.head.ref_name),
+                base_branch: Some(pr.base.ref_name),
+                head_sha: Some(pr.head.sha),
+                merge_commit_sha: pr.merge_commit_sha,
+                labels: Vec::new(),
+                updated_at: pr.updated_at,
+                html_url: pr.html_url,
+            })
+            .collect()
+    };
+
+    let total_returned = pull_requests.len();
+    Ok(PrListOutcome {
+        owner,
+        repo: repo_name,
+        state,
+        search: opts.search.clone(),
+        total_returned,
+        pull_requests,
+    })
+}
+
+/// Options controlling [`pr_edit`] (`oz pr edit <number>`).
+#[derive(Debug, Clone, Default)]
+pub struct PrEditOptions {
+    pub number: u64,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub base: Option<String>,
+    pub state: Option<String>,
+    pub draft: Option<bool>,
+    pub remote: Option<String>,
+    pub auth_token: Option<String>,
+    pub api_url: Option<String>,
+}
+
+/// Result returned by [`pr_edit`] (`oz pr edit <number>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrEditOutcome {
+    pub owner: String,
+    pub repo: String,
+    pub pull_request: GitHubPullRequest,
+    pub updated_fields: Vec<String>,
+}
+
+/// Updates an existing GitHub pull request's title, body, base branch, state, or draft flag.
+pub fn pr_edit(repo: &OzoneRepo, opts: &PrEditOptions) -> Result<PrEditOutcome> {
+    if opts.number == 0 {
+        return Err(OzError::InvalidUsage {
+            message: "pull request number must be positive".to_string(),
+            recovery: vec!["oz pr edit 3340 --title \"...\"".to_string()],
+        });
+    }
+    if opts.title.is_none()
+        && opts.body.is_none()
+        && opts.base.is_none()
+        && opts.state.is_none()
+        && opts.draft.is_none()
+    {
+        return Err(OzError::InvalidUsage {
+            message: "no fields specified to edit; pass at least one of --title, --body, --body-file, --base, --state, --draft, or --ready".to_string(),
+            recovery: vec![
+                format!("oz pr edit {} --title \"New title\"", opts.number),
+                format!("oz pr edit {} --body-file -", opts.number),
+            ],
+        });
+    }
+    if let Some(ref st) = opts.state
+        && !matches!(st.trim().to_ascii_lowercase().as_str(), "open" | "closed")
+    {
+        return Err(OzError::InvalidUsage {
+            message: format!("invalid PR state '{st}': expected open or closed"),
+            recovery: vec![format!("oz pr edit {} --state closed", opts.number)],
+        });
+    }
+
+    let (client, owner, repo_name) = resolve_github_pr_client(
+        repo,
+        opts.remote.as_deref(),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+    let _ = client.require_authenticated()?;
+
+    let mut updated_fields = Vec::new();
+    let mut patch = UpdatePullRequest::default();
+    if let Some(ref title) = opts.title {
+        patch.title = Some(title.clone());
+        updated_fields.push("title".to_string());
+    }
+    if let Some(ref body) = opts.body {
+        // Preserve any managed stack navigation table already present in the PR body.
+        let existing_stack = client
+            .get_pull_request(&owner, &repo_name, opts.number)
+            .ok()
+            .and_then(|pr| pr.body)
+            .and_then(|b| extract_existing_stack_block(&b));
+        let final_body = match existing_stack {
+            Some(block) if !body.contains(OZ_STACK_START) => {
+                upsert_stack_navigation_block(body, &block)
+            }
+            _ => body.clone(),
+        };
+        patch.body = Some(final_body);
+        updated_fields.push("body".to_string());
+    }
+    if let Some(ref base) = opts.base {
+        patch.base = Some(normalize_short_branch(base));
+        updated_fields.push("base".to_string());
+    }
+    if let Some(ref state) = opts.state {
+        patch.state = Some(state.trim().to_ascii_lowercase());
+        updated_fields.push("state".to_string());
+    }
+
+    let mut pull_request = if patch.title.is_some()
+        || patch.body.is_some()
+        || patch.base.is_some()
+        || patch.state.is_some()
+    {
+        client.update_pull_request(&owner, &repo_name, opts.number, &patch)?
+    } else {
+        client.get_pull_request(&owner, &repo_name, opts.number)?
+    };
+
+    if let Some(draft_flag) = opts.draft {
+        let is_draft =
+            client.set_pull_request_draft_graphql(&owner, &repo_name, opts.number, draft_flag)?;
+        pull_request.draft = is_draft;
+        updated_fields.push(if draft_flag { "draft" } else { "ready" }.to_string());
+    }
+
+    Ok(PrEditOutcome {
+        owner,
+        repo: repo_name,
+        pull_request,
+        updated_fields,
+    })
+}
+
+/// Options controlling [`pr_reply`] (`oz pr reply <number> <target> --body "..."`).
+#[derive(Debug, Clone, Default)]
+pub struct PrReplyOptions {
+    pub number: u64,
+    /// Thread handle (`t1` / `[t1]`), numeric comment ID (`4694921942` / `#4694921942`), or GraphQL thread ID (`PRRT_...`).
+    pub target: String,
+    pub body: String,
+    /// Also mark the thread resolved via GraphQL after replying (`--resolve`).
+    pub resolve: bool,
+    pub remote: Option<String>,
+    pub auth_token: Option<String>,
+    pub api_url: Option<String>,
+}
+
+/// Result returned by [`pr_reply`] (`oz pr reply`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrReplyOutcome {
+    pub owner: String,
+    pub repo: String,
+    pub pr_number: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub in_reply_to_comment_id: u64,
+    pub reply: PrReviewThreadComment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<bool>,
+}
+
+fn resolve_thread_target(
+    threads: &[PrReviewThread],
+    raw_target: &str,
+) -> Option<(Option<String>, Option<String>, u64)> {
+    let cleaned = raw_target
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if let Some(num_str) = cleaned.strip_prefix('#')
+        && let Ok(cid) = num_str.parse::<u64>()
+    {
+        if let Some(t) = threads
+            .iter()
+            .find(|t| t.root_comment_id == cid || t.comments.iter().any(|c| c.id == cid))
+        {
+            return Some((Some(t.id.clone()), t.thread_id.clone(), t.root_comment_id));
+        }
+        return Some((None, None, cid));
+    }
+    if let Ok(cid) = cleaned.parse::<u64>() {
+        if let Some(t) = threads
+            .iter()
+            .find(|t| t.root_comment_id == cid || t.comments.iter().any(|c| c.id == cid))
+        {
+            return Some((Some(t.id.clone()), t.thread_id.clone(), t.root_comment_id));
+        }
+        return Some((None, None, cid));
+    }
+    if let Some(t) = threads
+        .iter()
+        .find(|t| t.id.eq_ignore_ascii_case(cleaned) || t.thread_id.as_deref() == Some(cleaned))
+    {
+        return Some((Some(t.id.clone()), t.thread_id.clone(), t.root_comment_id));
+    }
+    None
+}
+
+/// Posts an inline reply to a PR review thread identified by `[t1]` handle, numeric comment ID, or GraphQL thread ID.
+pub fn pr_reply(repo: &OzoneRepo, opts: &PrReplyOptions) -> Result<PrReplyOutcome> {
+    if opts.number == 0 {
+        return Err(OzError::InvalidUsage {
+            message: "pull request number must be positive".to_string(),
+            recovery: vec!["oz pr reply 3347 t1 -m \"Fixed in latest commit\"".to_string()],
+        });
+    }
+    if opts.body.trim().is_empty() {
+        return Err(OzError::InvalidUsage {
+            message: "reply body cannot be empty".to_string(),
+            recovery: vec![format!("oz pr reply {} {} -m \"...\"", opts.number, opts.target)],
+        });
+    }
+    let (client, owner, repo_name) = resolve_github_pr_client(
+        repo,
+        opts.remote.as_deref(),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+    let _ = client.require_authenticated()?;
+
+    let cleaned = opts
+        .target
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    let direct_comment_id = cleaned
+        .strip_prefix('#')
+        .unwrap_or(cleaned)
+        .parse::<u64>()
+        .ok();
+
+    let (thread_handle, thread_id, root_comment_id) = if let Some(cid) = direct_comment_id
+        && !opts.resolve
+    {
+        (None, None, cid)
+    } else {
+        let raw_inline = client.list_pull_request_comments(&owner, &repo_name, opts.number)?;
+        let gql_meta = client
+            .list_pull_request_review_threads_graphql(&owner, &repo_name, opts.number)
+            .unwrap_or_default();
+        let threads = group_review_threads(&raw_inline, &gql_meta);
+        resolve_thread_target(&threads, &opts.target).ok_or_else(|| OzError::InvalidUsage {
+            message: format!(
+                "review thread '{}' not found on PR #{}",
+                opts.target, opts.number
+            ),
+            recovery: vec![format!("oz pr comments {} --unresolved", opts.number)],
+        })?
+    };
+
+    let created = client.reply_to_pull_request_comment(
+        &owner,
+        &repo_name,
+        opts.number,
+        root_comment_id,
+        &opts.body,
+    )?;
+
+    let resolved = if opts.resolve {
+        let tid = thread_id.as_deref().ok_or_else(|| OzError::CheckFailed {
+            message: format!(
+                "reply posted (#{}), but GraphQL thread ID could not be resolved for '{}'",
+                created.id, opts.target
+            ),
+            recovery: vec![format!("oz pr comments {} --json", opts.number)],
+        })?;
+        Some(client.set_pull_request_review_thread_resolved_graphql(tid, true)?)
+    } else {
+        None
+    };
+
+    Ok(PrReplyOutcome {
+        owner,
+        repo: repo_name,
+        pr_number: opts.number,
+        thread_handle,
+        thread_id,
+        in_reply_to_comment_id: root_comment_id,
+        reply: PrReviewThreadComment {
+            id: created.id,
+            review_id: created.pull_request_review_id,
+            author: created.user.map(|u| u.login),
+            body: created.body,
+            created_at: created.created_at,
+            html_url: created.html_url,
+        },
+        resolved,
+    })
+}
+
+/// Options controlling [`pr_resolve`] (`oz pr resolve <number> <target>`).
+#[derive(Debug, Clone, Default)]
+pub struct PrResolveOptions {
+    pub number: u64,
+    /// Thread handle (`t1` / `[t1]`), GraphQL thread ID (`PRRT_...`), or numeric comment ID (`#4694921942`).
+    pub target: String,
+    /// When `true`, marks the thread unresolved instead of resolved (`--unresolve`).
+    pub unresolve: bool,
+    pub remote: Option<String>,
+    pub auth_token: Option<String>,
+    pub api_url: Option<String>,
+}
+
+/// Result returned by [`pr_resolve`] (`oz pr resolve`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrResolveOutcome {
+    pub owner: String,
+    pub repo: String,
+    pub pr_number: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_handle: Option<String>,
+    pub thread_id: String,
+    pub is_resolved: bool,
+}
+
+/// Resolves or unresolves an inline PR review thread via GitHub GraphQL.
+pub fn pr_resolve(repo: &OzoneRepo, opts: &PrResolveOptions) -> Result<PrResolveOutcome> {
+    if opts.number == 0 {
+        return Err(OzError::InvalidUsage {
+            message: "pull request number must be positive".to_string(),
+            recovery: vec!["oz pr resolve 3347 t1".to_string()],
+        });
+    }
+    let (client, owner, repo_name) = resolve_github_pr_client(
+        repo,
+        opts.remote.as_deref(),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+    let _ = client.require_authenticated()?;
+
+    let cleaned = opts
+        .target
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+
+    let (thread_handle, thread_id) = if cleaned.starts_with("PRRT_") {
+        (None, cleaned.to_string())
+    } else {
+        let raw_inline = client.list_pull_request_comments(&owner, &repo_name, opts.number)?;
+        let gql_meta = client.list_pull_request_review_threads_graphql(&owner, &repo_name, opts.number)?;
+        let threads = group_review_threads(&raw_inline, &gql_meta);
+        let (handle, tid_opt, _) =
+            resolve_thread_target(&threads, cleaned).ok_or_else(|| OzError::InvalidUsage {
+                message: format!(
+                    "review thread '{}' not found on PR #{}",
+                    opts.target, opts.number
+                ),
+                recovery: vec![format!("oz pr comments {} --unresolved", opts.number)],
+            })?;
+        let tid = tid_opt.ok_or_else(|| OzError::CheckFailed {
+            message: format!(
+                "no GraphQL thread ID available for review thread '{}' on PR #{}",
+                opts.target, opts.number
+            ),
+            recovery: vec![format!("oz pr comments {} --json", opts.number)],
+        })?;
+        (handle, tid)
+    };
+
+    let is_resolved =
+        client.set_pull_request_review_thread_resolved_graphql(&thread_id, !opts.unresolve)?;
+    Ok(PrResolveOutcome {
+        owner,
+        repo: repo_name,
+        pr_number: opts.number,
+        thread_handle,
+        thread_id,
+        is_resolved,
+    })
+}
+
+/// Options controlling [`pr_status`] (`oz pr status [--pr 3338,3339,3340]`).
+#[derive(Debug, Clone, Default)]
+pub struct PrStatusOptions {
+    /// Pull request numbers to summarize; if empty, inspects the open PR for the current branch.
+    pub numbers: Vec<u64>,
+    pub remote: Option<String>,
+    pub auth_token: Option<String>,
+    pub api_url: Option<String>,
+}
+
+/// One-line multi-PR status summary item returned by [`pr_status`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrStatusItem {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub head_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_decision: Option<String>,
+    pub unresolved_threads: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable_state: Option<String>,
+    pub ci_status: String,
+    pub ci_passing: usize,
+    pub ci_failing: usize,
+    pub ci_pending: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub html_url: String,
+}
+
+/// Compact batch status report returned by [`pr_status`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrStatusOutcome {
+    pub owner: String,
+    pub repo: String,
+    pub pr_count: usize,
+    pub prs: Vec<PrStatusItem>,
+}
+
+/// Fetches compact one-line status (state, review verdict, unresolved threads, mergeability, CI summary)
+/// across one or more pull requests (`oz pr status --pr 3338,3339,3340`).
+pub fn pr_status(repo: &OzoneRepo, opts: &PrStatusOptions) -> Result<PrStatusOutcome> {
+    let (client, owner, repo_name) = resolve_github_pr_client(
+        repo,
+        opts.remote.as_deref(),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+
+    let mut target_numbers = Vec::new();
+    let mut seen = HashSet::new();
+    for &n in &opts.numbers {
+        if n > 0 && seen.insert(n) {
+            target_numbers.push(n);
+        }
+    }
+    if target_numbers.is_empty() {
+        let branch = repo.branch.as_deref().ok_or_else(|| OzError::InvalidUsage {
+            message: "no PR numbers specified and HEAD is detached; pass `--pr <num,...>`".to_string(),
+            recovery: vec!["oz pr status --pr 3338,3339 --json".to_string()],
+        })?;
+        let pr = find_open_pr_for_head(&client, &owner, &repo_name, branch)?.ok_or_else(|| {
+            OzError::CheckFailed {
+                message: format!("no open pull request found for branch '{branch}'"),
+                recovery: vec!["oz pr status --pr <number>".to_string()],
+            }
+        })?;
+        target_numbers.push(pr.number);
+    }
+
+    let mut prs = Vec::with_capacity(target_numbers.len());
+    for num in target_numbers {
+        let pr = client.get_pull_request(&owner, &repo_name, num)?;
+        let reviews = summarize_pr_reviews(
+            client
+                .list_pull_request_reviews(&owner, &repo_name, num)
+                .unwrap_or_default(),
+        );
+        let review_decision = derive_review_decision(&reviews);
+        let raw_inline = client
+            .list_pull_request_comments(&owner, &repo_name, num)
+            .unwrap_or_default();
+        let gql_meta = client
+            .list_pull_request_review_threads_graphql(&owner, &repo_name, num)
+            .unwrap_or_default();
+        let threads = group_review_threads(&raw_inline, &gql_meta);
+        let unresolved_threads = threads.iter().filter(|t| t.is_resolved != Some(true)).count();
+
+        let check_runs = client
+            .list_check_runs_for_ref(&owner, &repo_name, &pr.head.sha)
+            .unwrap_or_default();
+        let mut ci_passing = 0usize;
+        let mut ci_failing = 0usize;
+        let mut ci_pending = 0usize;
+        for cr in &check_runs {
+            if !cr.status.eq_ignore_ascii_case("completed") {
+                ci_pending += 1;
+            } else if matches!(
+                cr.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+                Some("success" | "neutral" | "skipped")
+            ) {
+                ci_passing += 1;
+            } else {
+                ci_failing += 1;
+            }
+        }
+        let ci_status = if check_runs.is_empty() {
+            "no_checks"
+        } else if ci_failing > 0 {
+            "failing"
+        } else if ci_pending > 0 {
+            "pending"
+        } else {
+            "passing"
+        }
+        .to_string();
+
+        prs.push(PrStatusItem {
+            number: pr.number,
+            title: pr.title.clone(),
+            state: format_pr_status(&pr),
+            head_branch: pr.head.ref_name.clone(),
+            base_branch: pr.base.ref_name.clone(),
+            head_sha: pr.head.sha.clone(),
+            review_decision,
+            unresolved_threads,
+            mergeable: pr.mergeable,
+            mergeable_state: pr.mergeable_state.clone(),
+            ci_status,
+            ci_passing,
+            ci_failing,
+            ci_pending,
+            html_url: pr.html_url,
+        });
+    }
+
+    let pr_count = prs.len();
+    Ok(PrStatusOutcome {
+        owner,
+        repo: repo_name,
+        pr_count,
+        prs,
     })
 }
 

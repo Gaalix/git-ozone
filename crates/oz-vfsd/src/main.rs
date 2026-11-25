@@ -5,19 +5,23 @@
 
 use clap::Parser;
 use oz_core::OzoneRepo;
-use oz_vfsd::client::socket_path_for_git_dir;
-use oz_vfsd::server::run_daemon;
+use oz_vfsd::client::{global_daemon_socket_path, socket_path_for_git_dir};
+use oz_vfsd::server::{run_daemon, run_global_daemon};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
 #[command(name = "oz-vfsd", version, about = "Ozone CoW VFS background daemon")]
 struct Args {
+    /// Run a single hardened user-wide daemon serving all repositories owned by this user.
+    #[arg(long, conflicts_with = "git_dir")]
+    global: bool,
+
     /// Path to the repository's `.git` common directory.
     #[arg(long)]
     git_dir: Option<PathBuf>,
 
-    /// Path to the local IPC socket (defaults to `<git-dir>/ozone/vfsd.sock`).
+    /// Path to the local IPC socket (defaults to `<git-dir>/ozone/vfsd.sock`, or `$XDG_RUNTIME_DIR/oz-vfsd.sock` with `--global`).
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -37,6 +41,25 @@ fn infer_git_dir_from_socket(sock: &Path) -> Option<PathBuf> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+
+    if args.global {
+        let Some(socket_path) = args.socket.or_else(global_daemon_socket_path) else {
+            eprintln!("oz-vfsd: cannot determine global socket path (pass --socket <PATH>)");
+            return ExitCode::from(2);
+        };
+        if args.foreground {
+            eprintln!(
+                "oz-vfsd {} listening globally on {}",
+                env!("CARGO_PKG_VERSION"),
+                socket_path.display()
+            );
+        }
+        if let Err(err) = run_global_daemon(&socket_path).await {
+            eprintln!("oz-vfsd error: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let (git_dir, socket_path) = match (args.git_dir, args.socket) {
         (Some(git_dir), Some(socket)) => (git_dir, socket),

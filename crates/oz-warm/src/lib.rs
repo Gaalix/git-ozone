@@ -206,8 +206,22 @@ pub fn detect_warm_targets_with_cargo_target_dir(
                     targets.push(WarmCacheTarget {
                         relative_path: dir.to_string(),
                         ecosystem: EcosystemKind::NodeJs,
-                        lock_indicators: vec!["package-lock.json".to_string()],
+                        lock_indicators: vec![
+                            "package-lock.json".to_string(),
+                            "pnpm-lock.yaml".to_string(),
+                        ],
                     });
+                }
+            }
+            if is_js_monorepo(repo_root) {
+                for nested in detect_nested_workspace_node_modules(repo_root) {
+                    if !targets.iter().any(|t| t.relative_path == nested) {
+                        targets.push(WarmCacheTarget {
+                            relative_path: nested,
+                            ecosystem: EcosystemKind::NodeJs,
+                            lock_indicators: vec!["pnpm-lock.yaml".to_string()],
+                        });
+                    }
                 }
             }
         }
@@ -238,6 +252,47 @@ pub fn detect_warm_targets_with_cargo_target_dir(
 
     targets.retain(|t| !config.warm.exclude_paths.contains(&t.relative_path));
     targets
+}
+
+fn is_js_monorepo(repo_root: &Path) -> bool {
+    if repo_root.join("pnpm-workspace.yaml").is_file() {
+        return true;
+    }
+    std::fs::read_to_string(repo_root.join("package.json"))
+        .ok()
+        .is_some_and(|raw| raw.contains("\"workspaces\""))
+}
+
+fn detect_nested_workspace_node_modules(repo_root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let walker = WalkDir::new(repo_root)
+        .min_depth(1)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                ".git" | ".ozone" | "node_modules" | "target" | ".venv" | ".next" | ".turbo" | ".vite" | "dist" | "build"
+            )
+        });
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        if dir.join("package.json").is_file()
+            && dir.join("node_modules").is_dir()
+            && let Ok(rel) = dir.join("node_modules").strip_prefix(repo_root)
+            && let Some(norm) = normalize_repo_relative_dir(repo_root, rel)
+        {
+            found.push(norm);
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Inspects Cargo `.fingerprint/*/*.json` files under `repo_root/target_rel` for path-coupled

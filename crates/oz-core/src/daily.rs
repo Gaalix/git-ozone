@@ -63,6 +63,21 @@ fn commit_tree_id(gix_repo: &gix::Repository, commit_id: ObjectId) -> Result<Obj
         .detach())
 }
 
+fn rev_parse_error(spec: &str, err: impl std::fmt::Display) -> OzError {
+    let trimmed = spec.trim();
+    let looks_like_hex_sha = (7..=40).contains(&trimmed.len())
+        && trimmed.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut recovery = Vec::new();
+    if looks_like_hex_sha {
+        recovery.push("oz fetch".to_string());
+    }
+    recovery.push("Run `oz log --oneline` or `oz branch -a` to inspect revisions.".to_string());
+    OzError::InvalidUsage {
+        message: format!("cannot resolve revision '{trimmed}': {err}"),
+        recovery,
+    }
+}
+
 fn resolve_commit_oid(gix_repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
@@ -79,10 +94,7 @@ fn resolve_commit_oid(gix_repo: &gix::Repository, spec: &str) -> Result<ObjectId
     }
     let id = gix_repo
         .rev_parse_single(trimmed)
-        .map_err(|err| OzError::InvalidUsage {
-            message: format!("cannot resolve revision '{trimmed}': {err}"),
-            recovery: vec!["Run `oz log --oneline` or `oz branch` to inspect revisions.".to_string()],
-        })?;
+        .map_err(|err| rev_parse_error(trimmed, err))?;
     let obj = id.object().map_err(|err| OzError::Git(err.to_string()))?;
     let commit = obj.peel_to_commit().map_err(|err| OzError::InvalidUsage {
         message: format!("revision '{trimmed}' does not point to a commit: {err}"),
@@ -1195,10 +1207,14 @@ pub fn parse_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<DateTime<U
 #[derive(Debug, Clone)]
 pub struct LogOptions {
     pub rev: Option<String>,
+    /// Optional multiple starting revisions, ranges (`A..B`, `A...B`), or `^exclude` refs.
+    pub revs: Vec<String>,
     pub all: bool,
     pub limit: Option<usize>,
     pub author: Option<String>,
     pub grep: Option<String>,
+    pub ignore_case: bool,
+    pub left_right: bool,
     pub search_string: Option<String>,
     pub search_diff_regex: Option<String>,
     pub since: Option<String>,
@@ -1210,10 +1226,13 @@ impl Default for LogOptions {
     fn default() -> Self {
         Self {
             rev: None,
+            revs: Vec::new(),
             all: false,
             limit: None,
             author: None,
             grep: None,
+            ignore_case: false,
+            left_right: false,
             search_string: None,
             search_diff_regex: None,
             since: None,
@@ -1243,6 +1262,9 @@ pub struct LogCommitEntry {
     pub change_id: Option<String>,
     #[serde(default)]
     pub refs: Vec<String>,
+    /// Symmetric-difference side (`"left"` or `"right"`) when logging an `A...B` range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
     pub graph_prefix: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graph_connectors: Vec<String>,
@@ -1270,7 +1292,7 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
     let diff_re = opts
         .search_diff_regex
         .as_deref()
-        .map(|pat| SimpleRegex::compile(pat, false))
+        .map(|pat| SimpleRegex::compile(pat, opts.ignore_case))
         .transpose()?;
     let since_cutoff = opts
         .since
@@ -1278,7 +1300,8 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
         .map(|s| parse_since_timestamp(s, Utc::now()))
         .transpose()?;
 
-    let (starts, hidden, target_label) = resolve_log_bounds(repo, &gix_repo, opts)?;
+    let (starts, hidden, target_label, symmetric_sides) =
+        resolve_log_bounds(repo, &gix_repo, opts)?;
     if starts.is_empty() {
         return Ok(LogReport {
             target_rev: target_label,
@@ -1287,6 +1310,17 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
             commits: Vec::new(),
         });
     }
+
+    let left_reachable: HashSet<ObjectId> = if let Some((left_tip, _)) = symmetric_sides {
+        collect_reachable_excluding(&gix_repo, left_tip, &hidden)?
+    } else {
+        HashSet::new()
+    };
+    let right_reachable: HashSet<ObjectId> = if let Some((_, right_tip)) = symmetric_sides {
+        collect_reachable_excluding(&gix_repo, right_tip, &hidden)?
+    } else {
+        HashSet::new()
+    };
 
     let normalized_paths: Vec<LogPathFilter> = opts
         .paths
@@ -1404,6 +1438,17 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
         let oid_hex = commit_id.to_hex().to_string();
         let short_oid = oid_hex[..oid_hex.len().min(7)].to_string();
         let refs = ref_decorations.get(&commit_id).cloned().unwrap_or_default();
+        let side = if symmetric_sides.is_some() {
+            if left_reachable.contains(&commit_id) {
+                Some("left".to_string())
+            } else if right_reachable.contains(&commit_id) {
+                Some("right".to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         commits.push(LogCommitEntry {
             oid: oid_hex,
@@ -1424,6 +1469,7 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
             message,
             change_id,
             refs,
+            side,
             graph_prefix,
             graph_connectors,
         });
@@ -1438,11 +1484,34 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
     })
 }
 
+fn collect_reachable_excluding(
+    gix_repo: &gix::Repository,
+    start: ObjectId,
+    hidden: &[ObjectId],
+) -> Result<HashSet<ObjectId>> {
+    let mut walk = gix_repo.rev_walk([start]);
+    if !hidden.is_empty() {
+        walk = walk.with_hidden(hidden.iter().copied());
+    }
+    let mut set = HashSet::new();
+    for item in walk.all().map_err(|err| OzError::Git(err.to_string()))? {
+        let info = item.map_err(|err| OzError::Git(err.to_string()))?;
+        set.insert(info.id);
+    }
+    Ok(set)
+}
+
+#[allow(clippy::type_complexity)]
 fn resolve_log_bounds(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     opts: &LogOptions,
-) -> Result<(Vec<ObjectId>, Vec<ObjectId>, Option<String>)> {
+) -> Result<(
+    Vec<ObjectId>,
+    Vec<ObjectId>,
+    Option<String>,
+    Option<(ObjectId, ObjectId)>,
+)> {
     if opts.all {
         let mut starts = Vec::new();
         let platform = gix_repo
@@ -1472,29 +1541,88 @@ fn resolve_log_bounds(
         {
             starts.push(cid);
         }
-        return Ok((starts, Vec::new(), Some("--all".to_string())));
+        return Ok((starts, Vec::new(), Some("--all".to_string()), None));
     }
 
-    let Some(ref raw_rev) = opts.rev else {
+    let mut raw_specs: Vec<&str> = Vec::new();
+    if let Some(ref single) = opts.rev {
+        raw_specs.push(single.as_str());
+    }
+    for r in &opts.revs {
+        raw_specs.push(r.as_str());
+    }
+
+    if raw_specs.is_empty() {
         let head = resolve_workspace_head(repo, gix_repo)?;
         return match head.commit_oid {
-            Some(cid) => Ok((vec![cid], Vec::new(), head.branch.or(Some("HEAD".to_string())))),
-            None => Ok((Vec::new(), Vec::new(), head.branch)),
+            Some(cid) => Ok((
+                vec![cid],
+                Vec::new(),
+                head.branch.or(Some("HEAD".to_string())),
+                None,
+            )),
+            None => Ok((Vec::new(), Vec::new(), head.branch, None)),
         };
-    };
-
-    if let Some((lhs, rhs)) = raw_rev.split_once("..")
-        && !rhs.starts_with('.')
-    {
-        let left_spec = if lhs.trim().is_empty() { "HEAD" } else { lhs.trim() };
-        let right_spec = if rhs.trim().is_empty() { "HEAD" } else { rhs.trim() };
-        let left_oid = resolve_commit_oid(gix_repo, left_spec)?;
-        let right_oid = resolve_commit_oid(gix_repo, right_spec)?;
-        return Ok((vec![right_oid], vec![left_oid], Some(raw_rev.clone())));
     }
 
-    let oid = resolve_commit_oid(gix_repo, raw_rev)?;
-    Ok((vec![oid], Vec::new(), Some(raw_rev.clone())))
+    let mut starts: Vec<ObjectId> = Vec::new();
+    let mut hidden: Vec<ObjectId> = Vec::new();
+    let mut symmetric_sides: Option<(ObjectId, ObjectId)> = None;
+
+    for raw_rev in &raw_specs {
+        if let Some((lhs, rhs)) = raw_rev.split_once("...") {
+            let left_spec = if lhs.trim().is_empty() { "HEAD" } else { lhs.trim() };
+            let right_spec = if rhs.trim().is_empty() { "HEAD" } else { rhs.trim() };
+            let left_oid = resolve_commit_oid(gix_repo, left_spec)?;
+            let right_oid = resolve_commit_oid(gix_repo, right_spec)?;
+            if !starts.contains(&left_oid) {
+                starts.push(left_oid);
+            }
+            if !starts.contains(&right_oid) {
+                starts.push(right_oid);
+            }
+            if let Ok(Some(mb)) = gix_repo.merge_base(left_oid, right_oid) {
+                let mb_id = mb.detach();
+                if !hidden.contains(&mb_id) {
+                    hidden.push(mb_id);
+                }
+            }
+            symmetric_sides = Some((left_oid, right_oid));
+        } else if let Some((lhs, rhs)) = raw_rev.split_once("..")
+            && !rhs.starts_with('.')
+        {
+            let left_spec = if lhs.trim().is_empty() { "HEAD" } else { lhs.trim() };
+            let right_spec = if rhs.trim().is_empty() { "HEAD" } else { rhs.trim() };
+            let left_oid = resolve_commit_oid(gix_repo, left_spec)?;
+            let right_oid = resolve_commit_oid(gix_repo, right_spec)?;
+            if !starts.contains(&right_oid) {
+                starts.push(right_oid);
+            }
+            if !hidden.contains(&left_oid) {
+                hidden.push(left_oid);
+            }
+        } else if let Some(neg) = raw_rev.strip_prefix('^') {
+            let oid = resolve_commit_oid(gix_repo, neg)?;
+            if !hidden.contains(&oid) {
+                hidden.push(oid);
+            }
+        } else {
+            let oid = resolve_commit_oid(gix_repo, raw_rev)?;
+            if !starts.contains(&oid) {
+                starts.push(oid);
+            }
+        }
+    }
+
+    if starts.is_empty() {
+        let head = resolve_workspace_head(repo, gix_repo)?;
+        if let Some(cid) = head.commit_oid {
+            starts.push(cid);
+        }
+    }
+
+    let label = Some(raw_specs.join(" "));
+    Ok((starts, hidden, label, symmetric_sides))
 }
 
 fn collect_ref_decorations(
@@ -1978,10 +2106,7 @@ pub fn show_commit(repo: &OzoneRepo, opts: &ShowOptions) -> Result<ShowReport> {
     let resolved_id = match rev_spec {
         Some(spec) => gix_repo
             .rev_parse_single(spec)
-            .map_err(|err| OzError::InvalidUsage {
-                message: format!("cannot resolve revision '{spec}': {err}"),
-                recovery: vec!["Run `oz log --oneline` to inspect revisions.".to_string()],
-            })?
+            .map_err(|err| rev_parse_error(spec, err))?
             .detach(),
         None => {
             let head = resolve_workspace_head(repo, &gix_repo)?;
@@ -2283,10 +2408,7 @@ pub fn show_blob(repo: &OzoneRepo, opts: &ShowBlobOptions) -> Result<ShowBlobRep
     } else {
         let id = gix_repo
             .rev_parse_single(rev_label.as_str())
-            .map_err(|err| OzError::InvalidUsage {
-                message: format!("cannot resolve revision '{rev_label}': {err}"),
-                recovery: vec!["Run `oz log --oneline` or `oz branch` to list valid revisions.".to_string()],
-            })?
+            .map_err(|err| rev_parse_error(&rev_label, err))?
             .detach();
         gix_repo
             .find_object(id)
@@ -4438,8 +4560,10 @@ pub struct GrepOptions {
     pub pattern: String,
     /// Optional commit, branch, or remote-tracking ref (e.g. `origin/main`) to search without checking out.
     pub rev: Option<String>,
-    /// Optional path prefixes, exact file paths, or globs to scope the search.
+    /// Optional path prefixes, exact file paths, or globs to scope the search (also accepts `:!<pat>` / `:(exclude)<pat>`).
     pub paths: Vec<String>,
+    /// Optional path prefixes or globs to exclude (`--exclude`).
+    pub excludes: Vec<String>,
     /// Case-insensitive matching (`-i` / `--ignore-case`).
     pub ignore_case: bool,
     /// Interpret `pattern` as a literal substring instead of a regular expression (`-F` / `--fixed-strings`).
@@ -4448,6 +4572,12 @@ pub struct GrepOptions {
     pub files_with_matches: bool,
     /// Optional cap on total returned line matches.
     pub max_matches: Option<usize>,
+    /// Optional maximum display length (in characters) per matched line before truncating (`None` or `Some(0)` disables truncation).
+    pub max_line_len: Option<usize>,
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 
 /// Single matching line returned by [`grep_repo`].
@@ -4471,6 +4601,39 @@ pub struct GrepReport {
     pub matches: Vec<GrepMatch>,
     #[serde(default)]
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub lines_truncated: usize,
+}
+
+fn normalize_grep_pat(raw: &str) -> String {
+    raw.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn compile_grep_glob(pat: &str) -> Option<globset::GlobMatcher> {
+    if pat.contains('*') || pat.contains('?') || pat.contains('[') || pat.contains('{') {
+        globset::GlobBuilder::new(pat)
+            .literal_separator(false)
+            .build()
+            .ok()
+            .map(|g| g.compile_matcher())
+    } else {
+        None
+    }
+}
+
+fn truncate_grep_line(line: &str, max_len: usize) -> (String, bool) {
+    let total_chars = line.chars().count();
+    if max_len == 0 || total_chars <= max_len {
+        return (line.to_string(), false);
+    }
+    let prefix: String = line.chars().take(max_len).collect();
+    let remaining = total_chars - max_len;
+    (format!("{prefix}... (+{remaining} chars truncated)"), true)
 }
 
 /// Searches tracked working-tree files or a committed Git revision's tree (`origin/main`, `HEAD`, etc.)
@@ -4500,26 +4663,59 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
         }
     };
 
-    let normalized_paths: Vec<String> = opts
-        .paths
+    let mut normalized_paths: Vec<String> = Vec::new();
+    let mut normalized_excludes: Vec<String> = opts
+        .excludes
         .iter()
-        .map(|p| {
-            p.trim()
-                .replace('\\', "/")
-                .trim_start_matches("./")
-                .trim_start_matches('/')
-                .trim_end_matches('/')
-                .to_string()
-        })
+        .map(|p| normalize_grep_pat(p))
         .filter(|p| !p.is_empty())
         .collect();
+    for raw in &opts.paths {
+        let trimmed = raw.trim();
+        if let Some(ex) = trimmed
+            .strip_prefix(":!")
+            .or_else(|| trimmed.strip_prefix(":(exclude)"))
+        {
+            let norm = normalize_grep_pat(ex);
+            if !norm.is_empty() {
+                normalized_excludes.push(norm);
+            }
+        } else {
+            let norm = normalize_grep_pat(trimmed);
+            if !norm.is_empty() {
+                normalized_paths.push(norm);
+            }
+        }
+    }
+
     let glob_matchers: Vec<globset::GlobMatcher> = normalized_paths
         .iter()
-        .filter(|p| p.contains('*') || p.contains('?') || p.contains('['))
-        .filter_map(|p| globset::Glob::new(p).ok().map(|g| g.compile_matcher()))
+        .filter_map(|p| compile_grep_glob(p))
+        .collect();
+    let exclude_globs: Vec<globset::GlobMatcher> = normalized_excludes
+        .iter()
+        .filter_map(|p| compile_grep_glob(p))
         .collect();
 
+    let path_excluded = |rel: &str| -> bool {
+        if normalized_excludes.is_empty() {
+            return false;
+        }
+        if normalized_excludes.iter().any(|p| {
+            rel == p
+                || (rel.len() > p.len()
+                    && rel.starts_with(p.as_str())
+                    && rel.as_bytes()[p.len()] == b'/')
+        }) {
+            return true;
+        }
+        exclude_globs.iter().any(|m| m.is_match(rel))
+    };
+
     let path_included = |rel: &str| -> bool {
+        if path_excluded(rel) {
+            return false;
+        }
         if normalized_paths.is_empty() {
             return true;
         }
@@ -4535,6 +4731,14 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
     };
 
     let dir_could_match = |dir_prefix: &str| -> bool {
+        if normalized_excludes.iter().any(|p| {
+            dir_prefix == p
+                || (dir_prefix.len() > p.len()
+                    && dir_prefix.starts_with(p.as_str())
+                    && dir_prefix.as_bytes()[p.len()] == b'/')
+        }) {
+            return false;
+        }
         if normalized_paths.is_empty() || !glob_matchers.is_empty() {
             return true;
         }
@@ -4552,7 +4756,9 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
     let mut matches: Vec<GrepMatch> = Vec::new();
     let mut matched_files: Vec<String> = Vec::new();
     let mut truncated = false;
+    let mut lines_truncated = 0usize;
     let max_matches = opts.max_matches.unwrap_or(usize::MAX);
+    let max_line_len = opts.max_line_len.unwrap_or(0);
 
     let mut scan_bytes = |rel_path: &str, bytes: &[u8]| -> bool {
         if truncated || is_binary_bytes(bytes) {
@@ -4574,10 +4780,14 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
                     truncated = true;
                     return true;
                 }
+                let (rendered_line, was_cut) = truncate_grep_line(line, max_line_len);
+                if was_cut {
+                    lines_truncated += 1;
+                }
                 matches.push(GrepMatch {
                     path: rel_path.to_string(),
                     line_number: idx + 1,
-                    line: line.to_string(),
+                    line: rendered_line,
                 });
             }
         }
@@ -4676,6 +4886,7 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
         matched_files,
         matches,
         truncated,
+        lines_truncated,
     })
 }
 

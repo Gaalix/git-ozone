@@ -948,7 +948,6 @@ impl McpServer {
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let opts = LogOptions {
             rev: args.rev,
-            all: false,
             limit: Some(args.limit.unwrap_or(10)),
             author: args.author,
             grep: args.grep,
@@ -957,6 +956,7 @@ impl McpServer {
             since: args.since,
             graph: false,
             paths: args.paths,
+            ..LogOptions::default()
         };
         let report = log_commits(&repo, &opts)?;
         let commits_val = if args.oneline.unwrap_or(true) {

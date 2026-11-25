@@ -511,6 +511,7 @@ fn tcp_loopback_daemon_round_trips_ipc_and_cleans_up_endpoint_on_shutdown() {
         &sock_path,
         &VfsRequest::DirtyPaths {
             workspace: "missing".to_string(),
+            git_dir: None,
         },
     )
     .expect("dirty missing")

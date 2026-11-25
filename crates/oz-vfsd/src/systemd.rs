@@ -3,7 +3,7 @@
 
 //! `systemd --user` service unit generation and installation helpers for `oz setup`.
 
-use oz_core::{OzError, Result};
+use oz_core::{OzError, OzoneLayout, Result};
 use std::path::{Path, PathBuf};
 
 fn systemd_escape_arg(path: &Path) -> String {
@@ -74,12 +74,70 @@ pub fn systemd_user_unit_dir() -> Result<PathBuf> {
     ))
 }
 
+/// Canonical filename for the user-wide `oz-vfsd` systemd user unit serving all repositories.
+pub const GLOBAL_SYSTEMD_UNIT_NAME: &str = "oz-vfsd.service";
+
+/// Generates a single user-wide `systemd --user` unit file (`oz-vfsd.service`) that runs
+/// `oz-vfsd --global --foreground` for all Git repositories on this machine.
+#[must_use]
+pub fn generate_global_systemd_user_unit(vfsd_bin: &Path) -> String {
+    let bin_arg = systemd_escape_arg(vfsd_bin);
+    format!(
+        "[Unit]\n\
+         Description=Ozone CoW VFS Daemon (User-Wide)\n\
+         After=default.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={bin_arg} --global --foreground\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
+/// Installs the user-wide `oz-vfsd.service` unit file into `unit_dir`, returning the written path.
+/// When `try_systemctl_enable` is `true`, runs `systemctl --user daemon-reload` and
+/// `systemctl --user enable --now oz-vfsd.service`.
+pub fn install_global_systemd_user_unit_in(
+    unit_dir: &Path,
+    vfsd_bin: &Path,
+    try_systemctl_enable: bool,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(unit_dir)?;
+    let unit_path = unit_dir.join(GLOBAL_SYSTEMD_UNIT_NAME);
+    let content = generate_global_systemd_user_unit(vfsd_bin);
+
+    let tmp_path = unit_dir.join(format!(
+        ".{GLOBAL_SYSTEMD_UNIT_NAME}.tmp.{}",
+        std::process::id()
+    ));
+    std::fs::write(&tmp_path, content.as_bytes())?;
+    std::fs::rename(&tmp_path, &unit_path)?;
+
+    if try_systemctl_enable {
+        try_systemctl(&["--user", "daemon-reload"]);
+        try_systemctl(&["--user", "enable", "--now", GLOBAL_SYSTEMD_UNIT_NAME]);
+    }
+
+    Ok(unit_path)
+}
+
+/// Installs and starts the single user-wide `oz-vfsd.service` unit into the user's systemd directory.
+pub fn install_global_systemd_user_unit(vfsd_bin: &Path) -> Result<PathBuf> {
+    let dir = systemd_user_unit_dir()?;
+    install_global_systemd_user_unit_in(&dir, vfsd_bin, cfg!(target_os = "linux"))
+}
+
 /// Generates a `systemd --user` service unit file for running `oz-vfsd` on `git_dir`.
 #[must_use]
 pub fn generate_systemd_user_unit(vfsd_bin: &Path, git_dir: &Path) -> String {
     let bin_arg = systemd_escape_arg(vfsd_bin);
     let git_arg = systemd_escape_arg(git_dir);
-    let sock_arg = systemd_escape_arg(&git_dir.join("ozone").join("vfsd.sock"));
+    let sock_path = OzoneLayout::from_git_common_dir(git_dir).vfsd_socket_path();
+    let sock_arg = systemd_escape_arg(&sock_path);
     let display_dir = git_dir.display();
 
     format!(
@@ -118,7 +176,7 @@ pub fn install_systemd_user_unit_in(
 
     if try_systemctl_enable {
         try_systemctl(&["--user", "daemon-reload"]);
-        try_systemctl(&["--user", "enable", &unit_name]);
+        try_systemctl(&["--user", "enable", "--now", &unit_name]);
     }
 
     Ok(unit_path)
@@ -174,5 +232,18 @@ mod tests {
         );
         let on_disk = std::fs::read_to_string(&installed).expect("read unit");
         assert_eq!(on_disk, content);
+
+        let global_content = generate_global_systemd_user_unit(bin);
+        assert!(global_content.contains("--global --foreground"));
+        let global_installed =
+            install_global_systemd_user_unit_in(&unit_dir, bin, false).expect("install global");
+        assert_eq!(
+            global_installed.file_name().and_then(|n| n.to_str()),
+            Some(GLOBAL_SYSTEMD_UNIT_NAME)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&global_installed).unwrap(),
+            global_content
+        );
     }
 }

@@ -229,6 +229,20 @@ pub struct CiJobLogReport {
     pub log_excerpt: Option<String>,
 }
 
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
+fn is_passing_check(c: &CiCheckSummary) -> bool {
+    c.status.eq_ignore_ascii_case("completed")
+        && c.failing_step.is_none()
+        && c.log_excerpt.is_none()
+        && matches!(
+            c.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("success" | "neutral" | "skipped")
+        )
+}
+
 /// Complete CI health & failure excerpt report returned by [`query_ci_status`] and [`watch_ci_status`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiReport {
@@ -242,9 +256,33 @@ pub struct CiReport {
     pub total_count: usize,
     pub failing_count: usize,
     pub pending_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub passed_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passed_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<CiCheckSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<CiWatchMetadata>,
+}
+
+impl CiReport {
+    /// Compacts passing checks into `passed_count` + `passed_checks` (names only), keeping all
+    /// failing, pending, or active checks in full inside `checks` to minimize agent token usage.
+    pub fn compact_for_agent(&mut self) {
+        let mut kept = Vec::new();
+        let mut passed = Vec::new();
+        for check in std::mem::take(&mut self.checks) {
+            if is_passing_check(&check) {
+                passed.push(check.name);
+            } else {
+                kept.push(check);
+            }
+        }
+        self.passed_count = passed.len();
+        self.passed_checks = passed;
+        self.checks = kept;
+    }
 }
 
 /// Multi-PR CI aggregation report returned by [`query_multi_pr_ci_status`] (`oz ci --pr 1,2,3`).
@@ -258,6 +296,51 @@ pub struct MultiPrCiReport {
     pub failing_prs: usize,
     pub pending_prs: usize,
     pub reports: Vec<CiReport>,
+}
+
+impl MultiPrCiReport {
+    /// Compacts passing checks on every per-PR report to minimize multi-PR JSON token usage.
+    pub fn compact_for_agent(&mut self) {
+        for r in &mut self.reports {
+            r.compact_for_agent();
+        }
+    }
+}
+
+/// Options controlling [`query_ci_runs`] (`oz ci --runs [--branch main] [--limit N]`).
+#[derive(Debug, Clone)]
+pub struct CiRunsOptions {
+    /// Optional branch filter (`--branch` / `--ref`).
+    pub branch: Option<String>,
+    /// Maximum recent runs to return across all workflows (default: 10).
+    pub limit: usize,
+    pub remote: Option<String>,
+    pub auth_token: Option<String>,
+    pub api_url: Option<String>,
+}
+
+impl Default for CiRunsOptions {
+    fn default() -> Self {
+        Self {
+            branch: None,
+            limit: 10,
+            remote: None,
+            auth_token: None,
+            api_url: None,
+        }
+    }
+}
+
+/// Cross-workflow run overview returned by [`query_ci_runs`] (`oz ci --runs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiRunsReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_filter: Option<String>,
+    pub total_runs: usize,
+    pub passing_count: usize,
+    pub failing_count: usize,
+    pub pending_count: usize,
+    pub runs: Vec<CiWorkflowRunSummary>,
 }
 
 /// Options controlling [`query_workflow_ci_status`] and [`watch_workflow_ci_status`] (`oz ci --workflow <name>`).
@@ -319,7 +402,30 @@ pub struct CiWorkflowRunSummary {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub passed_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passed_jobs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<CiCheckSummary>,
+}
+
+impl CiWorkflowRunSummary {
+    /// Compacts passing jobs into `passed_count` + `passed_jobs` (names only).
+    pub fn compact_for_agent(&mut self) {
+        let mut kept = Vec::new();
+        let mut passed = Vec::new();
+        for job in std::mem::take(&mut self.jobs) {
+            if is_passing_check(&job) {
+                passed.push(job.name);
+            } else {
+                kept.push(job);
+            }
+        }
+        self.passed_count = passed.len();
+        self.passed_jobs = passed;
+        self.jobs = kept;
+    }
 }
 
 /// Workflow-level CI report returned by [`query_workflow_ci_status`] and [`watch_workflow_ci_status`].
@@ -339,6 +445,94 @@ pub struct CiWorkflowReport {
     pub runs: Vec<CiWorkflowRunSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<CiWatchMetadata>,
+}
+
+impl CiWorkflowReport {
+    /// Compacts passing jobs across all workflow runs to minimize JSON token usage.
+    pub fn compact_for_agent(&mut self) {
+        for run in &mut self.runs {
+            run.compact_for_agent();
+        }
+    }
+}
+
+/// Lists recent GitHub Actions runs across ALL workflows (`oz ci --runs [--branch main] [--limit N]`).
+pub fn query_ci_runs(repo: &OzoneRepo, opts: &CiRunsOptions) -> Result<CiRunsReport> {
+    let remote_name = opts
+        .remote
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("origin");
+    let limit = if opts.limit == 0 { 10 } else { opts.limit.min(50) };
+    let branch_filter = opts
+        .branch
+        .as_deref()
+        .map(normalize_short_branch)
+        .filter(|s| !s.is_empty());
+
+    let (client, parsed_remote) = GitHubClient::for_repo(
+        repo,
+        Some(remote_name),
+        opts.auth_token.as_deref(),
+        opts.api_url.as_deref(),
+    )?;
+    let _ = client.require_authenticated()?;
+    let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
+
+    let raw_runs = client.list_workflow_runs_limited(
+        owner,
+        gh_repo,
+        branch_filter.as_deref(),
+        None,
+        limit,
+    )?;
+
+    let runs: Vec<CiWorkflowRunSummary> = raw_runs
+        .into_iter()
+        .take(limit)
+        .map(|run| CiWorkflowRunSummary {
+            run_id: run.id,
+            workflow_name: run.name.or(run.path),
+            event: run.event,
+            branch: run.head_branch,
+            commit_sha: run.head_sha,
+            status: run.status,
+            conclusion: run.conclusion,
+            html_url: run.html_url,
+            created_at: run.created_at,
+            updated_at: run.updated_at,
+            passed_count: 0,
+            passed_jobs: Vec::new(),
+            jobs: Vec::new(),
+        })
+        .collect();
+
+    let total_runs = runs.len();
+    let mut passing_count = 0usize;
+    let mut failing_count = 0usize;
+    let mut pending_count = 0usize;
+    for r in &runs {
+        if !r.status.eq_ignore_ascii_case("completed") {
+            pending_count += 1;
+        } else if matches!(
+            r.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("success" | "neutral" | "skipped")
+        ) {
+            passing_count += 1;
+        } else {
+            failing_count += 1;
+        }
+    }
+
+    Ok(CiRunsReport {
+        branch_filter,
+        total_runs,
+        passing_count,
+        failing_count,
+        pending_count,
+        runs,
+    })
 }
 
 /// Queries GitHub Check Runs and Actions jobs for the target branch/commit/PR, downloads logs
@@ -1055,6 +1249,8 @@ fn build_single_workflow_run_summary(
         html_url: run.html_url.clone(),
         created_at: run.created_at.clone(),
         updated_at: run.updated_at.clone(),
+        passed_count: 0,
+        passed_jobs: Vec::new(),
         jobs: job_summaries,
     }
 }
@@ -1800,6 +1996,8 @@ fn assemble_ci_report_inner(
         total_count,
         failing_count,
         pending_count,
+        passed_count: 0,
+        passed_checks: Vec::new(),
         checks: summaries,
         watch: None,
     }

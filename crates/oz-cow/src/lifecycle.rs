@@ -68,6 +68,7 @@ pub struct SpawnedWorkspaceInfo {
     pub state: WorkspaceState,
     pub git_worktree_dir: PathBuf,
     pub baseline_source: Option<BaselineSource>,
+    pub warnings: Vec<String>,
 }
 
 /// Summary entry returned by [`list_workspaces`].
@@ -189,11 +190,13 @@ pub fn spawn_workspace(
     let created_branch = prepared_branch.created_branch;
 
     let spawn_result = (|| -> Result<SpawnedWorkspaceInfo> {
-        let backend_kind = select_backend_fast(
+        let configured_backend = opts.backend.or(repo.config.backend);
+        let mut backend_kind = select_backend_fast(
             &repo.repo_root,
             Some(&repo.layout.ozone_dir),
-            opts.backend.or(repo.config.backend),
+            configured_backend,
         )?;
+        let mut warnings: Vec<String> = Vec::new();
 
         let mut baseline_dir: Option<PathBuf> = None;
         let mut baseline_id: Option<String> = None;
@@ -291,7 +294,27 @@ pub fn spawn_workspace(
             )?;
         }
 
-        let spawned = spawn_with_backend(repo, backend_kind, &spawn_req)?;
+        let spawned = match spawn_with_backend(repo, backend_kind, &spawn_req) {
+            Ok(ws) => ws,
+            Err(OzError::MountUnavailable { message, .. })
+                if configured_backend.is_none() && backend_kind.requires_daemon() =>
+            {
+                let prev_backend = backend_kind;
+                let _ = remove_dir_if_exists(&repo.layout.ws_meta_dir(&opts.name));
+                let _ = remove_dir_if_exists(&target_path);
+                backend_kind = BackendKind::CasHardlink;
+                let fallback_req = SpawnRequest {
+                    upper_dir: None,
+                    meta_dir: None,
+                    ..spawn_req
+                };
+                warnings.push(format!(
+                    "{prev_backend} mount unavailable ({message}); fell back to cas_hardlink (hint: run `oz setup --systemd-user` once from a regular shell so `oz-vfsd` mounts FUSE3 natively even for sandboxed agents)"
+                ));
+                spawn_with_backend(repo, backend_kind, &fallback_req)?
+            }
+            Err(err) => return Err(err),
+        };
 
         if !backend_kind.requires_daemon() {
             if baseline_dir.is_some()
@@ -356,6 +379,7 @@ pub fn spawn_workspace(
             state,
             git_worktree_dir: wt_git_dir.clone(),
             baseline_source,
+            warnings,
         })
     })();
 

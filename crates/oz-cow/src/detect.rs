@@ -15,6 +15,13 @@ pub struct LinuxFuseReadiness {
     pub fusermount3_path: Option<PathBuf>,
     pub fusermount3_version: Option<String>,
     pub user_allow_other_enabled: bool,
+    /// `true` when Linux `PR_SET_NO_NEW_PRIVS` is enabled on this process (blocks setuid `fusermount3`
+    /// unless an external `oz-vfsd` daemon such as `oz setup --systemd-user` is already running).
+    #[serde(default)]
+    pub no_new_privs: bool,
+    /// `true` when an external `oz-vfsd` daemon is already reachable for this repository.
+    #[serde(default)]
+    pub daemon_running: bool,
     pub ready: bool,
 }
 
@@ -64,14 +71,16 @@ pub(crate) fn select_backend_fast(
     } else {
         probe_reflink_ephemeral(&existing).unwrap_or(true)
     };
-    let fuse_ready = detect_linux_fuse_ready_fast();
+    let fuse_ready = detect_linux_fuse_ready_fast(ozone_dir);
     let projfs_ready = detect_windows_projfs();
-    let fuse = fuse_ready.map(|ready| LinuxFuseReadiness {
+    let fuse = fuse_ready.map(|(ready, no_new_privs, daemon_running)| LinuxFuseReadiness {
         dev_fuse_exists: ready,
         dev_fuse_rw: ready,
         fusermount3_path: None,
         fusermount3_version: None,
         user_allow_other_enabled: false,
+        no_new_privs,
+        daemon_running,
         ready,
     });
     Ok(recommend_backend(
@@ -83,14 +92,41 @@ pub(crate) fn select_backend_fast(
 }
 
 #[cfg(target_os = "linux")]
-fn detect_linux_fuse_ready_fast() -> Option<bool> {
+fn process_has_no_new_privs() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let rest = line.strip_prefix("NoNewPrivs:")?;
+                Some(rest.trim() == "1")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn is_vfsd_daemon_running(ozone_dir: Option<&Path>) -> bool {
+    let git_common_dir = ozone_dir.and_then(|oz| oz.parent());
+    oz_vfsd::is_any_daemon_running(git_common_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_fuse_ready_fast(ozone_dir: Option<&Path>) -> Option<(bool, bool, bool)> {
     let dev_fuse_rw =
         unsafe { libc::access(c"/dev/fuse".as_ptr(), libc::R_OK | libc::W_OK) == 0 };
-    Some(dev_fuse_rw && find_fusermount3().is_some())
+    let has_bin = find_fusermount3().is_some();
+    let no_new_privs = process_has_no_new_privs();
+    let daemon_running = if no_new_privs && dev_fuse_rw && has_bin {
+        is_vfsd_daemon_running(ozone_dir)
+    } else {
+        false
+    };
+    let ready = dev_fuse_rw && has_bin && (!no_new_privs || daemon_running);
+    Some((ready, no_new_privs, daemon_running))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_linux_fuse_ready_fast() -> Option<bool> {
+fn detect_linux_fuse_ready_fast(_ozone_dir: Option<&Path>) -> Option<(bool, bool, bool)> {
     None
 }
 
@@ -117,7 +153,7 @@ pub fn detect_filesystem_with_ozone(
         false
     };
 
-    let fuse = detect_linux_fuse();
+    let fuse = detect_linux_fuse(ozone_dir);
     let projfs_ready = detect_windows_projfs();
     let recommended_backend = recommend_backend(&fs_kind, reflink_supported, fuse.as_ref(), projfs_ready);
 
@@ -380,7 +416,7 @@ fn probe_fs_kind(_path: &Path) -> Result<(FilesystemKind, Option<String>)> {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_linux_fuse() -> Option<LinuxFuseReadiness> {
+fn detect_linux_fuse(ozone_dir: Option<&Path>) -> Option<LinuxFuseReadiness> {
     let dev_fuse = Path::new("/dev/fuse");
     let dev_fuse_exists = dev_fuse.exists();
     let dev_fuse_rw = if dev_fuse_exists {
@@ -408,7 +444,9 @@ fn detect_linux_fuse() -> Option<LinuxFuseReadiness> {
         })
         .unwrap_or(false);
 
-    let ready = dev_fuse_rw && fusermount3_path.is_some();
+    let no_new_privs = process_has_no_new_privs();
+    let daemon_running = is_vfsd_daemon_running(ozone_dir);
+    let ready = dev_fuse_rw && fusermount3_path.is_some() && (!no_new_privs || daemon_running);
 
     Some(LinuxFuseReadiness {
         dev_fuse_exists,
@@ -416,12 +454,14 @@ fn detect_linux_fuse() -> Option<LinuxFuseReadiness> {
         fusermount3_path,
         fusermount3_version,
         user_allow_other_enabled,
+        no_new_privs,
+        daemon_running,
         ready,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_linux_fuse() -> Option<LinuxFuseReadiness> {
+fn detect_linux_fuse(_ozone_dir: Option<&Path>) -> Option<LinuxFuseReadiness> {
     None
 }
 
@@ -481,6 +521,8 @@ mod tests {
                 fusermount3_path: Some(PathBuf::from("/usr/bin/fusermount3")),
                 fusermount3_version: Some("fusermount3 version: 3.18.3".to_string()),
                 user_allow_other_enabled: false,
+                no_new_privs: false,
+                daemon_running: false,
                 ready: true,
             }),
             projfs_ready: None,

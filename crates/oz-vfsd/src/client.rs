@@ -17,11 +17,75 @@ pub struct DaemonPong {
     pub pid: u32,
 }
 
+/// Environment variable overriding the user-wide `oz-vfsd` global socket path.
+pub const OZ_VFSD_GLOBAL_SOCKET_ENV: &str = "OZ_VFSD_GLOBAL_SOCKET";
+
 /// Returns the canonical IPC endpoint path for `git_dir` (`.git/ozone/vfsd.sock`, or a
 /// short hashed Unix runtime socket path when `.git/ozone/vfsd.sock` would exceed `SUN_LEN`).
 #[must_use]
 pub fn socket_path_for_git_dir(git_dir: &Path) -> PathBuf {
     OzoneLayout::from_git_common_dir(git_dir).vfsd_socket_path()
+}
+
+/// Returns the user-wide global `oz-vfsd` Unix socket path (`$XDG_RUNTIME_DIR/oz-vfsd.sock`
+/// or `/tmp/oz-vfsd-<uid>/vfsd.sock` on Unix; `None` on non-Unix unless `OZ_VFSD_GLOBAL_SOCKET` is set).
+#[must_use]
+pub fn global_daemon_socket_path() -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os(OZ_VFSD_GLOBAL_SOCKET_ENV)
+        && !raw.is_empty()
+    {
+        return Some(PathBuf::from(raw));
+    }
+    #[cfg(unix)]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
+            && !xdg.is_empty()
+        {
+            return Some(PathBuf::from(xdg).join("oz-vfsd.sock"));
+        }
+        let uid = unsafe { libc::geteuid() };
+        Some(PathBuf::from(format!("/tmp/oz-vfsd-{uid}/vfsd.sock")))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Resolves the best active `oz-vfsd` socket for `git_dir`:
+/// 1. Existing live per-repo socket (`socket_path_for_git_dir(git_dir)`).
+/// 2. Existing live user-wide global daemon (`global_daemon_socket_path()`).
+/// 3. Fallback to per-repo socket path (used when auto-spawning a local daemon).
+#[must_use]
+pub fn resolve_active_daemon_socket(git_dir: &Path) -> PathBuf {
+    let repo_sock = socket_path_for_git_dir(git_dir);
+    if ping_daemon(&repo_sock).is_ok() {
+        return repo_sock;
+    }
+    if let Some(global_sock) = global_daemon_socket_path()
+        && ping_daemon(&global_sock).is_ok()
+    {
+        return global_sock;
+    }
+    repo_sock
+}
+
+/// Returns `true` when either the user-wide global `oz-vfsd` daemon or the repository's
+/// per-repo `oz-vfsd` daemon responds to `Ping`.
+#[must_use]
+pub fn is_any_daemon_running(git_dir: Option<&Path>) -> bool {
+    if let Some(gd) = git_dir {
+        let repo_sock = socket_path_for_git_dir(gd);
+        if ping_daemon(&repo_sock).is_ok() {
+            return true;
+        }
+    }
+    if let Some(global_sock) = global_daemon_socket_path()
+        && ping_daemon(&global_sock).is_ok()
+    {
+        return true;
+    }
+    false
 }
 
 fn exchange_ipc_line<S: std::io::Read + std::io::Write>(
@@ -133,7 +197,7 @@ pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
     let layout = OzoneLayout::from_git_common_dir(git_dir);
     std::fs::create_dir_all(&layout.ozone_dir)?;
     std::fs::create_dir_all(layout.ws_dir())?;
-    let sock = socket_path_for_git_dir(git_dir);
+    let sock = resolve_active_daemon_socket(git_dir);
     let records = load_expected_daemon_mounts(&layout);
 
     if ping_daemon(&sock).is_ok() {
@@ -266,19 +330,22 @@ pub fn mount_via_daemon_with_auto_start(
     spec: &MountSpec,
     auto_start: bool,
 ) -> Result<MountInfo> {
-    let sock = socket_path_for_git_dir(git_dir);
-    if auto_start {
-        let _ = ensure_daemon_and_mounts(git_dir)?;
-    } else if ping_daemon(&sock).is_err() {
-        return Err(OzError::MountUnavailable {
-            workspace: spec.workspace.clone(),
-            path: spec.mount_point.clone(),
-            errno: None,
-            message: format!(
-                "oz-vfsd socket {} is not listening and daemon.auto_start is disabled",
-                sock.display()
-            ),
-        });
+    let mut sock = resolve_active_daemon_socket(git_dir);
+    if ping_daemon(&sock).is_err() {
+        if auto_start {
+            let _ = ensure_daemon_and_mounts(git_dir)?;
+            sock = resolve_active_daemon_socket(git_dir);
+        } else {
+            return Err(OzError::MountUnavailable {
+                workspace: spec.workspace.clone(),
+                path: spec.mount_point.clone(),
+                errno: None,
+                message: format!(
+                    "oz-vfsd socket {} is not listening and daemon.auto_start is disabled",
+                    sock.display()
+                ),
+            });
+        }
     }
     if let Err(err) = std::fs::symlink_metadata(&spec.mount_point)
         && oz_core::is_enotconn(&err)
@@ -332,13 +399,14 @@ pub fn mount_via_daemon_with_auto_start(
 /// Unmounts `workspace` via `oz-vfsd` (or falls back to `fusermount3 -u -z` if the daemon
 /// is dead or `force` is requested).
 pub fn unmount_via_daemon(git_dir: &Path, workspace: &str, force: bool) -> Result<()> {
-    let sock = socket_path_for_git_dir(git_dir);
+    let sock = resolve_active_daemon_socket(git_dir);
     if ping_daemon(&sock).is_ok() {
         match send_request(
             &sock,
             &VfsRequest::Unmount {
                 workspace: workspace.to_string(),
                 force,
+                git_dir: Some(git_dir.to_path_buf()),
             },
         )? {
             VfsResponse::Unmounted { .. } => return Ok(()),
@@ -371,11 +439,12 @@ pub fn unmount_via_daemon(git_dir: &Path, workspace: &str, force: bool) -> Resul
 /// the daemon and mounts first if necessary).
 pub fn dirty_paths_via_daemon(git_dir: &Path, workspace: &str) -> Result<Vec<DirtyPathEntry>> {
     let _ = ensure_daemon_and_mounts(git_dir)?;
-    let sock = socket_path_for_git_dir(git_dir);
+    let sock = resolve_active_daemon_socket(git_dir);
     match send_request(
         &sock,
         &VfsRequest::DirtyPaths {
             workspace: workspace.to_string(),
+            git_dir: Some(git_dir.to_path_buf()),
         },
     )? {
         VfsResponse::DirtySet { paths, .. } => Ok(paths),

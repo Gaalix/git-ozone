@@ -501,7 +501,7 @@ fn fuse3_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_unix_listener
     let requests = seen_requests.lock().expect("lock");
     assert_eq!(requests.len(), 2);
     assert!(matches!(&requests[0], VfsRequest::Mount { .. }));
-    assert!(matches!(&requests[1], VfsRequest::Unmount { workspace, force: true } if workspace == "agent-vfs"));
+    assert!(matches!(&requests[1], VfsRequest::Unmount { workspace, force: true, .. } if workspace == "agent-vfs"));
 }
 
 #[cfg(target_os = "linux")]
@@ -867,5 +867,5 @@ fn projfs_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_tcp_listener
     let requests = seen_requests.lock().expect("lock");
     assert_eq!(requests.len(), 2);
     assert!(matches!(&requests[0], VfsRequest::Mount { .. }));
-    assert!(matches!(&requests[1], VfsRequest::Unmount { workspace, force: true } if workspace == "agent-win"));
+    assert!(matches!(&requests[1], VfsRequest::Unmount { workspace, force: true, .. } if workspace == "agent-win"));
 }

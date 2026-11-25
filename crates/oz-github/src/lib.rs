@@ -17,8 +17,8 @@ pub use api::{
     GitHubCheckRunOutput, GitHubClient, GitHubIssue, GitHubIssueComment,
     GitHubIssuePullRequestRef, GitHubJobStep, GitHubLabel, GitHubMilestone, GitHubPrRef,
     GitHubPullRequest, GitHubPullRequestComment, GitHubPullRequestFile, GitHubPullRequestReview,
-    GitHubReviewCommentPayload, GitHubReviewThreadMeta, GitHubUser, GitHubWorkflow,
-    GitHubWorkflowRun, UpdatePullRequest,
+    GitHubReviewCommentPayload, GitHubReviewThreadMeta, GitHubSearchIssuesResponse, GitHubUser,
+    GitHubWorkflow, GitHubWorkflowRun, UpdatePullRequest,
 };
 pub use auth::{
     DEFAULT_GITHUB_API_URL, DiscoveredToken, GitHubAuthProbe, ParsedGitRemote, RemoteScheme,
@@ -33,24 +33,32 @@ pub use ssh_config::{
     resolve_ssh_host, resolve_ssh_host_with_context,
 };
 pub use ci::{
-    CiJobLogOptions, CiJobLogReport, CiQueryOptions, CiReport, CiWatchEvent, CiWatchMetadata,
-    CiWatchOptions, CiWatchOutcome, CiWorkflowOptions, CiWorkflowReport, CiWorkflowRunSummary,
-    DEFAULT_MAX_EXCERPT_LINES, DEFAULT_WATCH_STARTUP_TIMEOUT_SECS, DEFAULT_WATCH_TIMEOUT_SECS,
-    DEFAULT_WORKFLOW_RUN_LIMIT, MAX_MCP_WAIT_SECONDS, MultiPrCiReport, extract_log_text_from_bytes,
-    query_ci_job_log, query_ci_status, query_multi_pr_ci_status, query_workflow_ci_status,
+    CiJobLogOptions, CiJobLogReport, CiQueryOptions, CiReport, CiRunsOptions, CiRunsReport,
+    CiWatchEvent, CiWatchMetadata, CiWatchOptions, CiWatchOutcome, CiWorkflowOptions,
+    CiWorkflowReport, CiWorkflowRunSummary, DEFAULT_MAX_EXCERPT_LINES,
+    DEFAULT_WATCH_STARTUP_TIMEOUT_SECS, DEFAULT_WATCH_TIMEOUT_SECS, DEFAULT_WORKFLOW_RUN_LIMIT,
+    MAX_MCP_WAIT_SECONDS, MultiPrCiReport, extract_log_text_from_bytes, query_ci_job_log,
+    query_ci_runs, query_ci_status, query_multi_pr_ci_status, query_workflow_ci_status,
     strip_actions_timestamp, strip_ansi_escapes, summarize_failing_log, watch_ci_status,
     watch_workflow_ci_status,
 };
-pub use issue::{IssueViewOptions, IssueViewOutcome, ParsedIssueTarget, issue_view, parse_issue_target};
+pub use issue::{
+    IssueCommentOptions, IssueCommentOutcome, IssueListItem, IssueListOptions, IssueListOutcome,
+    IssueViewOptions, IssueViewOutcome, ParsedIssueTarget, issue_comment, issue_list, issue_view,
+    parse_issue_target,
+};
 pub use pr::{
     OZ_STACK_END, OZ_STACK_START, PrCommentSide, PrCommentsOptions, PrCommentsOutcome,
     PrConversationComment, PrCreateOptions, PrCreateOutcome, PrDiffOptions, PrDiffOutcome,
-    PrInlineCommentInput, PrReadOptions, PrReadOutcome, PrReviewEvent, PrReviewOptions,
-    PrReviewOutcome, PrReviewThread, PrReviewThreadComment, PrStackOptions, PrStackOutcome,
-    PrViewFileSummary, PrViewOptions, PrViewOutcome, PrViewReviewSummary, StackPrItem,
-    group_review_threads, infer_title_body_and_change_ids, parse_github_patch_to_hunks,
-    parse_inline_comment_spec, pr_comments, pr_create, pr_diff, pr_files_to_changes, pr_read,
-    pr_review, pr_stack, pr_view, render_stack_navigation_block, strip_stack_navigation_block,
+    PrEditOptions, PrEditOutcome, PrInlineCommentInput, PrListItem, PrListOptions, PrListOutcome,
+    PrReadOptions, PrReadOutcome, PrReplyOptions, PrReplyOutcome, PrResolveOptions,
+    PrResolveOutcome, PrReviewEvent, PrReviewOptions, PrReviewOutcome, PrReviewThread,
+    PrReviewThreadComment, PrStackOptions, PrStackOutcome, PrStatusItem, PrStatusOptions,
+    PrStatusOutcome, PrViewFileSummary, PrViewOptions, PrViewOutcome, PrViewReviewSummary,
+    StackPrItem, group_review_threads, infer_title_body_and_change_ids,
+    parse_github_patch_to_hunks, parse_inline_comment_spec, pr_comments, pr_create, pr_diff,
+    pr_edit, pr_files_to_changes, pr_list, pr_read, pr_reply, pr_resolve, pr_review, pr_stack,
+    pr_status, pr_view, render_stack_navigation_block, strip_stack_navigation_block,
     upsert_stack_navigation_block, validate_pr_review_comments,
 };
 pub use sync::{
@@ -88,8 +96,11 @@ pub struct PullRequestSpec {
 pub struct CiCheckSummary {
     pub name: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failing_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<u64>,

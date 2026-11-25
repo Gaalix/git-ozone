@@ -59,9 +59,13 @@ pub enum VfsRequest {
         workspace: String,
         #[serde(default)]
         force: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_dir: Option<PathBuf>,
     },
     DirtyPaths {
         workspace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_dir: Option<PathBuf>,
     },
     ListMounts,
     Shutdown,
