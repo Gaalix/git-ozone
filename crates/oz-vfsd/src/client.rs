@@ -730,6 +730,8 @@ mod win_no_inherit {
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
     const INVALID_HANDLE_VALUE: *mut c_void = (-1isize) as *mut c_void;
 
+    // SAFETY: `GetStdHandle`, `GetHandleInformation`, and `SetHandleInformation` are standard
+    // Win32 APIs exported by `kernel32.dll` with these exact `"system"` ABI signatures.
     unsafe extern "system" {
         fn GetStdHandle(nStdHandle: u32) -> *mut c_void;
         fn GetHandleInformation(hObject: *mut c_void, lpdwFlags: *mut u32) -> i32;

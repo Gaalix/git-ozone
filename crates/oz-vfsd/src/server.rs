@@ -1100,6 +1100,8 @@ fn fill_csprng_bytes(buf: &mut [u8]) -> std::io::Result<()> {
 
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
 
+    // SAFETY: `BCryptGenRandom` is a standard Win32 CNG API exported by `bcrypt.dll` with this
+    // exact `"system"` ABI signature.
     #[link(name = "bcrypt")]
     unsafe extern "system" {
         fn BCryptGenRandom(
@@ -1182,6 +1184,8 @@ mod win_acl {
         user: SidAndAttributes,
     }
 
+    // SAFETY: `GetCurrentProcess`, `CloseHandle`, and `LocalFree` are standard Win32 APIs
+    // exported by `kernel32.dll` with these exact `"system"` ABI signatures.
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
@@ -1189,6 +1193,8 @@ mod win_acl {
         fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
     }
 
+    // SAFETY: These token/SID/SDDL/ACL functions are standard Win32 security APIs exported by
+    // `advapi32.dll` with these exact `"system"` ABI signatures.
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn OpenProcessToken(
@@ -1683,6 +1689,15 @@ fn write_tcp_endpoint_file(socket_path: &Path, endpoint: &str) -> Result<()> {
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const WRITE_DAC: u32 = 0x0004_0000;
+            // Request `WRITE_DAC` alongside `GENERIC_WRITE` so `SetSecurityInfo` can install
+            // the protected owner-only DACL on this handle before writing secret token bytes.
+            opts.access_mode(GENERIC_WRITE | WRITE_DAC);
         }
         let mut file = opts.open(&tmp)?;
         #[cfg(unix)]
