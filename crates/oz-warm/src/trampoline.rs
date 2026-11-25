@@ -4,6 +4,7 @@
 //! Portable POSIX polyglot trampoline, activation, `pyvenv.cfg`, and `.pth` rewriting
 //! for Python virtual environments (`.venv/`).
 
+use std::fmt::Write as _;
 use std::path::{Component, Path};
 
 /// Parses a hardcoded absolute Python shebang (`#!/.../python...`) into `(exe_name, args)`.
@@ -223,7 +224,8 @@ pub fn rewrite_venv_activate_bytes(
                         ""
                     };
                     let fallback = rhs.trim();
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "{indent}if [ -n \"${{BASH_VERSION:-}}\" ]; then\n\
                          {indent}    _OZ_VENV_BIN_DIR=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\n\
                          {indent}    VIRTUAL_ENV=\"$(dirname \"$_OZ_VENV_BIN_DIR\")\"\n\
@@ -234,7 +236,7 @@ pub fn rewrite_venv_activate_bytes(
                          {indent}else\n\
                          {indent}    VIRTUAL_ENV={fallback}\n\
                          {indent}fi\n"
-                    ));
+                    );
                     if !export_kw.is_empty() {
                         out.push_str(indent);
                         out.push_str(export_kw);
@@ -247,14 +249,15 @@ pub fn rewrite_venv_activate_bytes(
                     && let Some(path_arg) = inner.strip_suffix(')')
                     && matches_orig(path_arg)
                 {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "{indent}if [ -n \"${{BASH_VERSION:-}}\" ]; then\n\
                          {indent}    _OZ_VENV_BIN_DIR=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\n\
                          {indent}    VIRTUAL_ENV=\"$(dirname \"$_OZ_VENV_BIN_DIR\")\"\n\
                          {indent}else\n\
                          {indent}    VIRTUAL_ENV=$(cygpath {path_arg})\n\
                          {indent}fi{eol}"
-                    ));
+                    );
                     changed = true;
                     continue;
                 }
@@ -279,9 +282,10 @@ pub fn rewrite_venv_activate_bytes(
                 if let Some(rhs) = trimmed.strip_prefix("set -gx VIRTUAL_ENV ")
                     && matches_orig(rhs)
                 {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "{indent}set -gx VIRTUAL_ENV (dirname (dirname (status filename))){eol}"
-                    ));
+                    );
                     changed = true;
                     continue;
                 }
@@ -379,14 +383,16 @@ pub fn rewrite_python_pth_bytes(content: &[u8], repo_root: &Path) -> Option<Vec<
                 .collect::<Vec<_>>()
                 .join("/");
             if rel_slash.is_empty() {
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "import os, sys; sys.path.append(os.path.dirname(os.path.abspath(sys.prefix))){eol}"
-                ));
+                );
             } else {
                 let escaped = rel_slash.replace('\\', "\\\\").replace('"', "\\\"");
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "import os, sys; sys.path.append(os.path.join(os.path.dirname(os.path.abspath(sys.prefix)), \"{escaped}\")){eol}"
-                ));
+                );
             }
             changed = true;
         } else {

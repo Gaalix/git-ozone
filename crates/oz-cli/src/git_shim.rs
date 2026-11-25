@@ -21,13 +21,13 @@ use oz_agent::{
 };
 use oz_core::{
     CheckoutPathsOptions, CommitOptions, DiffReport, Envelope, ExitCode, FileChange, GitConfig,
-    InteractionMode, OzError, OzoneRepo, PathspecMatcher, Result, SwitchOptions,
-    add_pinned_paths, checkout_paths, clear_pinned_paths, commit_changes,
-    commit_changes_ignoring_pinned, compute_diff_with_overrides, compute_status,
-    compute_status_with_overrides, create_or_reset_local_branch, is_local_branch,
-    list_git_worktree_entries, list_tracked_paths_in_head, lookup_tree_entries_meta,
-    normalize_lexical, read_pinned_paths, remove_pinned_paths, render_unified_diff,
-    resolves_as_revision, switch_branch, validate_workspace_name,
+    InteractionMode, OzError, OzoneRepo, PathspecMatcher, Result, SwitchOptions, add_pinned_paths,
+    checkout_paths, clear_pinned_paths, commit_changes, commit_changes_ignoring_pinned,
+    compute_diff_with_overrides, compute_status, compute_status_with_overrides,
+    create_or_reset_local_branch, is_local_branch, list_git_worktree_entries,
+    list_tracked_paths_in_head, lookup_tree_entries_meta, normalize_lexical, read_pinned_paths,
+    remove_pinned_paths, render_unified_diff, resolves_as_revision, switch_branch,
+    validate_workspace_name,
 };
 use oz_cow::{
     GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnWorkspaceOptions, gc_workspaces,
@@ -35,8 +35,7 @@ use oz_cow::{
 };
 use oz_github::{
     CloneOptions, FetchOptions, FetchOutcome, ForceLeaseSpec, HttpAuthScheme, PushOptions,
-    PushOutcome, RemoteScheme, clone_repo, fetch_remote, parse_git_remote,
-    push_refs_with_options,
+    PushOutcome, RemoteScheme, clone_repo, fetch_remote, parse_git_remote, push_refs_with_options,
 };
 use oz_integrate::{
     IntegrateOptions, IntegrationMode, StackRebaseOptions, StackRebaseOutcome, abort_integration,
@@ -55,7 +54,11 @@ use std::process::{Command, Stdio};
 #[command(disable_help_flag = true, disable_version_flag = true)]
 pub struct GitShimArgs {
     /// Git subcommand and flags (`oz git <args...>`).
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "ARGS")]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARGS"
+    )]
     pub args: Vec<OsString>,
 }
 
@@ -459,7 +462,10 @@ where
     }
 }
 
-fn extract_json_agent_flags(args: &[OsString], mut mode: InteractionMode) -> (Vec<String>, InteractionMode) {
+fn extract_json_agent_flags(
+    args: &[OsString],
+    mut mode: InteractionMode,
+) -> (Vec<String>, InteractionMode) {
     let mut out = Vec::with_capacity(args.len());
     let mut after_sep = false;
     for raw in args {
@@ -582,14 +588,20 @@ pub fn resolve_real_git() -> Result<PathBuf> {
             });
         }
         if let Some(path_var) = std::env::var_os("PATH")
-            && let Some(found) =
-                find_git_in_path(&override_raw.to_string_lossy(), &path_var, current_exe_canon.as_deref())
+            && let Some(found) = find_git_in_path(
+                &override_raw.to_string_lossy(),
+                &path_var,
+                current_exe_canon.as_deref(),
+            )
         {
             return Ok(found);
         }
         return Err(OzError::BinaryNotFound {
             name: "git".to_string(),
-            message: format!("OZ_REAL_GIT '{}' not found on PATH", override_raw.to_string_lossy()),
+            message: format!(
+                "OZ_REAL_GIT '{}' not found on PATH",
+                override_raw.to_string_lossy()
+            ),
         });
     }
 
@@ -697,7 +709,12 @@ fn build_real_git_command(
     let needs_piped_stdin = subcmd.is_some_and(|s| {
         matches!(
             s,
-            "check-ignore" | "check-attr" | "hash-object" | "cat-file" | "rev-parse" | "update-index"
+            "check-ignore"
+                | "check-attr"
+                | "hash-object"
+                | "cat-file"
+                | "rev-parse"
+                | "update-index"
         )
     }) && args.iter().any(|a| {
         matches!(
@@ -732,11 +749,7 @@ fn delegate_readonly(
     extra_args: &[OsString],
 ) -> ExitCode {
     let subcmd = subcmd_slice.first().copied();
-    let mut all_args: Vec<OsString> = subcmd_slice
-        .iter()
-        .skip(1)
-        .map(OsString::from)
-        .collect();
+    let mut all_args: Vec<OsString> = subcmd_slice.iter().skip(1).map(OsString::from).collect();
     all_args.extend(extra_args.iter().cloned());
 
     let mut cmd = match build_real_git_command(parsed, subcmd, &all_args, false) {
@@ -890,10 +903,10 @@ fn delegate_mutating(
                 raw_code_to_exit_code(raw_code),
                 msg,
             );
-            env.op_id = op_id.clone();
-            if let Some(id) = op_id {
+            if let Some(ref id) = op_id {
                 env.recovery_commands.push(format!("oz undo {id}"));
             }
+            env.op_id = op_id;
             print_json_envelope(&env);
             raw_code_to_exit_code(raw_code)
         }
@@ -907,7 +920,11 @@ fn delegate_mutating(
     }
 }
 
-fn sync_pinned_after_clean_or_reset(repo: &OzoneRepo, subcmd: &str, args: &[OsString]) -> Result<()> {
+fn sync_pinned_after_clean_or_reset(
+    repo: &OzoneRepo,
+    subcmd: &str,
+    args: &[OsString],
+) -> Result<()> {
     let pinned = read_pinned_paths(repo)?;
     if pinned.is_empty() {
         return Ok(());
@@ -1206,7 +1223,9 @@ fn handle_git_worktree(parsed: &ParsedGitGlobals) -> ExitCode {
                         target = Some(arg.clone());
                     } else {
                         return Err(OzError::InvalidUsage {
-                            message: format!("unexpected argument `{arg}` for `oz git worktree remove`"),
+                            message: format!(
+                                "unexpected argument `{arg}` for `oz git worktree remove`"
+                            ),
                             recovery: vec!["Run `oz git worktree remove [-f] <ws>`.".to_string()],
                         });
                     }
@@ -1273,7 +1292,9 @@ fn handle_git_worktree(parsed: &ParsedGitGlobals) -> ExitCode {
                         dry_run = true;
                     } else if arg != "-v" && arg != "--verbose" {
                         return Err(OzError::InvalidUsage {
-                            message: format!("unexpected argument `{arg}` for `oz git worktree prune`"),
+                            message: format!(
+                                "unexpected argument `{arg}` for `oz git worktree prune`"
+                            ),
                             recovery: vec!["Run `oz git worktree prune [-n]`.".to_string()],
                         });
                     }
@@ -1344,7 +1365,10 @@ fn handle_git_worktree(parsed: &ParsedGitGlobals) -> ExitCode {
                     .as_array()
                     .map(Vec::len)
                     .unwrap_or(0);
-                println!("pruned {} workspace(s) and {} stale git worktree dir(s)", removed, extra);
+                println!(
+                    "pruned {} workspace(s) and {} stale git worktree dir(s)",
+                    removed, extra
+                );
             })
         }
         _ => delegate_readonly(parsed, &["worktree"], &parsed.subcommand_args),
@@ -1381,7 +1405,9 @@ fn parse_worktree_target(
         .to_string();
     validate_workspace_name(&ws_name)?;
 
-    let default_path = repo.config.render_workspace_path(&repo.repo_root, &ws_name)?;
+    let default_path = repo
+        .config
+        .render_workspace_path(&repo.repo_root, &ws_name)?;
     if abs == default_path {
         Ok((ws_name, None))
     } else {
@@ -1611,8 +1637,7 @@ fn handle_git_status(parsed: &ParsedGitGlobals) -> ExitCode {
                     return;
                 }
 
-                let staged: Vec<&FileChange> =
-                    report.changes.iter().filter(|c| c.pinned).collect();
+                let staged: Vec<&FileChange> = report.changes.iter().filter(|c| c.pinned).collect();
                 let unstaged: Vec<&FileChange> = report
                     .changes
                     .iter()
@@ -1927,11 +1952,12 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
         }
         if ignore_all_submodules {
             let paths: Vec<&str> = report.files.iter().map(|f| f.path.as_str()).collect();
-            let head_meta = if let Some(ref tree_hex) = compute_status(&repo).ok().and_then(|s| s.base_tree) {
-                lookup_tree_entries_meta(&repo, tree_hex, &paths)
-            } else {
-                std::collections::BTreeMap::new()
-            };
+            let head_meta =
+                if let Some(ref tree_hex) = compute_status(&repo).ok().and_then(|s| s.base_tree) {
+                    lookup_tree_entries_meta(&repo, tree_hex, &paths)
+                } else {
+                    std::collections::BTreeMap::new()
+                };
             report
                 .files
                 .retain(|f| head_meta.get(&f.path).is_none_or(|(m, _)| *m != "160000"));
@@ -1953,7 +1979,9 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
         .with_head_oid(oid))
     })();
 
-    let has_diff = res.as_ref().is_ok_and(|env| !env.data.report.files.is_empty());
+    let has_diff = res
+        .as_ref()
+        .is_ok_and(|env| !env.data.report.files.is_empty());
 
     let code = emit_json_or_human(mode, res, |env| {
         if quiet {
@@ -2019,12 +2047,7 @@ fn handle_git_diff(parsed: &ParsedGitGlobals) -> ExitCode {
                 if report.files.is_empty() {
                     return;
                 }
-                let max_len = report
-                    .files
-                    .iter()
-                    .map(|f| f.path.len())
-                    .max()
-                    .unwrap_or(0);
+                let max_len = report.files.iter().map(|f| f.path.len()).max().unwrap_or(0);
                 for f in &report.files {
                     if f.is_binary {
                         println!(" {:<max_len$} | Bin", f.path);
@@ -2184,7 +2207,9 @@ fn handle_git_add(parsed: &ParsedGitGlobals) -> ExitCode {
                     if !exists_on_disk && !matches_tracked {
                         return Err(OzError::InvalidUsage {
                             message: format!("pathspec '{raw_spec}' did not match any files"),
-                            recovery: vec!["Run `oz git status` to inspect changed files.".to_string()],
+                            recovery: vec![
+                                "Run `oz git status` to inspect changed files.".to_string(),
+                            ],
                         });
                     }
                 }
@@ -2789,7 +2814,9 @@ fn handle_git_switch(parsed: &ParsedGitGlobals, allow_detached_commit: bool) -> 
                         mode,
                         &OzError::InvalidUsage {
                             message: format!("option `{arg}` requires a branch name"),
-                            recovery: vec!["Pass `oz git switch -c <branch> [<start>]`.".to_string()],
+                            recovery: vec![
+                                "Pass `oz git switch -c <branch> [<start>]`.".to_string(),
+                            ],
                         },
                     );
                 };
@@ -2853,8 +2880,8 @@ fn handle_git_switch(parsed: &ParsedGitGlobals, allow_detached_commit: bool) -> 
             },
         )?;
 
-        let post_repo = OzoneRepo::discover(parsed.effective_dir.as_deref())
-            .unwrap_or_else(|_| repo.clone());
+        let post_repo =
+            OzoneRepo::discover(parsed.effective_dir.as_deref()).unwrap_or_else(|_| repo.clone());
         let entry = tx.finish(&post_repo, None)?;
 
         Ok(Envelope::success(outcome.clone())
@@ -2891,8 +2918,9 @@ fn handle_git_checkout(parsed: &ParsedGitGlobals) -> ExitCode {
             return emit_error(
                 mode,
                 &OzError::InvalidUsage {
-                    message: "`git checkout -p` is interactive and disabled in non-interactive mode"
-                        .to_string(),
+                    message:
+                        "`git checkout -p` is interactive and disabled in non-interactive mode"
+                            .to_string(),
                     recovery: vec!["Pass `oz git checkout -- <file>`.".to_string()],
                 },
             );
@@ -2954,12 +2982,7 @@ fn handle_git_checkout(parsed: &ParsedGitGlobals) -> ExitCode {
                     && resolves_as_revision(&repo, first)
                 {
                     let rest: Vec<String> = positionals[1..].iter().map(|s| (*s).clone()).collect();
-                    return run_native_checkout_paths(
-                        parsed,
-                        mode,
-                        Some(first.clone()),
-                        &rest,
-                    );
+                    return run_native_checkout_paths(parsed, mode, Some(first.clone()), &rest);
                 } else if !resolves_as_revision(&repo, first) {
                     let all_paths: Vec<String> = positionals.iter().map(|s| (*s).clone()).collect();
                     return run_native_checkout_paths(parsed, mode, None, &all_paths);
@@ -3032,7 +3055,9 @@ fn read_git_message_file(parsed: &ParsedGitGlobals, fpath: &str) -> Result<Optio
 }
 
 enum GitMergeAction {
-    Continue { verify_cmd: Option<String> },
+    Continue {
+        verify_cmd: Option<String>,
+    },
     Abort,
     Integrate {
         sources: Vec<String>,
@@ -3044,10 +3069,7 @@ enum GitMergeAction {
     Fallback,
 }
 
-fn parse_git_merge_action(
-    parsed: &ParsedGitGlobals,
-    args: &[String],
-) -> Result<GitMergeAction> {
+fn parse_git_merge_action(parsed: &ParsedGitGlobals, args: &[String]) -> Result<GitMergeAction> {
     let mut is_continue = false;
     let mut is_abort = false;
     let mut messages = Vec::new();
@@ -3100,7 +3122,9 @@ fn parse_git_merge_action(
                     let Some(val) = args.get(i + 1) else {
                         return Err(OzError::InvalidUsage {
                             message: "option `--verify` requires a command string".to_string(),
-                            recovery: vec!["oz git merge <branch> --verify \"cargo test\"".to_string()],
+                            recovery: vec![
+                                "oz git merge <branch> --verify \"cargo test\"".to_string(),
+                            ],
                         });
                     };
                     verify_cmd = Some(val.clone());
@@ -3114,8 +3138,8 @@ fn parse_git_merge_action(
                     force = true;
                     i += 1;
                 }
-                "--no-ff" | "--ff" | "--no-edit" | "--edit" | "-e" | "-q" | "--quiet"
-                | "-v" | "--verbose" | "--stat" | "--no-stat" | "--progress" | "--no-progress"
+                "--no-ff" | "--ff" | "--no-edit" | "--edit" | "-e" | "-q" | "--quiet" | "-v"
+                | "--verbose" | "--stat" | "--no-stat" | "--progress" | "--no-progress"
                 | "--no-verify" => {
                     i += 1;
                 }
@@ -3317,10 +3341,7 @@ pub fn handle_git_merge(parsed: &ParsedGitGlobals) -> ExitCode {
 enum GitRebaseAction {
     Continue,
     Abort,
-    StackRebase {
-        onto: String,
-        update_refs: bool,
-    },
+    StackRebase { onto: String, update_refs: bool },
     Fallback,
 }
 
@@ -3824,7 +3845,11 @@ fn handle_git_clone(parsed: &ParsedGitGlobals) -> ExitCode {
 
         return emit_json_or_human(mode, res, |env| {
             if !quiet {
-                println!("Cloned '{}' into '{}'", env.data.url, env.data.path.display());
+                println!(
+                    "Cloned '{}' into '{}'",
+                    env.data.url,
+                    env.data.path.display()
+                );
             }
         });
     }
@@ -4057,7 +4082,9 @@ fn parse_git_fetch_action(args: &[String], has_exotic_globals: bool) -> Result<G
                         return Err(OzError::InvalidUsage {
                             message: "option `--filter` requires an object filter specification"
                                 .to_string(),
-                            recovery: vec!["oz git fetch --filter=blob:none [<remote>]".to_string()],
+                            recovery: vec![
+                                "oz git fetch --filter=blob:none [<remote>]".to_string(),
+                            ],
                         });
                     };
                     filter = Some(val.clone());
@@ -4202,7 +4229,10 @@ fn handle_git_fetch(parsed: &ParsedGitGlobals) -> ExitCode {
                             let old_short = &old[..old.len().min(7)];
                             let sep = if u.forced { "..." } else { ".." };
                             let prefix = if u.forced { " + " } else { "   " };
-                            println!("{prefix}{old_short}{sep}{new_short}  {} -> {}", u.remote_ref, u.local_ref);
+                            println!(
+                                "{prefix}{old_short}{sep}{new_short}  {} -> {}",
+                                u.remote_ref, u.local_ref
+                            );
                         }
                         None => {
                             println!(" * [new ref]         {} -> {}", u.remote_ref, u.local_ref);
@@ -4465,7 +4495,10 @@ fn handle_git_push(parsed: &ParsedGitGlobals) -> ExitCode {
                                 p.remote_ref
                             );
                         } else {
-                            println!("   {old_short}..{new_short}  {local_label} -> {}", p.remote_ref);
+                            println!(
+                                "   {old_short}..{new_short}  {local_label} -> {}",
+                                p.remote_ref
+                            );
                         }
                     } else {
                         println!(" * [new branch]      {local_label} -> {}", p.remote_ref);
@@ -4590,14 +4623,18 @@ fn is_read_only_git_command(subcmd: &str, args: &[OsString]) -> bool {
                 .any(|a| matches!(a.as_str(), "-l" | "--list" | "-v" | "--verify"))
                 || str_args.iter().all(|a| a.starts_with('-'))
         }
-        "stash" => matches!(
-            str_args.first().map(String::as_str),
-            Some("list" | "show")
-        ),
+        "stash" => matches!(str_args.first().map(String::as_str), Some("list" | "show")),
         "remote" => !str_args.iter().any(|a| {
             matches!(
                 a.as_str(),
-                "add" | "remove" | "rm" | "rename" | "set-url" | "prune" | "update" | "set-head"
+                "add"
+                    | "remove"
+                    | "rm"
+                    | "rename"
+                    | "set-url"
+                    | "prune"
+                    | "update"
+                    | "set-head"
                     | "set-branches"
             )
         }),
@@ -4614,8 +4651,10 @@ fn is_read_only_git_command(subcmd: &str, args: &[OsString]) -> bool {
                     | "--show-scope"
             )
         }),
-        "symbolic-ref" => !str_args.iter().any(|a| a == "-d" || a == "--delete")
-            && str_args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
+        "symbolic-ref" => {
+            !str_args.iter().any(|a| a == "-d" || a == "--delete")
+                && str_args.iter().filter(|a| !a.starts_with('-')).count() <= 1
+        }
         "reflog" => matches!(
             str_args.first().map(String::as_str),
             None | Some("show" | "exists")

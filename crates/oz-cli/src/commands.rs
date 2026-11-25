@@ -566,10 +566,20 @@ pub struct PrEditArgs {
     #[arg(short = 't', long = "title", value_name = "TITLE")]
     pub title: Option<String>,
     /// Updated pull request markdown body.
-    #[arg(short = 'b', long = "body", value_name = "BODY", conflicts_with = "body_file")]
+    #[arg(
+        short = 'b',
+        long = "body",
+        value_name = "BODY",
+        conflicts_with = "body_file"
+    )]
     pub body: Option<String>,
     /// Read updated pull request body from a file path or `-` for stdin.
-    #[arg(short = 'F', long = "body-file", value_name = "PATH", conflicts_with = "body")]
+    #[arg(
+        short = 'F',
+        long = "body-file",
+        value_name = "PATH",
+        conflicts_with = "body"
+    )]
     pub body_file: Option<String>,
     /// Updated base target branch.
     #[arg(short = 'B', long = "base", value_name = "BRANCH")]
@@ -595,10 +605,22 @@ pub struct PrReplyArgs {
     /// Inline review thread handle (`t1` / `[t1]`), numeric comment ID (`#4694921942`), or GraphQL thread ID (`PRRT_...`).
     pub target: String,
     /// Reply body text.
-    #[arg(short = 'm', long = "message", visible_short_alias = 'b', visible_alias = "body", value_name = "TEXT", conflicts_with = "body_file")]
+    #[arg(
+        short = 'm',
+        long = "message",
+        visible_short_alias = 'b',
+        visible_alias = "body",
+        value_name = "TEXT",
+        conflicts_with = "body_file"
+    )]
     pub body: Option<String>,
     /// Read reply body from a file path or `-` for stdin.
-    #[arg(short = 'F', long = "body-file", value_name = "PATH", conflicts_with = "body")]
+    #[arg(
+        short = 'F',
+        long = "body-file",
+        value_name = "PATH",
+        conflicts_with = "body"
+    )]
     pub body_file: Option<String>,
     /// Also mark the review thread resolved after posting the reply.
     #[arg(long = "resolve")]
@@ -702,10 +724,22 @@ pub struct IssueCommentArgs {
     /// Issue number (`3344`, `#3344`) or full GitHub issue URL.
     pub target: String,
     /// Comment markdown body.
-    #[arg(short = 'b', long = "body", visible_short_alias = 'm', visible_alias = "message", value_name = "BODY", conflicts_with = "body_file")]
+    #[arg(
+        short = 'b',
+        long = "body",
+        visible_short_alias = 'm',
+        visible_alias = "message",
+        value_name = "BODY",
+        conflicts_with = "body_file"
+    )]
     pub body: Option<String>,
     /// Read comment body from a file path or `-` for stdin.
-    #[arg(short = 'F', long = "body-file", value_name = "PATH", conflicts_with = "body")]
+    #[arg(
+        short = 'F',
+        long = "body-file",
+        value_name = "PATH",
+        conflicts_with = "body"
+    )]
     pub body_file: Option<String>,
     /// Remote name (defaults to `origin`).
     #[arg(long = "remote", value_name = "REMOTE")]
@@ -766,10 +800,20 @@ pub struct PrReviewArgs {
     #[arg(long = "comment", conflicts_with_all = ["approve", "request_changes"])]
     pub comment: bool,
     /// Top-level review summary body.
-    #[arg(short = 'b', long = "body", value_name = "TEXT", conflicts_with = "body_file")]
+    #[arg(
+        short = 'b',
+        long = "body",
+        value_name = "TEXT",
+        conflicts_with = "body_file"
+    )]
     pub body: Option<String>,
     /// Read top-level review summary body from a file path or `-` for stdin.
-    #[arg(short = 'F', long = "body-file", value_name = "PATH", conflicts_with = "body")]
+    #[arg(
+        short = 'F',
+        long = "body-file",
+        value_name = "PATH",
+        conflicts_with = "body"
+    )]
     pub body_file: Option<String>,
     /// Inline diff comment (`<path>:<line>[:LEFT|RIGHT]=<body>` or `<path>:<start>-<end>[:LEFT|RIGHT]=<body>`).
     #[arg(long = "inline", alias = "comment-inline", action = clap::ArgAction::Append, value_name = "SPEC")]
@@ -791,10 +835,20 @@ pub struct PrCreateArgs {
     #[arg(short = 't', long = "title", value_name = "TITLE")]
     pub title: Option<String>,
     /// Pull request markdown body (inferred from commit body + `Change-Id:` when omitted).
-    #[arg(short = 'b', long = "body", value_name = "BODY", conflicts_with = "body_file")]
+    #[arg(
+        short = 'b',
+        long = "body",
+        value_name = "BODY",
+        conflicts_with = "body_file"
+    )]
     pub body: Option<String>,
     /// Read pull request markdown body from a file path or `-` for stdin.
-    #[arg(short = 'F', long = "body-file", value_name = "PATH", conflicts_with = "body")]
+    #[arg(
+        short = 'F',
+        long = "body-file",
+        value_name = "PATH",
+        conflicts_with = "body"
+    )]
     pub body_file: Option<String>,
     /// Base target branch on GitHub (defaults to `main`).
     #[arg(short = 'B', long = "base", value_name = "BRANCH")]
@@ -882,10 +936,7 @@ pub struct CiArgs {
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
     /// Maximum recent workflow runs to return with `--workflow` or `--runs` (default: 5; `--runs` defaults to 10 if omitted).
-    #[arg(
-        long = "limit",
-        value_name = "N"
-    )]
+    #[arg(long = "limit", value_name = "N")]
     pub limit: Option<usize>,
     /// Maximum lines per failing check log excerpt (default: 40).
     #[arg(
@@ -1105,7 +1156,10 @@ fn baseline_source_label(source: BaselineSource) -> &'static str {
 pub(crate) fn write_stdout_line(line: &str) {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
-    if let Err(err) = out.write_all(line.as_bytes()).and_then(|()| out.write_all(b"\n")).and_then(|()| out.flush())
+    if let Err(err) = out
+        .write_all(line.as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
         && err.kind() != std::io::ErrorKind::BrokenPipe
     {
         eprintln!("error: failed writing stdout: {err}");
@@ -1157,10 +1211,8 @@ pub(crate) fn handle_ws(
     mode: InteractionMode,
 ) -> ExitCode {
     match cmd {
-        WsCommand::Spawn(args) => render_command_result(
-            mode,
-            execute_ws_spawn(&args, directory, mode),
-            |env| {
+        WsCommand::Spawn(args) => {
+            render_command_result(mode, execute_ws_spawn(&args, directory, mode), |env| {
                 let d = &env.data;
                 let commit_suffix = d
                     .base_commit
@@ -1182,44 +1234,36 @@ pub(crate) fn handle_ws(
                         WarningEntry::Structured { message, .. } => eprintln!("warning: {message}"),
                     }
                 }
-            },
-        ),
-        WsCommand::List => render_command_result(
-            mode,
-            execute_ws_list(directory),
-            |env| {
-                if env.data.workspaces.is_empty() {
-                    println!("no workspaces");
-                } else {
-                    for ws in &env.data.workspaces {
-                        println!(
-                            "{}  branch={}  backend={}  health={}  path={}",
-                            ws.name,
-                            ws.branch,
-                            ws.backend,
-                            ws.mount_health,
-                            ws.worktree_path.display()
-                        );
-                    }
+            })
+        }
+        WsCommand::List => render_command_result(mode, execute_ws_list(directory), |env| {
+            if env.data.workspaces.is_empty() {
+                println!("no workspaces");
+            } else {
+                for ws in &env.data.workspaces {
+                    println!(
+                        "{}  branch={}  backend={}  health={}  path={}",
+                        ws.name,
+                        ws.branch,
+                        ws.backend,
+                        ws.mount_health,
+                        ws.worktree_path.display()
+                    );
                 }
-            },
-        ),
-        WsCommand::Rm(args) => render_command_result(
-            mode,
-            execute_ws_rm(&args, directory, mode),
-            |env| {
+            }
+        }),
+        WsCommand::Rm(args) => {
+            render_command_result(mode, execute_ws_rm(&args, directory, mode), |env| {
                 let d = &env.data;
                 println!(
                     "removed workspace '{}' ({})",
                     d.name,
                     d.worktree_path.display()
                 );
-            },
-        ),
-        WsCommand::Gc(args) => render_command_result(
-            mode,
-            execute_ws_gc(&args, directory, mode),
-            |env| {
+            })
+        }
+        WsCommand::Gc(args) => {
+            render_command_result(mode, execute_ws_gc(&args, directory, mode), |env| {
                 let d = &env.data;
                 println!(
                     "gc: removed {} workspace(s) ({} skipped dirty), {} baseline(s) ({} bytes reclaimed)",
@@ -1228,8 +1272,8 @@ pub(crate) fn handle_ws(
                     d.removed_baselines.len(),
                     d.reclaimed_baseline_bytes
                 );
-            },
-        ),
+            })
+        }
     }
 }
 
@@ -1247,13 +1291,15 @@ fn execute_ws_spawn(
     let backend_override = match args.backend.as_deref().map(str::trim) {
         None | Some("") | Some("auto") => None,
         Some(raw) => {
-            let parsed = raw.parse::<BackendKind>().map_err(|message| OzError::InvalidUsage {
-                message,
-                recovery: vec![
+            let parsed = raw
+                .parse::<BackendKind>()
+                .map_err(|message| OzError::InvalidUsage {
+                    message,
+                    recovery: vec![
                     "Pass `--backend cas_hardlink` (or omit `--backend` for automatic selection)."
                         .to_string(),
                 ],
-            })?;
+                })?;
             Some(parsed)
         }
     };
@@ -1700,12 +1746,7 @@ pub(crate) fn handle_commit(
         } else {
             "oz commit"
         };
-        let tx = MutationTransaction::begin(
-            &repo,
-            cmd_label,
-            actor,
-            Some(&pre_status.changes),
-        )?;
+        let tx = MutationTransaction::begin(&repo, cmd_label, actor, Some(&pre_status.changes))?;
 
         let opts = CommitOptions {
             message,
@@ -1834,21 +1875,20 @@ pub(crate) fn handle_undo(
     mode: InteractionMode,
 ) -> ExitCode {
     let res = (|| -> Result<Envelope<UndoData>> {
-        if args.op_id.is_some() && args.steps.is_some() {
-            return Err(OzError::InvalidUsage {
-                message: "cannot pass both `<op_id>` and `--steps` to `oz undo`".to_string(),
-                recovery: vec!["Run `oz undo <op_id>` or `oz undo --steps <n>`.".to_string()],
-            });
-        }
-
-        let repo = discover_and_recover_repo(directory, false)?;
-        let actor = actor_from_mode(mode, &repo);
         let target = match (&args.op_id, args.steps) {
+            (Some(_), Some(_)) => {
+                return Err(OzError::InvalidUsage {
+                    message: "cannot pass both `<op_id>` and `--steps` to `oz undo`".to_string(),
+                    recovery: vec!["Run `oz undo <op_id>` or `oz undo --steps <n>`.".to_string()],
+                });
+            }
             (Some(id), None) => UndoTarget::OpId(id.clone()),
             (None, Some(n)) => UndoTarget::Steps(n),
             (None, None) => UndoTarget::Steps(1),
-            (Some(_), Some(_)) => unreachable!(),
         };
+
+        let repo = discover_and_recover_repo(directory, false)?;
+        let actor = actor_from_mode(mode, &repo);
 
         let t0 = Instant::now();
         let outcome = undo(&repo, target, actor)?;
@@ -1919,14 +1959,18 @@ pub(crate) fn handle_setup(
     mode: InteractionMode,
 ) -> ExitCode {
     let res = (|| -> Result<Envelope<SetupData>> {
-        let repo_opt = discover_and_recover_repo(directory, false).ok();
-        if let Some(ref repo) = repo_opt {
-            repo.layout.ensure_initialized()?;
-        } else if !args.systemd_user || args.per_repo {
+        let repo_opt = if !args.systemd_user || args.per_repo {
             // Repo-scoped setup requires being inside a Git repository.
             let repo = discover_and_recover_repo(directory, false)?;
             repo.layout.ensure_initialized()?;
-        }
+            Some(repo)
+        } else {
+            let repo_opt = discover_and_recover_repo(directory, false).ok();
+            if let Some(ref repo) = repo_opt {
+                repo.layout.ensure_initialized()?;
+            }
+            repo_opt
+        };
 
         let projfs_enabled = if args.enable_projfs {
             let newly_enabled = oz_vfsd::enable_windows_projfs()?;
@@ -1949,7 +1993,16 @@ pub(crate) fn handle_setup(
             #[cfg(target_os = "linux")]
             {
                 if args.per_repo {
-                    let repo = repo_opt.as_ref().expect("repo checked above");
+                    let Some(ref repo) = repo_opt else {
+                        return Err(OzError::InvalidUsage {
+                            message: "`--per-repo` requires running inside a Git repository"
+                                .to_string(),
+                            recovery: vec![
+                                "Run `oz setup --systemd-user --per-repo` inside a Git repository."
+                                    .to_string(),
+                            ],
+                        });
+                    };
                     Some(oz_vfsd::install_systemd_user_unit(
                         &vfsd_bin,
                         &repo.layout.git_common_dir,
@@ -1978,14 +2031,7 @@ pub(crate) fn handle_setup(
                 repo.branch,
                 repo.head_oid,
             ),
-            None => (
-                probe_path,
-                PathBuf::new(),
-                PathBuf::new(),
-                None,
-                None,
-                None,
-            ),
+            None => (probe_path, PathBuf::new(), PathBuf::new(), None, None, None),
         };
 
         let mut env = Envelope::success(SetupData {
@@ -2004,7 +2050,10 @@ pub(crate) fn handle_setup(
         if cfg!(target_os = "linux") && !args.systemd_user {
             env = env.with_recovery_command("oz setup --systemd-user");
         }
-        if cfg!(target_os = "windows") && !args.enable_projfs && !oz_vfsd::is_windows_projfs_enabled() {
+        if cfg!(target_os = "windows")
+            && !args.enable_projfs
+            && !oz_vfsd::is_windows_projfs_enabled()
+        {
             env = env.with_recovery_command("oz setup --enable-projfs");
         }
         Ok(env)
@@ -2203,8 +2252,7 @@ pub(crate) fn handle_integrate(
         }
 
         if args.continue_session {
-            let outcome =
-                continue_integration_with_verify(&repo, args.verify.as_deref(), actor)?;
+            let outcome = continue_integration_with_verify(&repo, args.verify.as_deref(), actor)?;
             let wrapped = wrap_integrate_envelope(outcome, repo.workspace);
             return Ok(map_envelope_data(wrapped, IntegrateCliData::Integrated));
         }
@@ -2277,8 +2325,7 @@ pub(crate) fn handle_merge(
         }
 
         if args.continue_session {
-            let outcome =
-                continue_integration_with_verify(&repo, args.verify.as_deref(), actor)?;
+            let outcome = continue_integration_with_verify(&repo, args.verify.as_deref(), actor)?;
             let wrapped = wrap_integrate_envelope(outcome, repo.workspace);
             return Ok(map_envelope_data(wrapped, IntegrateCliData::Integrated));
         }
@@ -2531,14 +2578,22 @@ fn handle_stack_status(
 
     render_command_result(mode, res, |env| {
         let d = &env.data;
-        println!("Stack onto {} ({} branch(es))", d.onto_branch, d.branches.len());
+        println!(
+            "Stack onto {} ({} branch(es))",
+            d.onto_branch,
+            d.branches.len()
+        );
         if d.branches.is_empty() {
             println!("no stacked branches ahead of {}", d.onto_branch);
             return;
         }
         for b in &d.branches {
             let parent = b.parent_branch.as_deref().unwrap_or(&d.onto_branch);
-            let status_flag = if b.needs_rebase { "needs-rebase" } else { "up-to-date" };
+            let status_flag = if b.needs_rebase {
+                "needs-rebase"
+            } else {
+                "up-to-date"
+            };
             println!(
                 "  {} (parent: {}, ahead: {}, behind: {}, {})",
                 b.branch, parent, b.ahead_count, b.behind_onto_count, status_flag
@@ -2725,7 +2780,10 @@ pub(crate) fn handle_fetch(
     render_command_result(mode, res, |env| {
         let d = &env.data;
         if d.updated_refs.is_empty() && d.pruned_refs.is_empty() {
-            println!("Fetched '{}' ({}): already up to date", d.remote, d.remote_url);
+            println!(
+                "Fetched '{}' ({}): already up to date",
+                d.remote, d.remote_url
+            );
         } else {
             println!(
                 "Fetched '{}' ({}): {} updated, {} pruned",
@@ -3057,7 +3115,10 @@ fn handle_issue_list(
     render_command_result(mode, res, |env| {
         let d = &env.data;
         if d.issues.is_empty() {
-            println!("No matching issues in {}/{} (state={})", d.owner, d.repo, d.state);
+            println!(
+                "No matching issues in {}/{} (state={})",
+                d.owner, d.repo, d.state
+            );
             return;
         }
         println!(
@@ -3090,8 +3151,8 @@ fn handle_issue_comment(
 ) -> ExitCode {
     let res = (|| -> Result<Envelope<IssueCommentOutcome>> {
         let parsed = parse_issue_target(&args.target)?;
-        let body = read_body_or_file(args.body.as_deref(), args.body_file.as_deref())?
-            .unwrap_or_default();
+        let body =
+            read_body_or_file(args.body.as_deref(), args.body_file.as_deref())?.unwrap_or_default();
         let repo = discover_and_recover_repo(directory, false)?;
         let outcome = issue_comment(
             &repo,
@@ -3126,11 +3187,7 @@ fn handle_issue_comment(
     })
 }
 
-fn handle_pr_list(
-    args: &PrListArgs,
-    directory: Option<&Path>,
-    mode: InteractionMode,
-) -> ExitCode {
+fn handle_pr_list(args: &PrListArgs, directory: Option<&Path>, mode: InteractionMode) -> ExitCode {
     let res = (|| -> Result<Envelope<PrListOutcome>> {
         let repo = discover_and_recover_repo(directory, false)?;
         let outcome = pr_list(
@@ -3157,7 +3214,10 @@ fn handle_pr_list(
     render_command_result(mode, res, |env| {
         let d = &env.data;
         if d.pull_requests.is_empty() {
-            println!("No matching PRs in {}/{} (state={})", d.owner, d.repo, d.state);
+            println!(
+                "No matching PRs in {}/{} (state={})",
+                d.owner, d.repo, d.state
+            );
             return;
         }
         println!(
@@ -3178,11 +3238,7 @@ fn handle_pr_list(
     })
 }
 
-fn handle_pr_edit(
-    args: &PrEditArgs,
-    directory: Option<&Path>,
-    mode: InteractionMode,
-) -> ExitCode {
+fn handle_pr_edit(args: &PrEditArgs, directory: Option<&Path>, mode: InteractionMode) -> ExitCode {
     let res = (|| -> Result<Envelope<PrEditOutcome>> {
         let body = read_body_or_file(args.body.as_deref(), args.body_file.as_deref())?;
         let draft = if args.draft {
@@ -3230,8 +3286,8 @@ fn handle_pr_reply(
     mode: InteractionMode,
 ) -> ExitCode {
     let res = (|| -> Result<Envelope<PrReplyOutcome>> {
-        let body = read_body_or_file(args.body.as_deref(), args.body_file.as_deref())?
-            .unwrap_or_default();
+        let body =
+            read_body_or_file(args.body.as_deref(), args.body_file.as_deref())?.unwrap_or_default();
         let repo = discover_and_recover_repo(directory, false)?;
         let outcome = pr_reply(
             &repo,
@@ -3301,7 +3357,11 @@ fn handle_pr_resolve(
 
     render_command_result(mode, res, |env| {
         let d = &env.data;
-        let verb = if d.is_resolved { "Resolved" } else { "Unresolved" };
+        let verb = if d.is_resolved {
+            "Resolved"
+        } else {
+            "Unresolved"
+        };
         let handle = d
             .thread_handle
             .as_deref()
@@ -3397,7 +3457,11 @@ fn handle_issue_view(
     render_command_result(mode, res, |env| {
         let d = &env.data;
         let issue = &d.issue;
-        let kind_label = if d.is_pull_request { "PR/Issue" } else { "Issue" };
+        let kind_label = if d.is_pull_request {
+            "PR/Issue"
+        } else {
+            "Issue"
+        };
         let author = issue
             .user
             .as_ref()
@@ -3554,11 +3618,7 @@ fn handle_pr_comments(
     })
 }
 
-fn handle_pr_view(
-    args: &PrViewArgs,
-    directory: Option<&Path>,
-    mode: InteractionMode,
-) -> ExitCode {
+fn handle_pr_view(args: &PrViewArgs, directory: Option<&Path>, mode: InteractionMode) -> ExitCode {
     let omit_body = args.brief || args.no_body;
     let omit_files = args.brief || args.no_files;
 
@@ -3619,13 +3679,7 @@ fn handle_pr_view(
             let summaries: Vec<String> = d
                 .reviews
                 .iter()
-                .map(|r| {
-                    format!(
-                        "{}:{}",
-                        r.author.as_deref().unwrap_or("unknown"),
-                        r.state
-                    )
-                })
+                .map(|r| format!("{}:{}", r.author.as_deref().unwrap_or("unknown"), r.state))
                 .collect();
             println!("  reviews: {}", summaries.join(", "));
         }
@@ -3664,11 +3718,7 @@ struct PrDiffCliData {
     unified_diff: String,
 }
 
-fn handle_pr_diff(
-    args: &PrDiffArgs,
-    directory: Option<&Path>,
-    mode: InteractionMode,
-) -> ExitCode {
+fn handle_pr_diff(args: &PrDiffArgs, directory: Option<&Path>, mode: InteractionMode) -> ExitCode {
     let res = (|| -> Result<Envelope<PrDiffCliData>> {
         let repo = discover_and_recover_repo(directory, false)?;
         let outcome = pr_diff(
@@ -3706,11 +3756,7 @@ fn handle_pr_diff(
     })
 }
 
-fn handle_pr_read(
-    args: &PrReadArgs,
-    directory: Option<&Path>,
-    mode: InteractionMode,
-) -> ExitCode {
+fn handle_pr_read(args: &PrReadArgs, directory: Option<&Path>, mode: InteractionMode) -> ExitCode {
     let res = (|| -> Result<Envelope<PrReadOutcome>> {
         let repo = discover_and_recover_repo(directory, false)?;
         let (start_line, end_line) = match args.lines.as_deref() {
@@ -3776,9 +3822,9 @@ fn handle_pr_review(
             let raw_json = if file_spec == "-" {
                 use std::io::Read as _;
                 let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|err| OzError::Other(format!("failed reading comments from stdin: {err}")))?;
+                std::io::stdin().read_to_string(&mut buf).map_err(|err| {
+                    OzError::Other(format!("failed reading comments from stdin: {err}"))
+                })?;
                 buf
             } else {
                 std::fs::read_to_string(file_spec).map_err(|err| {
@@ -4182,7 +4228,9 @@ pub(crate) fn handle_ci(
 
         let (repo, mut report) = match wf_res {
             Ok(pair) => pair,
-            Err(err) => return render_command_result::<CiWorkflowReport, _>(mode, Err(err), |_| {}),
+            Err(err) => {
+                return render_command_result::<CiWorkflowReport, _>(mode, Err(err), |_| {});
+            }
         };
 
         let report_snapshot = report.clone();
@@ -4303,8 +4351,7 @@ pub(crate) fn handle_ci(
         return exit_code;
     }
 
-    let explicit_target =
-        args.target_ref.is_some() || args.branch.is_some() || !args.pr.is_empty();
+    let explicit_target = args.target_ref.is_some() || args.branch.is_some() || !args.pr.is_empty();
     let query_res = (|| -> Result<(OzoneRepo, CiReport)> {
         let repo = discover_and_recover_repo(directory, false)?;
         let query_opts = CiQueryOptions {
@@ -4417,10 +4464,7 @@ fn apply_ci_report_to_envelope<T>(env: &mut Envelope<T>, report: &CiReport) -> E
                 let exit_code = ExitCode::ConflictOrCheckFail;
                 let msg = format!(
                     "CI watch timed out after {}s on {} ({} pending, {} failing)",
-                    watch.elapsed_secs,
-                    report.ref_name,
-                    report.pending_count,
-                    report.failing_count
+                    watch.elapsed_secs, report.ref_name, report.pending_count, report.failing_count
                 );
                 env.ok = false;
                 env.error = Some(EnvelopeError {
@@ -4428,7 +4472,8 @@ fn apply_ci_report_to_envelope<T>(env: &mut Envelope<T>, report: &CiReport) -> E
                     exit_code: exit_code.as_i32(),
                     message: msg,
                 });
-                env.recovery_commands.push("oz ci --watch --json".to_string());
+                env.recovery_commands
+                    .push("oz ci --watch --json".to_string());
                 return exit_code;
             }
             CiWatchOutcome::NoChecksTimedOut => {
@@ -4453,17 +4498,15 @@ fn apply_ci_report_to_envelope<T>(env: &mut Envelope<T>, report: &CiReport) -> E
                     .as_deref()
                     .map(|s| &s[..s.len().min(10)])
                     .unwrap_or("newer commit");
-                let msg = format!(
-                    "CI watch on {} was superseded by {newer}",
-                    report.ref_name
-                );
+                let msg = format!("CI watch on {} was superseded by {newer}", report.ref_name);
                 env.ok = false;
                 env.error = Some(EnvelopeError {
                     code: "watch_superseded".to_string(),
                     exit_code: exit_code.as_i32(),
                     message: msg,
                 });
-                env.recovery_commands.push("oz ci --watch --json".to_string());
+                env.recovery_commands
+                    .push("oz ci --watch --json".to_string());
                 return exit_code;
             }
         }
@@ -4495,8 +4538,9 @@ fn append_ci_failure_recovery<T>(env: &mut Envelope<T>, report: &CiReport) {
         .find(|c| c.log_excerpt.is_some() || c.failing_step.is_some())
         .and_then(|c| c.job_id)
     {
-        env.recovery_commands
-            .push(format!("oz ci --job {job_id} --max-excerpt-lines 150 --json"));
+        env.recovery_commands.push(format!(
+            "oz ci --job {job_id} --max-excerpt-lines 150 --json"
+        ));
     }
     env.recovery_commands.push("oz status --json".to_string());
     env.recovery_commands.push("oz commit --amend".to_string());
@@ -4609,18 +4653,15 @@ fn apply_workflow_report_to_envelope<T>(
             exit_code: code.as_i32(),
             message: format!("latest run of workflow '{}' failed", report.workflow),
         });
-        if let Some(job_id) = report
-            .runs
-            .first()
-            .and_then(|r| {
-                r.jobs
-                    .iter()
-                    .find(|j| j.log_excerpt.is_some() || j.failing_step.is_some())
-                    .and_then(|j| j.job_id)
-            })
-        {
-            env.recovery_commands
-                .push(format!("oz ci --job {job_id} --max-excerpt-lines 150 --json"));
+        if let Some(job_id) = report.runs.first().and_then(|r| {
+            r.jobs
+                .iter()
+                .find(|j| j.log_excerpt.is_some() || j.failing_step.is_some())
+                .and_then(|j| j.job_id)
+        }) {
+            env.recovery_commands.push(format!(
+                "oz ci --job {job_id} --max-excerpt-lines 150 --json"
+            ));
         }
         code
     } else {
@@ -4745,12 +4786,7 @@ fn handle_agent_setup(
 
         let (target_root, workspace, branch, head_oid) =
             match discover_and_recover_repo(directory, false) {
-                Ok(repo) => (
-                    repo.repo_root,
-                    repo.workspace,
-                    repo.branch,
-                    repo.head_oid,
-                ),
+                Ok(repo) => (repo.repo_root, repo.workspace, repo.branch, repo.head_oid),
                 Err(OzError::NotARepository { .. }) => {
                     let dir = match directory {
                         Some(d) => d.to_path_buf(),
@@ -4886,10 +4922,7 @@ pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -
 
         let wait_secs = req.wait_seconds.unwrap_or(0).min(MAX_MCP_WAIT_SECONDS);
         let ci_report = if wait_secs > 0 {
-            let startup_secs = req
-                .startup_timeout_seconds
-                .unwrap_or(30)
-                .min(wait_secs);
+            let startup_secs = req.startup_timeout_seconds.unwrap_or(30).min(wait_secs);
             let watch_opts = CiWatchOptions {
                 query: query_opts,
                 fail_fast: req.fail_fast.unwrap_or(true),
@@ -4943,7 +4976,9 @@ pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -
             pending_count: Some(ci_report.pending_count),
             watch_outcome: watch_meta.as_ref().map(|w| w.outcome.as_str().to_string()),
             elapsed_secs: watch_meta.as_ref().map(|w| w.elapsed_secs),
-            superseded_by_sha: watch_meta.as_ref().and_then(|w| w.superseded_by_sha.clone()),
+            superseded_by_sha: watch_meta
+                .as_ref()
+                .and_then(|w| w.superseded_by_sha.clone()),
             recommended_poll_secs: watch_meta.as_ref().and_then(|w| w.recommended_poll_secs),
             checks,
         })

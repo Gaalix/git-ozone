@@ -85,11 +85,9 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
 
         let oz = oz_bin();
-        if let Ok(resolved) = oz_vfsd::resolve_oz_vfsd_bin_with(
-            None,
-            Some(&oz),
-            std::env::var_os("PATH").as_deref(),
-        ) {
+        if let Ok(resolved) =
+            oz_vfsd::resolve_oz_vfsd_bin_with(None, Some(&oz), std::env::var_os("PATH").as_deref())
+        {
             return resolved;
         }
         if let Ok(resolved) = oz_vfsd::find_oz_vfsd_bin() {
@@ -111,7 +109,11 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
         let status = build.status().expect("cargo build --bin oz-vfsd");
         assert!(status.success(), "failed to build oz-vfsd helper binary");
-        assert!(sibling.is_file(), "expected oz-vfsd at {}", sibling.display());
+        assert!(
+            sibling.is_file(),
+            "expected oz-vfsd at {}",
+            sibling.display()
+        );
         sibling
     })
 }
@@ -258,6 +260,7 @@ impl M4Sandbox {
 impl Drop for M4Sandbox {
     fn drop(&mut self) {
         let git_dir = self.repo_root.join(".git");
+        let mut ws_names_to_unmount: Vec<String> = Vec::new();
         let mut mounts_to_clean: Vec<PathBuf> = Vec::new();
         let mut pids_to_kill: Vec<u32> = Vec::new();
 
@@ -268,6 +271,9 @@ impl Drop for M4Sandbox {
                 if let Ok(raw) = fs::read_to_string(&mj)
                     && let Ok(rec) = serde_json::from_str::<MountRecord>(&raw)
                 {
+                    if !ws_names_to_unmount.contains(&rec.workspace) {
+                        ws_names_to_unmount.push(rec.workspace);
+                    }
                     if !mounts_to_clean.contains(&rec.mount_point) {
                         mounts_to_clean.push(rec.mount_point);
                     }
@@ -281,6 +287,9 @@ impl Drop for M4Sandbox {
         }
 
         if git_dir.is_dir() {
+            for ws_name in &ws_names_to_unmount {
+                let _ = oz_vfsd::unmount_via_daemon(&git_dir, ws_name, true);
+            }
             let _ = oz_vfsd::shutdown_daemon(&git_dir);
         }
 
@@ -306,8 +315,14 @@ impl Drop for M4Sandbox {
                 if let Ok(bytes) = fs::read(&cmdline_path) {
                     let cmdline = String::from_utf8_lossy(&bytes);
                     if cmdline.contains("oz-vfsd") && cmdline.contains(&root_marker) {
-                        unsafe {
-                            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                        if let Ok(raw_pid) = libc::pid_t::try_from(pid)
+                            && raw_pid > 0
+                        {
+                            // SAFETY: `raw_pid` is strictly positive and verified via
+                            // `/proc/<pid>/cmdline` to be this test sandbox's `oz-vfsd` daemon.
+                            unsafe {
+                                let _ = libc::kill(raw_pid, libc::SIGKILL);
+                            }
                         }
                         let deadline = Instant::now() + Duration::from_secs(2);
                         let proc_dir = PathBuf::from(format!("/proc/{pid}"));
@@ -375,7 +390,10 @@ fn assert_oz_v1_envelope_invariants(v: &Value, expected_ok: bool) {
         v.get("workspace").is_some(),
         "envelope must include workspace key"
     );
-    assert!(v.get("branch").is_some(), "envelope must include branch key");
+    assert!(
+        v.get("branch").is_some(),
+        "envelope must include branch key"
+    );
     assert!(
         v.get("head_oid").is_some(),
         "envelope must include head_oid key"
@@ -393,7 +411,10 @@ fn assert_oz_v1_envelope_invariants(v: &Value, expected_ok: bool) {
             "successful envelope must omit error"
         );
     } else {
-        assert!(v["error"].is_object(), "failing envelope must include error");
+        assert!(
+            v["error"].is_object(),
+            "failing envelope must include error"
+        );
         assert!(v["error"]["code"].is_string());
         assert!(v["error"]["exit_code"].is_i64());
         assert!(v["error"]["message"].is_string());
@@ -477,7 +498,10 @@ fn gate1_v1_0_0_version_consistency_and_binstall_contract() {
     }
 
     // 4. oz-github User-Agent constants derive from CARGO_PKG_VERSION (no hardcoded 0.3.0).
-    for rel in ["crates/oz-github/src/wire.rs", "crates/oz-github/src/api.rs"] {
+    for rel in [
+        "crates/oz-github/src/wire.rs",
+        "crates/oz-github/src/api.rs",
+    ] {
         let src = fs::read_to_string(root.join(rel)).expect("read oz-github source");
         assert!(
             src.contains("env!(\"CARGO_PKG_VERSION\")"),
@@ -581,14 +605,17 @@ fn gate3_doctor_json_m4_completeness_and_zero_secret_leakage() {
 
     // Remote URL with embedded credentials to prove sanitization.
     let secret_remote_pass = "top_secret_remote_pass_999888";
-    let remote_with_creds = format!(
-        "https://botuser:{secret_remote_pass}@github.com/ozone-vcs/ozone.git"
-    );
+    let remote_with_creds =
+        format!("https://botuser:{secret_remote_pass}@github.com/ozone-vcs/ozone.git");
     sys_git(&repo, &["remote", "add", "origin", &remote_with_creds]);
 
     // Spawn a real workspace so active_mounts and oz-vfsd health are exercised live.
     let spawn = spawn_ws_or_cas_fallback(&repo, "doc-ws");
-    assert_eq!(spawn.code, 0, "ws spawn failed: {}\n{}", spawn.stdout, spawn.stderr);
+    assert_eq!(
+        spawn.code, 0,
+        "ws spawn failed: {}\n{}",
+        spawn.stdout, spawn.stderr
+    );
 
     let secret_token = "ghp_m4_super_secret_token_do_not_leak_123456";
     let doc = run_bin_clean_auth(
@@ -688,8 +715,13 @@ fn gate3_doctor_json_m4_completeness_and_zero_secret_leakage() {
     assert_eq!(data["github_auth"]["host"], "github.com");
     assert_eq!(data["github_auth"]["owner"], "ozone-vcs");
     assert_eq!(data["github_auth"]["repo"], "ozone");
-    assert_eq!(data["github_auth"]["token_source"]["kind"], "github_token_env");
-    let masked = data["github_auth"]["masked_token"].as_str().expect("masked token");
+    assert_eq!(
+        data["github_auth"]["token_source"]["kind"],
+        "github_token_env"
+    );
+    let masked = data["github_auth"]["masked_token"]
+        .as_str()
+        .expect("masked token");
     assert!(masked.ends_with("****"));
     assert!(!masked.contains("m4_super_secret"));
 
@@ -703,10 +735,7 @@ fn gate3_doctor_json_m4_completeness_and_zero_secret_leakage() {
 
     // Structured M4 checks list covers all 8 required domains.
     let checks = data["checks"].as_array().expect("checks array");
-    let ids: BTreeSet<&str> = checks
-        .iter()
-        .filter_map(|c| c["id"].as_str())
-        .collect();
+    let ids: BTreeSet<&str> = checks.iter().filter_map(|c| c["id"].as_str()).collect();
     for required_id in [
         "linux_fuse",
         "windows_projfs_dev_drive",
@@ -800,9 +829,11 @@ fn gate3_doctor_json_m4_completeness_and_zero_secret_leakage() {
         &[("GITHUB_TOKEN", secret_token)],
     );
     assert_eq!(human.code, 0, "human doctor failed: {}", human.stderr);
-    assert!(human
-        .stdout
-        .contains(&format!("Ozone Doctor (oz {})", env!("CARGO_PKG_VERSION"))));
+    assert!(
+        human
+            .stdout
+            .contains(&format!("Ozone Doctor (oz {})", env!("CARGO_PKG_VERSION")))
+    );
     assert!(!human.stdout.contains("m4_super_secret_token_do_not_leak"));
     assert!(!human.stdout.contains("BEGIN OPENSSH PRIVATE KEY"));
 }
@@ -825,7 +856,10 @@ fn gate4_cli_edge_cases_exit_codes_and_json_envelope_invariants() {
         &[
             ("HOME", isolated_home.path().to_str().expect("home")),
             ("USERPROFILE", isolated_home.path().to_str().expect("home")),
-            ("XDG_CONFIG_HOME", isolated_home.path().to_str().expect("xdg")),
+            (
+                "XDG_CONFIG_HOME",
+                isolated_home.path().to_str().expect("xdg"),
+            ),
             ("GH_CONFIG_DIR", empty_gh_dir.to_str().expect("gh")),
         ],
     );
@@ -918,15 +952,21 @@ fn gate4_cli_edge_cases_exit_codes_and_json_envelope_invariants() {
 
     // 7. Exit code 1 (`ConflictOrCheckFail`) via real merge conflict + `oz resolve --continue`.
     sys_git(&repo, &["checkout", "-b", "branch-a"]);
-    fs::write(repo.join("lib.rs"), "pub fn greet() -> &'static str {\n    \"from-a\"\n}\n")
-        .expect("write branch-a");
+    fs::write(
+        repo.join("lib.rs"),
+        "pub fn greet() -> &'static str {\n    \"from-a\"\n}\n",
+    )
+    .expect("write branch-a");
     sys_git(&repo, &["add", "lib.rs"]);
     sys_git(&repo, &["commit", "-m", "feat: branch-a greeting"]);
 
     sys_git(&repo, &["checkout", "main"]);
     sys_git(&repo, &["checkout", "-b", "branch-b"]);
-    fs::write(repo.join("lib.rs"), "pub fn greet() -> &'static str {\n    \"from-b\"\n}\n")
-        .expect("write branch-b");
+    fs::write(
+        repo.join("lib.rs"),
+        "pub fn greet() -> &'static str {\n    \"from-b\"\n}\n",
+    )
+    .expect("write branch-b");
     sys_git(&repo, &["add", "lib.rs"]);
     sys_git(&repo, &["commit", "-m", "feat: branch-b greeting"]);
 
@@ -934,7 +974,14 @@ fn gate4_cli_edge_cases_exit_codes_and_json_envelope_invariants() {
     let conflict = run_bin(
         &oz_bin(),
         &repo,
-        &["integrate", "branch-a", "branch-b", "--into", "main", "--json"],
+        &[
+            "integrate",
+            "branch-a",
+            "branch-b",
+            "--into",
+            "main",
+            "--json",
+        ],
         &[],
     );
     assert_eq!(
@@ -1050,19 +1097,40 @@ fn gate5_end_to_end_core_workflow_smoke() {
 
     fs::write(ws_path.join("scratch.txt"), "temporary edit\n").expect("write scratch");
     let undo = run_bin(&oz_bin(), &ws_path, &["undo", "--json"], &[]);
-    assert_eq!(undo.code, 0, "undo failed: {}\n{}", undo.stdout, undo.stderr);
+    assert_eq!(
+        undo.code, 0,
+        "undo failed: {}\n{}",
+        undo.stdout, undo.stderr
+    );
     assert_oz_v1_envelope_invariants(&undo.json.expect("undo json"), true);
-    assert!(!ws_path.join("scratch.txt").exists(), "undo must revert scratch.txt");
+    assert!(
+        !ws_path.join("scratch.txt").exists(),
+        "undo must revert scratch.txt"
+    );
 
     let redo = run_bin(&oz_bin(), &ws_path, &["redo", "--json"], &[]);
-    assert_eq!(redo.code, 0, "redo failed: {}\n{}", redo.stdout, redo.stderr);
+    assert_eq!(
+        redo.code, 0,
+        "redo failed: {}\n{}",
+        redo.stdout, redo.stderr
+    );
     assert_oz_v1_envelope_invariants(&redo.json.expect("redo json"), true);
-    assert!(ws_path.join("scratch.txt").exists(), "redo must restore scratch.txt");
+    assert!(
+        ws_path.join("scratch.txt").exists(),
+        "redo must restore scratch.txt"
+    );
 
     let undo2 = run_bin(&oz_bin(), &ws_path, &["undo", "--json"], &[]);
-    assert_eq!(undo2.code, 0, "second undo failed: {}\n{}", undo2.stdout, undo2.stderr);
+    assert_eq!(
+        undo2.code, 0,
+        "second undo failed: {}\n{}",
+        undo2.stdout, undo2.stderr
+    );
     assert_oz_v1_envelope_invariants(&undo2.json.expect("undo2 json"), true);
-    assert!(!ws_path.join("scratch.txt").exists(), "second undo must clean scratch.txt");
+    assert!(
+        !ws_path.join("scratch.txt").exists(),
+        "second undo must clean scratch.txt"
+    );
 
     // 5. Radar + Integrate into `main` + Workspace removal + `git fsck --full`.
     let radar = run_bin(&oz_bin(), &repo, &["radar", "--json"], &[]);

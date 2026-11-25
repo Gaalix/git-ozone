@@ -135,8 +135,9 @@ fn apply_cas_ref_deltas_and_head(
 
     let head_edit = if update_git_head && head_changed && !transitions.contains_key("HEAD") {
         let new_target = if let Some(ref br) = dst.branch {
-            let full = FullName::try_from(format!("refs/heads/{br}").as_str())
-                .map_err(|err| OzError::Git(format!("invalid branch ref 'refs/heads/{br}': {err}")))?;
+            let full = FullName::try_from(format!("refs/heads/{br}").as_str()).map_err(|err| {
+                OzError::Git(format!("invalid branch ref 'refs/heads/{br}': {err}"))
+            })?;
             Some(Target::Symbolic(full))
         } else {
             dst.head_commit.map(Target::Object)
@@ -190,7 +191,12 @@ fn apply_cas_ref_deltas_and_head(
             }
             (None, Some(target_hex)) => {
                 let target_oid = parse_oid(target_hex)?;
-                RefEdit::update(full_name, target_oid, PreviousValue::MustNotExist, reflog_msg)
+                RefEdit::update(
+                    full_name,
+                    target_oid,
+                    PreviousValue::MustNotExist,
+                    reflog_msg,
+                )
             }
             (None, None) => continue,
         };
@@ -247,12 +253,10 @@ fn fold_inverse_ref_deltas(ops_rev: &[&OpLogEntry]) -> Result<BTreeMap<String, R
                                 op.op_id
                             ),
                             conflicts: Vec::new(),
-                            recovery: vec![
-                                "Undo newer conflicting operations first.".to_string(),
-                            ],
+                            recovery: vec!["Undo newer conflicting operations first.".to_string()],
                         });
                     }
-                    existing.new = delta.old.clone();
+                    existing.new.clone_from(&delta.old);
                 }
                 None => {
                     folded.insert(
@@ -286,10 +290,15 @@ fn post_slice(snap: &WsSnapshot) -> Result<SnapshotSlice> {
 }
 
 fn pre_slice(snap: &WsSnapshot, op_id: &str) -> Result<SnapshotSlice> {
-    let pre_base = snap.pre_base_tree.as_deref().ok_or_else(|| OzError::InvalidUsage {
-        message: format!("operation '{op_id}' has no recorded pre-operation workspace snapshot"),
-        recovery: vec!["No prior state exists before the earliest checkpoint.".to_string()],
-    })?;
+    let pre_base = snap
+        .pre_base_tree
+        .as_deref()
+        .ok_or_else(|| OzError::InvalidUsage {
+            message: format!(
+                "operation '{op_id}' has no recorded pre-operation workspace snapshot"
+            ),
+            recovery: vec!["No prior state exists before the earliest checkpoint.".to_string()],
+        })?;
     let branch = if snap.pre_detached {
         None
     } else {
@@ -667,7 +676,10 @@ fn rewind_to_checkpoint(
         TransitionPlan {
             kind: OpKind::Undo,
             command: format!("oz undo {}", checkpoint_entry.op_id),
-            message: format!("rewind working tree to checkpoint {}", checkpoint_entry.op_id),
+            message: format!(
+                "rewind working tree to checkpoint {}",
+                checkpoint_entry.op_id
+            ),
             inverse_of: Some(checkpoint_entry.op_id.clone()),
             undone_ops: Vec::new(),
             outcome_ids: vec![checkpoint_entry.op_id.clone()],
@@ -688,11 +700,16 @@ fn execute_undo_ops(
     live_override: Option<SnapshotSlice>,
     actor: ActorInfo,
 ) -> Result<UndoOutcome> {
-    let newest_op = ops_rev.first().ok_or_else(|| OzError::InvalidUsage {
-        message: "no operations selected to undo".to_string(),
-        recovery: Vec::new(),
-    })?;
-    let oldest_op = ops_rev.last().expect("non-empty ops_rev");
+    let (newest_op, oldest_op) = match ops_rev {
+        [] => {
+            return Err(OzError::InvalidUsage {
+                message: "no operations selected to undo".to_string(),
+                recovery: Vec::new(),
+            });
+        }
+        [only] => (only, only),
+        [first, .., last] => (first, last),
+    };
 
     let src = match live_override {
         Some(live) => live,

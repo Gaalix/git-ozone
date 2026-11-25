@@ -5,9 +5,7 @@
 //! guardrails, collision radar, in-memory integration, conflict sandbox resolution,
 //! `--verify`, main working-tree + `.git/index` sync, stacked rebasing, and `< 10 ms` undo.
 
-use oz_core::{
-    BackendKind, CommitOptions, OzError, OzoneRepo, commit_changes, compute_status,
-};
+use oz_core::{BackendKind, CommitOptions, OzError, OzoneRepo, commit_changes, compute_status};
 use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
 use oz_integrate::{
     CollisionSeverity, IntegrateOptions, IntegrationGuardrailOptions, IntegrationMode,
@@ -16,6 +14,7 @@ use oz_integrate::{
     resolve_conflict, scan_radar, stack_rebase, stack_status,
 };
 use oz_oplog::{ActorInfo, ActorKind, undo};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -128,7 +127,12 @@ deny = ["Cargo.lock"]
         "crates/billing/src/lib.rs",
         b"pub fn bill() { /* touched */ }\n",
     );
-    commit_ws(&ws_oos.workspace.workspace_path, "out of scope edit", true, false);
+    commit_ws(
+        &ws_oos.workspace.workspace_path,
+        "out of scope edit",
+        true,
+        false,
+    );
 
     let err = check_workspace_scope_for_integration(
         &repo,
@@ -238,12 +242,17 @@ fn radar_detects_overlapping_out_of_scope_and_same_file_different_lines_with_pro
         "crates/core/src/other.rs",
         auth_other.concat().as_bytes(),
     );
-    commit_ws(&ws_auth.workspace.workspace_path, "auth edits", false, false);
+    commit_ws(
+        &ws_auth.workspace.workspace_path,
+        "auth edits",
+        false,
+        false,
+    );
 
     // Advance `main` by inserting 10 lines at the top of `session.rs` (M0 -> M1).
     let mut main_session = String::new();
     for i in 1..=10 {
-        main_session.push_str(&format!("header {i}\n"));
+        let _ = writeln!(main_session, "header {i}");
     }
     main_session.push_str(&lines);
     fs::write(repo_root.join("crates/core/src/session.rs"), &main_session).expect("write main");
@@ -320,16 +329,17 @@ fn radar_detects_overlapping_out_of_scope_and_same_file_different_lines_with_pro
     .expect("scan dirty only");
     assert_eq!(dirty_only.collisions.len(), 1);
     assert_eq!(dirty_only.collisions[0].path, "Cargo.lock");
-    assert_eq!(dirty_only.collisions[0].severity, CollisionSeverity::OutOfScope);
+    assert_eq!(
+        dirty_only.collisions[0].severity,
+        CollisionSeverity::OutOfScope
+    );
 }
 
 #[test]
 fn integrate_clean_syncs_main_worktree_index_and_supports_sub_10ms_undo() {
     let lines: String = (1..=30).map(|i| format!("line {i}\n")).collect();
-    let (_tmp, repo_root, repo) = init_test_repo(&[
-        ("shared.txt", &lines),
-        ("obsolete.txt", "remove me\n"),
-    ]);
+    let (_tmp, repo_root, repo) =
+        init_test_repo(&[("shared.txt", &lines), ("obsolete.txt", "remove me\n")]);
     let old_main_oid = run_git(&repo_root, &["rev-parse", "HEAD"]);
 
     let ws_a = spawn_cas_ws(&repo, "ws-a", &[], &[]);
@@ -340,11 +350,7 @@ fn integrate_clean_syncs_main_worktree_index_and_supports_sub_10ms_undo() {
         "shared.txt",
         a_lines.concat().as_bytes(),
     );
-    write_ws_file(
-        &ws_a.workspace.workspace_path,
-        "added/a.txt",
-        b"hello a\n",
-    );
+    write_ws_file(&ws_a.workspace.workspace_path, "added/a.txt", b"hello a\n");
     commit_ws(&ws_a.workspace.workspace_path, "ws-a commit", false, false);
 
     let ws_b = spawn_cas_ws(&repo, "ws-b", &[], &[]);
@@ -408,13 +414,20 @@ fn integrate_clean_syncs_main_worktree_index_and_supports_sub_10ms_undo() {
     assert_eq!(run_git(&repo_root, &["rev-parse", "HEAD"]), old_main_oid);
     assert!(repo_root.join("obsolete.txt").is_file());
     assert!(!repo_root.join("added/a.txt").exists());
-    assert!(!fs::read_to_string(repo_root.join("shared.txt")).unwrap().contains("ws-a"));
+    assert!(
+        !fs::read_to_string(repo_root.join("shared.txt"))
+            .unwrap()
+            .contains("ws-a")
+    );
     assert_eq!(
         fs::read_to_string(repo_root.join("unrelated_notes.txt")).unwrap(),
         "keep me\n"
     );
     assert_eq!(
-        undo_out.ref_deltas.get("refs/heads/main").and_then(|d| d.new.as_deref()),
+        undo_out
+            .ref_deltas
+            .get("refs/heads/main")
+            .and_then(|d| d.new.as_deref()),
         Some(old_main_oid.as_str())
     );
 }
@@ -513,7 +526,10 @@ fn integrate_verify_gate_uses_warm_cache_and_cleans_sandbox_on_failure() {
     assert!(matches!(fail_err, OzError::CheckFailed { .. }));
     assert_eq!(fail_err.exit_code().as_i32(), 1);
     assert_eq!(run_git(&repo_root, &["rev-parse", "HEAD"]), main_oid);
-    assert!(!sandbox_dir.exists(), "_integrate sandbox must be cleaned on verify failure");
+    assert!(
+        !sandbox_dir.exists(),
+        "_integrate sandbox must be cleaned on verify failure"
+    );
 
     // 2. Passing --verify sees warm baseline + candidate code and advances `main`.
     let pass_cmd = if cfg!(windows) {
@@ -533,7 +549,10 @@ fn integrate_verify_gate_uses_warm_cache_and_cleans_sandbox_on_failure() {
     )
     .expect("passing verify should succeed");
     assert_ne!(ok.commit_oid, main_oid);
-    assert!(!sandbox_dir.exists(), "_integrate sandbox must be cleaned on success");
+    assert!(
+        !sandbox_dir.exists(),
+        "_integrate sandbox must be cleaned on success"
+    );
     assert_eq!(
         fs::read_to_string(repo_root.join("lib.rs")).unwrap(),
         "pub fn val() -> i32 { 2 }\n"
@@ -542,10 +561,7 @@ fn integrate_verify_gate_uses_warm_cache_and_cleans_sandbox_on_failure() {
 
 #[test]
 fn integrate_conflict_resolution_resolve_continue_and_abort_workflow() {
-    let (tmp, repo_root, repo) = init_test_repo(&[
-        ("a.txt", "base-a\n"),
-        ("b.txt", "base-b\n"),
-    ]);
+    let (tmp, repo_root, repo) = init_test_repo(&[("a.txt", "base-a\n"), ("b.txt", "base-b\n")]);
     let old_main_oid = run_git(&repo_root, &["rev-parse", "HEAD"]);
 
     let ws1 = spawn_cas_ws(&repo, "ws1", &[], &[]);
@@ -568,7 +584,10 @@ fn integrate_conflict_resolution_resolve_continue_and_abort_workflow() {
         &IntegrateOptions {
             sources: vec!["ws1".to_string(), "ws2".to_string(), "ws3".to_string()],
             into: Some("main".to_string()),
-            verify_cmd: Some("grep -q 'ws1-a' a.txt && grep -q 'ws2-b' b.txt && grep -q 'ws3-c' c.txt".to_string()),
+            verify_cmd: Some(
+                "grep -q 'ws1-a' a.txt && grep -q 'ws2-b' b.txt && grep -q 'ws3-c' c.txt"
+                    .to_string(),
+            ),
             ..Default::default()
         },
         agent_actor(None),
@@ -634,9 +653,18 @@ fn integrate_conflict_resolution_resolve_continue_and_abort_workflow() {
     assert!(!sandbox_dir.exists());
     assert!(active_session(&repo).unwrap().is_none());
 
-    assert_eq!(fs::read_to_string(repo_root.join("a.txt")).unwrap(), "ws1-a\n");
-    assert_eq!(fs::read_to_string(repo_root.join("b.txt")).unwrap(), "ws2-b\n");
-    assert_eq!(fs::read_to_string(repo_root.join("c.txt")).unwrap(), "ws3-c\n");
+    assert_eq!(
+        fs::read_to_string(repo_root.join("a.txt")).unwrap(),
+        "ws1-a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_root.join("b.txt")).unwrap(),
+        "ws2-b\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_root.join("c.txt")).unwrap(),
+        "ws3-c\n"
+    );
 
     // Also test abort_integration on a fresh conflict.
     let ws4 = spawn_cas_ws(&repo, "ws4", &[], &[]);
@@ -665,21 +693,31 @@ fn integrate_conflict_resolution_resolve_continue_and_abort_workflow() {
     assert!(aborted.session_removed);
     assert!(!sandbox_dir.exists());
     assert!(active_session(&repo).unwrap().is_none());
-    assert_eq!(run_git(&repo_root, &["rev-parse", "HEAD"]), main_before_abort);
+    assert_eq!(
+        run_git(&repo_root, &["rev-parse", "HEAD"]),
+        main_before_abort
+    );
 }
 
 #[test]
 fn integrate_handles_swapped_modify_delete_conflict_without_inverting_ours_theirs() {
     // Regression test for `gix::merge::tree::Conflict` `ConflictMapping::Swapped`:
     // ours (`main`) DELETES `shared.txt`, theirs (`ws-mod`) MODIFIES `shared.txt`.
-    let (_tmp, repo_root, repo) = init_test_repo(&[
-        ("shared.txt", "base content\n"),
-        ("keep.txt", "keep\n"),
-    ]);
+    let (_tmp, repo_root, repo) =
+        init_test_repo(&[("shared.txt", "base content\n"), ("keep.txt", "keep\n")]);
 
     let ws_mod = spawn_cas_ws(&repo, "ws-mod", &[], &[]);
-    write_ws_file(&ws_mod.workspace.workspace_path, "shared.txt", b"theirs modified\n");
-    commit_ws(&ws_mod.workspace.workspace_path, "modify shared", false, false);
+    write_ws_file(
+        &ws_mod.workspace.workspace_path,
+        "shared.txt",
+        b"theirs modified\n",
+    );
+    commit_ws(
+        &ws_mod.workspace.workspace_path,
+        "modify shared",
+        false,
+        false,
+    );
 
     // Advance `main` by deleting `shared.txt`.
     fs::remove_file(repo_root.join("shared.txt")).expect("delete shared on main");
@@ -767,8 +805,17 @@ fn integrate_handles_binary_conflict_requiring_explicit_resolve() {
     run_git(&repo_root, &["commit", "-m", "add bin"]);
 
     let ws_bin = spawn_cas_ws(&repo, "ws-bin", &[], &[]);
-    write_ws_file(&ws_bin.workspace.workspace_path, "blob.bin", &[0u8, 9, 9, 9]);
-    commit_ws(&ws_bin.workspace.workspace_path, "ws binary change", false, false);
+    write_ws_file(
+        &ws_bin.workspace.workspace_path,
+        "blob.bin",
+        &[0u8, 9, 9, 9],
+    );
+    commit_ws(
+        &ws_bin.workspace.workspace_path,
+        "ws binary change",
+        false,
+        false,
+    );
 
     fs::write(repo_root.join("blob.bin"), [0u8, 4, 5, 6]).expect("main bin edit");
     run_git(&repo_root, &["add", "blob.bin"]);
@@ -820,9 +867,19 @@ fn stack_rebase_clean_preserves_change_ids_syncs_workspaces_and_undoes_atomicall
     // Step 1 workspace stacked on `main`.
     let ws1 = spawn_cas_ws(&repo, "ws1", &[], &[]);
     write_ws_file(&ws1.workspace.workspace_path, "s1.txt", b"s1 commit 1\n");
-    let c_s1_1 = commit_ws(&ws1.workspace.workspace_path, "feat(s1): part 1", false, false);
+    let c_s1_1 = commit_ws(
+        &ws1.workspace.workspace_path,
+        "feat(s1): part 1",
+        false,
+        false,
+    );
     write_ws_file(&ws1.workspace.workspace_path, "s1_extra.txt", b"s1 extra\n");
-    let c_s1_2 = commit_ws(&ws1.workspace.workspace_path, "feat(s1): part 2", false, false);
+    let c_s1_2 = commit_ws(
+        &ws1.workspace.workspace_path,
+        "feat(s1): part 2",
+        false,
+        false,
+    );
 
     // Step 2 workspace stacked on `ws1`.
     let mut ws2_opts = SpawnWorkspaceOptions::new("ws2");
@@ -831,7 +888,12 @@ fn stack_rebase_clean_preserves_change_ids_syncs_workspaces_and_undoes_atomicall
     ws2_opts.from_ref = Some("ws1".to_string());
     let ws2 = spawn_workspace(&repo, &ws2_opts).expect("spawn ws2 from ws1");
     write_ws_file(&ws2.workspace.workspace_path, "s2.txt", b"s2 commit 1\n");
-    let c_s2_1 = commit_ws(&ws2.workspace.workspace_path, "feat(s2): part 1", false, false);
+    let c_s2_1 = commit_ws(
+        &ws2.workspace.workspace_path,
+        "feat(s2): part 1",
+        false,
+        false,
+    );
 
     // Advance `main` on an unrelated file (`base.txt`).
     fs::write(repo_root.join("base.txt"), "base v2 from main\n").expect("update main");
@@ -928,14 +990,20 @@ fn stack_rebase_clean_preserves_change_ids_syncs_workspaces_and_undoes_atomicall
 
 #[test]
 fn stack_rebase_conflict_leaves_refs_untouched_and_supports_resolve_continue_abort() {
-    let (tmp, repo_root, repo) = init_test_repo(&[
-        ("shared.txt", "line1\n"),
-        ("s2.txt", "init\n"),
-    ]);
+    let (tmp, repo_root, repo) = init_test_repo(&[("shared.txt", "line1\n"), ("s2.txt", "init\n")]);
 
     let ws1 = spawn_cas_ws(&repo, "stack1", &[], &[]);
-    write_ws_file(&ws1.workspace.workspace_path, "shared.txt", b"stack1 edit\n");
-    let orig_s1 = commit_ws(&ws1.workspace.workspace_path, "feat: s1 shared", false, false);
+    write_ws_file(
+        &ws1.workspace.workspace_path,
+        "shared.txt",
+        b"stack1 edit\n",
+    );
+    let orig_s1 = commit_ws(
+        &ws1.workspace.workspace_path,
+        "feat: s1 shared",
+        false,
+        false,
+    );
 
     let mut ws2_opts = SpawnWorkspaceOptions::new("stack2");
     ws2_opts.backend = Some(BackendKind::CasHardlink);
@@ -1038,10 +1106,8 @@ fn stack_rebase_conflict_leaves_refs_untouched_and_supports_resolve_continue_abo
 #[test]
 fn radar_handles_add_add_delete_modify_binary_and_multi_hunk_spans() {
     let base_text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
-    let (_tmp, repo_root, repo) = init_test_repo(&[
-        ("multi.txt", &base_text),
-        ("to_del.txt", "a\nb\nc\n"),
-    ]);
+    let (_tmp, repo_root, repo) =
+        init_test_repo(&[("multi.txt", &base_text), ("to_del.txt", "a\nb\nc\n")]);
     fs::write(repo_root.join("asset.bin"), [0u8, 1, 2]).expect("write bin");
     run_git(&repo_root, &["add", "asset.bin"]);
     run_git(&repo_root, &["commit", "-m", "add bin"]);
@@ -1051,11 +1117,23 @@ fn radar_handles_add_add_delete_modify_binary_and_multi_hunk_spans() {
 
     // Same new file added with DIFFERENT content -> OverlappingHunks.
     write_ws_file(&ws1.workspace.workspace_path, "new_diff.txt", b"one\ntwo\n");
-    write_ws_file(&ws2.workspace.workspace_path, "new_diff.txt", b"one\nthree\n");
+    write_ws_file(
+        &ws2.workspace.workspace_path,
+        "new_diff.txt",
+        b"one\nthree\n",
+    );
 
     // Same new file added with IDENTICAL content -> no collision.
-    write_ws_file(&ws1.workspace.workspace_path, "new_same.txt", b"identical\n");
-    write_ws_file(&ws2.workspace.workspace_path, "new_same.txt", b"identical\n");
+    write_ws_file(
+        &ws1.workspace.workspace_path,
+        "new_same.txt",
+        b"identical\n",
+    );
+    write_ws_file(
+        &ws2.workspace.workspace_path,
+        "new_same.txt",
+        b"identical\n",
+    );
 
     // Binary file modified by both -> OverlappingHunks ("binary").
     write_ws_file(&ws1.workspace.workspace_path, "asset.bin", &[0u8, 8, 8]);
@@ -1063,16 +1141,28 @@ fn radar_handles_add_add_delete_modify_binary_and_multi_hunk_spans() {
 
     // Delete vs modify on `to_del.txt` -> OverlappingHunks.
     fs::remove_file(ws1.workspace.workspace_path.join("to_del.txt")).expect("del in ws1");
-    write_ws_file(&ws2.workspace.workspace_path, "to_del.txt", b"a\nmodified\nc\n");
+    write_ws_file(
+        &ws2.workspace.workspace_path,
+        "to_del.txt",
+        b"a\nmodified\nc\n",
+    );
 
     // Multiple non-overlapping hunks on `multi.txt` -> SameFileDifferentLines with comma-joined spans.
     let mut m1: Vec<String> = (1..=40).map(|i| format!("line {i}\n")).collect();
     m1[1] = "ws1 top\n".to_string();
     m1[30] = "ws1 bottom\n".to_string();
-    write_ws_file(&ws1.workspace.workspace_path, "multi.txt", m1.concat().as_bytes());
+    write_ws_file(
+        &ws1.workspace.workspace_path,
+        "multi.txt",
+        m1.concat().as_bytes(),
+    );
     let mut m2: Vec<String> = (1..=40).map(|i| format!("line {i}\n")).collect();
     m2[15] = "ws2 middle\n".to_string();
-    write_ws_file(&ws2.workspace.workspace_path, "multi.txt", m2.concat().as_bytes());
+    write_ws_file(
+        &ws2.workspace.workspace_path,
+        "multi.txt",
+        m2.concat().as_bytes(),
+    );
 
     let report = scan_radar(&repo, &RadarOptions::default()).expect("radar");
     assert!(!report.collisions.iter().any(|c| c.path == "new_same.txt"));
@@ -1113,14 +1203,15 @@ fn radar_handles_add_add_delete_modify_binary_and_multi_hunk_spans() {
 
 #[test]
 fn integrate_manual_resolution_preserves_warm_cache_exclusion_and_handles_sequential_conflicts() {
-    let (tmp, repo_root, repo) = init_test_repo(&[
-        ("f1.txt", "base-1\n"),
-        ("f2.txt", "base-2\n"),
-    ]);
+    let (tmp, repo_root, repo) = init_test_repo(&[("f1.txt", "base-1\n"), ("f2.txt", "base-2\n")]);
     let main_oid = run_git(&repo_root, &["rev-parse", "HEAD"]);
 
     // Seed warm cache so `_integrate/target/cached.bin` exists during manual conflict editing.
-    let b_target = repo.layout.baselines_dir().join(&main_oid).join("root/target");
+    let b_target = repo
+        .layout
+        .baselines_dir()
+        .join(&main_oid)
+        .join("root/target");
     fs::create_dir_all(&b_target).expect("mkdir warm");
     fs::write(b_target.join("cached.bin"), b"warm").expect("write warm");
     fs::write(
@@ -1273,7 +1364,11 @@ fn integrate_supports_plain_git_branch_names_and_workspace_branch_names() {
     ws_opts.warm = false;
     ws_opts.branch = Some("feat/ws-br".to_string());
     let ws = spawn_workspace(&repo, &ws_opts).expect("spawn ws-alias");
-    write_ws_file(&ws.workspace.workspace_path, "ws_br.txt", b"from ws branch\n");
+    write_ws_file(
+        &ws.workspace.workspace_path,
+        "ws_br.txt",
+        b"from ws branch\n",
+    );
     commit_ws(&ws.workspace.workspace_path, "ws commit", false, false);
 
     // Pass BOTH by branch name (`feat/plain-branch` and `feat/ws-br`).
@@ -1299,5 +1394,3 @@ fn integrate_supports_plain_git_branch_names_and_workspace_branch_names() {
     );
     assert_eq!(run_git(&repo_root, &["status", "--porcelain"]), "");
 }
-
-

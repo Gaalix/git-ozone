@@ -6,9 +6,8 @@
 
 use crate::detect::detect_filesystem;
 use crate::materialize::{
-    apply_tree_delta_to_dir, clone_dir_with_reflink, compute_tree_delta,
-    materialize_cas_workspace, materialize_tree_from_odb, resolve_baseline_tree_id,
-    resolve_git_common_dir,
+    apply_tree_delta_to_dir, clone_dir_with_reflink, compute_tree_delta, materialize_cas_workspace,
+    materialize_tree_from_odb, resolve_baseline_tree_id, resolve_git_common_dir,
 };
 use crate::{BackendHealth, SpawnRequest, SpawnedWorkspace, WorkspaceBackend};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -19,9 +18,7 @@ use oz_core::{MountHealth, MountRecord, OzoneLayout, OzoneRepo, probe_mount_heal
 #[cfg(target_os = "linux")]
 use oz_vfsd::lazy_unmount_fuse;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use oz_vfsd::{
-    MountSpec, mount_via_daemon_with_auto_start, ping_daemon, unmount_via_daemon,
-};
+use oz_vfsd::{MountSpec, mount_via_daemon_with_auto_start, ping_daemon, unmount_via_daemon};
 use std::path::{Path, PathBuf};
 
 /// Returns the concrete [`WorkspaceBackend`] implementation for `kind` on the current OS.
@@ -119,6 +116,7 @@ fn try_macos_clonefile_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let c_dst = CString::new(dst.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_src` and `c_dst` are valid NUL-terminated C strings passed to macOS `clonefile(2)`.
     let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
     if rc == 0 {
         Ok(())
@@ -389,14 +387,14 @@ impl WorkspaceBackend for ProjFsVfsBackend {
                     message: None,
                 })
             }
-            MountHealth::DisconnectedEnotconn | MountHealth::NotMounted | MountHealth::NotApplicable => {
-                Ok(BackendHealth {
-                    healthy: false,
-                    backend: BackendKind::WindowsProjFs,
-                    mount_active: false,
-                    message: Some("ProjFS workspace path is not mounted".to_string()),
-                })
-            }
+            MountHealth::DisconnectedEnotconn
+            | MountHealth::NotMounted
+            | MountHealth::NotApplicable => Ok(BackendHealth {
+                healthy: false,
+                backend: BackendKind::WindowsProjFs,
+                mount_active: false,
+                message: Some("ProjFS workspace path is not mounted".to_string()),
+            }),
         }
     }
 }
@@ -490,9 +488,8 @@ fn spawn_daemon_vfs_workspace(
         writeback_cache,
     };
 
-    let _mount_info =
-        mount_via_daemon_with_auto_start(&git_common_dir, &spec, auto_start)
-            .map_err(wrap_mount_err)?;
+    let _mount_info = mount_via_daemon_with_auto_start(&git_common_dir, &spec, auto_start)
+        .map_err(wrap_mount_err)?;
 
     // Prefer the MountRecord persisted by live oz-vfsd (includes daemon_pid), or update
     // mounted=true if a test mock listener handled the IPC without writing mount.json.
@@ -759,9 +756,9 @@ fn is_linux_mountpoint(path: &Path) -> bool {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let parent = path.parent().ok_or_else(|| {
-        OzError::Other(format!("path {} has no parent", path.display()))
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| OzError::Other(format!("path {} has no parent", path.display())))?;
     std::fs::create_dir_all(parent)?;
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = parent.join(format!(

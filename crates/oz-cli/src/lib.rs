@@ -3,13 +3,13 @@
 
 //! Ozone CLI (`oz` and `git-ozone`) argument parsing, `oz.v1` JSON rendering, and subcommands.
 
-pub mod aliases;
-pub mod commands;
-pub mod daily;
-pub mod git_shim;
-pub mod maintenance;
-pub mod pager;
-pub mod recovery;
+pub(crate) mod aliases;
+pub(crate) mod commands;
+pub(crate) mod daily;
+pub(crate) mod git_shim;
+pub(crate) mod maintenance;
+pub(crate) mod pager;
+pub(crate) mod recovery;
 
 use clap::{CommandFactory, Parser, Subcommand};
 pub use commands::build_mcp_server;
@@ -28,6 +28,8 @@ use daily::{
     handle_completions, handle_diff_paged, handle_grep, handle_log, handle_restore,
     handle_rev_parse, handle_revert, handle_show, handle_stash, handle_switch, handle_tag,
 };
+#[doc(hidden)]
+pub use git_shim::resolve_real_git;
 use oz_core::{
     BackendKind, CliInvocation, Envelope, ExitCode, FilesystemKind, InteractionMode, MountHealth,
     MountRecord, OzError, OzoneRepo, SshSigningReport, expand_tilde_path, find_git_ozone_on_path,
@@ -36,6 +38,8 @@ use oz_core::{
 use oz_cow::{FilesystemProbe, LinuxFuseReadiness, detect_filesystem, select_backend};
 use oz_github::{GitHubAuthProbe, probe_github_auth};
 use oz_vfsd::{PROJFS_ENABLE_POWERSHELL_CMD, find_oz_vfsd_bin, ping_daemon, projected_fs_dll_path};
+#[doc(hidden)]
+pub use pager::{PagerChoice, PagerSelectionInput, resolve_pager_spec};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -415,9 +419,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Merge(args)) => handle_merge(&args, cli.directory.as_deref(), mode),
         Some(Commands::Integrate(args)) => handle_integrate(&args, cli.directory.as_deref(), mode),
         Some(Commands::Resolve(args)) => handle_resolve(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Stack(stack_cmd)) => {
-            handle_stack(stack_cmd, cli.directory.as_deref(), mode)
-        }
+        Some(Commands::Stack(stack_cmd)) => handle_stack(stack_cmd, cli.directory.as_deref(), mode),
         Some(Commands::Clone(args)) => handle_clone(&args, cli.directory.as_deref(), mode),
         Some(Commands::Fetch(args)) => handle_fetch(&args, cli.directory.as_deref(), mode),
         Some(Commands::Pull(args)) => handle_pull(&args, cli.directory.as_deref(), mode),
@@ -433,7 +435,9 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Show(args)) => handle_show(&args, cli.directory.as_deref(), mode),
         Some(Commands::RevParse(args)) => handle_rev_parse(&args, cli.directory.as_deref(), mode),
         Some(Commands::Stash(args)) => handle_stash(&args, cli.directory.as_deref(), mode),
-        Some(Commands::CherryPick(args)) => handle_cherry_pick(&args, cli.directory.as_deref(), mode),
+        Some(Commands::CherryPick(args)) => {
+            handle_cherry_pick(&args, cli.directory.as_deref(), mode)
+        }
         Some(Commands::Revert(args)) => handle_revert(&args, cli.directory.as_deref(), mode),
         Some(Commands::Tag(args)) => handle_tag(&args, cli.directory.as_deref(), mode),
         Some(Commands::Branch(args)) => handle_branch(&args, cli.directory.as_deref(), mode),
@@ -511,7 +515,11 @@ fn handle_version(invocation: CliInvocation, mode: InteractionMode) -> ExitCode 
         let env = Envelope::success(data);
         print_json_envelope(&env);
     } else {
-        write_stdout_line(&format!("{} {}", invocation.binary_name(), env!("CARGO_PKG_VERSION")));
+        write_stdout_line(&format!(
+            "{} {}",
+            invocation.binary_name(),
+            env!("CARGO_PKG_VERSION")
+        ));
     }
     ExitCode::Success
 }
@@ -892,7 +900,9 @@ fn evaluate_doctor_checks(
                     "sudo modprobe fuse  # or run container with --device /dev/fuse".to_string(),
                 );
             } else if !fuse.dev_fuse_rw {
-                rem.push("sudo usermod -aG fuse $USER  # then re-login for /dev/fuse rw".to_string());
+                rem.push(
+                    "sudo usermod -aG fuse $USER  # then re-login for /dev/fuse rw".to_string(),
+                );
             }
             if fuse.fusermount3_path.is_none() {
                 rem.push("sudo apt-get install -y fuse3".to_string());
@@ -1057,7 +1067,10 @@ fn evaluate_doctor_checks(
             id: "macos_apfs_clonefile",
             category: "platform",
             status: DoctorCheckStatus::NotApplicable,
-            summary: format!("macOS APFS clonefile(2) check not applicable on {}", probe.os),
+            summary: format!(
+                "macOS APFS clonefile(2) check not applicable on {}",
+                probe.os
+            ),
             remediation: Vec::new(),
         });
     }
@@ -1066,7 +1079,8 @@ fn evaluate_doctor_checks(
     match oz_vfsd.daemon_health {
         "binary_missing" => {
             let rem = vec![
-                "Install `oz-vfsd` alongside `oz` or export OZ_VFSD_BIN=/path/to/oz-vfsd".to_string(),
+                "Install `oz-vfsd` alongside `oz` or export OZ_VFSD_BIN=/path/to/oz-vfsd"
+                    .to_string(),
             ];
             warnings.push(format!(
                 "oz-vfsd binary not found on PATH or next to oz (required by recommended backend '{recommended_backend}')"
@@ -1086,7 +1100,10 @@ fn evaluate_doctor_checks(
             });
         }
         "stopped_with_active_mounts" => {
-            let rem = vec!["oz ws list --json".to_string(), "oz status --json".to_string()];
+            let rem = vec![
+                "oz ws list --json".to_string(),
+                "oz status --json".to_string(),
+            ];
             warnings.push(
                 "oz-vfsd daemon is not running while VFS workspace mounts are registered; run any workspace command to auto-remount"
                     .to_string(),
@@ -1172,13 +1189,9 @@ fn evaluate_doctor_checks(
                 category: "daemon",
                 status: DoctorCheckStatus::Ok,
                 summary: if oz_vfsd.found {
-                    format!(
-                        "oz-vfsd binary found (not required by {recommended_backend} backend)"
-                    )
+                    format!("oz-vfsd binary found (not required by {recommended_backend} backend)")
                 } else {
-                    format!(
-                        "oz-vfsd daemon not required by {recommended_backend} backend"
-                    )
+                    format!("oz-vfsd daemon not required by {recommended_backend} backend")
                 },
                 remediation: Vec::new(),
             });
@@ -1240,7 +1253,9 @@ fn evaluate_doctor_checks(
             summary: if ssh_signing.enabled_by_default {
                 format!("SSH commit signing enabled by default and ready ({fp})")
             } else {
-                format!("Ed25519 SSH signing key ready ({fp}); pass `oz commit -S` or enable by default")
+                format!(
+                    "Ed25519 SSH signing key ready ({fp}); pass `oz commit -S` or enable by default"
+                )
             },
             remediation: Vec::new(),
         });
@@ -1349,7 +1364,10 @@ fn evaluate_doctor_checks(
                 repo.unhealthy_mount_count
             ));
         }
-        let rem = vec!["oz ws list --json".to_string(), "oz status --json".to_string()];
+        let rem = vec![
+            "oz ws list --json".to_string(),
+            "oz status --json".to_string(),
+        ];
         for r in &rem {
             push_unique(&mut recovery_commands, r.clone());
             push_unique(&mut remediation_hints, r.clone());

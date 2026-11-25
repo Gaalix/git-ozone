@@ -112,8 +112,9 @@ fn is_vfsd_daemon_running(ozone_dir: Option<&Path>) -> bool {
 
 #[cfg(target_os = "linux")]
 fn detect_linux_fuse_ready_fast(ozone_dir: Option<&Path>) -> Option<(bool, bool, bool)> {
-    let dev_fuse_rw =
-        unsafe { libc::access(c"/dev/fuse".as_ptr(), libc::R_OK | libc::W_OK) == 0 };
+    // SAFETY: `c"/dev/fuse"` is a static NUL-terminated C string literal and `libc::access`
+    // only inspects permissions for the given path without retaining the pointer.
+    let dev_fuse_rw = unsafe { libc::access(c"/dev/fuse".as_ptr(), libc::R_OK | libc::W_OK) == 0 };
     let has_bin = find_fusermount3().is_some();
     let no_new_privs = process_has_no_new_privs();
     let daemon_running = if no_new_privs && dev_fuse_rw && has_bin {
@@ -155,7 +156,8 @@ pub fn detect_filesystem_with_ozone(
 
     let fuse = detect_linux_fuse(ozone_dir);
     let projfs_ready = detect_windows_projfs();
-    let recommended_backend = recommend_backend(&fs_kind, reflink_supported, fuse.as_ref(), projfs_ready);
+    let recommended_backend =
+        recommend_backend(&fs_kind, reflink_supported, fuse.as_ref(), projfs_ready);
 
     Ok(FilesystemProbe {
         os: std::env::consts::OS.to_string(),
@@ -213,7 +215,10 @@ fn find_existing_ozone_dir(path: &Path) -> Option<PathBuf> {
             return Some(cand);
         }
         if anc.file_name().is_some_and(|n| n == "ozone")
-            && anc.parent().and_then(|p| p.file_name()).is_some_and(|n| n == ".git")
+            && anc
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == ".git")
             && anc.is_dir()
         {
             return Some(anc.to_path_buf());
@@ -292,10 +297,13 @@ fn probe_fs_kind(path: &Path) -> Result<(FilesystemKind, Option<String>)> {
         .map_err(|e| OzError::Other(format!("invalid path for statfs: {e}")))?;
 
     let mut buf = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c_path` is a valid NUL-terminated C string and `buf.as_mut_ptr()` points to
+    // properly aligned writable storage for a `libc::statfs` struct.
     let rc = unsafe { libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) };
     if rc != 0 {
         return Err(OzError::Io(std::io::Error::last_os_error()));
     }
+    // SAFETY: `libc::statfs` returned `0`, guaranteeing `buf` was fully initialized by the kernel.
     let stat = unsafe { buf.assume_init() };
     let magic = stat.f_type as u64;
     let kind = match magic {
@@ -323,11 +331,15 @@ fn probe_fs_kind(path: &Path) -> Result<(FilesystemKind, Option<String>)> {
         .map_err(|e| OzError::Other(format!("invalid path for statfs: {e}")))?;
 
     let mut buf = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c_path` is a valid NUL-terminated C string and `buf.as_mut_ptr()` points to
+    // properly aligned writable storage for a `libc::statfs` struct.
     let rc = unsafe { libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) };
     if rc != 0 {
         return Err(OzError::Io(std::io::Error::last_os_error()));
     }
+    // SAFETY: `libc::statfs` returned `0`, guaranteeing `buf` was fully initialized by the kernel.
     let stat = unsafe { buf.assume_init() };
+    // SAFETY: `stat` was initialized by `statfs(2)` on macOS, which NUL-terminates `f_fstypename`.
     let fs_name = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }
         .to_string_lossy()
         .to_ascii_lowercase();
@@ -370,6 +382,8 @@ fn probe_fs_kind(path: &Path) -> Result<(FilesystemKind, Option<String>)> {
         .chain(std::iter::once(0))
         .collect();
     let mut vol_buf = vec![0u16; 260];
+    // SAFETY: `wide_path` is NUL-terminated UTF-16, and `vol_buf` is a writable buffer whose
+    // element count (`vol_buf.len()`) is passed to `GetVolumePathNameW`.
     let ok = unsafe {
         GetVolumePathNameW(
             wide_path.as_ptr(),
@@ -382,6 +396,8 @@ fn probe_fs_kind(path: &Path) -> Result<(FilesystemKind, Option<String>)> {
     }
 
     let mut fs_buf = vec![0u16; 64];
+    // SAFETY: `vol_buf` holds the NUL-terminated volume root populated above, optional out pointers
+    // are null, and `fs_buf` is a writable UTF-16 buffer of length `fs_buf.len()`.
     let info_ok = unsafe {
         GetVolumeInformationW(
             vol_buf.as_ptr(),
@@ -420,6 +436,8 @@ fn detect_linux_fuse(ozone_dir: Option<&Path>) -> Option<LinuxFuseReadiness> {
     let dev_fuse = Path::new("/dev/fuse");
     let dev_fuse_exists = dev_fuse.exists();
     let dev_fuse_rw = if dev_fuse_exists {
+        // SAFETY: `c"/dev/fuse"` is a static NUL-terminated C string literal and `libc::access`
+        // only checks permissions without retaining the pointer.
         unsafe { libc::access(c"/dev/fuse".as_ptr(), libc::R_OK | libc::W_OK) == 0 }
     } else {
         false

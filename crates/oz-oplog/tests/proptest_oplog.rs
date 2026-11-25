@@ -140,14 +140,11 @@ impl OracleModel {
             .clone()
             .unwrap_or_else(|| fallback_base.clone());
         let changed_paths = diff_snapshots(&pre_disk, &post_disk);
-        self.current_head = post_head.clone();
-        self.current_tree = post_tree.clone();
+        self.current_head.clone_from(&post_head);
+        self.current_tree.clone_from(&post_tree);
         self.current_disk = post_disk.clone();
-        self.latest_recorded_ws_state = Some((
-            post_head.clone(),
-            post_tree.clone(),
-            post_disk.clone(),
-        ));
+        self.latest_recorded_ws_state =
+            Some((post_head.clone(), post_tree.clone(), post_disk.clone()));
         self.active.push(RecordedTransition {
             op_id,
             is_checkpoint: true,
@@ -181,14 +178,11 @@ impl OracleModel {
         let mut changed_paths = diff_snapshots(&pre_tree_snap, &post_tree_snap);
         changed_paths.extend(diff_snapshots(&pre_tree_snap, &pre_disk));
         changed_paths.extend(diff_snapshots(&post_tree_snap, &post_disk));
-        self.current_head = post_head.clone();
-        self.current_tree = post_tree.clone();
+        self.current_head.clone_from(&post_head);
+        self.current_tree.clone_from(&post_tree);
         self.current_disk = post_disk.clone();
-        self.latest_recorded_ws_state = Some((
-            post_head.clone(),
-            post_tree.clone(),
-            post_disk.clone(),
-        ));
+        self.latest_recorded_ws_state =
+            Some((post_head.clone(), post_tree.clone(), post_disk.clone()));
         self.active.push(RecordedTransition {
             op_id,
             is_checkpoint: false,
@@ -223,8 +217,8 @@ impl OracleModel {
         if top.is_checkpoint && self.current_disk != top.post_disk {
             let live_disk = self.current_disk.clone();
             let changed_paths = diff_snapshots(&top.post_disk, &live_disk);
-            self.current_head = top.post_head.clone();
-            self.current_tree = top.post_tree.clone();
+            self.current_head.clone_from(&top.post_head);
+            self.current_tree.clone_from(&top.post_tree);
             self.current_disk = top.post_disk.clone();
             self.latest_recorded_ws_state = Some((
                 self.current_head.clone(),
@@ -269,8 +263,8 @@ impl OracleModel {
                 }
             }
         }
-        self.current_head = popped.pre_head.clone();
-        self.current_tree = popped.pre_tree.clone();
+        self.current_head.clone_from(&popped.pre_head);
+        self.current_tree.clone_from(&popped.pre_tree);
         self.latest_recorded_ws_state = Some((
             self.current_head.clone(),
             self.current_tree.clone(),
@@ -284,8 +278,8 @@ impl OracleModel {
         let Some(top) = self.redo_stack.pop() else {
             return false;
         };
-        self.current_head = top.post_head.clone();
-        self.current_tree = top.post_tree.clone();
+        self.current_head.clone_from(&top.post_head);
+        self.current_tree.clone_from(&top.post_tree);
         if self.current_disk == top.pre_disk {
             self.current_disk = top.post_disk.clone();
         } else {
@@ -329,7 +323,11 @@ fn snapshot_gix_tree(repo: &OzoneRepo, tree_oid_hex: &str) -> BTreeMap<String, T
             continue;
         }
         let rel = String::from_utf8_lossy(entry.filepath.as_ref()).into_owned();
-        let bytes = gix_repo.find_blob(entry.oid).expect("find blob").data.clone();
+        let bytes = gix_repo
+            .find_blob(entry.oid)
+            .expect("find blob")
+            .data
+            .clone();
         if entry.mode.kind() == gix::objs::tree::EntryKind::Link {
             out.insert(
                 rel,
@@ -589,10 +587,7 @@ fn apply_file_edit(root: &Path, op: &FileEditOp) {
             {
                 let entry = if meta.file_type().is_symlink() {
                     TreeEntry::Symlink {
-                        target: fs::read_link(&full)
-                            .unwrap()
-                            .to_string_lossy()
-                            .into_owned(),
+                        target: fs::read_link(&full).unwrap().to_string_lossy().into_owned(),
                     }
                 } else {
                     #[cfg(unix)]
@@ -777,13 +772,15 @@ fn arb_state_machine_case() -> BoxedStrategy<StateMachineCase> {
         arb_link_target(),
         prop::collection::vec(arb_machine_step(), 6..12),
     )
-        .prop_map(|(base_tok, base_bin, base_exec, base_link, steps)| StateMachineCase {
-            base_tok,
-            base_bin,
-            base_exec,
-            base_link,
-            steps,
-        })
+        .prop_map(
+            |(base_tok, base_bin, base_exec, base_link, steps)| StateMachineCase {
+                base_tok,
+                base_bin,
+                base_exec,
+                base_link,
+                steps,
+            },
+        )
         .boxed()
 }
 

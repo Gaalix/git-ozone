@@ -83,7 +83,8 @@ pub fn expand_aliases(args: Vec<OsString>) -> Result<Vec<OsString>> {
 }
 
 /// Pure testable alias expansion using an explicit alias table.
-pub fn expand_aliases_with_map(
+#[cfg(test)]
+fn expand_aliases_with_map(
     args: Vec<OsString>,
     aliases: &BTreeMap<String, String>,
 ) -> Result<Vec<OsString>> {
@@ -169,7 +170,9 @@ fn expand_aliases_at_index(
         if !visited.insert(next_head.to_string()) {
             return Err(OzError::InvalidConfig {
                 path: PathBuf::from(".ozone.toml"),
-                message: format!("cyclic alias expansion involving '{head_token}' and '{next_head}'"),
+                message: format!(
+                    "cyclic alias expansion involving '{head_token}' and '{next_head}'"
+                ),
             });
         }
         head_token = next_head.to_string();
@@ -277,7 +280,9 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
 fn load_aliases_for_dir(dir: Option<&Path>) -> Result<BTreeMap<String, String>> {
     match OzoneRepo::discover(dir) {
         Ok(repo) => Ok(repo.config.aliases),
-        Err(OzError::InvalidConfig { path, message }) => Err(OzError::InvalidConfig { path, message }),
+        Err(OzError::InvalidConfig { path, message }) => {
+            Err(OzError::InvalidConfig { path, message })
+        }
         Err(_) => {
             // If outside a Git repository (or invalid directory handled downstream),
             // still honor standalone `.ozone.toml` if present, otherwise built-in defaults.
@@ -385,11 +390,8 @@ mod tests {
             os(&["oz", "--json", "--agent", "log", "-n", "3"])
         );
         assert_eq!(
-            expand_aliases_with_map(
-                os(&["oz", "-C", "/tmp/repo", "co", "main", "--json"]),
-                &map
-            )
-            .unwrap(),
+            expand_aliases_with_map(os(&["oz", "-C", "/tmp/repo", "co", "main", "--json"]), &map)
+                .unwrap(),
             os(&["oz", "-C", "/tmp/repo", "git", "checkout", "main", "--json"])
         );
         assert_eq!(
@@ -406,7 +408,16 @@ mod tests {
         );
         assert_eq!(
             expand_aliases_with_map(os(&["oz", "recent", "--json"]), &map).unwrap(),
-            os(&["oz", "log", "--oneline", "-n", "5", "--grep", "fix bug", "--json"])
+            os(&[
+                "oz",
+                "log",
+                "--oneline",
+                "-n",
+                "5",
+                "--grep",
+                "fix bug",
+                "--json"
+            ])
         );
         // `oz ci -m "..."` expands to `commit`, while `oz ci --json` keeps built-in `ci` command.
         assert_eq!(

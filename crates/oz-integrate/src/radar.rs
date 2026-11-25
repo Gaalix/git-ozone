@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Live cross-workspace collision radar (`oz radar`) projecting dirty worktrees and
-//! branch-diverged commits onto base-branch line coordinates via `imara-diff`.
+//! branch-diverged commits onto base-branch line coordinates via `gix::diff::blob`.
 
 use crate::guardrails::CombinedScopePolicy;
 use crate::sandbox::{
@@ -10,8 +10,8 @@ use crate::sandbox::{
     open_gix_with_fallback, parse_oid, resolve_local_branch, resolve_main_repo,
 };
 use crate::{CollisionReportItem, CollisionSeverity, WorkspaceLineSpan};
+use gix::diff::blob::{Algorithm, Diff, Hunk, InternedInput, sources};
 use gix::hash::ObjectId;
-use imara_diff::{Algorithm, Diff, InternedInput, sources};
 use oz_core::{
     ChangeKind, OzError, OzoneRepo, Result, WorkspaceState, compute_status, is_binary_bytes,
 };
@@ -74,12 +74,13 @@ struct WorkspaceFileEdit {
 
 /// Scans all active workspaces (`oz_cow::list_workspaces`), combining uncommitted dirty
 /// working-tree edits (`oz_core::compute_status`) and (by default) branch-diverged commits
-/// projected onto `base_branch` coordinates via `imara-diff`, returning deterministic collisions.
+/// projected onto `base_branch` coordinates via `gix::diff::blob`, returning deterministic collisions.
 pub fn scan_radar(repo: &OzoneRepo, opts: &RadarOptions) -> Result<RadarReport> {
     let main_repo = resolve_main_repo(repo)?;
     let gix_repo = open_gix_with_fallback(&main_repo.repo_root)?;
 
-    let base_branch = resolve_radar_base_branch(repo, &main_repo, &gix_repo, opts.base_branch.as_deref());
+    let base_branch =
+        resolve_radar_base_branch(repo, &main_repo, &gix_repo, opts.base_branch.as_deref());
     let base_commit_id = resolve_local_branch(&gix_repo, &base_branch)?.map(|(_, id)| id);
     let base_tree_id = match base_commit_id {
         Some(cid) => commit_tree_id(&gix_repo, cid)?,
@@ -394,7 +395,7 @@ fn build_workspace_file_edit(
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
 
-    let proj_hunks: Vec<imara_diff::Hunk> = if fork_slice != base_slice {
+    let proj_hunks: Vec<Hunk> = if fork_slice != base_slice {
         let proj_input = InternedInput::new(fork_slice, base_slice);
         let mut p_diff = Diff::compute(Algorithm::Histogram, &proj_input);
         p_diff.postprocess_lines(&proj_input);
@@ -463,7 +464,7 @@ fn build_workspace_file_edit(
 
 /// Maps a 0-based half-open line range in `fork` coordinates onto `base` coordinates
 /// using `proj_hunks` computed from `fork -> base`.
-fn project_range_onto_base(range: &Range<u32>, proj_hunks: &[imara_diff::Hunk]) -> Range<u32> {
+fn project_range_onto_base(range: &Range<u32>, proj_hunks: &[Hunk]) -> Range<u32> {
     let start = project_pos_onto_base(range.start, false, proj_hunks);
     let end = project_pos_onto_base(range.end, true, proj_hunks);
     if end < start {
@@ -473,7 +474,7 @@ fn project_range_onto_base(range: &Range<u32>, proj_hunks: &[imara_diff::Hunk]) 
     }
 }
 
-fn project_pos_onto_base(pos: u32, is_end: bool, proj_hunks: &[imara_diff::Hunk]) -> u32 {
+fn project_pos_onto_base(pos: u32, is_end: bool, proj_hunks: &[Hunk]) -> u32 {
     let mut offset: isize = 0;
     for ph in proj_hunks {
         if pos < ph.before.start {

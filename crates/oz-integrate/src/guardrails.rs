@@ -4,13 +4,12 @@
 //! Path scope (`--scope`/`--deny`) and content guardrails enforced before integration.
 
 use crate::sandbox::{
-    commit_tree_id, merge_base_tree_id, normalize_branch_short, open_gix_with_fallback,
-    parse_oid, resolve_local_branch, resolve_main_repo,
+    commit_tree_id, merge_base_tree_id, normalize_branch_short, open_gix_with_fallback, parse_oid,
+    resolve_local_branch, resolve_main_repo,
 };
 use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
 use gix::object::tree::diff::Change;
-use gix::objs::tree::EntryKind;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use oz_core::{
     ChangeKind, GuardrailOptions, GuardrailTarget, OzError, OzoneRepo, Result, WorkspaceState,
@@ -508,10 +507,4 @@ fn check_collected_changes(
             allow_out_of_scope: true,
         },
     )
-}
-
-/// Helper to read a blob's size/bytes safely when inspecting tree entries directly.
-#[allow(dead_code)]
-pub(crate) fn entry_kind_is_link(kind: EntryKind) -> bool {
-    kind == EntryKind::Link
 }

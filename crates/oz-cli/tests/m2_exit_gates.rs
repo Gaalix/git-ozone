@@ -47,11 +47,9 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
 
         let oz = oz_bin();
-        if let Ok(resolved) = oz_vfsd::resolve_oz_vfsd_bin_with(
-            None,
-            Some(&oz),
-            std::env::var_os("PATH").as_deref(),
-        ) {
+        if let Ok(resolved) =
+            oz_vfsd::resolve_oz_vfsd_bin_with(None, Some(&oz), std::env::var_os("PATH").as_deref())
+        {
             return resolved;
         }
         if let Ok(resolved) = oz_vfsd::find_oz_vfsd_bin() {
@@ -80,7 +78,11 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
         let status = build.status().expect("cargo build --bin oz-vfsd");
         assert!(status.success(), "failed to build oz-vfsd helper binary");
-        assert!(sibling.is_file(), "expected oz-vfsd at {}", sibling.display());
+        assert!(
+            sibling.is_file(),
+            "expected oz-vfsd at {}",
+            sibling.display()
+        );
         sibling
     })
 }
@@ -160,6 +162,7 @@ impl Drop for GateSandbox {
             }
         }
         let mut mounts_to_clean = self.mount_points.clone();
+        let mut ws_to_unmount: Vec<(PathBuf, String)> = Vec::new();
         let mut pids_to_kill: Vec<u32> = Vec::new();
 
         for git_dir in &git_dirs {
@@ -170,6 +173,10 @@ impl Drop for GateSandbox {
                     if let Ok(raw) = fs::read_to_string(&mj)
                         && let Ok(rec) = serde_json::from_str::<MountRecord>(&raw)
                     {
+                        let pair = (git_dir.clone(), rec.workspace);
+                        if !ws_to_unmount.contains(&pair) {
+                            ws_to_unmount.push(pair);
+                        }
                         if !mounts_to_clean.contains(&rec.mount_point) {
                             mounts_to_clean.push(rec.mount_point);
                         }
@@ -199,6 +206,11 @@ impl Drop for GateSandbox {
             }
         }
 
+        for (git_dir, ws_name) in &ws_to_unmount {
+            if git_dir.is_dir() {
+                let _ = oz_vfsd::unmount_via_daemon(git_dir, ws_name, true);
+            }
+        }
         for git_dir in &git_dirs {
             if git_dir.is_dir() {
                 let _ = oz_vfsd::shutdown_daemon(git_dir);
@@ -243,6 +255,23 @@ impl Drop for GateSandbox {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_live_fuse3_available() -> bool {
+    let no_new_privs = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let rest = line.strip_prefix("NoNewPrivs:")?;
+                Some(rest.trim() == "1")
+            })
+        })
+        .unwrap_or(false);
+    if !no_new_privs {
+        return true;
+    }
+    oz_vfsd::global_daemon_socket_path().is_some_and(|sock| oz_vfsd::ping_daemon(&sock).is_ok())
+}
+
+#[cfg(target_os = "linux")]
 fn kill_test_vfsd_pid(pid: u32, git_dir_marker: &str) {
     let cmdline_path = format!("/proc/{pid}/cmdline");
     let Ok(bytes) = fs::read(&cmdline_path) else {
@@ -250,8 +279,14 @@ fn kill_test_vfsd_pid(pid: u32, git_dir_marker: &str) {
     };
     let cmdline = String::from_utf8_lossy(&bytes);
     if cmdline.contains("oz-vfsd") && cmdline.contains(git_dir_marker) {
-        unsafe {
-            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        if let Ok(raw_pid) = libc::pid_t::try_from(pid)
+            && raw_pid > 0
+        {
+            // SAFETY: `raw_pid` is strictly positive and verified via `/proc/<pid>/cmdline` to be
+            // this test sandbox's `oz-vfsd` daemon before sending `SIGKILL`.
+            unsafe {
+                let _ = libc::kill(raw_pid, libc::SIGKILL);
+            }
         }
         wait_pid_dead(pid, std::time::Duration::from_secs(2));
     }
@@ -378,7 +413,10 @@ fn verify_op_ids_reachable_from_head(git_dir: &Path, expected_op_ids: &[String])
         .map(|e| e.op_id)
         .collect();
     for op_id in expected_op_ids {
-        assert!(listed.contains(op_id), "op_id '{op_id}' missing from list_entries");
+        assert!(
+            listed.contains(op_id),
+            "op_id '{op_id}' missing from list_entries"
+        );
     }
 }
 
@@ -402,7 +440,15 @@ fn gate_m2_10_process_concurrent_oz_commit_stress() {
 
         let out = run_oz(
             &repo,
-            &["ws", "spawn", &ws_name, "--branch", &branch, "--no-warm", "--json"],
+            &[
+                "ws",
+                "spawn",
+                &ws_name,
+                "--branch",
+                &branch,
+                "--no-warm",
+                "--json",
+            ],
         );
         assert_eq!(out.code, 0, "spawn {ws_name} failed: {}", out.stderr);
         let j = out.json.expect("spawn json");
@@ -415,8 +461,12 @@ fn gate_m2_10_process_concurrent_oz_commit_stress() {
 
         #[cfg(target_os = "linux")]
         {
-            assert_eq!(j["data"]["backend"], "linux_fuse3");
-            assert_eq!(j["data"]["mounted"], true);
+            if linux_live_fuse3_available() {
+                assert_eq!(j["data"]["backend"], "linux_fuse3");
+                assert_eq!(j["data"]["mounted"], true);
+            } else {
+                assert_eq!(j["data"]["backend"], "cas_hardlink");
+            }
         }
 
         ws_paths.push(ws_dir);
@@ -491,11 +541,19 @@ fn gate_m2_10_process_concurrent_oz_commit_stress() {
         }
 
         let radar_res = radar_handle.join().expect("join radar reader");
-        assert_eq!(radar_res.code, 0, "concurrent radar failed: {}", radar_res.stderr);
+        assert_eq!(
+            radar_res.code, 0,
+            "concurrent radar failed: {}",
+            radar_res.stderr
+        );
         assert_eq!(radar_res.json.expect("radar json")["ok"], true);
 
         let status_res = status_handle.join().expect("join status reader");
-        assert_eq!(status_res.code, 0, "concurrent status failed: {}", status_res.stderr);
+        assert_eq!(
+            status_res.code, 0,
+            "concurrent status failed: {}",
+            status_res.stderr
+        );
         assert_eq!(status_res.json.expect("status json")["ok"], true);
     }
 
@@ -507,7 +565,10 @@ fn gate_m2_10_process_concurrent_oz_commit_stress() {
         assert_eq!(&actual_oid, expected_oid, "branch {branch} ref mismatch");
 
         let shown = sys_git(&repo, &["show", &format!("{branch}:src/agent_{i}_r2.rs")]);
-        assert!(shown.contains(&format!("agent_{i}_r2")), "missing committed file for {branch}");
+        assert!(
+            shown.contains(&format!("agent_{i}_r2")),
+            "missing committed file for {branch}"
+        );
     }
 
     verify_op_ids_reachable_from_head(&repo.join(".git"), &expected_op_ids);
@@ -536,7 +597,14 @@ fn gate_m2_cross_os_doctor_and_setup_projfs_behavior() {
     #[cfg(target_os = "linux")]
     {
         assert!(doc_json["data"]["projfs_ready"].is_null());
-        assert_eq!(doc_json["data"]["recommended_backend"], "linux_fuse3");
+        if linux_live_fuse3_available() {
+            assert_eq!(doc_json["data"]["recommended_backend"], "linux_fuse3");
+        } else {
+            eprintln!(
+                "[SKIP] gate_m2_cross_os_doctor_and_setup_projfs_behavior (linux_fuse3): NoNewPrivs=1 without external user-wide oz-vfsd daemon"
+            );
+            assert_eq!(doc_json["data"]["recommended_backend"], "cas_hardlink");
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -557,7 +625,11 @@ fn gate_m2_cross_os_doctor_and_setup_projfs_behavior() {
     let projfs_setup = run_oz(&repo, &["setup", "--enable-projfs", "--json"]);
     #[cfg(target_os = "windows")]
     {
-        assert_eq!(projfs_setup.code, 0, "windows setup --enable-projfs failed: {}", projfs_setup.stderr);
+        assert_eq!(
+            projfs_setup.code, 0,
+            "windows setup --enable-projfs failed: {}",
+            projfs_setup.stderr
+        );
         let sj = projfs_setup.json.expect("windows setup json");
         assert_eq!(sj["ok"], true);
         assert_eq!(sj["data"]["projfs_enabled"], true);
@@ -641,6 +713,8 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
             .ok()?;
         let handle = file.as_raw_handle();
         let mut info = ByHandleFileInformation::default();
+        // SAFETY: `handle` is an open Win32 file handle from `file` and `&mut info` is a valid
+        // writable `ByHandleFileInformation` struct.
         if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
             return None;
         }
@@ -651,6 +725,8 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
             delete_pending: 0,
             directory: 0,
         };
+        // SAFETY: `handle` is an open Win32 file handle and `std_info` matches
+        // `FILE_STANDARD_INFO_CLASS` with its exact byte size passed in `dw_buffer_size`.
         let alloc = if unsafe {
             GetFileInformationByHandleEx(
                 handle,
@@ -722,7 +798,11 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
     let mut sandbox = GateSandbox::new("g2w");
     let repo = sandbox.repo_root.clone();
     write_repo_file(&repo, ".gitignore", "/target\n/node_modules\n/.venv\n");
-    write_repo_file(&repo, "Cargo.toml", "[package]\nname = \"g2w\"\nversion = \"0.1.0\"\n");
+    write_repo_file(
+        &repo,
+        "Cargo.toml",
+        "[package]\nname = \"g2w\"\nversion = \"0.1.0\"\n",
+    );
     write_repo_file(&repo, "package.json", "{\"name\":\"g2w\"}\n");
     write_repo_file(&repo, "pyproject.toml", "[project]\nname = \"g2w\"\n");
     write_repo_file(&repo, "README.md", "# Windows ProjFS Gate\n");
@@ -733,7 +813,11 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
     for (rel, size, byte) in [
         ("target/debug/deps/libhuge.rlib", 20 * 1024 * 1024, 0xA1u8),
         ("node_modules/mega-pkg/bundle.bin", 20 * 1024 * 1024, 0xB2u8),
-        (".venv/Lib/site-packages/weights.bin", 12 * 1024 * 1024, 0xC3u8),
+        (
+            ".venv/Lib/site-packages/weights.bin",
+            12 * 1024 * 1024,
+            0xC3u8,
+        ),
     ] {
         let p = repo.join(rel);
         fs::create_dir_all(p.parent().expect("parent")).expect("mkdir warm");
@@ -742,9 +826,13 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
 
     let ozone_dir = repo.join(".git/ozone");
     fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
-    let baseline_meta =
-        oz_warm::capture_baseline(&repo, &ozone_dir, &base_commit, &oz_core::OzoneConfig::default())
-            .expect("capture warm baseline");
+    let baseline_meta = oz_warm::capture_baseline(
+        &repo,
+        &ozone_dir,
+        &base_commit,
+        &oz_core::OzoneConfig::default(),
+    )
+    .expect("capture warm baseline");
     assert!(
         baseline_meta.total_bytes >= 50 * 1024 * 1024,
         "warm baseline must be >= 50 MB (got {})",
@@ -763,7 +851,10 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
         mount_roots.push(ws_path);
 
         let t0 = Instant::now();
-        let out = run_oz(&repo, &["ws", "spawn", &ws_name, "--branch", &branch, "--json"]);
+        let out = run_oz(
+            &repo,
+            &["ws", "spawn", &ws_name, "--branch", &branch, "--json"],
+        );
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(out.code, 0, "ProjFS spawn {ws_name} failed: {}", out.stderr);
         let j = out.json.expect("spawn json");
@@ -798,10 +889,17 @@ fn gate_m2_windows_ntfs_projfs_10_workspaces_space_and_speed() {
 
     // Verify virtual read + CoW write + oz commit on ProjFS workspace 1.
     let ws1 = &mount_roots[0];
-    assert_eq!(fs::read_to_string(ws1.join("src/lib.rs")).unwrap(), "pub fn win() -> u32 { 7 }\n");
+    assert_eq!(
+        fs::read_to_string(ws1.join("src/lib.rs")).unwrap(),
+        "pub fn win() -> u32 { 7 }\n"
+    );
     write_repo_file(ws1, "src/lib.rs", "pub fn win() -> u32 { 99 }\n");
     let commit_out = run_oz(ws1, &["commit", "-m", "feat: projfs edit", "--json"]);
-    assert_eq!(commit_out.code, 0, "ProjFS commit failed: {}", commit_out.stderr);
+    assert_eq!(
+        commit_out.code, 0,
+        "ProjFS commit failed: {}",
+        commit_out.stderr
+    );
 }
 
 #[test]
@@ -862,7 +960,11 @@ fn gate_m2_guardrails_and_live_radar() {
     );
 
     // 1. Out-of-scope + denied edits in ws-auth -> structured `out_of_scope` warnings in `oz status --json`.
-    write_repo_file(&ws_auth, "crates/billing/src/lib.rs", "pub fn bill() { /* oos */ }\n");
+    write_repo_file(
+        &ws_auth,
+        "crates/billing/src/lib.rs",
+        "pub fn bill() { /* oos */ }\n",
+    );
     write_repo_file(&ws_auth, "Cargo.lock", "lock-v2-denied\n");
 
     let st = run_oz(&ws_auth, &["status", "--json"]);
@@ -870,9 +972,9 @@ fn gate_m2_guardrails_and_live_radar() {
     let st_json = st.json.expect("status json");
     let warnings = st_json["warnings"].as_array().expect("warnings array");
     assert!(
-        warnings.iter().any(|w| {
-            w["code"] == "out_of_scope" && w["path"] == "crates/billing/src/lib.rs"
-        }),
+        warnings
+            .iter()
+            .any(|w| { w["code"] == "out_of_scope" && w["path"] == "crates/billing/src/lib.rs" }),
         "missing out_of_scope structured warning for crates/billing/src/lib.rs: {warnings:?}"
     );
     assert!(
@@ -884,7 +986,11 @@ fn gate_m2_guardrails_and_live_radar() {
 
     // 2. Exit-2 guardrail block in `oz commit`, overridden with `--allow-out-of-scope`.
     let blocked_commit = run_oz(&ws_auth, &["commit", "-m", "oos blocked", "--json"]);
-    assert_eq!(blocked_commit.code, 2, "expected exit 2: {}", blocked_commit.stdout);
+    assert_eq!(
+        blocked_commit.code, 2,
+        "expected exit 2: {}",
+        blocked_commit.stdout
+    );
     let bc_json = blocked_commit.json.expect("blocked commit json");
     assert_eq!(bc_json["ok"], false);
     assert_eq!(bc_json["error"]["code"], "guardrail_violation");
@@ -899,11 +1005,19 @@ fn gate_m2_guardrails_and_live_radar() {
             "--json",
         ],
     );
-    assert_eq!(override_commit.code, 0, "override commit failed: {}", override_commit.stderr);
+    assert_eq!(
+        override_commit.code, 0,
+        "override commit failed: {}",
+        override_commit.stderr
+    );
 
     // 3. Exit-2 guardrail block in `oz integrate`, overridden with `--allow-out-of-scope`, then undone.
     let blocked_int = run_oz(&repo, &["integrate", "ws-auth", "--into", "main", "--json"]);
-    assert_eq!(blocked_int.code, 2, "expected exit 2 on integrate: {}", blocked_int.stdout);
+    assert_eq!(
+        blocked_int.code, 2,
+        "expected exit 2 on integrate: {}",
+        blocked_int.stdout
+    );
     let bi_json = blocked_int.json.expect("blocked integrate json");
     assert_eq!(bi_json["ok"], false);
     assert_eq!(bi_json["error"]["code"], "guardrail_violation");
@@ -920,11 +1034,19 @@ fn gate_m2_guardrails_and_live_radar() {
             "--json",
         ],
     );
-    assert_eq!(override_int.code, 0, "override integrate failed: {}", override_int.stderr);
+    assert_eq!(
+        override_int.code, 0,
+        "override integrate failed: {}",
+        override_int.stderr
+    );
     assert_ne!(sys_git(&repo, &["rev-parse", "main"]), base_oid);
 
     let undo_int = run_oz(&repo, &["undo", "--json"]);
-    assert_eq!(undo_int.code, 0, "undo integrate failed: {}", undo_int.stderr);
+    assert_eq!(
+        undo_int.code, 0,
+        "undo integrate failed: {}",
+        undo_int.stderr
+    );
     assert_eq!(sys_git(&repo, &["rev-parse", "main"]), base_oid);
 
     // 4. Live `oz radar --json`: overlapping_hunks ("42-68" & "50-75"), same_file_different_lines, and out_of_scope.
@@ -932,7 +1054,11 @@ fn gate_m2_guardrails_and_live_radar() {
     for (idx, line) in auth_session.iter_mut().enumerate().take(68).skip(41) {
         *line = format!("auth line {}\n", idx + 1);
     }
-    write_repo_file(&ws_auth, "crates/core/src/session.rs", &auth_session.concat());
+    write_repo_file(
+        &ws_auth,
+        "crates/core/src/session.rs",
+        &auth_session.concat(),
+    );
     let mut auth_other: Vec<String> = (1..=100).map(|i| format!("line {i}\n")).collect();
     auth_other[4] = "auth other line 5\n".to_string();
     write_repo_file(&ws_auth, "crates/core/src/other.rs", &auth_other.concat());
@@ -941,7 +1067,11 @@ fn gate_m2_guardrails_and_live_radar() {
     for (idx, line) in bill_session.iter_mut().enumerate().take(75).skip(49) {
         *line = format!("bill line {}\n", idx + 1);
     }
-    write_repo_file(&ws_bill, "crates/core/src/session.rs", &bill_session.concat());
+    write_repo_file(
+        &ws_bill,
+        "crates/core/src/session.rs",
+        &bill_session.concat(),
+    );
     let mut bill_other: Vec<String> = (1..=100).map(|i| format!("line {i}\n")).collect();
     bill_other[79] = "bill other line 80\n".to_string();
     write_repo_file(&ws_bill, "crates/core/src/other.rs", &bill_other.concat());
@@ -956,7 +1086,9 @@ fn gate_m2_guardrails_and_live_radar() {
     let rj = radar.json.expect("radar json");
     assert_eq!(rj["schema"], OZ_SCHEMA_V1);
     assert_eq!(rj["ok"], true);
-    let collisions = rj["data"]["collisions"].as_array().expect("collisions array");
+    let collisions = rj["data"]["collisions"]
+        .as_array()
+        .expect("collisions array");
 
     let session_col = collisions
         .iter()
@@ -965,11 +1097,15 @@ fn gate_m2_guardrails_and_live_radar() {
     assert_eq!(session_col["severity"], "overlapping_hunks");
     let spans = session_col["workspaces"].as_array().expect("spans");
     assert!(
-        spans.iter().any(|w| w["ws"] == "ws-auth" && w["lines"] == "42-68"),
+        spans
+            .iter()
+            .any(|w| w["ws"] == "ws-auth" && w["lines"] == "42-68"),
         "expected ws-auth 42-68 span in {spans:?}"
     );
     assert!(
-        spans.iter().any(|w| w["ws"] == "ws-bill" && w["lines"] == "50-75"),
+        spans
+            .iter()
+            .any(|w| w["ws"] == "ws-bill" && w["lines"] == "50-75"),
         "expected ws-bill 50-75 span in {spans:?}"
     );
 
@@ -990,7 +1126,9 @@ fn gate_m2_guardrails_and_live_radar() {
     let radar_dirty_only = run_oz(&repo, &["radar", "--no-committed", "--json"]);
     assert_eq!(radar_dirty_only.code, 0);
     let rj_dirty = radar_dirty_only.json.expect("radar --no-committed json");
-    let dirty_cols = rj_dirty["data"]["collisions"].as_array().expect("dirty collisions");
+    let dirty_cols = rj_dirty["data"]["collisions"]
+        .as_array()
+        .expect("dirty collisions");
     assert!(
         !dirty_cols
             .iter()
@@ -1016,8 +1154,14 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     let ws2 = sandbox.ws_path("ws-2");
     sandbox.register_mount(ws1.clone());
     sandbox.register_mount(ws2.clone());
-    assert_eq!(run_oz(&repo, &["ws", "spawn", "ws-1", "--no-warm", "--json"]).code, 0);
-    assert_eq!(run_oz(&repo, &["ws", "spawn", "ws-2", "--no-warm", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&repo, &["ws", "spawn", "ws-1", "--no-warm", "--json"]).code,
+        0
+    );
+    assert_eq!(
+        run_oz(&repo, &["ws", "spawn", "ws-2", "--no-warm", "--json"]).code,
+        0
+    );
 
     write_repo_file(&ws1, "f1.txt", "ws1-ok\n");
     assert_eq!(run_oz(&ws1, &["commit", "-m", "ws1 f1", "--json"]).code, 0);
@@ -1042,11 +1186,18 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
             "--json",
         ],
     );
-    assert_eq!(int_ok.code, 0, "clean integrate failed: stdout={} stderr={}", int_ok.stdout, int_ok.stderr);
+    assert_eq!(
+        int_ok.code, 0,
+        "clean integrate failed: stdout={} stderr={}",
+        int_ok.stdout, int_ok.stderr
+    );
     let ij = int_ok.json.expect("integrate json");
     assert_eq!(ij["schema"], OZ_SCHEMA_V1);
     assert_eq!(ij["ok"], true);
-    assert_eq!(ij["data"]["merged_sources"], serde_json::json!(["ws-1", "ws-2"]));
+    assert_eq!(
+        ij["data"]["merged_sources"],
+        serde_json::json!(["ws-1", "ws-2"])
+    );
     assert_eq!(ij["data"]["main_worktree_synced"], true);
     assert_eq!(fs::read_to_string(repo.join("f1.txt")).unwrap(), "ws1-ok\n");
     assert_eq!(fs::read_to_string(repo.join("f2.txt")).unwrap(), "ws2-ok\n");
@@ -1054,12 +1205,21 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     assert_eq!(sys_git(&repo, &["status", "--porcelain"]), "");
 
     let undo_int = run_oz(&repo, &["undo", "--json"]);
-    assert_eq!(undo_int.code, 0, "undo integrate failed: {}", undo_int.stderr);
+    assert_eq!(
+        undo_int.code, 0,
+        "undo integrate failed: {}",
+        undo_int.stderr
+    );
     let uij = undo_int.json.expect("undo integrate json");
     assert_eq!(uij["ok"], true);
-    let undo_ms = uij["data"]["engine_elapsed_ms"].as_f64().expect("engine_elapsed_ms");
+    let undo_ms = uij["data"]["engine_elapsed_ms"]
+        .as_f64()
+        .expect("engine_elapsed_ms");
     let budget_ms = sub10ms_budget_ms();
-    assert!(undo_ms < budget_ms, "integrate undo took {undo_ms:.2}ms (>= {budget_ms}ms)");
+    assert!(
+        undo_ms < budget_ms,
+        "integrate undo took {undo_ms:.2}ms (>= {budget_ms}ms)"
+    );
     assert_eq!(sys_git(&repo, &["rev-parse", "main"]), main_oid_0);
     assert!(!repo.join("f1.txt").exists());
     assert!(!repo.join("f2.txt").exists());
@@ -1067,9 +1227,21 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     // 2. Failing --verify leaves `main` 100% untouched (exit 1).
     let int_fail = run_oz(
         &repo,
-        &["integrate", "ws-1", "--into", "main", "--verify", "exit 1", "--json"],
+        &[
+            "integrate",
+            "ws-1",
+            "--into",
+            "main",
+            "--verify",
+            "exit 1",
+            "--json",
+        ],
     );
-    assert_eq!(int_fail.code, 1, "expected exit 1 on verify fail: {}", int_fail.stdout);
+    assert_eq!(
+        int_fail.code, 1,
+        "expected exit 1 on verify fail: {}",
+        int_fail.stdout
+    );
     let ifj = int_fail.json.expect("verify fail json");
     assert_eq!(ifj["ok"], false);
     assert_eq!(ifj["error"]["code"], "check_failed");
@@ -1083,19 +1255,38 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     let ws_c2 = sandbox.ws_path("ws-c2");
     sandbox.register_mount(ws_c1.clone());
     sandbox.register_mount(ws_c2.clone());
-    assert_eq!(run_oz(&repo, &["ws", "spawn", "ws-c1", "--no-warm", "--json"]).code, 0);
-    assert_eq!(run_oz(&repo, &["ws", "spawn", "ws-c2", "--no-warm", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&repo, &["ws", "spawn", "ws-c1", "--no-warm", "--json"]).code,
+        0
+    );
+    assert_eq!(
+        run_oz(&repo, &["ws", "spawn", "ws-c2", "--no-warm", "--json"]).code,
+        0
+    );
 
     write_repo_file(&ws_c1, "shared.txt", "ours-from-c1\n");
-    assert_eq!(run_oz(&ws_c1, &["commit", "-m", "c1 edit", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&ws_c1, &["commit", "-m", "c1 edit", "--json"]).code,
+        0
+    );
     let c1_branch_oid = sys_git(&repo, &["rev-parse", "refs/heads/ws-c1"]);
 
     write_repo_file(&ws_c2, "shared.txt", "theirs-from-c2\n");
-    assert_eq!(run_oz(&ws_c2, &["commit", "-m", "c2 edit", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&ws_c2, &["commit", "-m", "c2 edit", "--json"]).code,
+        0
+    );
     let c2_branch_oid = sys_git(&repo, &["rev-parse", "refs/heads/ws-c2"]);
 
-    let conflict_out = run_oz(&repo, &["integrate", "ws-c1", "ws-c2", "--into", "main", "--json"]);
-    assert_eq!(conflict_out.code, 1, "expected conflict exit 1: {}", conflict_out.stdout);
+    let conflict_out = run_oz(
+        &repo,
+        &["integrate", "ws-c1", "ws-c2", "--into", "main", "--json"],
+    );
+    assert_eq!(
+        conflict_out.code, 1,
+        "expected conflict exit 1: {}",
+        conflict_out.stdout
+    );
     let cj = conflict_out.json.expect("conflict json");
     assert_eq!(cj["ok"], false);
     assert_eq!(cj["error"]["code"], "conflict");
@@ -1108,17 +1299,38 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     assert_eq!(c1["theirs"], "theirs-from-c2\n");
 
     let sandbox_integrate = sandbox.ws_path("_integrate");
-    assert!(sandbox_integrate.is_dir(), "_integrate sandbox must be materialized");
+    assert!(
+        sandbox_integrate.is_dir(),
+        "_integrate sandbox must be materialized"
+    );
     let sandbox_shared = fs::read_to_string(sandbox_integrate.join("shared.txt")).unwrap();
-    assert!(sandbox_shared.contains("<<<<<<<"), "expected conflict markers in _integrate/shared.txt");
+    assert!(
+        sandbox_shared.contains("<<<<<<<"),
+        "expected conflict markers in _integrate/shared.txt"
+    );
 
     // `main` and agent worktrees remain 100% untouched.
     assert_eq!(sys_git(&repo, &["rev-parse", "main"]), main_oid_0);
-    assert_eq!(fs::read_to_string(repo.join("shared.txt")).unwrap(), "base-line\n");
-    assert_eq!(sys_git(&repo, &["rev-parse", "refs/heads/ws-c1"]), c1_branch_oid);
-    assert_eq!(sys_git(&repo, &["rev-parse", "refs/heads/ws-c2"]), c2_branch_oid);
-    assert_eq!(fs::read_to_string(ws_c1.join("shared.txt")).unwrap(), "ours-from-c1\n");
-    assert_eq!(fs::read_to_string(ws_c2.join("shared.txt")).unwrap(), "theirs-from-c2\n");
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).unwrap(),
+        "base-line\n"
+    );
+    assert_eq!(
+        sys_git(&repo, &["rev-parse", "refs/heads/ws-c1"]),
+        c1_branch_oid
+    );
+    assert_eq!(
+        sys_git(&repo, &["rev-parse", "refs/heads/ws-c2"]),
+        c2_branch_oid
+    );
+    assert_eq!(
+        fs::read_to_string(ws_c1.join("shared.txt")).unwrap(),
+        "ours-from-c1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(ws_c2.join("shared.txt")).unwrap(),
+        "theirs-from-c2\n"
+    );
 
     let resolved = run_oz(&repo, &["resolve", "c1", "--take", "ours", "--json"]);
     assert_eq!(resolved.code, 0, "resolve c1 failed: {}", resolved.stderr);
@@ -1134,19 +1346,20 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     };
     let continued = run_oz(
         &repo,
-        &[
-            "integrate",
-            "--continue",
-            "--verify",
-            verify_ours,
-            "--json",
-        ],
+        &["integrate", "--continue", "--verify", verify_ours, "--json"],
     );
-    assert_eq!(continued.code, 0, "integrate --continue failed: stdout={} stderr={}", continued.stdout, continued.stderr);
+    assert_eq!(
+        continued.code, 0,
+        "integrate --continue failed: stdout={} stderr={}",
+        continued.stdout, continued.stderr
+    );
     let cont_j = continued.json.expect("continue json");
     assert_eq!(cont_j["ok"], true);
     assert_ne!(cont_j["data"]["commit_oid"], main_oid_0);
-    assert_eq!(fs::read_to_string(repo.join("shared.txt")).unwrap(), "ours-from-c1\n");
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).unwrap(),
+        "ours-from-c1\n"
+    );
     assert!(!sandbox_integrate.exists());
 
     // Also verify `oz integrate --abort --json`.
@@ -1155,19 +1368,33 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     let ws_a2 = sandbox.ws_path("ws-a2");
     sandbox.register_mount(ws_a1.clone());
     sandbox.register_mount(ws_a2.clone());
-    assert_eq!(run_oz(&repo, &["ws", "spawn", "ws-a1", "--no-warm", "--json"]).code, 0);
-    assert_eq!(run_oz(&repo, &["ws", "spawn", "ws-a2", "--no-warm", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&repo, &["ws", "spawn", "ws-a1", "--no-warm", "--json"]).code,
+        0
+    );
+    assert_eq!(
+        run_oz(&repo, &["ws", "spawn", "ws-a2", "--no-warm", "--json"]).code,
+        0
+    );
     write_repo_file(&ws_a1, "app.txt", "abort-a1\n");
     assert_eq!(run_oz(&ws_a1, &["commit", "-m", "a1", "--json"]).code, 0);
     write_repo_file(&ws_a2, "app.txt", "abort-a2\n");
     assert_eq!(run_oz(&ws_a2, &["commit", "-m", "a2", "--json"]).code, 0);
     assert_eq!(
-        run_oz(&repo, &["integrate", "ws-a1", "ws-a2", "--into", "main", "--json"]).code,
+        run_oz(
+            &repo,
+            &["integrate", "ws-a1", "ws-a2", "--into", "main", "--json"]
+        )
+        .code,
         1
     );
     assert!(sandbox_integrate.is_dir());
     let aborted = run_oz(&repo, &["integrate", "--abort", "--json"]);
-    assert_eq!(aborted.code, 0, "integrate --abort failed: {}", aborted.stderr);
+    assert_eq!(
+        aborted.code, 0,
+        "integrate --abort failed: {}",
+        aborted.stderr
+    );
     assert!(!sandbox_integrate.exists());
     assert_eq!(sys_git(&repo, &["rev-parse", "main"]), abort_pre_main);
 
@@ -1179,7 +1406,17 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     assert_eq!(
         run_oz(
             &repo,
-            &["ws", "spawn", "stack-1", "--branch", "stack-1", "--from", "main", "--no-warm", "--json"],
+            &[
+                "ws",
+                "spawn",
+                "stack-1",
+                "--branch",
+                "stack-1",
+                "--from",
+                "main",
+                "--no-warm",
+                "--json"
+            ],
         )
         .code,
         0
@@ -1195,7 +1432,17 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     assert_eq!(
         run_oz(
             &repo,
-            &["ws", "spawn", "stack-2", "--branch", "stack-2", "--from", "stack-1", "--no-warm", "--json"],
+            &[
+                "ws",
+                "spawn",
+                "stack-2",
+                "--branch",
+                "stack-2",
+                "--from",
+                "stack-1",
+                "--no-warm",
+                "--json"
+            ],
         )
         .code,
         0
@@ -1230,9 +1477,15 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
 
     let rebased = run_oz(
         &repo,
-        &["stack", "rebase", "stack-1", "stack-2", "--onto", "main", "--json"],
+        &[
+            "stack", "rebase", "stack-1", "stack-2", "--onto", "main", "--json",
+        ],
     );
-    assert_eq!(rebased.code, 0, "stack rebase failed: stdout={} stderr={}", rebased.stdout, rebased.stderr);
+    assert_eq!(
+        rebased.code, 0,
+        "stack rebase failed: stdout={} stderr={}",
+        rebased.stdout, rebased.stderr
+    );
     let rbj = rebased.json.expect("stack rebase json");
     assert_eq!(rbj["ok"], true);
 
@@ -1243,19 +1496,38 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
         .map(|c| c["change_id"].as_str().expect("cid").to_string())
         .collect();
     assert_eq!(rebased_cids, vec![cid1.clone(), cid2.clone()]);
-    assert!(sys_git(&repo, &["log", "-1", "--pretty=%B", "stack-1"]).contains(&format!("Change-Id: {cid1}")));
-    assert!(sys_git(&repo, &["log", "-1", "--pretty=%B", "stack-2"]).contains(&format!("Change-Id: {cid2}")));
+    assert!(
+        sys_git(&repo, &["log", "-1", "--pretty=%B", "stack-1"])
+            .contains(&format!("Change-Id: {cid1}"))
+    );
+    assert!(
+        sys_git(&repo, &["log", "-1", "--pretty=%B", "stack-2"])
+            .contains(&format!("Change-Id: {cid2}"))
+    );
 
     let new_s1_oid = sys_git(&repo, &["rev-parse", "stack-1"]);
-    assert_eq!(sys_git(&repo, &["merge-base", "main", "stack-1"]), new_main_oid);
-    assert_eq!(sys_git(&repo, &["merge-base", "stack-1", "stack-2"]), new_s1_oid);
+    assert_eq!(
+        sys_git(&repo, &["merge-base", "main", "stack-1"]),
+        new_main_oid
+    );
+    assert_eq!(
+        sys_git(&repo, &["merge-base", "stack-1", "stack-2"]),
+        new_s1_oid
+    );
 
     let undo_rb = run_oz(&repo, &["undo", "--json"]);
-    assert_eq!(undo_rb.code, 0, "undo stack rebase failed: {}", undo_rb.stderr);
+    assert_eq!(
+        undo_rb.code, 0,
+        "undo stack rebase failed: {}",
+        undo_rb.stderr
+    );
     let urj = undo_rb.json.expect("undo stack rebase json");
     let undo_rb_ms = urj["data"]["engine_elapsed_ms"].as_f64().expect("ms");
     let budget_ms = sub10ms_budget_ms();
-    assert!(undo_rb_ms < budget_ms, "stack rebase undo took {undo_rb_ms:.2}ms (>= {budget_ms}ms)");
+    assert!(
+        undo_rb_ms < budget_ms,
+        "stack rebase undo took {undo_rb_ms:.2}ms (>= {budget_ms}ms)"
+    );
     assert_eq!(sys_git(&repo, &["rev-parse", "stack-1"]), orig_s1);
     assert_eq!(sys_git(&repo, &["rev-parse", "stack-2"]), orig_s2);
 }
@@ -1272,7 +1544,10 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
     write_repo_file(&seed, "a.rs", "pub fn a() -> i32 { 1 }\n");
     write_repo_file(&seed, "b.rs", "pub fn b() -> i32 { 1 }\n");
     init_git_repo(&seed);
-    sys_git(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    sys_git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
     sys_git(&seed, &["push", "-u", "origin", "main"]);
 
     // 1. `oz git clone` auto-initializes `.git/ozone/`.
@@ -1305,16 +1580,35 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
 
     let porcelain = run_oz(&cloned, &["git", "status", "--porcelain"]);
     assert_eq!(porcelain.code, 0);
-    assert!(porcelain.stdout.contains("M  a.rs"), "got:\n{}", porcelain.stdout);
-    assert!(porcelain.stdout.contains(" M b.rs"), "got:\n{}", porcelain.stdout);
-    assert!(porcelain.stdout.contains("?? new_a.rs"), "got:\n{}", porcelain.stdout);
+    assert!(
+        porcelain.stdout.contains("M  a.rs"),
+        "got:\n{}",
+        porcelain.stdout
+    );
+    assert!(
+        porcelain.stdout.contains(" M b.rs"),
+        "got:\n{}",
+        porcelain.stdout
+    );
+    assert!(
+        porcelain.stdout.contains("?? new_a.rs"),
+        "got:\n{}",
+        porcelain.stdout
+    );
 
     let diff_cached = run_oz(&cloned, &["git", "diff", "--cached", "--name-only"]);
     assert_eq!(diff_cached.code, 0);
     assert_eq!(diff_cached.stdout.lines().collect::<Vec<_>>(), vec!["a.rs"]);
 
-    let commit_pinned = run_oz(&cloned, &["git", "commit", "-m", "feat: commit pinned a", "--json"]);
-    assert_eq!(commit_pinned.code, 0, "git commit failed: {}", commit_pinned.stderr);
+    let commit_pinned = run_oz(
+        &cloned,
+        &["git", "commit", "-m", "feat: commit pinned a", "--json"],
+    );
+    assert_eq!(
+        commit_pinned.code, 0,
+        "git commit failed: {}",
+        commit_pinned.stderr
+    );
     let cpj = commit_pinned.json.expect("commit json");
     assert_eq!(cpj["data"]["committed_paths"], serde_json::json!(["a.rs"]));
     assert_eq!(cpj["data"]["remaining_dirty_count"], 2);
@@ -1322,8 +1616,15 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
     // 3. `oz git switch -c` + `oz git commit`.
     let sw = run_oz(&cloned, &["git", "switch", "-c", "feat/shim", "--json"]);
     assert_eq!(sw.code, 0, "git switch -c failed: {}", sw.stderr);
-    let commit_feat = run_oz(&cloned, &["git", "commit", "-m", "feat: shim branch", "--json"]);
-    assert_eq!(commit_feat.code, 0, "git commit on feat/shim failed: {}", commit_feat.stderr);
+    let commit_feat = run_oz(
+        &cloned,
+        &["git", "commit", "-m", "feat: shim branch", "--json"],
+    );
+    assert_eq!(
+        commit_feat.code, 0,
+        "git commit on feat/shim failed: {}",
+        commit_feat.stderr
+    );
     let feat_cid = commit_feat.json.expect("feat commit json")["data"]["change_id"]
         .as_str()
         .expect("feat cid")
@@ -1334,47 +1635,103 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
     sandbox.register_mount(wt_shim_path.clone());
     let wt_add = run_oz(
         &cloned,
-        &["git", "worktree", "add", "-b", "feat/wt-shim", "wt-shim", "main", "--json"],
+        &[
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "feat/wt-shim",
+            "wt-shim",
+            "main",
+            "--json",
+        ],
     );
     assert_eq!(wt_add.code, 0, "git worktree add failed: {}", wt_add.stderr);
     let wt_list = run_oz(&cloned, &["git", "worktree", "list", "--json"]);
     assert_eq!(wt_list.code, 0);
-    assert_eq!(wt_list.json.expect("wt list")["data"].as_array().unwrap().len(), 2);
-    let wt_rm = run_oz(&cloned, &["git", "worktree", "remove", "-f", "wt-shim", "--json"]);
-    assert_eq!(wt_rm.code, 0, "git worktree remove failed: {}", wt_rm.stderr);
+    assert_eq!(
+        wt_list.json.expect("wt list")["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let wt_rm = run_oz(
+        &cloned,
+        &["git", "worktree", "remove", "-f", "wt-shim", "--json"],
+    );
+    assert_eq!(
+        wt_rm.code, 0,
+        "git worktree remove failed: {}",
+        wt_rm.stderr
+    );
 
     // 5. `oz git merge` (via `oz_integrate::integrate`) + `oz undo`.
-    assert_eq!(run_oz(&cloned, &["git", "switch", "main", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&cloned, &["git", "switch", "main", "--json"]).code,
+        0
+    );
     write_repo_file(&cloned, "main_only.txt", "main line\n");
     assert_eq!(
-        run_oz(&cloned, &["git", "commit", "-m", "feat: main advance", "--json"]).code,
+        run_oz(
+            &cloned,
+            &["git", "commit", "-m", "feat: main advance", "--json"]
+        )
+        .code,
         0
     );
     let main_before_merge = sys_git(&cloned, &["rev-parse", "HEAD"]);
 
     let merge_out = run_oz(
         &cloned,
-        &["git", "merge", "--no-ff", "feat/shim", "-m", "merge feat/shim", "--json"],
+        &[
+            "git",
+            "merge",
+            "--no-ff",
+            "feat/shim",
+            "-m",
+            "merge feat/shim",
+            "--json",
+        ],
     );
-    assert_eq!(merge_out.code, 0, "git merge failed: stdout={} stderr={}", merge_out.stdout, merge_out.stderr);
+    assert_eq!(
+        merge_out.code, 0,
+        "git merge failed: stdout={} stderr={}",
+        merge_out.stdout, merge_out.stderr
+    );
     let mj = merge_out.json.expect("merge json");
     assert_eq!(mj["ok"], true);
-    assert_eq!(mj["data"]["merged_sources"], serde_json::json!(["feat/shim"]));
+    assert_eq!(
+        mj["data"]["merged_sources"],
+        serde_json::json!(["feat/shim"])
+    );
     assert!(cloned.join("new_a.rs").is_file());
 
     let budget_ms = sub10ms_budget_ms();
     let undo_merge = run_oz(&cloned, &["undo", "--json"]);
     assert_eq!(undo_merge.code, 0);
-    assert!(undo_merge.json.expect("undo merge")["data"]["engine_elapsed_ms"].as_f64().unwrap() < budget_ms);
+    assert!(
+        undo_merge.json.expect("undo merge")["data"]["engine_elapsed_ms"]
+            .as_f64()
+            .unwrap()
+            < budget_ms
+    );
     assert_eq!(sys_git(&cloned, &["rev-parse", "HEAD"]), main_before_merge);
     assert!(!cloned.join("new_a.rs").exists());
 
     // 6. `oz git rebase` (via `oz_integrate::stack_rebase`) preserving `Change-Id:` + `oz undo`.
-    assert_eq!(run_oz(&cloned, &["git", "switch", "feat/shim", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&cloned, &["git", "switch", "feat/shim", "--json"]).code,
+        0
+    );
     let feat_before_rebase = sys_git(&cloned, &["rev-parse", "HEAD"]);
 
     let rebase_out = run_oz(&cloned, &["git", "rebase", "main", "--json"]);
-    assert_eq!(rebase_out.code, 0, "git rebase failed: stdout={} stderr={}", rebase_out.stdout, rebase_out.stderr);
+    assert_eq!(
+        rebase_out.code, 0,
+        "git rebase failed: stdout={} stderr={}",
+        rebase_out.stdout, rebase_out.stderr
+    );
     let rj = rebase_out.json.expect("rebase json");
     assert_eq!(rj["ok"], true);
     assert_eq!(rj["data"]["onto_branch"], "main");
@@ -1386,16 +1743,28 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
 
     let undo_rebase = run_oz(&cloned, &["undo", "--json"]);
     assert_eq!(undo_rebase.code, 0);
-    assert!(undo_rebase.json.expect("undo rebase")["data"]["engine_elapsed_ms"].as_f64().unwrap() < budget_ms);
+    assert!(
+        undo_rebase.json.expect("undo rebase")["data"]["engine_elapsed_ms"]
+            .as_f64()
+            .unwrap()
+            < budget_ms
+    );
     assert_eq!(sys_git(&cloned, &["rev-parse", "HEAD"]), feat_before_rebase);
     assert!(!cloned.join("main_only.txt").exists());
 
     // 7. Destructive `oz git reset --hard HEAD~1` completely reversed by `oz undo --json` in < 10 ms.
-    assert_eq!(run_oz(&cloned, &["git", "switch", "main", "--json"]).code, 0);
+    assert_eq!(
+        run_oz(&cloned, &["git", "switch", "main", "--json"]).code,
+        0
+    );
     write_repo_file(&cloned, "c2_file.txt", "born in c2\n");
     write_repo_file(&cloned, "a.rs", "pub fn a() -> i32 { 200 }\n");
     assert_eq!(
-        run_oz(&cloned, &["git", "commit", "-m", "feat: commit c2", "--json"]).code,
+        run_oz(
+            &cloned,
+            &["git", "commit", "-m", "feat: commit c2", "--json"]
+        )
+        .code,
         0
     );
     let c2_oid = sys_git(&cloned, &["rev-parse", "HEAD"]);
@@ -1406,7 +1775,11 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
     write_repo_file(&cloned, "scratch/note.md", "precious nested\n");
 
     let reset_hard = run_oz(&cloned, &["git", "reset", "--hard", "HEAD~1"]);
-    assert_eq!(reset_hard.code, 0, "git reset --hard failed: {}", reset_hard.stderr);
+    assert_eq!(
+        reset_hard.code, 0,
+        "git reset --hard failed: {}",
+        reset_hard.stderr
+    );
     assert_ne!(sys_git(&cloned, &["rev-parse", "HEAD"]), c2_oid);
     assert!(!cloned.join("c2_file.txt").exists());
     assert_eq!(
@@ -1415,7 +1788,11 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
     );
 
     let undo_reset = run_oz(&cloned, &["undo", "--json"]);
-    assert_eq!(undo_reset.code, 0, "undo reset --hard failed: {}", undo_reset.stderr);
+    assert_eq!(
+        undo_reset.code, 0,
+        "undo reset --hard failed: {}",
+        undo_reset.stderr
+    );
     let urj = undo_reset.json.expect("undo reset json");
     assert_eq!(urj["ok"], true);
     let reset_undo_ms = urj["data"]["engine_elapsed_ms"].as_f64().expect("ms");
@@ -1424,8 +1801,14 @@ fn gate_m2_git_shim_and_reset_hard_undo() {
         "reset --hard undo took {reset_undo_ms:.2}ms (>= {budget_ms}ms)"
     );
     assert_eq!(sys_git(&cloned, &["rev-parse", "HEAD"]), c2_oid);
-    assert_eq!(fs::read_to_string(cloned.join("c2_file.txt")).unwrap(), "born in c2\n");
-    assert_eq!(fs::read_to_string(cloned.join("a.rs")).unwrap(), "precious dirty edit\n");
+    assert_eq!(
+        fs::read_to_string(cloned.join("c2_file.txt")).unwrap(),
+        "born in c2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(cloned.join("a.rs")).unwrap(),
+        "precious dirty edit\n"
+    );
     assert_eq!(
         fs::read_to_string(cloned.join("precious_untracked.txt")).unwrap(),
         "precious untracked\n"

@@ -7,7 +7,6 @@
 
 use crate::pager::emit_paged_output;
 use crate::recovery::discover_and_recover_repo;
-use chrono::{DateTime, Utc};
 use clap::{Args, Command, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use oz_agent::{
@@ -18,7 +17,7 @@ use oz_core::{
     BranchCreateOutcome, BranchDeleteOutcome, BranchListOptions, BranchListReport,
     BranchRenameOutcome, CherryPickOptions, CherryPickOutcome, Envelope, ExitCode, GrepOptions,
     GrepReport, InteractionMode, LogCommitEntry, LogOptions, OZ_STASH_REF, OzError, OzoneRepo,
-    Result, RestoreOptions, RestoreOutcome, RevParseOptions, RevParseReport, RevertOptions,
+    RestoreOptions, RestoreOutcome, Result, RevParseOptions, RevParseReport, RevertOptions,
     RevertOutcome, ShowBlobOptions, ShowBlobReport, ShowOptions, ShowReport, StashDropOutcome,
     StashListReport, StashPopOutcome, StashPushOutcome, SwitchOptions, SwitchOutcome,
     TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome, apply_stash_pop,
@@ -311,7 +310,9 @@ fn format_log_human(
 
     let mut out = String::new();
     let (c_yellow, c_green, c_cyan, c_magenta, c_dim, c_reset) = if color {
-        ("\x1b[33m", "\x1b[32m", "\x1b[36m", "\x1b[35m", "\x1b[2m", "\x1b[0m")
+        (
+            "\x1b[33m", "\x1b[32m", "\x1b[36m", "\x1b[35m", "\x1b[2m", "\x1b[0m",
+        )
     } else {
         ("", "", "", "", "", "")
     };
@@ -649,12 +650,7 @@ fn format_show_human(data: &ShowCliData, stat_only: bool, color: bool) -> String
     let r = &data.report;
     let (c_yellow, c_cyan, c_magenta, c_green, c_red, c_reset) = if color {
         (
-            "\x1b[33m",
-            "\x1b[36m",
-            "\x1b[35m",
-            "\x1b[32m",
-            "\x1b[31m",
-            "\x1b[0m",
+            "\x1b[33m", "\x1b[36m", "\x1b[35m", "\x1b[32m", "\x1b[31m", "\x1b[0m",
         )
     } else {
         ("", "", "", "", "", "")
@@ -1213,15 +1209,6 @@ pub struct TagArgs {
     pub signing_key: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum TagCliData {
-    List(TagListReport),
-    Created(TagInfo),
-    Deleted(TagDeleteOutcome),
-    Verified(TagVerifyOutcome),
-}
-
 pub(crate) fn handle_tag(
     args: &TagArgs,
     directory: Option<&Path>,
@@ -1701,7 +1688,10 @@ pub(crate) fn handle_restore(
         let d = &env.data;
         let short_src = &d.source_oid[..d.source_oid.len().min(7)];
         if !d.restored_paths.is_empty() {
-            println!("Restored {} file(s) from {short_src}", d.restored_paths.len());
+            println!(
+                "Restored {} file(s) from {short_src}",
+                d.restored_paths.len()
+            );
         }
         if !d.removed_paths.is_empty() {
             println!("Removed {} untracked path(s)", d.removed_paths.len());
@@ -1719,10 +1709,19 @@ pub struct SwitchArgs {
     /// Target branch, tag, or commit revision to switch to.
     pub target: Option<String>,
     /// Create a new branch starting at `<TARGET>` (or HEAD) and switch to it.
-    #[arg(short = 'c', long = "create", value_name = "BRANCH", conflicts_with = "force_create")]
+    #[arg(
+        short = 'c',
+        long = "create",
+        value_name = "BRANCH",
+        conflicts_with = "force_create"
+    )]
     pub create: Option<String>,
     /// Create or reset `<BRANCH>` starting at `<TARGET>` (or HEAD) and switch to it.
-    #[arg(long = "force-create", value_name = "BRANCH", conflicts_with = "create")]
+    #[arg(
+        long = "force-create",
+        value_name = "BRANCH",
+        conflicts_with = "create"
+    )]
     pub force_create: Option<String>,
     /// Detach `HEAD` at the resolved commit revision.
     #[arg(short = 'd', long = "detach")]
@@ -1894,6 +1893,3 @@ pub(crate) fn handle_grep(
         Ok(())
     })
 }
-
-#[allow(dead_code)]
-fn _unused_chrono_keep(_: DateTime<Utc>) {}

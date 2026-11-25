@@ -174,16 +174,12 @@ fn summarize_category(
     let (status, summary) = if unresolved_errors > 0 {
         (
             FsckCheckStatus::Fail,
-            format!(
-                "{unresolved_errors} unresolved error(s) ({repaired_here} repaired)"
-            ),
+            format!("{unresolved_errors} unresolved error(s) ({repaired_here} repaired)"),
         )
     } else if unresolved_warnings > 0 {
         (
             FsckCheckStatus::Warn,
-            format!(
-                "{unresolved_warnings} warning(s) ({repaired_here} repaired)"
-            ),
+            format!("{unresolved_warnings} warning(s) ({repaired_here} repaired)"),
         )
     } else {
         (
@@ -364,7 +360,10 @@ fn check_and_repair_git(
                 let mut action = None;
                 if repair && fs::remove_dir_all(&entry_dir).is_ok() {
                     repaired = true;
-                    let msg = format!("removed orphaned git worktree metadata {}", entry_dir.display());
+                    let msg = format!(
+                        "removed orphaned git worktree metadata {}",
+                        entry_dir.display()
+                    );
                     repaired_actions.push(msg.clone());
                     action = Some(msg);
                 }
@@ -426,7 +425,10 @@ fn check_and_repair_interrupted_txns(
                 let mut action = None;
                 if repair && fs::remove_file(&path).is_ok() {
                     repaired = true;
-                    let msg = format!("removed interrupted transaction temp file {}", path.display());
+                    let msg = format!(
+                        "removed interrupted transaction temp file {}",
+                        path.display()
+                    );
                     repaired_actions.push(msg.clone());
                     action = Some(msg);
                 }
@@ -463,7 +465,10 @@ fn check_and_repair_interrupted_txns(
                 let mut action = None;
                 if repair && fs::remove_dir_all(&path).is_ok() {
                     repaired = true;
-                    let msg = format!("removed interrupted baseline staging dir {}", path.display());
+                    let msg = format!(
+                        "removed interrupted baseline staging dir {}",
+                        path.display()
+                    );
                     repaired_actions.push(msg.clone());
                     action = Some(msg);
                 }
@@ -496,7 +501,10 @@ fn check_and_repair_interrupted_txns(
                 if repair && fs::remove_file(&session_path).is_ok() {
                     let _ = fs::remove_dir(&integrate_dir);
                     repaired = true;
-                    let msg = format!("removed corrupt integrate session {}", session_path.display());
+                    let msg = format!(
+                        "removed corrupt integrate session {}",
+                        session_path.display()
+                    );
                     repaired_actions.push(msg.clone());
                     action = Some(msg);
                 }
@@ -504,7 +512,10 @@ fn check_and_repair_interrupted_txns(
                     code: "corrupt_integrate_session".to_string(),
                     category: FsckCategory::Transaction,
                     severity: FsckSeverity::Error,
-                    message: format!("corrupt integrate session file '{}'", session_path.display()),
+                    message: format!(
+                        "corrupt integrate session file '{}'",
+                        session_path.display()
+                    ),
                     path: Some(session_path.display().to_string()),
                     op_id: None,
                     repairable: true,
@@ -546,7 +557,9 @@ fn check_and_repair_interrupted_txns(
                 }
             }
         }
-    } else if let Ok(sandbox_dir) = repo.config.render_workspace_path(&repo.repo_root, "_integrate")
+    } else if let Ok(sandbox_dir) = repo
+        .config
+        .render_workspace_path(&repo.repo_root, "_integrate")
         && sandbox_dir.is_dir()
     {
         let has_files = dir_has_user_files(&sandbox_dir);
@@ -554,7 +567,10 @@ fn check_and_repair_interrupted_txns(
         let mut action = None;
         if repair && !has_files && fs::remove_dir_all(&sandbox_dir).is_ok() {
             repaired = true;
-            let msg = format!("removed empty orphaned _integrate sandbox {}", sandbox_dir.display());
+            let msg = format!(
+                "removed empty orphaned _integrate sandbox {}",
+                sandbox_dir.display()
+            );
             repaired_actions.push(msg.clone());
             action = Some(msg);
         }
@@ -585,8 +601,7 @@ fn check_and_repair_interrupted_txns(
 }
 
 fn is_interrupted_temp_filename(name: &str) -> bool {
-    name.starts_with(".tmp")
-        || (name.starts_with('.') && name.contains(".tmp."))
+    name.starts_with(".tmp") || (name.starts_with('.') && name.contains(".tmp."))
 }
 
 fn check_and_repair_oplog(
@@ -652,10 +667,7 @@ fn check_and_repair_oplog(
         let mut action = None;
         if repair {
             let quarantine_dir = oplog.join("quarantine");
-            let fname = cp
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
+            let fname = cp.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
             let file_len = fs::metadata(cp).map(|m| m.len()).unwrap_or(0);
             if file_len == 0 {
                 if fs::remove_file(cp).is_ok() {
@@ -739,7 +751,7 @@ fn check_and_repair_oplog(
             let mut action = None;
             if repair {
                 write_head_op_id(layout, newest.as_deref())?;
-                head_op_id = newest.clone();
+                head_op_id.clone_from(&newest);
                 repaired = true;
                 let msg = match &newest {
                     Some(id) => format!("repaired unreadable oplog/HEAD -> {id}"),
@@ -767,7 +779,7 @@ fn check_and_repair_oplog(
                 let mut action = None;
                 if repair {
                     write_head_op_id(layout, newest.as_deref())?;
-                    head_op_id = newest.clone();
+                    head_op_id.clone_from(&newest);
                     repaired = true;
                     let msg = match &newest {
                         Some(id) => format!("repaired broken oplog/HEAD '{raw_id}' -> {id}"),
@@ -997,7 +1009,7 @@ fn check_and_repair_oplog(
                 if let Some(newest_tip) = unlinked_tips.first()
                     && reachable_from_head(&valid_entries, newest_tip).contains(&current_head)
                 {
-                    current_head = newest_tip.clone();
+                    current_head.clone_from(newest_tip);
                     write_head_op_id(layout, Some(&current_head))?;
                     advanced_head_to = Some(current_head.clone());
                     reachable = reachable_from_head(&valid_entries, &current_head);
@@ -1049,7 +1061,9 @@ fn check_and_repair_oplog(
                     code: "unlinked_oplog_entry".to_string(),
                     category: FsckCategory::Oplog,
                     severity: FsckSeverity::Warning,
-                    message: format!("oplog entry '{uid}' is not reachable from oplog/HEAD '{hid}'"),
+                    message: format!(
+                        "oplog entry '{uid}' is not reachable from oplog/HEAD '{hid}'"
+                    ),
                     path: entry_path(layout, uid)
                         .ok()
                         .map(|p| p.display().to_string()),
@@ -1112,10 +1126,8 @@ fn find_cycle_edges(entries: &BTreeMap<String, OpLogEntry>) -> Vec<(String, Stri
         Gray,
         Black,
     }
-    let mut color: HashMap<&str, Color> = entries
-        .keys()
-        .map(|k| (k.as_str(), Color::White))
-        .collect();
+    let mut color: HashMap<&str, Color> =
+        entries.keys().map(|k| (k.as_str(), Color::White)).collect();
     let mut edges = Vec::new();
 
     for start in entries.keys() {
@@ -1222,7 +1234,8 @@ fn check_and_repair_snapshots(
                             .is_ok()
                     {
                         repaired = true;
-                        let msg = format!("restored missing checkpoint ref {ref_name} -> {dirty_hex}");
+                        let msg =
+                            format!("restored missing checkpoint ref {ref_name} -> {dirty_hex}");
                         repaired_actions.push(msg.clone());
                         action = Some(msg);
                     }
@@ -1255,13 +1268,10 @@ fn check_and_repair_snapshots(
                 continue;
             };
             let full_name = reference.name().as_bstr().to_str_lossy().into_owned();
-            let obj_ok = reference
-                .peel_to_id()
-                .ok()
-                .is_some_and(|id| {
-                    let oid = id.detach();
-                    oid.is_empty_tree() || gix_repo.find_object(oid).is_ok()
-                });
+            let obj_ok = reference.peel_to_id().ok().is_some_and(|id| {
+                let oid = id.detach();
+                oid.is_empty_tree() || gix_repo.find_object(oid).is_ok()
+            });
 
             if !obj_ok {
                 let mut repaired = false;
@@ -1356,7 +1366,9 @@ fn verify_tree_exists(
             code: "missing_snapshot_object".to_string(),
             category: FsckCategory::Snapshot,
             severity: FsckSeverity::Error,
-            message: format!("oplog entry '{op_id}' {field} tree '{hex}' missing from .git/objects/"),
+            message: format!(
+                "oplog entry '{op_id}' {field} tree '{hex}' missing from .git/objects/"
+            ),
             path: None,
             op_id: Some(op_id.to_string()),
             repairable: false,
@@ -1381,7 +1393,9 @@ fn verify_commit_exists(
             code: "missing_snapshot_object".to_string(),
             category: FsckCategory::Snapshot,
             severity: FsckSeverity::Error,
-            message: format!("oplog entry '{op_id}' {field} commit '{hex}' missing from .git/objects/"),
+            message: format!(
+                "oplog entry '{op_id}' {field} commit '{hex}' missing from .git/objects/"
+            ),
             path: None,
             op_id: Some(op_id.to_string()),
             repairable: false,
@@ -1572,7 +1586,8 @@ fn check_and_repair_mounts(
                     let mut action = None;
                     if repair && !has_files && fs::remove_dir_all(&meta_dir).is_ok() {
                         repaired = true;
-                        let msg = format!("removed empty orphaned mount dir {}", meta_dir.display());
+                        let msg =
+                            format!("removed empty orphaned mount dir {}", meta_dir.display());
                         repaired_actions.push(msg.clone());
                         action = Some(msg);
                     }
@@ -1873,12 +1888,15 @@ fn check_and_repair_baselines(
             None
         };
 
-        if parsed_meta.is_none() || !root_dir.is_dir() {
+        let Some(meta) = parsed_meta.filter(|_| root_dir.is_dir()) else {
             let mut repaired = false;
             let mut action = None;
             if repair && fs::remove_dir_all(&path).is_ok() {
                 repaired = true;
-                let msg = format!("removed incomplete/corrupt baseline cache {}", path.display());
+                let msg = format!(
+                    "removed incomplete/corrupt baseline cache {}",
+                    path.display()
+                );
                 repaired_actions.push(msg.clone());
                 action = Some(msg);
             }
@@ -1897,11 +1915,10 @@ fn check_and_repair_baselines(
                 action,
             });
             continue;
-        }
+        };
 
-        let meta = parsed_meta.expect("checked above");
-        let referenced_by_ws = active_baseline_ids.contains(id)
-            || active_baseline_ids.contains(&meta.commit_oid);
+        let referenced_by_ws =
+            active_baseline_ids.contains(id) || active_baseline_ids.contains(&meta.commit_oid);
         let commit_exists = gix_repo_opt.is_none_or(|gr| {
             ObjectId::from_hex(meta.commit_oid.as_bytes())
                 .ok()
@@ -1955,22 +1972,18 @@ fn dir_has_user_files(dir: &Path) -> bool {
 }
 
 fn is_pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        Path::new(&format!("/proc/{pid}")).exists()
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if raw_pid <= 0 {
+            return false;
+        }
+        // SAFETY: `raw_pid` is verified strictly positive (> 0), and signal `0` probes process
+        // existence/permissions via `kill(2)` without delivering any signal to the target process.
+        let ret = unsafe { libc::kill(raw_pid, 0) };
+        ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
@@ -2044,5 +2057,18 @@ fn resolve_real_git() -> Option<PathBuf> {
         Some(fallback.to_path_buf())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_pid_alive;
+
+    #[test]
+    fn is_pid_alive_rejects_zero_and_overflow_and_detects_current_process() {
+        assert!(!is_pid_alive(0));
+        assert!(!is_pid_alive(u32::MAX));
+        #[cfg(unix)]
+        assert!(is_pid_alive(std::process::id()));
     }
 }

@@ -45,16 +45,15 @@ use oz_agent::{
     setup_agent_harnesses,
 };
 use oz_core::{
-    BackendKind, CommitOptions, MountRecord, OZ_SCHEMA_V1, OzError, OzoneRepo,
-    SSHSIG_ARMOR_HEADER, base64_encode, commit_changes, compute_status,
-    verify_commit_signature_with_allowed_signers,
+    BackendKind, CommitOptions, MountRecord, OZ_SCHEMA_V1, OzError, OzoneRepo, SSHSIG_ARMOR_HEADER,
+    base64_encode, commit_changes, compute_status, verify_commit_signature_with_allowed_signers,
 };
 use oz_cow::{SpawnWorkspaceOptions, SpawnedWorkspaceInfo, list_workspaces, spawn_workspace};
 use oz_github::{
     CiQueryOptions, CloneOptions, GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput,
-    GitHubJobStep, GitHubPrRef, GitHubPullRequest, GitHubWorkflowRun, HttpAuthScheme,
-    OZ_STACK_END, OZ_STACK_START, PrStackOptions, PushOptions, SyncOptions, clone_repo, pr_stack,
-    push_refs, query_ci_status, sync_repo,
+    GitHubJobStep, GitHubPrRef, GitHubPullRequest, GitHubWorkflowRun, HttpAuthScheme, OZ_STACK_END,
+    OZ_STACK_START, PrStackOptions, PushOptions, SyncOptions, clone_repo, pr_stack, push_refs,
+    query_ci_status, sync_repo,
 };
 use oz_oplog::{ActorInfo, ActorKind, MutationTransaction, checkpoint};
 use serde_json::{Value, json};
@@ -115,11 +114,9 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
 
         let oz = oz_bin();
-        if let Ok(resolved) = oz_vfsd::resolve_oz_vfsd_bin_with(
-            None,
-            Some(&oz),
-            std::env::var_os("PATH").as_deref(),
-        ) {
+        if let Ok(resolved) =
+            oz_vfsd::resolve_oz_vfsd_bin_with(None, Some(&oz), std::env::var_os("PATH").as_deref())
+        {
             return resolved;
         }
         if let Ok(resolved) = oz_vfsd::find_oz_vfsd_bin() {
@@ -141,7 +138,11 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
         let status = build.status().expect("cargo build --bin oz-vfsd");
         assert!(status.success(), "failed to build oz-vfsd helper binary");
-        assert!(sibling.is_file(), "expected oz-vfsd at {}", sibling.display());
+        assert!(
+            sibling.is_file(),
+            "expected oz-vfsd at {}",
+            sibling.display()
+        );
         sibling
     })
 }
@@ -208,6 +209,7 @@ impl Drop for GateSandbox {
             }
         }
         let mut mounts_to_clean = self.mount_points.clone();
+        let mut ws_to_unmount: Vec<(PathBuf, String)> = Vec::new();
         let mut pids_to_kill: Vec<u32> = Vec::new();
 
         for git_dir in &git_dirs {
@@ -218,6 +220,10 @@ impl Drop for GateSandbox {
                     if let Ok(raw) = fs::read_to_string(&mj)
                         && let Ok(rec) = serde_json::from_str::<MountRecord>(&raw)
                     {
+                        let pair = (git_dir.clone(), rec.workspace);
+                        if !ws_to_unmount.contains(&pair) {
+                            ws_to_unmount.push(pair);
+                        }
                         if !mounts_to_clean.contains(&rec.mount_point) {
                             mounts_to_clean.push(rec.mount_point);
                         }
@@ -247,6 +253,11 @@ impl Drop for GateSandbox {
             }
         }
 
+        for (git_dir, ws_name) in &ws_to_unmount {
+            if git_dir.is_dir() {
+                let _ = oz_vfsd::unmount_via_daemon(git_dir, ws_name, true);
+            }
+        }
         for git_dir in &git_dirs {
             if git_dir.is_dir() {
                 let _ = oz_vfsd::shutdown_daemon(git_dir);
@@ -286,8 +297,14 @@ fn kill_test_vfsd_pid(pid: u32, git_dir_marker: &str) {
     };
     let cmdline = String::from_utf8_lossy(&bytes);
     if cmdline.contains("oz-vfsd") && cmdline.contains(git_dir_marker) {
-        unsafe {
-            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        if let Ok(raw_pid) = libc::pid_t::try_from(pid)
+            && raw_pid > 0
+        {
+            // SAFETY: `raw_pid` is strictly positive and verified via `/proc/<pid>/cmdline` to be
+            // this test sandbox's `oz-vfsd` daemon before sending `SIGKILL`.
+            unsafe {
+                let _ = libc::kill(raw_pid, libc::SIGKILL);
+            }
         }
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let proc_dir = PathBuf::from(format!("/proc/{pid}"));
@@ -513,16 +530,15 @@ impl VcsAgentHarness {
 
     fn record_exchange(
         &mut self,
-        cmd_line: String,
+        cmd_line: &str,
         stdin_payload: &str,
         exit_code: i32,
         stdout: String,
         stderr: String,
     ) -> InvocationMetrics {
-        let utf8_bytes =
-            cmd_line.len() + stdin_payload.len() + stdout.len() + stderr.len();
+        let utf8_bytes = cmd_line.len() + stdin_payload.len() + stdout.len() + stderr.len();
         let approx_tokens = approx_llm_tokens(utf8_bytes);
-        let lexical_tokens = count_lexical_tokens(&cmd_line)
+        let lexical_tokens = count_lexical_tokens(cmd_line)
             + count_lexical_tokens(stdin_payload)
             + count_lexical_tokens(&stdout)
             + count_lexical_tokens(&stderr);
@@ -586,7 +602,7 @@ impl VcsAgentHarness {
                 self.label
             );
         }
-        self.record_exchange(rendered_cmd, stdin_str, code, stdout, stderr)
+        self.record_exchange(&rendered_cmd, stdin_str, code, stdout, stderr)
     }
 
     /// Executes Ozone (`oz`) subprocess in strict non-interactive agent mode (`OZ_AGENT=1`).
@@ -613,7 +629,7 @@ impl VcsAgentHarness {
                 self.label
             );
         }
-        self.record_exchange(rendered_cmd, "", code, stdout, stderr)
+        self.record_exchange(&rendered_cmd, "", code, stdout, stderr)
     }
 
     /// Executes `oz commit --amend` via `oz_core::commit_changes` + `MutationTransaction` (matching
@@ -640,8 +656,13 @@ impl VcsAgentHarness {
             client: Some("oz-cli".to_string()),
             workspace: repo.workspace.clone(),
         };
-        let tx = MutationTransaction::begin(&repo, "oz commit --amend", actor, Some(&pre_status.changes))
-            .expect("begin oplog tx");
+        let tx = MutationTransaction::begin(
+            &repo,
+            "oz commit --amend",
+            actor,
+            Some(&pre_status.changes),
+        )
+        .expect("begin oplog tx");
 
         let opts = CommitOptions::new(message)
             .with_amend(true)
@@ -665,7 +686,7 @@ impl VcsAgentHarness {
             outcome.remaining_dirty_count,
             outcome.change_id
         );
-        self.record_exchange(rendered_cmd, "", 0, stdout, String::new())
+        self.record_exchange(&rendered_cmd, "", 0, stdout, String::new())
     }
 }
 
@@ -731,11 +752,7 @@ struct VcBenchTaskSummary {
 }
 
 impl VcBenchTaskSummary {
-    fn from_harnesses(
-        name: &'static str,
-        git: &VcsAgentHarness,
-        oz: &VcsAgentHarness,
-    ) -> Self {
+    fn from_harnesses(name: &'static str, git: &VcsAgentHarness, oz: &VcsAgentHarness) -> Self {
         Self {
             name,
             git_commands: git.command_count(),
@@ -846,7 +863,10 @@ fn init_paired_repos(sandbox: &mut GateSandbox, prefix: &str) -> (PathBuf, PathB
         unmethered_git(dir, &["config", "user.email", "agent@vcbench.dev"]);
     }
     let oz_repo = OzoneRepo::discover(Some(&oz_dir)).expect("discover oz repo");
-    oz_repo.layout.ensure_initialized().expect("init .git/ozone");
+    oz_repo
+        .layout
+        .ensure_initialized()
+        .expect("init .git/ozone");
     sandbox.register_repo(&oz_dir);
     (git_dir, oz_dir)
 }
@@ -890,7 +910,10 @@ fn run_vcbench_task1_selective_hunk_commits(sandbox: &mut GateSandbox) -> VcBenc
         write_rel(repo, "crates/billing/src/invoice.rs", &base_invoice);
         write_rel(repo, "crates/telemetry/src/metrics.rs", &base_metrics);
         unmethered_git(repo, &["add", "-A"]);
-        unmethered_git(repo, &["commit", "-m", "chore: seed baseline service modules"]);
+        unmethered_git(
+            repo,
+            &["commit", "-m", "chore: seed baseline service modules"],
+        );
     }
 
     // Apply identical 4-file dirty state to both repositories:
@@ -951,7 +974,10 @@ impl PkceVerifier {
     assert!(st.stdout.contains("hunks: h1a, h1b, h1c"));
     assert!(st.stdout.contains("[f2] A  crates/auth/src/verifier.rs"));
     assert!(st.stdout.contains("[f3] M  crates/billing/src/invoice.rs"));
-    assert!(st.stdout.contains("[f4] M  crates/telemetry/src/metrics.rs"));
+    assert!(
+        st.stdout
+            .contains("[f4] M  crates/telemetry/src/metrics.rs")
+    );
 
     let cm = oz_agent.exec_oz(
         &oz_dir,
@@ -976,18 +1002,30 @@ impl PkceVerifier {
         None,
         true,
     );
-    git_agent.exec_git(&git_dir, &["apply", "--cached", "-"], Some(&h1a_patch), true);
+    git_agent.exec_git(
+        &git_dir,
+        &["apply", "--cached", "-"],
+        Some(&h1a_patch),
+        true,
+    );
     git_agent.exec_git(&git_dir, &["diff", "--cached", "--stat"], None, true);
     git_agent.exec_git(&git_dir, &["commit", "-m", commit_msg], None, true);
     let post_git_st = git_agent.exec_git(&git_dir, &["status"], None, true);
     assert!(post_git_st.stdout.contains("crates/auth/src/session.rs"));
     assert!(post_git_st.stdout.contains("crates/billing/src/invoice.rs"));
-    assert!(post_git_st.stdout.contains("crates/telemetry/src/metrics.rs"));
+    assert!(
+        post_git_st
+            .stdout
+            .contains("crates/telemetry/src/metrics.rs")
+    );
 
     // Verify identical committed Git tree OIDs, identical remaining working trees, and git fsck!
     let oz_tree = unmethered_git(&oz_dir, &["rev-parse", "HEAD^{tree}"]);
     let git_tree = unmethered_git(&git_dir, &["rev-parse", "HEAD^{tree}"]);
-    assert_eq!(oz_tree, git_tree, "Task 1 committed tree OIDs must match bit-for-bit");
+    assert_eq!(
+        oz_tree, git_tree,
+        "Task 1 committed tree OIDs must match bit-for-bit"
+    );
     assert_eq!(
         snapshot_worktree_files(&oz_dir),
         snapshot_worktree_files(&git_dir),
@@ -1117,7 +1155,11 @@ pub fn format_retry_after_secs(deficit_tokens: u64, refill_per_sec: u64) -> Stri
     git_agent.exec_git(&git_dir, &["status"], None, true);
     git_agent.exec_git(
         &git_dir,
-        &["add", "crates/api/src/headers.rs", "crates/api/src/middleware.rs"],
+        &[
+            "add",
+            "crates/api/src/headers.rs",
+            "crates/api/src/middleware.rs",
+        ],
         None,
         true,
     );
@@ -1154,14 +1196,25 @@ pub fn format_retry_after_secs(deficit_tokens: u64, refill_per_sec: u64) -> Stri
     let g_diff3 = git_agent.exec_git(&git_dir, &["diff", "crates/api/src/limiter.rs"], None, true);
     let g_patch3 = extract_single_hunk_patch(&g_diff3.stdout, 0);
     git_agent.exec_git(&git_dir, &["apply", "--cached", "-"], Some(&g_patch3), true);
-    git_agent.exec_git(&git_dir, &["add", "crates/api/src/middleware.rs"], None, true);
+    git_agent.exec_git(
+        &git_dir,
+        &["add", "crates/api/src/middleware.rs"],
+        None,
+        true,
+    );
     git_agent.exec_git(&git_dir, &["commit", "--amend", "--no-edit"], None, true);
     git_agent.exec_git(&git_dir, &["status"], None, true);
 
     // Verify:
     // 1. Single commit above `main` in both repos (no extra commits created)
-    assert_eq!(unmethered_git(&oz_dir, &["rev-parse", "HEAD^"]), root_main_oid_oz);
-    assert_eq!(unmethered_git(&git_dir, &["rev-parse", "HEAD^"]), root_main_oid_git);
+    assert_eq!(
+        unmethered_git(&oz_dir, &["rev-parse", "HEAD^"]),
+        root_main_oid_oz
+    );
+    assert_eq!(
+        unmethered_git(&git_dir, &["rev-parse", "HEAD^"]),
+        root_main_oid_git
+    );
     // 2. Original `Change-Id:` preserved across all 3 amends!
     let oz_head_msg = unmethered_git(&oz_dir, &["log", "-1", "--format=%B"]);
     let git_head_msg = unmethered_git(&git_dir, &["log", "-1", "--format=%B"]);
@@ -1253,7 +1306,11 @@ pub fn compute_signature_tag(secret_id: &str, payload_len: usize) -> String {
     let dirty_audit = base_audit.replace("    100", "    500 // high-throughput SOC2 export batch");
 
     for repo in [&git_dir, &oz_dir] {
-        write_rel(repo, "crates/app_config/src/settings.rs", &entangled_settings);
+        write_rel(
+            repo,
+            "crates/app_config/src/settings.rs",
+            &entangled_settings,
+        );
         write_rel(repo, "crates/audit/src/exporter.rs", &dirty_audit);
         write_rel(repo, "crates/db/src/pool.rs", &dirty_db);
         write_rel(repo, "crates/webhooks/src/dispatcher.rs", &dirty_dispatcher);
@@ -1273,12 +1330,19 @@ pub fn compute_signature_tag(secret_id: &str, payload_len: usize) -> String {
     // [f3] crates/db/src/pool.rs
     // [f4] crates/webhooks/src/dispatcher.rs
     // [f5] crates/webhooks/src/signature.rs
-    assert!(st.stdout.contains("[f1] M  crates/app_config/src/settings.rs"));
+    assert!(
+        st.stdout
+            .contains("[f1] M  crates/app_config/src/settings.rs")
+    );
     assert!(st.stdout.contains("hunks: h1a, h1b, h1c"));
 
     // Commit 1 (Concern A): `f3` (`db/pool.rs`) + `h1a` (first hunk of `settings.rs`)
     // Remaining dirty becomes: [f1] settings.rs (2 hunks: webhook=h1a, audit=h1b), [f2] audit, [f3] dispatcher, [f4] signature
-    let c1 = oz_agent.exec_oz(&oz_dir, &["commit", "-m", msg_a, "--pick", "f3", "h1a"], true);
+    let c1 = oz_agent.exec_oz(
+        &oz_dir,
+        &["commit", "-m", msg_a, "--pick", "f3", "h1a"],
+        true,
+    );
     assert!(c1.stdout.contains("2 file(s) committed (4 dirty remaining"));
 
     // Commit 2 (Concern B): `f3` (`dispatcher.rs`) + `f4` (`signature.rs`) + `h1a` (webhook hunk of `settings.rs`)
@@ -1291,7 +1355,11 @@ pub fn compute_signature_tag(secret_id: &str, payload_len: usize) -> String {
     assert!(c2.stdout.contains("3 file(s) committed (2 dirty remaining"));
 
     // Commit 3 (Concern C): `f1` (`settings.rs`) + `f2` (`audit/exporter.rs`)
-    let c3 = oz_agent.exec_oz(&oz_dir, &["commit", "-m", msg_c, "--pick", "f1", "f2"], true);
+    let c3 = oz_agent.exec_oz(
+        &oz_dir,
+        &["commit", "-m", msg_c, "--pick", "f1", "f2"],
+        true,
+    );
     assert!(c3.stdout.contains("2 file(s) committed (0 dirty remaining"));
 
     // --- Baseline C `git` Agent Execution (non-interactive) ---
@@ -1411,7 +1479,10 @@ fn run_vcbench_task4_conflict_resolution(sandbox: &mut GateSandbox) -> VcBenchTa
             "pub fn lru_shards() -> usize {\n    64\n}\n",
         );
         unmethered_git(repo, &["add", "-A"]);
-        unmethered_git(repo, &["commit", "-m", "feat(runtime): tune cache worker pool"]);
+        unmethered_git(
+            repo,
+            &["commit", "-m", "feat(runtime): tune cache worker pool"],
+        );
 
         // Branch 2: `feat/tenant-isolation` (forked from `main`, conflicting on executor.rs & policy.rs)
         unmethered_git(repo, &["checkout", "-b", "feat/tenant-isolation", "main"]);
@@ -1433,7 +1504,11 @@ fn run_vcbench_task4_conflict_resolution(sandbox: &mut GateSandbox) -> VcBenchTa
         unmethered_git(repo, &["add", "-A"]);
         unmethered_git(
             repo,
-            &["commit", "-m", "feat(runtime): strict tenant sandbox policy"],
+            &[
+                "commit",
+                "-m",
+                "feat(runtime): strict tenant sandbox policy",
+            ],
         );
         // Note: start both agents while checked out on `feat/tenant-isolation` (realistic post-feature state)
     }
@@ -1451,14 +1526,14 @@ fn run_vcbench_task4_conflict_resolution(sandbox: &mut GateSandbox) -> VcBenchTa
         ],
         false,
     );
-    assert_eq!(int_out.exit_code, 1, "expected structured conflict exit code 1");
+    assert_eq!(
+        int_out.exit_code, 1,
+        "expected structured conflict exit code 1"
+    );
     assert!(int_out.stderr.contains("hint: oz resolve c1 --take ours"));
     assert!(int_out.stderr.contains("hint: oz resolve c2 --take theirs"));
 
-    let oz_sandbox_dir = sandbox
-        .root
-        .join("t4-conflicts-oz.oz")
-        .join("_integrate");
+    let oz_sandbox_dir = sandbox.root.join("t4-conflicts-oz.oz").join("_integrate");
     let sandbox_diff = oz_agent.exec_oz(
         &oz_dir,
         &["-C", "../t4-conflicts-oz.oz/_integrate", "diff"],
@@ -1473,15 +1548,22 @@ fn run_vcbench_task4_conflict_resolution(sandbox: &mut GateSandbox) -> VcBenchTa
         &["resolve", "c2", "--take", "theirs", "--continue"],
         true,
     );
-    assert!(cont_out
-        .stdout
-        .contains("Integrated [feat/cache-policy, feat/tenant-isolation] into main"));
+    assert!(
+        cont_out
+            .stdout
+            .contains("Integrated [feat/cache-policy, feat/tenant-isolation] into main")
+    );
 
     // --- Baseline C `git` Agent Execution (non-interactive) ---
     let mut git_agent = VcsAgentHarness::new("git/task4");
     git_agent.exec_git(&git_dir, &["status"], None, true);
     git_agent.exec_git(&git_dir, &["checkout", "main"], None, true);
-    git_agent.exec_git(&git_dir, &["merge", "--no-edit", "feat/cache-policy"], None, true);
+    git_agent.exec_git(
+        &git_dir,
+        &["merge", "--no-edit", "feat/cache-policy"],
+        None,
+        true,
+    );
     let merge2 = git_agent.exec_git(
         &git_dir,
         &["merge", "--no-edit", "feat/tenant-isolation"],
@@ -1543,7 +1625,10 @@ fn run_vcbench_task4_conflict_resolution(sandbox: &mut GateSandbox) -> VcBenchTa
     let merged_pol = unmethered_git(&oz_dir, &["show", "main:crates/runtime/src/policy.rs"]);
     assert!(merged_exec.contains("16 // cache-aware worker pool"));
     assert!(merged_pol.contains("\"strict_cow_sandbox\""));
-    assert!(!oz_sandbox_dir.exists(), "_integrate sandbox must be cleaned up after --continue");
+    assert!(
+        !oz_sandbox_dir.exists(),
+        "_integrate sandbox must be cleaned up after --continue"
+    );
 
     assert_git_fsck_clean(&oz_dir);
     assert_git_fsck_clean(&git_dir);
@@ -1574,9 +1659,15 @@ fn vcbench_agent_eval_exit_gate_commands_and_tokens() {
         100.0 * (1.0 - (total_oz_approx_toks as f64 / total_git_approx_toks as f64));
     let agg_lex_red = 100.0 * (1.0 - (total_oz_lex_toks as f64 / total_git_lex_toks as f64));
 
-    println!("\n==========================================================================================");
-    println!("  Milestone 3 VCBench-Style Autonomous Agent Evaluation (Baseline C `git` vs Ozone `oz`)");
-    println!("==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
+    println!(
+        "  Milestone 3 VCBench-Style Autonomous Agent Evaluation (Baseline C `git` vs Ozone `oz`)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<28} | {:>8} {:>8} {:>9} | {:>9} {:>9} {:>9} | {:>9} {:>9} {:>9}",
         "Task",
@@ -1590,7 +1681,9 @@ fn vcbench_agent_eval_exit_gate_commands_and_tokens() {
         "oz lex",
         "lex Δ"
     );
-    println!("------------------------------------------------------------------------------------------");
+    println!(
+        "------------------------------------------------------------------------------------------"
+    );
     for r in &results {
         println!(
             "{:<28} | {:>8} {:>8} {:>8.1}% | {:>9} {:>9} {:>8.1}% | {:>9} {:>9} {:>8.1}%",
@@ -1606,7 +1699,9 @@ fn vcbench_agent_eval_exit_gate_commands_and_tokens() {
             -r.lexical_token_reduction_pct(),
         );
     }
-    println!("------------------------------------------------------------------------------------------");
+    println!(
+        "------------------------------------------------------------------------------------------"
+    );
     println!(
         "{:<28} | {:>8} {:>8} {:>8.1}% | {:>9} {:>9} {:>8.1}% | {:>9} {:>9} {:>8.1}%",
         "AGGREGATE (All 4 Tasks)",
@@ -1620,7 +1715,9 @@ fn vcbench_agent_eval_exit_gate_commands_and_tokens() {
         total_oz_lex_toks,
         -agg_lex_red,
     );
-    println!("==========================================================================================\n");
+    println!(
+        "==========================================================================================\n"
+    );
 
     // Per-task sanity gates: every single task must achieve substantial command & token savings!
     for r in &results {
@@ -2234,7 +2331,10 @@ async fn gate2_e2e_signed_stacked_pr_ci_self_healing_and_sync_loop() {
         "pub fn base_version() -> &'static str {\n    \"0.1.0\"\n}\n",
     );
     unmethered_git(&sandbox.repo_root, &["add", "-A"]);
-    unmethered_git(&sandbox.repo_root, &["commit", "-m", "chore: initial rocket crate"]);
+    unmethered_git(
+        &sandbox.repo_root,
+        &["commit", "-m", "chore: initial rocket crate"],
+    );
     unmethered_git(
         &sandbox.repo_root,
         &["push", bare_dir.to_str().unwrap(), "main:main"],
@@ -2549,15 +2649,24 @@ async fn gate2_e2e_signed_stacked_pr_ci_self_healing_and_sync_loop() {
             upstream_merger.to_str().unwrap(),
         ],
     );
-    unmethered_git(&upstream_merger, &["config", "user.name", "GitHub Merge Queue"]);
-    unmethered_git(&upstream_merger, &["config", "user.email", "noreply@github.com"]);
+    unmethered_git(
+        &upstream_merger,
+        &["config", "user.name", "GitHub Merge Queue"],
+    );
+    unmethered_git(
+        &upstream_merger,
+        &["config", "user.email", "noreply@github.com"],
+    );
     write_rel(
         &upstream_merger,
         "src/auth.rs",
         "pub fn verify_token(tok: &str) -> bool {\n    tok.starts_with(\"oz_\")\n}\n",
     );
     write_rel(&upstream_merger, "RELEASE_NOTES.md", "- Landed PR #1\n");
-    unmethered_git(&upstream_merger, &["add", "src/auth.rs", "RELEASE_NOTES.md"]);
+    unmethered_git(
+        &upstream_merger,
+        &["add", "src/auth.rs", "RELEASE_NOTES.md"],
+    );
     unmethered_git(
         &upstream_merger,
         &[
@@ -2601,14 +2710,29 @@ async fn gate2_e2e_signed_stacked_pr_ci_self_healing_and_sync_loop() {
 
     assert!(sync_out.fetched);
     assert!(sync_out.fast_forwarded);
-    assert_eq!(sync_out.base_oid.as_deref(), Some(new_upstream_main.as_str()));
-    assert!(sync_out.merged_branches.contains(&"feat/stack-1".to_string()));
+    assert_eq!(
+        sync_out.base_oid.as_deref(),
+        Some(new_upstream_main.as_str())
+    );
+    assert!(
+        sync_out
+            .merged_branches
+            .contains(&"feat/stack-1".to_string())
+    );
     assert_eq!(sync_out.retargeted_prs.len(), 1);
     assert_eq!(sync_out.retargeted_prs[0].number, pr2_num);
     assert_eq!(sync_out.retargeted_prs[0].old_base, "feat/stack-1");
     assert_eq!(sync_out.retargeted_prs[0].new_base, "main");
-    assert!(sync_out.rebased_branches.contains(&"feat/stack-2".to_string()));
-    assert!(sync_out.removed_workspaces.contains(&"ws-stack-1".to_string()));
+    assert!(
+        sync_out
+            .rebased_branches
+            .contains(&"feat/stack-2".to_string())
+    );
+    assert!(
+        sync_out
+            .removed_workspaces
+            .contains(&"ws-stack-1".to_string())
+    );
     assert!(!ws1.workspace.workspace_path.exists());
     assert!(
         sync_out
@@ -2648,8 +2772,8 @@ fn gate3_e2e_agent_setup_mcp_stdio_notes_provenance_blame_and_undo() {
     unmethered_git(repo_dir, &["config", "user.email", "lead@ozone.dev"]);
 
     // 1. Run `oz_agent::setup_agent_harnesses` across all 5 harnesses and verify idempotency!
-    let setup_report =
-        setup_agent_harnesses(repo_dir, &AgentSetupOptions::all_harnesses()).expect("setup 5 harnesses");
+    let setup_report = setup_agent_harnesses(repo_dir, &AgentSetupOptions::all_harnesses())
+        .expect("setup 5 harnesses");
     assert_eq!(setup_report.harnesses, AgentHarness::ALL.to_vec());
 
     let expected_harness_files = [
@@ -2674,12 +2798,12 @@ fn gate3_e2e_agent_setup_mcp_stdio_notes_provenance_blame_and_undo() {
     }
     let agents_md = fs::read_to_string(repo_dir.join("AGENTS.md")).expect("read AGENTS.md");
     assert!(agents_md.contains(AGENTS_MD_START_MARKER) && agents_md.contains(AGENTS_MD_END_MARKER));
-    let claude_settings =
-        fs::read_to_string(repo_dir.join(".claude/settings.json")).expect("read .claude/settings.json");
+    let claude_settings = fs::read_to_string(repo_dir.join(".claude/settings.json"))
+        .expect("read .claude/settings.json");
     assert!(claude_settings.contains(OZ_CHECKPOINT_HOOK_CMD));
 
-    let second_setup =
-        setup_agent_harnesses(repo_dir, &AgentSetupOptions::all_harnesses()).expect("idempotent setup");
+    let second_setup = setup_agent_harnesses(repo_dir, &AgentSetupOptions::all_harnesses())
+        .expect("idempotent setup");
     assert!(second_setup.created.is_empty() && second_setup.updated.is_empty());
     assert_eq!(second_setup.unchanged.len(), expected_harness_files.len());
 
@@ -2732,8 +2856,7 @@ pub fn annual_discount_bps() -> u64 {
     // 4. Drive `oz mcp` stdio session (testing both JSON-line and `Content-Length` LSP framing):
     //    `initialize` -> `tools/list` -> `oz_status` -> `oz_diff` -> `oz_checkpoint` -> `oz_commit` (`pick: ["h1a"]`)
     let mcp_session_id = "mcp-sess-m3-gate3";
-    let mut mcp_server =
-        McpServer::new(Some(repo_dir.clone())).with_session_id(mcp_session_id);
+    let mut mcp_server = McpServer::new(Some(repo_dir.clone())).with_session_id(mcp_session_id);
 
     let json_line_requests = [
         json!({
@@ -2816,8 +2939,14 @@ pub fn annual_discount_bps() -> u64 {
         .collect();
     assert_eq!(line_resps.len(), 5);
 
-    let tools_list = line_resps[1]["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools_list.len(), 11, "MCP server must advertise all 11 Ozone tools");
+    let tools_list = line_resps[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert_eq!(
+        tools_list.len(),
+        11,
+        "MCP server must advertise all 11 Ozone tools"
+    );
 
     let (_, cl_body) = content_len_part
         .split_once("\r\n\r\n")
@@ -2860,7 +2989,8 @@ pub fn annual_discount_bps() -> u64 {
     assert_eq!(note.line_ranges[0].end_line, 4);
 
     let sys_note_raw = unmethered_git(repo_dir, &["notes", "--ref=ai", "show", &agent_commit_oid]);
-    let sys_note_json: Value = serde_json::from_str(&sys_note_raw).expect("valid JSON in git notes");
+    let sys_note_json: Value =
+        serde_json::from_str(&sys_note_raw).expect("valid JSON in git notes");
     assert_eq!(sys_note_json["session_id"], mcp_session_id);
 
     // 6. Verify `oz_agent::blame_file` (`oz blame`) exact line-level human vs. agent attribution!

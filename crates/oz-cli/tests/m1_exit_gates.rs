@@ -26,6 +26,47 @@ fn sub10ms_budget_ms() -> f64 {
     }
 }
 
+fn process_has_no_new_privs() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let rest = line.strip_prefix("NoNewPrivs:")?;
+                Some(rest.trim() == "1")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn external_global_vfsd_reachable() -> bool {
+    oz_vfsd::global_daemon_socket_path().is_some_and(|sock| oz_vfsd::ping_daemon(&sock).is_ok())
+}
+
+/// Returns `true` when live FUSE3 mounting is permitted or an external user-wide `oz-vfsd`
+/// daemon is already active; otherwise prints a clear skip diagnostic and returns `false`.
+fn require_live_fuse3(test_name: &str) -> bool {
+    if process_has_no_new_privs() && !external_global_vfsd_reachable() {
+        eprintln!(
+            "[SKIP] {test_name}: Linux process has NoNewPrivs=1 (setuid fusermount3 blocked by kernel) and no reachable external user-wide oz-vfsd daemon"
+        );
+        return false;
+    }
+    true
+}
+
+/// Returns `true` when the test process can spawn and SIGKILL its own isolated per-repo
+/// `oz-vfsd` daemon without hitting `NoNewPrivs=1` (and without killing any external
+/// user-wide `oz-vfsd` service shared by other processes/tests).
+fn require_isolated_per_repo_fuse3(test_name: &str) -> bool {
+    if process_has_no_new_privs() {
+        eprintln!(
+            "[SKIP] {test_name}: Linux process has NoNewPrivs=1 (cannot spawn/respawn an isolated per-repo oz-vfsd daemon with setuid fusermount3, and refuses to SIGKILL an external user-wide daemon)"
+        );
+        return false;
+    }
+    true
+}
+
 static VFSD_BIN_LOCK: OnceLock<PathBuf> = OnceLock::new();
 
 fn oz_bin() -> PathBuf {
@@ -46,11 +87,9 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
 
         let oz = oz_bin();
-        if let Ok(resolved) = oz_vfsd::resolve_oz_vfsd_bin_with(
-            None,
-            Some(&oz),
-            std::env::var_os("PATH").as_deref(),
-        ) {
+        if let Ok(resolved) =
+            oz_vfsd::resolve_oz_vfsd_bin_with(None, Some(&oz), std::env::var_os("PATH").as_deref())
+        {
             return resolved;
         }
         if let Ok(resolved) = oz_vfsd::find_oz_vfsd_bin() {
@@ -79,7 +118,11 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
         }
         let status = build.status().expect("cargo build --bin oz-vfsd");
         assert!(status.success(), "failed to build oz-vfsd helper binary");
-        assert!(sibling.is_file(), "expected oz-vfsd at {}", sibling.display());
+        assert!(
+            sibling.is_file(),
+            "expected oz-vfsd at {}",
+            sibling.display()
+        );
         sibling
     })
 }
@@ -143,6 +186,7 @@ impl Drop for GateSandbox {
     fn drop(&mut self) {
         let git_dir = self.repo_root.join(".git");
         let mut mounts_to_clean = self.mount_points.clone();
+        let mut ws_names_to_unmount: Vec<String> = Vec::new();
         let mut pids_to_kill: Vec<u32> = Vec::new();
 
         // Collect all mounts and daemon PIDs persisted under .git/ozone/ws/*/mount.json.
@@ -153,6 +197,9 @@ impl Drop for GateSandbox {
                 if let Ok(raw) = std::fs::read_to_string(&mj)
                     && let Ok(rec) = serde_json::from_str::<MountRecord>(&raw)
                 {
+                    if !ws_names_to_unmount.contains(&rec.workspace) {
+                        ws_names_to_unmount.push(rec.workspace);
+                    }
                     if !mounts_to_clean.contains(&rec.mount_point) {
                         mounts_to_clean.push(rec.mount_point);
                     }
@@ -182,6 +229,9 @@ impl Drop for GateSandbox {
         }
 
         if git_dir.is_dir() {
+            for ws_name in &ws_names_to_unmount {
+                let _ = oz_vfsd::unmount_via_daemon(&git_dir, ws_name, true);
+            }
             let _ = oz_vfsd::shutdown_daemon(&git_dir);
         }
 
@@ -221,8 +271,14 @@ fn kill_test_vfsd_pid(pid: u32, git_dir_marker: &str) {
     };
     let cmdline = String::from_utf8_lossy(&bytes);
     if cmdline.contains("oz-vfsd") && cmdline.contains(git_dir_marker) {
-        unsafe {
-            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        if let Ok(raw_pid) = libc::pid_t::try_from(pid)
+            && raw_pid > 0
+        {
+            // SAFETY: `raw_pid` is strictly positive and was matched against `/proc/<pid>/cmdline`
+            // for this test sandbox's `oz-vfsd` process before sending `SIGKILL`.
+            unsafe {
+                let _ = libc::kill(raw_pid, libc::SIGKILL);
+            }
         }
         wait_pid_dead(pid, Duration::from_secs(2));
     }
@@ -374,7 +430,10 @@ fn visit_non_dir_files<F: FnMut(&Path, &std::fs::Metadata)>(root: &Path, cb: &mu
     }
 }
 
-fn physical_st_blocks_bytes(paths: &[PathBuf], exclude_inodes: Option<&HashSet<(u64, u64)>>) -> u64 {
+fn physical_st_blocks_bytes(
+    paths: &[PathBuf],
+    exclude_inodes: Option<&HashSet<(u64, u64)>>,
+) -> u64 {
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut total = 0u64;
 
@@ -424,8 +483,11 @@ fn ext4_allocated_bytes(path: &Path) -> u64 {
 
     let c_path = CString::new(path.as_os_str().as_bytes()).expect("cstr");
     let mut buf = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a valid NUL-terminated C string and `buf.as_mut_ptr()` points to
+    // properly aligned writable storage for `libc::statvfs`.
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) };
     assert_eq!(rc, 0, "statvfs failed");
+    // SAFETY: `libc::statvfs` returned `0`, so `buf` has been initialized by the kernel.
     let st = unsafe { buf.assume_init() };
     let used_blocks = st.f_blocks.saturating_sub(st.f_bfree);
     used_blocks.saturating_mul(st.f_frsize)
@@ -459,8 +521,14 @@ fn gate_m0_version_doctor_and_setup_json_on_ext4() {
     assert_eq!(doc_json["head_oid"], head_oid);
     assert_eq!(doc_json["data"]["invoked_as"], "git-ozone");
     assert_eq!(doc_json["data"]["filesystem"]["type"], "ext4");
-    assert_eq!(doc_json["data"]["fuse"]["ready"], true);
-    assert_eq!(doc_json["data"]["recommended_backend"], "linux_fuse3");
+    if require_live_fuse3("gate_m0_version_doctor_and_setup_json_on_ext4 (fuse readiness)") {
+        assert_eq!(doc_json["data"]["fuse"]["ready"], true);
+        assert_eq!(doc_json["data"]["recommended_backend"], "linux_fuse3");
+    } else {
+        assert_eq!(doc_json["data"]["fuse"]["no_new_privs"], true);
+        assert_eq!(doc_json["data"]["fuse"]["ready"], false);
+        assert_eq!(doc_json["data"]["recommended_backend"], "cas_hardlink");
+    }
     assert_eq!(doc_json["data"]["oz_vfsd"]["found"], true);
     assert_eq!(doc_json["data"]["repo"]["in_repo"], true);
     assert_eq!(doc_json["data"]["repo"]["colocated"], true);
@@ -485,6 +553,9 @@ fn gate_m0_version_doctor_and_setup_json_on_ext4() {
 
 #[test]
 fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
+    if !require_live_fuse3("gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache") {
+        return;
+    }
     let mut sandbox = GateSandbox::new("mono-warm");
     let repo = sandbox.repo_root.clone();
 
@@ -498,14 +569,23 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
     .expect("write Cargo.toml");
     std::fs::write(repo.join("package.json"), "{\"name\":\"mono-warm\"}\n")
         .expect("write package.json");
-    std::fs::write(repo.join("pyproject.toml"), "[project]\nname = \"mono-warm\"\n")
-        .expect("write pyproject.toml");
+    std::fs::write(
+        repo.join("pyproject.toml"),
+        "[project]\nname = \"mono-warm\"\n",
+    )
+    .expect("write pyproject.toml");
     std::fs::write(repo.join("README.md"), "# Mono Warm\n").expect("write readme");
     std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
-    std::fs::write(repo.join("src/untouched.rs"), "pub fn untouched() -> u32 { 1 }\n")
-        .expect("write untouched");
-    std::fs::write(repo.join("src/branch_mod.rs"), "pub fn mod_val() -> u32 { 1 }\n")
-        .expect("write branch_mod");
+    std::fs::write(
+        repo.join("src/untouched.rs"),
+        "pub fn untouched() -> u32 { 1 }\n",
+    )
+    .expect("write untouched");
+    std::fs::write(
+        repo.join("src/branch_mod.rs"),
+        "pub fn mod_val() -> u32 { 1 }\n",
+    )
+    .expect("write branch_mod");
 
     let base_commit = init_git_repo(&repo);
 
@@ -543,7 +623,12 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
     let cache_mtime_secs = now_secs - 60;
 
     // Backdate baseline source files so source_mtime <= cached artifact mtime.
-    for rel in ["README.md", "src/main.rs", "src/untouched.rs", "src/branch_mod.rs"] {
+    for rel in [
+        "README.md",
+        "src/main.rs",
+        "src/untouched.rs",
+        "src/branch_mod.rs",
+    ] {
         set_mtime_unix_secs(&repo.join(rel), source_mtime_secs);
     }
 
@@ -601,8 +686,9 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
     // Capture warm baseline at main (c1) prior to spawning 10 workspaces.
     let ozone_dir = repo.join(".git/ozone");
     std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
-    let baseline_meta = oz_warm::capture_baseline(&repo, &ozone_dir, &base_commit, &OzoneConfig::default())
-        .expect("capture warm baseline");
+    let baseline_meta =
+        oz_warm::capture_baseline(&repo, &ozone_dir, &base_commit, &OzoneConfig::default())
+            .expect("capture warm baseline");
     assert!(
         baseline_meta.total_bytes >= 50 * 1024 * 1024,
         "warm cache baseline must be >= 50 MB (got {} bytes)",
@@ -640,7 +726,11 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
             &[],
         );
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(out.code, 0, "spawn {ws_name} failed: stdout={} stderr={}", out.stdout, out.stderr);
+        assert_eq!(
+            out.code, 0,
+            "spawn {ws_name} failed: stdout={} stderr={}",
+            out.stdout, out.stderr
+        );
         let json = out.json.expect("spawn json");
         assert_eq!(json["schema"], OZ_SCHEMA_V1);
         assert_eq!(json["ok"], true);
@@ -651,10 +741,7 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
     }
 
     let mean_ms = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
-    let max_ms = latencies_ms
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max);
+    let max_ms = latencies_ms.iter().copied().fold(0.0_f64, f64::max);
 
     let backing_paths = vec![
         ozone_dir.join("ws"),
@@ -754,7 +841,11 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
         .as_array()
         .expect("workspaces array");
     assert_eq!(workspaces.len(), 10);
-    assert!(workspaces.iter().all(|w| w["healthy"] == true && w["mount_health"] == "healthy"));
+    assert!(
+        workspaces
+            .iter()
+            .all(|w| w["healthy"] == true && w["mount_health"] == "healthy")
+    );
 
     // Cleanly remove one workspace via CLI and verify `oz ws gc --max-gb`.
     let rm_out = run_bin(&oz_bin(), &repo, &["ws", "rm", "agent-10", "--json"], &[]);
@@ -770,13 +861,29 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
     assert_eq!(gc_out.code, 0, "ws gc failed: {}", gc_out.stdout);
     let gc_json = gc_out.json.expect("ws gc json");
     assert_eq!(gc_json["ok"], true);
-    assert!(gc_json["op_id"].as_str().is_some_and(|s| s.starts_with("op_")));
+    assert!(
+        gc_json["op_id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("op_"))
+    );
 }
 
 #[test]
 fn gate_m1_sigkill_auto_remount_zero_lost_edits_including_cwd_inside_dead_mount() {
+    if !require_isolated_per_repo_fuse3(
+        "gate_m1_sigkill_auto_remount_zero_lost_edits_including_cwd_inside_dead_mount",
+    ) {
+        return;
+    }
     let mut sandbox = GateSandbox::new("sigkill-app");
     let repo = sandbox.repo_root.clone();
+    // Isolate from any user-wide global oz-vfsd service so this test only spawns and SIGKILLs
+    // its own sandbox-local per-repo daemon.
+    let isolated_global_sock = sandbox.root.join("no-global-oz-vfsd.sock");
+    let isolated_env = [(
+        oz_vfsd::OZ_VFSD_GLOBAL_SOCKET_ENV,
+        isolated_global_sock.as_path(),
+    )];
 
     std::fs::create_dir_all(repo.join("src")).expect("mkdir src");
     std::fs::write(repo.join("README.md"), "baseline readme\n").expect("write readme");
@@ -786,26 +893,40 @@ fn gate_m1_sigkill_auto_remount_zero_lost_edits_including_cwd_inside_dead_mount(
     let ws_mount = sandbox.ws_path("ws-kill");
     sandbox.register_mount(ws_mount.clone());
 
-    let spawn_out = run_bin(&oz_bin(), &repo, &["ws", "spawn", "ws-kill", "--json"], &[]);
-    assert_eq!(spawn_out.code, 0, "spawn failed: stdout={} stderr={}", spawn_out.stdout, spawn_out.stderr);
+    let spawn_out = run_bin(
+        &oz_bin(),
+        &repo,
+        &["ws", "spawn", "ws-kill", "--json"],
+        &isolated_env,
+    );
+    assert_eq!(
+        spawn_out.code, 0,
+        "spawn failed: stdout={} stderr={}",
+        spawn_out.stdout, spawn_out.stderr
+    );
 
     // Perform write new file, modify baseline file, delete baseline file inside FUSE3 workspace.
-    std::fs::write(ws_mount.join("src/added.rs"), "pub fn added() -> i32 { 42 }\n")
-        .expect("write added.rs");
+    std::fs::write(
+        ws_mount.join("src/added.rs"),
+        "pub fn added() -> i32 { 42 }\n",
+    )
+    .expect("write added.rs");
     std::fs::write(ws_mount.join("src/lib.rs"), "pub fn base() -> i32 { 99 }\n")
         .expect("modify lib.rs");
     std::fs::remove_file(ws_mount.join("README.md")).expect("delete README.md");
 
     let mount_json_path = repo.join(".git/ozone/ws/ws-kill/mount.json");
-    let rec1: MountRecord = serde_json::from_str(
-        &std::fs::read_to_string(&mount_json_path).expect("read mount.json"),
-    )
-    .expect("parse mount.json");
+    let rec1: MountRecord =
+        serde_json::from_str(&std::fs::read_to_string(&mount_json_path).expect("read mount.json"))
+            .expect("parse mount.json");
     let pid1 = rec1.daemon_pid.expect("daemon_pid before first SIGKILL");
 
     // 1. SIGKILL daemon and verify ENOTCONN, then recover via `oz -C <ws_mount> status --json`.
+    let raw_pid1 = libc::pid_t::try_from(pid1).expect("daemon pid fits pid_t");
+    assert!(raw_pid1 > 0, "daemon pid must be positive");
+    // SAFETY: `raw_pid1` is the verified positive PID of this test's `oz-vfsd` daemon from `mount.json`.
     unsafe {
-        assert_eq!(libc::kill(pid1 as libc::pid_t, libc::SIGKILL), 0);
+        assert_eq!(libc::kill(raw_pid1, libc::SIGKILL), 0);
     }
     wait_pid_dead(pid1, Duration::from_secs(3));
     let dead_meta = std::fs::symlink_metadata(&ws_mount).expect_err("dead mount must fail stat");
@@ -819,7 +940,7 @@ fn gate_m1_sigkill_auto_remount_zero_lost_edits_including_cwd_inside_dead_mount(
         &oz_bin(),
         &sandbox.root,
         &["-C", ws_mount.to_str().expect("utf8"), "status", "--json"],
-        &[],
+        &isolated_env,
     );
     assert_eq!(
         recover_c.code, 0,
@@ -853,6 +974,7 @@ while kill -0 "$2" 2>/dev/null; do sleep 0.01; done
         .arg(&ws_mount)
         .arg(pid2.to_string())
         .arg(oz_bin())
+        .env(oz_vfsd::OZ_VFSD_GLOBAL_SOCKET_ENV, &isolated_global_sock)
         .env_remove("OZ_AGENT")
         .env_remove("CI")
         .env_remove("OZ_VFSD_BIN")
@@ -871,9 +993,21 @@ while kill -0 "$2" 2>/dev/null; do sleep 0.01; done
     assert_eq!(json2["workspace"], "ws-kill");
     let changes = json2["data"]["changes"].as_array().expect("changes array");
     assert_eq!(changes.len(), 3);
-    assert!(changes.iter().any(|c| c["path"] == "README.md" && c["kind"] == "deleted"));
-    assert!(changes.iter().any(|c| c["path"] == "src/added.rs" && c["kind"] == "added"));
-    assert!(changes.iter().any(|c| c["path"] == "src/lib.rs" && c["kind"] == "modified"));
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["path"] == "README.md" && c["kind"] == "deleted")
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["path"] == "src/added.rs" && c["kind"] == "added")
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["path"] == "src/lib.rs" && c["kind"] == "modified")
+    );
 
     // 3. Also verify subdirectory CWD inside dead FUSE mount recovers cleanly.
     let rec3: MountRecord = serde_json::from_str(
@@ -890,6 +1024,7 @@ while kill -0 "$2" 2>/dev/null; do sleep 0.01; done
         .arg(ws_mount.join("src"))
         .arg(pid3.to_string())
         .arg(oz_bin())
+        .env(oz_vfsd::OZ_VFSD_GLOBAL_SOCKET_ENV, &isolated_global_sock)
         .env_remove("OZ_AGENT")
         .env_remove("CI")
         .env_remove("OZ_VFSD_BIN")
@@ -916,6 +1051,9 @@ while kill -0 "$2" 2>/dev/null; do sleep 0.01; done
 
 #[test]
 fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
+    if !require_live_fuse3("gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo") {
+        return;
+    }
     let mut sandbox = GateSandbox::new("vcs-gate");
     let repo = sandbox.repo_root.clone();
 
@@ -928,7 +1066,11 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     let ws_vcs = sandbox.ws_path("ws-vcs");
     sandbox.register_mount(ws_vcs.clone());
     let sp = run_bin(&oz_bin(), &repo, &["ws", "spawn", "ws-vcs", "--json"], &[]);
-    assert_eq!(sp.code, 0, "spawn ws-vcs failed: stdout={} stderr={}", sp.stdout, sp.stderr);
+    assert_eq!(
+        sp.code, 0,
+        "spawn ws-vcs failed: stdout={} stderr={}",
+        sp.stdout, sp.stderr
+    );
 
     // Edit a_multi.txt (two separated hunks h1a and h1b), b_full.txt (f2), and c_keep.txt (f3).
     let mut lines_a: Vec<String> = (1..=30).map(|i| format!("line {i}\n")).collect();
@@ -989,7 +1131,11 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
         ],
         &[],
     );
-    assert_eq!(commit_out.code, 0, "partial commit failed: {}", commit_out.stderr);
+    assert_eq!(
+        commit_out.code, 0,
+        "partial commit failed: {}",
+        commit_out.stderr
+    );
     let c_json = commit_out.json.expect("commit json");
     assert_eq!(c_json["ok"], true);
     let partial_op_id = c_json["op_id"].as_str().expect("op_id").to_string();
@@ -1047,7 +1193,9 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     assert_eq!(undo1.code, 0, "undo failed: {}", undo1.stderr);
     let undo1_json = undo1.json.expect("undo1 json");
     assert_eq!(undo1_json["ok"], true);
-    let undo1_ms = undo1_json["data"]["engine_elapsed_ms"].as_f64().expect("ms");
+    let undo1_ms = undo1_json["data"]["engine_elapsed_ms"]
+        .as_f64()
+        .expect("ms");
     assert_eq!(undo1_json["head_oid"].as_str(), Some(base_commit.as_str()));
     assert_eq!(
         std::fs::read_to_string(ws_vcs.join("b_full.txt")).expect("read b after undo"),
@@ -1058,8 +1206,13 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     assert_eq!(redo1.code, 0, "redo failed: {}", redo1.stderr);
     let redo1_json = redo1.json.expect("redo1 json");
     assert_eq!(redo1_json["ok"], true);
-    let redo1_ms = redo1_json["data"]["engine_elapsed_ms"].as_f64().expect("ms");
-    assert_eq!(redo1_json["head_oid"].as_str(), Some(partial_commit_oid.as_str()));
+    let redo1_ms = redo1_json["data"]["engine_elapsed_ms"]
+        .as_f64()
+        .expect("ms");
+    assert_eq!(
+        redo1_json["head_oid"].as_str(),
+        Some(partial_commit_oid.as_str())
+    );
 
     let cp = run_bin(
         &oz_bin(),
@@ -1070,13 +1223,21 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     assert_eq!(cp.code, 0, "checkpoint failed: {}", cp.stderr);
     std::fs::write(ws_vcs.join("c_keep.txt"), "post checkpoint edit\n").expect("edit post cp");
     let undo_cp = run_bin(&oz_bin(), &ws_vcs, &["undo", "--json"], &[]);
-    assert_eq!(undo_cp.code, 0, "undo uncheckpointed failed: {}", undo_cp.stderr);
+    assert_eq!(
+        undo_cp.code, 0,
+        "undo uncheckpointed failed: {}",
+        undo_cp.stderr
+    );
     assert_eq!(
         std::fs::read_to_string(ws_vcs.join("c_keep.txt")).expect("read restored c_keep"),
         "updated c\n"
     );
     let redo_cp = run_bin(&oz_bin(), &ws_vcs, &["redo", "--json"], &[]);
-    assert_eq!(redo_cp.code, 0, "redo uncheckpointed failed: {}", redo_cp.stderr);
+    assert_eq!(
+        redo_cp.code, 0,
+        "redo uncheckpointed failed: {}",
+        redo_cp.stderr
+    );
     assert_eq!(
         std::fs::read_to_string(ws_vcs.join("c_keep.txt")).expect("read redone c_keep"),
         "post checkpoint edit\n"
@@ -1096,7 +1257,11 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
         ],
         &[],
     );
-    assert_eq!(excl_commit.code, 0, "exclude commit failed: {}", excl_commit.stdout);
+    assert_eq!(
+        excl_commit.code, 0,
+        "exclude commit failed: {}",
+        excl_commit.stdout
+    );
     let excl_json = excl_commit.json.expect("excl json");
     assert_eq!(
         excl_json["data"]["committed_paths"],
@@ -1104,7 +1269,11 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     );
     let excl_op_id = excl_json["op_id"].as_str().expect("excl op_id").to_string();
     let undo_by_id = run_bin(&oz_bin(), &ws_vcs, &["undo", &excl_op_id, "--json"], &[]);
-    assert_eq!(undo_by_id.code, 0, "undo by op_id failed: {}", undo_by_id.stdout);
+    assert_eq!(
+        undo_by_id.code, 0,
+        "undo by op_id failed: {}",
+        undo_by_id.stdout
+    );
 
     // Guardrail 1: .env file -> exit code 2.
     std::fs::write(ws_vcs.join(".env"), "API_KEY=supersecret\n").expect("write .env");
@@ -1114,8 +1283,15 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
         &["commit", "-m", "bad env", "--pick", ".env", "--json"],
         &[],
     );
-    assert_eq!(env_fail.code, 2, "expected exit 2 on .env: {}", env_fail.stdout);
-    assert_eq!(env_fail.json.expect("env json")["error"]["code"], "guardrail_violation");
+    assert_eq!(
+        env_fail.code, 2,
+        "expected exit 2 on .env: {}",
+        env_fail.stdout
+    );
+    assert_eq!(
+        env_fail.json.expect("env json")["error"]["code"],
+        "guardrail_violation"
+    );
     std::fs::remove_file(ws_vcs.join(".env")).expect("rm .env");
 
     // Guardrail 2: secret token -> exit code 2.
@@ -1127,11 +1303,25 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     let sec_fail = run_bin(
         &oz_bin(),
         &ws_vcs,
-        &["commit", "-m", "bad secret", "--pick", "token.txt", "--json"],
+        &[
+            "commit",
+            "-m",
+            "bad secret",
+            "--pick",
+            "token.txt",
+            "--json",
+        ],
         &[],
     );
-    assert_eq!(sec_fail.code, 2, "expected exit 2 on secret: {}", sec_fail.stdout);
-    assert_eq!(sec_fail.json.expect("sec json")["error"]["code"], "guardrail_violation");
+    assert_eq!(
+        sec_fail.code, 2,
+        "expected exit 2 on secret: {}",
+        sec_fail.stdout
+    );
+    assert_eq!(
+        sec_fail.json.expect("sec json")["error"]["code"],
+        "guardrail_violation"
+    );
     std::fs::remove_file(ws_vcs.join("token.txt")).expect("rm token");
 
     // Guardrail 3: conflict marker -> exit code 2.
@@ -1143,11 +1333,25 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     let cfl_fail = run_bin(
         &oz_bin(),
         &ws_vcs,
-        &["commit", "-m", "bad conflict", "--pick", "conflict.txt", "--json"],
+        &[
+            "commit",
+            "-m",
+            "bad conflict",
+            "--pick",
+            "conflict.txt",
+            "--json",
+        ],
         &[],
     );
-    assert_eq!(cfl_fail.code, 2, "expected exit 2 on conflict marker: {}", cfl_fail.stdout);
-    assert_eq!(cfl_fail.json.expect("cfl json")["error"]["code"], "guardrail_violation");
+    assert_eq!(
+        cfl_fail.code, 2,
+        "expected exit 2 on conflict marker: {}",
+        cfl_fail.stdout
+    );
+    assert_eq!(
+        cfl_fail.json.expect("cfl json")["error"]["code"],
+        "guardrail_violation"
+    );
     std::fs::remove_file(ws_vcs.join("conflict.txt")).expect("rm conflict");
 
     // Guardrail 4: > 50 MB binary -> exit code 2, overridden by `--force`.
@@ -1159,16 +1363,35 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
         &["commit", "-m", "bad huge", "--pick", "huge.bin", "--json"],
         &[],
     );
-    assert_eq!(bin_fail.code, 2, "expected exit 2 on >50MB binary: {}", bin_fail.stdout);
-    assert_eq!(bin_fail.json.expect("bin json")["error"]["code"], "guardrail_violation");
+    assert_eq!(
+        bin_fail.code, 2,
+        "expected exit 2 on >50MB binary: {}",
+        bin_fail.stdout
+    );
+    assert_eq!(
+        bin_fail.json.expect("bin json")["error"]["code"],
+        "guardrail_violation"
+    );
 
     let bin_force = run_bin(
         &oz_bin(),
         &ws_vcs,
-        &["commit", "-m", "force huge", "--pick", "huge.bin", "--force", "--json"],
+        &[
+            "commit",
+            "-m",
+            "force huge",
+            "--pick",
+            "huge.bin",
+            "--force",
+            "--json",
+        ],
         &[],
     );
-    assert_eq!(bin_force.code, 0, "expected --force override to pass: {}", bin_force.stderr);
+    assert_eq!(
+        bin_force.code, 0,
+        "expected --force override to pass: {}",
+        bin_force.stderr
+    );
 
     // Guardrail 5: workspace `--scope` / `--deny` enforcement + `--allow-out-of-scope`.
     let ws_scoped = sandbox.ws_path("ws-scoped");
@@ -1189,7 +1412,11 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
         ],
         &[],
     );
-    assert_eq!(sp_scoped.code, 0, "spawn scoped failed: {}", sp_scoped.stderr);
+    assert_eq!(
+        sp_scoped.code, 0,
+        "spawn scoped failed: {}",
+        sp_scoped.stderr
+    );
     std::fs::write(ws_scoped.join("b_full.txt"), "denied edit\n").expect("edit denied");
     let scope_fail = run_bin(
         &oz_bin(),
@@ -1205,10 +1432,19 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     let scope_override = run_bin(
         &oz_bin(),
         &ws_scoped,
-        &["commit", "-m", "allow out of scope", "--allow-out-of-scope", "--json"],
+        &[
+            "commit",
+            "-m",
+            "allow out of scope",
+            "--allow-out-of-scope",
+            "--json",
+        ],
         &[],
     );
-    assert_eq!(scope_override.code, 0, "expected --allow-out-of-scope override to pass");
+    assert_eq!(
+        scope_override.code, 0,
+        "expected --allow-out-of-scope override to pass"
+    );
 
     // Dedicated < 10 ms engine timing gate on a 1,500-file repository (both FUSE3 O(dirty_files) and non-FUSE).
     let mut bench_box = GateSandbox::new("oplog-1500-bench");
@@ -1234,13 +1470,21 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
         &["ws", "spawn", "ws-1500", "--json"],
         &[],
     );
-    assert_eq!(sp_bench.code, 0, "spawn ws-1500 failed: {}", sp_bench.stdout);
+    assert_eq!(
+        sp_bench.code, 0,
+        "spawn ws-1500 failed: {}",
+        sp_bench.stdout
+    );
 
-    std::fs::write(ws_bench.join("pkg_00/mod_000.rs"), "pub fn edited() -> usize { 999 }\n")
-        .expect("edit 1 file in 1500-file FUSE ws");
+    std::fs::write(
+        ws_bench.join("pkg_00/mod_000.rs"),
+        "pub fn edited() -> usize { 999 }\n",
+    )
+    .expect("edit 1 file in 1500-file FUSE ws");
     std::fs::write(ws_bench.join("pkg_01/new_file.rs"), "pub fn added() {}\n")
         .expect("add 1 file in 1500-file FUSE ws");
-    std::fs::remove_file(ws_bench.join("pkg_02/mod_000.rs")).expect("delete 1 file in 1500-file FUSE ws");
+    std::fs::remove_file(ws_bench.join("pkg_02/mod_000.rs"))
+        .expect("delete 1 file in 1500-file FUSE ws");
 
     let fuse_bench_repo = OzoneRepo::discover(Some(&ws_bench)).expect("discover ws-1500");
     let actor = ActorInfo {
@@ -1250,15 +1494,24 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     };
 
     let t_cp_fuse = Instant::now();
-    let _cp_fuse = checkpoint(&fuse_bench_repo, "oz checkpoint", Some("dirty3"), actor.clone(), None)
-        .expect("cp fuse 1500");
+    let _cp_fuse = checkpoint(
+        &fuse_bench_repo,
+        "oz checkpoint",
+        Some("dirty3"),
+        actor.clone(),
+        None,
+    )
+    .expect("cp fuse 1500");
     let fuse_1500_cp_ms = t_cp_fuse.elapsed().as_secs_f64() * 1000.0;
 
     // Make post-checkpoint edit, then run real `oz undo --json` and `oz redo --json` on 1,500-file FUSE mount.
-    std::fs::write(ws_bench.join("pkg_03/post_cp.rs"), "pub fn post() {}\n")
-        .expect("post cp edit");
+    std::fs::write(ws_bench.join("pkg_03/post_cp.rs"), "pub fn post() {}\n").expect("post cp edit");
     let cli_undo_1500 = run_bin(&oz_bin(), &ws_bench, &["undo", "--json"], &[]);
-    assert_eq!(cli_undo_1500.code, 0, "cli undo 1500 failed: {}", cli_undo_1500.stdout);
+    assert_eq!(
+        cli_undo_1500.code, 0,
+        "cli undo 1500 failed: {}",
+        cli_undo_1500.stdout
+    );
     let cli_undo_1500_json = cli_undo_1500.json.expect("cli undo 1500 json");
     let fuse_1500_undo_ms = cli_undo_1500_json["data"]["engine_elapsed_ms"]
         .as_f64()
@@ -1267,7 +1520,11 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     assert!(ws_bench.join("pkg_01/new_file.rs").is_file());
 
     let cli_redo_1500 = run_bin(&oz_bin(), &ws_bench, &["redo", "--json"], &[]);
-    assert_eq!(cli_redo_1500.code, 0, "cli redo 1500 failed: {}", cli_redo_1500.stdout);
+    assert_eq!(
+        cli_redo_1500.code, 0,
+        "cli redo 1500 failed: {}",
+        cli_redo_1500.stdout
+    );
     let cli_redo_1500_json = cli_redo_1500.json.expect("cli redo 1500 json");
     let fuse_1500_redo_ms = cli_redo_1500_json["data"]["engine_elapsed_ms"]
         .as_f64()
@@ -1291,12 +1548,17 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
         Some(&dirty_changes),
     )
     .expect("begin tx");
-    std::fs::write(bench_repo_dir.join("pkg_00/mod_000.rs"), "pub fn committed() -> usize { 1 }\n")
-        .expect("edit for commit");
+    std::fs::write(
+        bench_repo_dir.join("pkg_00/mod_000.rs"),
+        "pub fn committed() -> usize { 1 }\n",
+    )
+    .expect("edit for commit");
     git_commit_all(&bench_repo_dir, "bench commit");
     let mut post_changes = dirty_changes;
     post_changes.clear();
-    let m_entry = tx.finish(&main_bench_repo, Some(&post_changes)).expect("finish tx");
+    let m_entry = tx
+        .finish(&main_bench_repo, Some(&post_changes))
+        .expect("finish tx");
 
     let t_undo = Instant::now();
     let _u = undo(&main_bench_repo, m_entry.op_id.as_str(), main_actor.clone()).expect("undo 1500");
@@ -1319,11 +1581,32 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     );
 
     let budget_ms = sub10ms_budget_ms();
-    assert!(undo1_ms < budget_ms, "FUSE CLI undo engine took {undo1_ms:.2}ms (>= {budget_ms}ms)");
-    assert!(redo1_ms < budget_ms, "FUSE CLI redo engine took {redo1_ms:.2}ms (>= {budget_ms}ms)");
-    assert!(fuse_1500_cp_ms < budget_ms, "1500-file FUSE checkpoint took {fuse_1500_cp_ms:.2}ms (>= {budget_ms}ms)");
-    assert!(fuse_1500_undo_ms < budget_ms, "1500-file FUSE CLI undo took {fuse_1500_undo_ms:.2}ms (>= {budget_ms}ms)");
-    assert!(fuse_1500_redo_ms < budget_ms, "1500-file FUSE CLI redo took {fuse_1500_redo_ms:.2}ms (>= {budget_ms}ms)");
-    assert!(undo_1500_ms < budget_ms, "1500-file repo undo took {undo_1500_ms:.2}ms (>= {budget_ms}ms)");
-    assert!(redo_1500_ms < budget_ms, "1500-file repo redo took {redo_1500_ms:.2}ms (>= {budget_ms}ms)");
+    assert!(
+        undo1_ms < budget_ms,
+        "FUSE CLI undo engine took {undo1_ms:.2}ms (>= {budget_ms}ms)"
+    );
+    assert!(
+        redo1_ms < budget_ms,
+        "FUSE CLI redo engine took {redo1_ms:.2}ms (>= {budget_ms}ms)"
+    );
+    assert!(
+        fuse_1500_cp_ms < budget_ms,
+        "1500-file FUSE checkpoint took {fuse_1500_cp_ms:.2}ms (>= {budget_ms}ms)"
+    );
+    assert!(
+        fuse_1500_undo_ms < budget_ms,
+        "1500-file FUSE CLI undo took {fuse_1500_undo_ms:.2}ms (>= {budget_ms}ms)"
+    );
+    assert!(
+        fuse_1500_redo_ms < budget_ms,
+        "1500-file FUSE CLI redo took {fuse_1500_redo_ms:.2}ms (>= {budget_ms}ms)"
+    );
+    assert!(
+        undo_1500_ms < budget_ms,
+        "1500-file repo undo took {undo_1500_ms:.2}ms (>= {budget_ms}ms)"
+    );
+    assert!(
+        redo_1500_ms < budget_ms,
+        "1500-file repo redo took {redo_1500_ms:.2}ms (>= {budget_ms}ms)"
+    );
 }

@@ -15,7 +15,7 @@ use gix::bstr::ByteSlice;
 use gix::refs::FullName;
 use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
 use oz_core::{OzError, OzoneLayout, OzoneRepo, Result};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
@@ -120,7 +120,8 @@ pub fn compact_oplog(repo: &OzoneRepo, opts: &OpLogGcOptions) -> Result<OpLogGcO
     }
 
     let active_workspaces = discover_active_workspaces(repo);
-    let mut protected_ids = compute_protected_entries(&entries, head_op_id.as_deref(), &active_workspaces);
+    let mut protected_ids =
+        compute_protected_entries(&entries, head_op_id.as_deref(), &active_workspaces);
 
     // Initial retention set: protected entries + entries newer than `cutoff`.
     let mut keep_ids: HashSet<String> = protected_ids.clone();
@@ -161,12 +162,7 @@ pub fn compact_oplog(repo: &OzoneRepo, opts: &OpLogGcOptions) -> Result<OpLogGcO
         if !keep_ids.contains(&entry.op_id) {
             continue;
         }
-        let new_parents = compute_relinked_parents(
-            entry,
-            &entries_by_id,
-            &keep_ids,
-            &removed_ids,
-        );
+        let new_parents = compute_relinked_parents(entry, &entries_by_id, &keep_ids, &removed_ids);
         if new_parents != entry.parents {
             let mut updated = entry.clone();
             updated.parents = new_parents;
@@ -335,7 +331,9 @@ fn load_all_ops_strict(layout: &OzoneLayout) -> Result<LoadedOps> {
                 recovery: vec!["Run `oz fsck --repair`.".to_string()],
             });
         }
-        let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(raw.len() as u64);
+        let len = fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(raw.len() as u64);
         sizes.insert(entry.op_id.clone(), len);
         entries.push(entry);
     }
@@ -637,27 +635,4 @@ fn count_referenced_objects(entries: &[OpLogEntry], keep_ids: &HashSet<String>) 
         }
     }
     oids.len()
-}
-
-/// Computes chronological summary counts by workspace for callers/tests.
-#[allow(dead_code)]
-pub(crate) fn summarize_workspace_entries(
-    entries: &[OpLogEntry],
-) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for entry in entries {
-        if entry.ws_snapshots.is_empty() {
-            let ws = entry
-                .actor
-                .workspace
-                .as_deref()
-                .unwrap_or(DEFAULT_WORKSPACE_KEY);
-            *counts.entry(ws.to_string()).or_insert(0) += 1;
-        } else {
-            for ws in entry.ws_snapshots.keys() {
-                *counts.entry(ws.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-    counts
 }

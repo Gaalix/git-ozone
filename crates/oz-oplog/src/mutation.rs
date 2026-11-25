@@ -4,9 +4,9 @@
 //! Pre/post mutation transaction wrapper capturing `ref_deltas` and `ws_snapshots`.
 
 use crate::dirty::{
-    SnapshotSlice, build_dirty_tree, ensure_mount_healthy, make_ws_snapshot, open_gix_for_workspace,
-    read_ref_oid_hex, resolve_workspace_head, scan_dirty_files, snapshots_match,
-    sync_workspace_state_file, workspace_key,
+    SnapshotSlice, build_dirty_tree, ensure_mount_healthy, make_ws_snapshot,
+    open_gix_for_workspace, read_ref_oid_hex, resolve_workspace_head, scan_dirty_files,
+    snapshots_match, sync_workspace_state_file, workspace_key,
 };
 use crate::new_op_id;
 use crate::store::{append_entry, ensure_oplog_dirs};
@@ -43,15 +43,7 @@ impl MutationTransaction {
         actor: ActorInfo,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
-        Self::begin_with_options(
-            repo,
-            command,
-            actor,
-            &[],
-            false,
-            false,
-            pre_dirty_override,
-        )
+        Self::begin_with_options(repo, command, actor, &[], false, false, pre_dirty_override)
     }
 
     /// Captures pre-mutation workspace state, this workspace's active ref, and any explicit `watched_refs`.
@@ -81,15 +73,7 @@ impl MutationTransaction {
         actor: ActorInfo,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
-        Self::begin_with_options(
-            repo,
-            command,
-            actor,
-            &[],
-            true,
-            false,
-            pre_dirty_override,
-        )
+        Self::begin_with_options(repo, command, actor, &[], true, false, pre_dirty_override)
     }
 
     /// Captures pre-mutation workspace state plus ALL local (`refs/heads/*`) and remote-tracking
@@ -100,15 +84,7 @@ impl MutationTransaction {
         actor: ActorInfo,
         pre_dirty_override: Option<&[FileChange]>,
     ) -> Result<Self> {
-        Self::begin_with_options(
-            repo,
-            command,
-            actor,
-            &[],
-            true,
-            true,
-            pre_dirty_override,
-        )
+        Self::begin_with_options(repo, command, actor, &[], true, true, pre_dirty_override)
     }
 
     fn begin_with_options(
@@ -124,10 +100,8 @@ impl MutationTransaction {
         ensure_oplog_dirs(&repo.layout)?;
 
         let gix_repo = open_gix_for_workspace(repo)?;
-        let (pre_branch, pre_head_commit, pre_base_tree) =
-            resolve_workspace_head(repo, &gix_repo)?;
-        let pre_dirty_files =
-            scan_dirty_files(repo, &gix_repo, pre_base_tree, pre_dirty_override)?;
+        let (pre_branch, pre_head_commit, pre_base_tree) = resolve_workspace_head(repo, &gix_repo)?;
+        let pre_dirty_files = scan_dirty_files(repo, &gix_repo, pre_base_tree, pre_dirty_override)?;
         let pre_dirty_tree = build_dirty_tree(&gix_repo, pre_base_tree, &pre_dirty_files)?;
 
         let watched: Vec<String> = watched_refs.iter().map(|r| (*r).to_string()).collect();
@@ -172,10 +146,8 @@ impl MutationTransaction {
         message: Option<&str>,
         post_dirty_override: Option<&[FileChange]>,
     ) -> Result<OpLogEntry> {
-        let stored = self
-            .finish_inner(repo, message, post_dirty_override, false)?
-            .expect("finish_inner with only_if_changed=false always returns Some");
-        Ok(stored)
+        let prepared = self.prepare_finish(repo, post_dirty_override)?;
+        prepared.commit(repo, message)
     }
 
     /// Appends an [`OpKind::Mutate`] entry only if at least one watched ref, `HEAD`, or dirty
@@ -185,16 +157,18 @@ impl MutationTransaction {
         repo: &OzoneRepo,
         post_dirty_override: Option<&[FileChange]>,
     ) -> Result<Option<OpLogEntry>> {
-        self.finish_inner(repo, None, post_dirty_override, true)
+        let prepared = self.prepare_finish(repo, post_dirty_override)?;
+        if !prepared.changed {
+            return Ok(None);
+        }
+        Ok(Some(prepared.commit(repo, None)?))
     }
 
-    fn finish_inner(
+    fn prepare_finish(
         self,
         repo: &OzoneRepo,
-        message: Option<&str>,
         post_dirty_override: Option<&[FileChange]>,
-        only_if_changed: bool,
-    ) -> Result<Option<OpLogEntry>> {
+    ) -> Result<PreparedMutation> {
         ensure_mount_healthy(repo)?;
         let gix_repo = open_gix_for_workspace(repo)?;
 
@@ -231,8 +205,7 @@ impl MutationTransaction {
             }
         }
 
-        if only_if_changed
-            && ref_deltas.is_empty()
+        let unchanged = ref_deltas.is_empty()
             && self.pre_branch == post_branch
             && self.pre_head_commit == post_head_commit
             && snapshots_match(
@@ -240,58 +213,83 @@ impl MutationTransaction {
                 &self.pre_dirty_files,
                 &post_base_tree.to_hex().to_string(),
                 &post_dirty_files,
-            )
-        {
-            return Ok(None);
-        }
+            );
 
+        Ok(PreparedMutation {
+            tx: self,
+            gix_repo,
+            post_branch,
+            post_head_commit,
+            post_base_tree,
+            post_dirty_files,
+            post_dirty_tree,
+            ref_deltas,
+            changed: !unchanged,
+        })
+    }
+}
+
+struct PreparedMutation {
+    tx: MutationTransaction,
+    gix_repo: gix::Repository,
+    post_branch: Option<String>,
+    post_head_commit: Option<ObjectId>,
+    post_base_tree: ObjectId,
+    post_dirty_files: Vec<DirtyFileSnapshot>,
+    post_dirty_tree: ObjectId,
+    ref_deltas: BTreeMap<String, RefDelta>,
+    changed: bool,
+}
+
+impl PreparedMutation {
+    fn commit(self, repo: &OzoneRepo, message: Option<&str>) -> Result<OpLogEntry> {
         let ws_snap = make_ws_snapshot(
             SnapshotSlice {
-                base_tree: post_base_tree,
-                dirty_tree: Some(post_dirty_tree),
-                dirty_files: post_dirty_files.clone(),
-                head_commit: post_head_commit,
-                branch: post_branch.clone(),
+                base_tree: self.post_base_tree,
+                dirty_tree: Some(self.post_dirty_tree),
+                dirty_files: self.post_dirty_files.clone(),
+                head_commit: self.post_head_commit,
+                branch: self.post_branch.clone(),
             },
             Some(SnapshotSlice {
-                base_tree: self.pre_base_tree,
-                dirty_tree: Some(self.pre_dirty_tree),
-                dirty_files: self.pre_dirty_files,
-                head_commit: self.pre_head_commit,
-                branch: self.pre_branch,
+                base_tree: self.tx.pre_base_tree,
+                dirty_tree: Some(self.tx.pre_dirty_tree),
+                dirty_files: self.tx.pre_dirty_files,
+                head_commit: self.tx.pre_head_commit,
+                branch: self.tx.pre_branch,
             }),
         );
 
         let mut ws_snapshots = BTreeMap::new();
-        ws_snapshots.insert(self.ws_key, ws_snap);
+        ws_snapshots.insert(self.tx.ws_key, ws_snap);
 
         let entry = OpLogEntry {
             op_id: new_op_id(),
             parents: Vec::new(),
             timestamp: Utc::now(),
-            actor: self.actor,
+            actor: self.tx.actor,
             kind: OpKind::Mutate,
-            command: self.command,
+            command: self.tx.command,
             message: message.map(str::to_string),
             inverse_of: None,
             undone_ops: Vec::new(),
             rewound_uncheckpointed: false,
-            ref_deltas,
+            ref_deltas: self.ref_deltas,
             ws_snapshots,
         };
 
         let stored = append_entry(&repo.layout, entry)?;
         sync_workspace_state_file(
             repo,
-            &gix_repo,
-            post_head_commit,
-            post_base_tree,
-            &post_dirty_files,
+            &self.gix_repo,
+            self.post_head_commit,
+            self.post_base_tree,
+            &self.post_dirty_files,
             None,
-            post_branch.as_deref(),
+            self.post_branch.as_deref(),
         )?;
 
-        Ok(Some(stored))
+        Ok(stored)
     }
 }
 
@@ -327,8 +325,13 @@ pub fn record_mutation_with_refs<T, F>(
 where
     F: FnOnce() -> Result<(T, Option<Vec<FileChange>>)>,
 {
-    let tx =
-        MutationTransaction::begin_with_refs(repo, command, actor, watched_refs, pre_dirty_override)?;
+    let tx = MutationTransaction::begin_with_refs(
+        repo,
+        command,
+        actor,
+        watched_refs,
+        pre_dirty_override,
+    )?;
     let (result, post_dirty) = mutate()?;
     let entry = tx.finish(repo, post_dirty.as_deref())?;
     Ok((result, entry))
@@ -345,7 +348,8 @@ pub fn record_mutation_all_branches<T, F>(
 where
     F: FnOnce() -> Result<T>,
 {
-    let tx = MutationTransaction::begin_watching_all_branches(repo, command, actor, dirty_override)?;
+    let tx =
+        MutationTransaction::begin_watching_all_branches(repo, command, actor, dirty_override)?;
     let result = mutate()?;
     let entry = tx.finish(repo, None)?;
     Ok((result, entry))

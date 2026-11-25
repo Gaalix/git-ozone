@@ -9,7 +9,6 @@ description = "Path guardrails, collision radar, and atomic in-memory merge sand
 chrono.workspace = true
 gix.workspace = true
 globset.workspace = true
-imara-diff.workspace = true
 oz-core.workspace = true
 oz-cow.workspace = true
 oz-oplog.workspace = true

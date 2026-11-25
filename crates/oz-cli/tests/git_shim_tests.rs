@@ -3,7 +3,7 @@
 
 //! End-to-end integration tests for the `oz git <args...>` compatibility shim.
 
-use oz_cli::git_shim::resolve_real_git;
+use oz_cli::resolve_real_git;
 use oz_core::{OZ_SCHEMA_V1, OzoneLayout, OzoneRepo, WorkspaceState};
 use serde_json::Value;
 use std::fs;
@@ -178,7 +178,11 @@ fn real_git_resolution_skips_oz_alias_and_global_flags_work() {
         ],
         &[],
     );
-    assert_eq!(commit.code, 0, "stdout={} stderr={}", commit.stdout, commit.stderr);
+    assert_eq!(
+        commit.code, 0,
+        "stdout={} stderr={}",
+        commit.stdout, commit.stderr
+    );
     let log_author = sys_git(&repo_dir, &["log", "-1", "--pretty=%an <%ae>"]);
     assert_eq!(log_author.trim(), "Custom Bot <bot@custom.dev>");
 }
@@ -205,7 +209,10 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
     let no_msg = run_oz(
         &repo_dir,
         &["git", "commit"],
-        &[("EDITOR", "sh -c 'exit 99'"), ("GIT_EDITOR", "sh -c 'exit 99'")],
+        &[
+            ("EDITOR", "sh -c 'exit 99'"),
+            ("GIT_EDITOR", "sh -c 'exit 99'"),
+        ],
     );
     assert_eq!(no_msg.code, 2, "expected exit 2, got {}", no_msg.code);
 
@@ -226,15 +233,39 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
     // Verify `oz git status --porcelain` and `-s -b` show staged (`M ` / `A `) vs unstaged (` M` / `??`) columns.
     let porcelain = run_oz(&repo_dir, &["git", "status", "--porcelain"], &[]);
     assert_eq!(porcelain.code, 0);
-    assert!(porcelain.stdout.contains("M  a.rs"), "got:\n{}", porcelain.stdout);
-    assert!(porcelain.stdout.contains("A  new_a.rs"), "got:\n{}", porcelain.stdout);
-    assert!(porcelain.stdout.contains(" M b.rs"), "got:\n{}", porcelain.stdout);
-    assert!(porcelain.stdout.contains("?? new_b.rs"), "got:\n{}", porcelain.stdout);
+    assert!(
+        porcelain.stdout.contains("M  a.rs"),
+        "got:\n{}",
+        porcelain.stdout
+    );
+    assert!(
+        porcelain.stdout.contains("A  new_a.rs"),
+        "got:\n{}",
+        porcelain.stdout
+    );
+    assert!(
+        porcelain.stdout.contains(" M b.rs"),
+        "got:\n{}",
+        porcelain.stdout
+    );
+    assert!(
+        porcelain.stdout.contains("?? new_b.rs"),
+        "got:\n{}",
+        porcelain.stdout
+    );
 
     let short_b = run_oz(&repo_dir, &["git", "status", "-s", "-b"], &[]);
     assert_eq!(short_b.code, 0);
-    assert!(short_b.stdout.starts_with("## main\n"), "got:\n{}", short_b.stdout);
-    assert!(short_b.stdout.contains("M  a.rs"), "got:\n{}", short_b.stdout);
+    assert!(
+        short_b.stdout.starts_with("## main\n"),
+        "got:\n{}",
+        short_b.stdout
+    );
+    assert!(
+        short_b.stdout.contains("M  a.rs"),
+        "got:\n{}",
+        short_b.stdout
+    );
 
     // Verify `oz git status --json` emits valid oz.v1 with pinned flags.
     let st_json_run = run_oz(&repo_dir, &["git", "status", "--json"], &[]);
@@ -251,14 +282,21 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
 
     let diff_cached = run_oz(&repo_dir, &["git", "diff", "--cached", "--name-only"], &[]);
     assert_eq!(diff_cached.code, 0);
-    assert_eq!(diff_cached.stdout.lines().collect::<Vec<_>>(), vec!["a.rs", "new_a.rs"]);
+    assert_eq!(
+        diff_cached.stdout.lines().collect::<Vec<_>>(),
+        vec!["a.rs", "new_a.rs"]
+    );
 
     let diff_stat = run_oz(&repo_dir, &["git", "diff", "--stat"], &[]);
     assert_eq!(diff_stat.code, 0);
     assert!(diff_stat.stdout.contains("file(s) changed"));
 
     // Verify commit range `HEAD~1..HEAD` delegates cleanly read-only.
-    let diff_range = run_oz(&repo_dir, &["git", "diff", "--name-only", "HEAD~1..HEAD"], &[]);
+    let diff_range = run_oz(
+        &repo_dir,
+        &["git", "diff", "--name-only", "HEAD~1..HEAD"],
+        &[],
+    );
     assert_eq!(diff_range.code, 0);
     assert!(diff_range.stdout.contains("a.rs"));
 
@@ -272,12 +310,27 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
     // Multi-paragraph `-m` commit commits ONLY pinned `a.rs`, adds Change-Id, clears pinned set!
     let c_pin = run_oz(
         &repo_dir,
-        &["git", "commit", "-m", "feat: pin a", "-m", "Second paragraph body.", "--json"],
+        &[
+            "git",
+            "commit",
+            "-m",
+            "feat: pin a",
+            "-m",
+            "Second paragraph body.",
+            "--json",
+        ],
         &[],
     );
-    assert_eq!(c_pin.code, 0, "stdout={} stderr={}", c_pin.stdout, c_pin.stderr);
+    assert_eq!(
+        c_pin.code, 0,
+        "stdout={} stderr={}",
+        c_pin.stdout, c_pin.stderr
+    );
     let c_pin_json = c_pin.json.expect("commit json");
-    assert_eq!(c_pin_json["data"]["committed_paths"], serde_json::json!(["a.rs"]));
+    assert_eq!(
+        c_pin_json["data"]["committed_paths"],
+        serde_json::json!(["a.rs"])
+    );
     assert_eq!(c_pin_json["data"]["remaining_dirty_count"], 3);
     let msg = c_pin_json["data"]["message"].as_str().unwrap();
     assert!(msg.contains("feat: pin a\n\nSecond paragraph body."));
@@ -305,7 +358,11 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
         ],
         &[],
     );
-    assert_eq!(c_all.code, 0, "stdout={} stderr={}", c_all.stdout, c_all.stderr);
+    assert_eq!(
+        c_all.code, 0,
+        "stdout={} stderr={}",
+        c_all.stdout, c_all.stderr
+    );
     let c_all_json = c_all.json.expect("commit -a json");
     assert_eq!(
         c_all_json["data"]["committed_paths"],
@@ -314,13 +371,65 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
     assert_eq!(c_all_json["data"]["remaining_dirty_count"], 0);
 
     // Now test `oz git worktree add` + `oz git add` + `oz git commit` inside spawned workspace!
+    // RAII guard ensures `ws-shim` is unmounted even if an assertion panics before `worktree remove`.
+    struct ShimVfsCleanupGuard(PathBuf);
+    impl Drop for ShimVfsCleanupGuard {
+        fn drop(&mut self) {
+            let git_dir = self.0.join(".git");
+            let mut mounts = Vec::new();
+            if let Ok(entries) = fs::read_dir(git_dir.join("ozone/ws")) {
+                for entry in entries.flatten() {
+                    let mj = entry.path().join("mount.json");
+                    if let Ok(raw) = fs::read_to_string(&mj)
+                        && let Ok(rec) = serde_json::from_str::<oz_core::MountRecord>(&raw)
+                    {
+                        let _ = oz_vfsd::unmount_via_daemon(&git_dir, &rec.workspace, true);
+                        mounts.push(rec.mount_point);
+                    }
+                }
+            }
+            if git_dir.is_dir() {
+                let _ = oz_vfsd::shutdown_daemon(&git_dir);
+            }
+            #[cfg(target_os = "linux")]
+            for mp in &mounts {
+                let _ = Command::new("fusermount3")
+                    .args(["-u", "-z", "--"])
+                    .arg(mp)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = mounts;
+        }
+    }
+    let _vfs_guard = ShimVfsCleanupGuard(repo_dir.clone());
     let wt_add = run_oz(
         &repo_dir,
-        &["git", "worktree", "add", "-b", "feat/ws-shim", "ws-shim", "main", "--json"],
+        &[
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "feat/ws-shim",
+            "ws-shim",
+            "main",
+            "--json",
+        ],
         &[],
     );
-    assert_eq!(wt_add.code, 0, "stdout={} stderr={}", wt_add.stdout, wt_add.stderr);
-    let ws_path = PathBuf::from(wt_add.json.unwrap()["data"]["worktree_path"].as_str().unwrap());
+    assert_eq!(
+        wt_add.code, 0,
+        "stdout={} stderr={}",
+        wt_add.stdout, wt_add.stderr
+    );
+    let ws_path = PathBuf::from(
+        wt_add.json.unwrap()["data"]["worktree_path"]
+            .as_str()
+            .unwrap(),
+    );
 
     fs::write(ws_path.join("ws_one.rs"), "pub fn one() {}\n").unwrap();
     fs::write(ws_path.join("ws_two.rs"), "pub fn two() {}\n").unwrap();
@@ -329,16 +438,21 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
 
     // Verify WorkspaceState.pinned_paths in `.git/ozone/state/ws-shim.json`.
     let layout = OzoneLayout::from_git_common_dir(repo_dir.join(".git"));
-    let st: WorkspaceState = serde_json::from_str(
-        &fs::read_to_string(layout.workspace_state_path("ws-shim")).unwrap(),
-    )
-    .unwrap();
+    let st: WorkspaceState =
+        serde_json::from_str(&fs::read_to_string(layout.workspace_state_path("ws-shim")).unwrap())
+            .unwrap();
     assert!(st.pinned_paths.contains("ws_one.rs"));
     assert!(!st.pinned_paths.contains("ws_two.rs"));
 
     let ws_commit = run_oz(
         &ws_path,
-        &["git", "commit", "-m", "feat(ws): commit pinned ws_one", "--json"],
+        &[
+            "git",
+            "commit",
+            "-m",
+            "feat(ws): commit pinned ws_one",
+            "--json",
+        ],
         &[],
     );
     assert_eq!(ws_commit.code, 0, "stderr: {}", ws_commit.stderr);
@@ -346,10 +460,9 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
         ws_commit.json.unwrap()["data"]["committed_paths"],
         serde_json::json!(["ws_one.rs"])
     );
-    let st_after: WorkspaceState = serde_json::from_str(
-        &fs::read_to_string(layout.workspace_state_path("ws-shim")).unwrap(),
-    )
-    .unwrap();
+    let st_after: WorkspaceState =
+        serde_json::from_str(&fs::read_to_string(layout.workspace_state_path("ws-shim")).unwrap())
+            .unwrap();
     assert!(st_after.pinned_paths.is_empty());
 
     // `oz git worktree list --json` & `--porcelain` & `remove` & `prune`.
@@ -357,7 +470,11 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
     assert_eq!(wt_list.code, 0);
     assert_eq!(wt_list.json.unwrap()["data"].as_array().unwrap().len(), 2);
 
-    let wt_rm = run_oz(&repo_dir, &["git", "worktree", "remove", "-f", "ws-shim"], &[]);
+    let wt_rm = run_oz(
+        &repo_dir,
+        &["git", "worktree", "remove", "-f", "ws-shim"],
+        &[],
+    );
     assert_eq!(wt_rm.code, 0, "stderr: {}", wt_rm.stderr);
     assert!(!ws_path.exists());
 
@@ -377,10 +494,21 @@ fn git_switch_checkout_dirty_protection_and_undo() {
     sys_git(&repo_dir, &["commit", "-m", "base"]);
 
     // Create branch feat/target modifying `shared.txt`.
-    let sw_create = run_oz(&repo_dir, &["git", "switch", "-c", "feat/target", "--json"], &[]);
-    assert_eq!(sw_create.code, 0, "stdout={} stderr={}", sw_create.stdout, sw_create.stderr);
+    let sw_create = run_oz(
+        &repo_dir,
+        &["git", "switch", "-c", "feat/target", "--json"],
+        &[],
+    );
     assert_eq!(
-        OzoneRepo::discover(Some(&repo_dir)).unwrap().branch.as_deref(),
+        sw_create.code, 0,
+        "stdout={} stderr={}",
+        sw_create.stdout, sw_create.stderr
+    );
+    assert_eq!(
+        OzoneRepo::discover(Some(&repo_dir))
+            .unwrap()
+            .branch
+            .as_deref(),
         Some("feat/target")
     );
     fs::write(repo_dir.join("shared.txt"), "from feat\n").unwrap();
@@ -392,7 +520,10 @@ fn git_switch_checkout_dirty_protection_and_undo() {
     fs::write(repo_dir.join("untouched.txt"), "carried over\n").unwrap();
     let sw_main = run_oz(&repo_dir, &["git", "switch", "main"], &[]);
     assert_eq!(sw_main.code, 0, "stderr: {}", sw_main.stderr);
-    assert_eq!(fs::read_to_string(repo_dir.join("shared.txt")).unwrap(), "base\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("shared.txt")).unwrap(),
+        "base\n"
+    );
     assert!(!repo_dir.join("only_feat.txt").exists());
     assert_eq!(
         fs::read_to_string(repo_dir.join("untouched.txt")).unwrap(),
@@ -404,32 +535,61 @@ fn git_switch_checkout_dirty_protection_and_undo() {
     let refused = run_oz(&repo_dir, &["git", "switch", "feat/target"], &[]);
     assert_ne!(refused.code, 0);
     assert_eq!(
-        OzoneRepo::discover(Some(&repo_dir)).unwrap().branch.as_deref(),
+        OzoneRepo::discover(Some(&repo_dir))
+            .unwrap()
+            .branch
+            .as_deref(),
         Some("main")
     );
-    assert_eq!(fs::read_to_string(repo_dir.join("shared.txt")).unwrap(), "dirty conflict\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("shared.txt")).unwrap(),
+        "dirty conflict\n"
+    );
 
     // Force switch `-f` succeeds and overwrites `shared.txt`, wrapped in OpLog so `oz undo` restores!
-    let forced = run_oz(&repo_dir, &["git", "switch", "-f", "feat/target", "--json"], &[]);
-    assert_eq!(forced.code, 0, "stdout={} stderr={}", forced.stdout, forced.stderr);
-    assert_eq!(fs::read_to_string(repo_dir.join("shared.txt")).unwrap(), "from feat\n");
+    let forced = run_oz(
+        &repo_dir,
+        &["git", "switch", "-f", "feat/target", "--json"],
+        &[],
+    );
     assert_eq!(
-        OzoneRepo::discover(Some(&repo_dir)).unwrap().branch.as_deref(),
+        forced.code, 0,
+        "stdout={} stderr={}",
+        forced.stdout, forced.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("shared.txt")).unwrap(),
+        "from feat\n"
+    );
+    assert_eq!(
+        OzoneRepo::discover(Some(&repo_dir))
+            .unwrap()
+            .branch
+            .as_deref(),
         Some("feat/target")
     );
 
     let undo_sw = run_oz(&repo_dir, &["undo", "--json"], &[]);
     assert_eq!(undo_sw.code, 0, "stderr: {}", undo_sw.stderr);
     assert_eq!(
-        OzoneRepo::discover(Some(&repo_dir)).unwrap().branch.as_deref(),
+        OzoneRepo::discover(Some(&repo_dir))
+            .unwrap()
+            .branch
+            .as_deref(),
         Some("main")
     );
-    assert_eq!(fs::read_to_string(repo_dir.join("shared.txt")).unwrap(), "dirty conflict\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("shared.txt")).unwrap(),
+        "dirty conflict\n"
+    );
 
     // `oz git checkout -- shared.txt` restores from HEAD, and `oz git checkout feat/target -- only_feat.txt` restores from feat/target.
     let co_head = run_oz(&repo_dir, &["git", "checkout", "--", "shared.txt"], &[]);
     assert_eq!(co_head.code, 0, "stderr: {}", co_head.stderr);
-    assert_eq!(fs::read_to_string(repo_dir.join("shared.txt")).unwrap(), "base\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("shared.txt")).unwrap(),
+        "base\n"
+    );
 
     let co_rev = run_oz(
         &repo_dir,
@@ -437,13 +597,19 @@ fn git_switch_checkout_dirty_protection_and_undo() {
         &[],
     );
     assert_eq!(co_rev.code, 0, "stderr: {}", co_rev.stderr);
-    assert_eq!(fs::read_to_string(repo_dir.join("only_feat.txt")).unwrap(), "feat only\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("only_feat.txt")).unwrap(),
+        "feat only\n"
+    );
 
     // `oz git checkout -b feat/co` creates and switches branch.
     let co_b = run_oz(&repo_dir, &["git", "checkout", "-b", "feat/co"], &[]);
     assert_eq!(co_b.code, 0, "stderr: {}", co_b.stderr);
     assert_eq!(
-        OzoneRepo::discover(Some(&repo_dir)).unwrap().branch.as_deref(),
+        OzoneRepo::discover(Some(&repo_dir))
+            .unwrap()
+            .branch
+            .as_deref(),
         Some("feat/co")
     );
 }
@@ -458,13 +624,17 @@ fn git_reset_hard_head_tilde_1_and_clean_fd_restored_by_oz_undo() {
     fs::write(repo_dir.join("tracked.txt"), "v1\n").unwrap();
     sys_git(&repo_dir, &["add", "."]);
     sys_git(&repo_dir, &["commit", "-m", "commit c1b"]);
-    let _c1b = sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let _c1b = sys_git(&repo_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     fs::write(repo_dir.join("tracked.txt"), "v2-committed\n").unwrap();
     fs::write(repo_dir.join("c2_file.txt"), "born in c2\n").unwrap();
     sys_git(&repo_dir, &["add", "."]);
     sys_git(&repo_dir, &["commit", "-m", "commit c2"]);
-    let c2 = sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let c2 = sys_git(&repo_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     assert_ne!(c1, c2);
 
     // Uncommitted edits: modified tracked file + untracked non-ignored file + nested untracked file + ignored file.
@@ -479,15 +649,25 @@ fn git_reset_hard_head_tilde_1_and_clean_fd_restored_by_oz_undo() {
     assert_eq!(reset_out.code, 0, "stderr: {}", reset_out.stderr);
     assert_ne!(sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim(), c2);
     assert!(!repo_dir.join("c2_file.txt").exists());
-    assert_eq!(fs::read_to_string(repo_dir.join("tracked.txt")).unwrap(), "v1\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("tracked.txt")).unwrap(),
+        "v1\n"
+    );
 
     // `oz undo --json` MUST restore BOTH commit C2 AND every wiped dirty/untracked file!
     let undo_reset = run_oz(&repo_dir, &["undo", "--json"], &[]);
-    assert_eq!(undo_reset.code, 0, "stdout={} stderr={}", undo_reset.stdout, undo_reset.stderr);
+    assert_eq!(
+        undo_reset.code, 0,
+        "stdout={} stderr={}",
+        undo_reset.stdout, undo_reset.stderr
+    );
     let undo_json = undo_reset.json.expect("undo json");
     assert_eq!(undo_json["ok"], true);
     assert_eq!(sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim(), c2);
-    assert_eq!(fs::read_to_string(repo_dir.join("c2_file.txt")).unwrap(), "born in c2\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("c2_file.txt")).unwrap(),
+        "born in c2\n"
+    );
     assert_eq!(
         fs::read_to_string(repo_dir.join("tracked.txt")).unwrap(),
         "precious dirty edit\n"
@@ -503,7 +683,10 @@ fn git_reset_hard_head_tilde_1_and_clean_fd_restored_by_oz_undo() {
     let sys_st = sys_git(&repo_dir, &["status", "--porcelain"]);
     assert!(sys_st.contains(" M tracked.txt"), "git status:\n{sys_st}");
     assert!(sys_st.contains("?? untracked.txt"), "git status:\n{sys_st}");
-    assert!(!sys_st.contains("c2_file.txt"), "c2_file.txt should be clean in index:\n{sys_st}");
+    assert!(
+        !sys_st.contains("c2_file.txt"),
+        "c2_file.txt should be clean in index:\n{sys_st}"
+    );
 
     // 2. Destructive `oz git clean -fd` wipes untracked files; `oz undo` restores them!
     let clean_out = run_oz(&repo_dir, &["git", "clean", "-fd"], &[]);
@@ -528,9 +711,16 @@ fn git_reset_hard_head_tilde_1_and_clean_fd_restored_by_oz_undo() {
     assert_eq!(rm_out.code, 0, "stderr: {}", rm_out.stderr);
     assert!(!repo_dir.join("c2_file.txt").exists());
     assert_eq!(run_oz(&repo_dir, &["undo"], &[]).code, 0);
-    assert_eq!(fs::read_to_string(repo_dir.join("c2_file.txt")).unwrap(), "born in c2\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("c2_file.txt")).unwrap(),
+        "born in c2\n"
+    );
 
-    let mv_out = run_oz(&repo_dir, &["git", "mv", "c2_file.txt", "c2_moved.txt"], &[]);
+    let mv_out = run_oz(
+        &repo_dir,
+        &["git", "mv", "c2_file.txt", "c2_moved.txt"],
+        &[],
+    );
     assert_eq!(mv_out.code, 0, "stderr: {}", mv_out.stderr);
     assert!(!repo_dir.join("c2_file.txt").exists());
     assert!(repo_dir.join("c2_moved.txt").is_file());
@@ -549,16 +739,29 @@ fn git_clone_fetch_push_merge_and_rebase_wrappers() {
     // Seed bare remote via temporary upstream repo.
     let seed = tmp.path().join("seed");
     init_repo(&seed);
-    sys_git(&seed, &["remote", "add", "origin", bare_remote.to_str().unwrap()]);
+    sys_git(
+        &seed,
+        &["remote", "add", "origin", bare_remote.to_str().unwrap()],
+    );
     sys_git(&seed, &["push", "-u", "origin", "main"]);
 
     // 1. `oz git clone <url> cloned --json` auto-initializes `.git/ozone/` and emits oz.v1 JSON.
     let clone_out = run_oz(
         tmp.path(),
-        &["git", "clone", bare_remote.to_str().unwrap(), "cloned", "--json"],
+        &[
+            "git",
+            "clone",
+            bare_remote.to_str().unwrap(),
+            "cloned",
+            "--json",
+        ],
         &[],
     );
-    assert_eq!(clone_out.code, 0, "stdout={} stderr={}", clone_out.stdout, clone_out.stderr);
+    assert_eq!(
+        clone_out.code, 0,
+        "stdout={} stderr={}",
+        clone_out.stdout, clone_out.stderr
+    );
     let clone_json = clone_out.json.expect("clone json");
     assert_eq!(clone_json["schema"], OZ_SCHEMA_V1);
     assert_eq!(clone_json["ok"], true);
@@ -579,7 +782,11 @@ fn git_clone_fetch_push_merge_and_rebase_wrappers() {
     let new_upstream_oid = sys_git(&seed, &["rev-parse", "HEAD"]).trim().to_string();
 
     let fetch_out = run_oz(&cloned_dir, &["git", "fetch", "origin", "--json"], &[]);
-    assert_eq!(fetch_out.code, 0, "stdout={} stderr={}", fetch_out.stdout, fetch_out.stderr);
+    assert_eq!(
+        fetch_out.code, 0,
+        "stdout={} stderr={}",
+        fetch_out.stdout, fetch_out.stderr
+    );
     assert_eq!(
         sys_git(&cloned_dir, &["rev-parse", "refs/remotes/origin/main"]).trim(),
         new_upstream_oid
@@ -597,7 +804,11 @@ fn git_clone_fetch_push_merge_and_rebase_wrappers() {
     let c_seed = run_oz(&seed, &["git", "commit", "-m", "local push"], &[]);
     assert_eq!(c_seed.code, 0);
     let push_out = run_oz(&seed, &["git", "push", "origin", "main", "--json"], &[]);
-    assert_eq!(push_out.code, 0, "stdout={} stderr={}", push_out.stdout, push_out.stderr);
+    assert_eq!(
+        push_out.code, 0,
+        "stdout={} stderr={}",
+        push_out.stdout, push_out.stderr
+    );
 
     // 4. `oz git merge` and `oz git rebase` (Wave 1 OpLog wrappers) + `oz undo`.
     let sw_feat = run_oz(&cloned_dir, &["git", "switch", "-c", "feat/m"], &[]);
@@ -614,7 +825,9 @@ fn git_clone_fetch_push_merge_and_rebase_wrappers() {
         run_oz(&cloned_dir, &["git", "commit", "-m", "main m"], &[]).code,
         0
     );
-    let main_before_merge = sys_git(&cloned_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let main_before_merge = sys_git(&cloned_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     let merge_out = run_oz(
         &cloned_dir,
@@ -632,8 +845,13 @@ fn git_clone_fetch_push_merge_and_rebase_wrappers() {
     assert!(!cloned_dir.join("feat_m.txt").exists());
 
     // Test `oz git rebase main` from `feat/m` + `oz undo`.
-    assert_eq!(run_oz(&cloned_dir, &["git", "switch", "feat/m"], &[]).code, 0);
-    let feat_before_rebase = sys_git(&cloned_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        run_oz(&cloned_dir, &["git", "switch", "feat/m"], &[]).code,
+        0
+    );
+    let feat_before_rebase = sys_git(&cloned_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     let rebase_out = run_oz(&cloned_dir, &["git", "rebase", "main"], &[]);
     assert_eq!(rebase_out.code, 0, "stderr: {}", rebase_out.stderr);
     assert!(cloned_dir.join("main_m.txt").is_file());
@@ -693,7 +911,10 @@ fn seed_m3_bare_remote(root: &Path) -> (PathBuf, PathBuf, String, String, String
     sys_git(&seed, &["checkout", "main"]);
 
     sys_git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
-    sys_git(&seed, &["push", "origin", "main:main", "feat/alpha:feat/alpha"]);
+    sys_git(
+        &seed,
+        &["push", "origin", "main:main", "feat/alpha:feat/alpha"],
+    );
 
     (bare, seed, legacy_blob_oid, main_tip, alpha_tip)
 }
@@ -734,9 +955,7 @@ fn m3_git_clone_partial_blob_none_and_exotic_fallbacks() {
     assert_eq!(cj["data"]["branch"], "main");
     assert_eq!(cj["data"]["head_oid"], main_tip);
     assert!(
-        cj["op_id"]
-            .as_str()
-            .is_some_and(|s| s.starts_with("op_")),
+        cj["op_id"].as_str().is_some_and(|s| s.starts_with("op_")),
         "expected initial OpLog op_id in {cj}"
     );
 
@@ -825,7 +1044,14 @@ fn m3_git_clone_partial_blob_none_and_exotic_fallbacks() {
 
     let bare_clone = run_oz(
         tmp.path(),
-        &["git", "clone", "--bare", &file_url, "bare-copy.git", "--json"],
+        &[
+            "git",
+            "clone",
+            "--bare",
+            &file_url,
+            "bare-copy.git",
+            "--json",
+        ],
         &[],
     );
     assert_eq!(bare_clone.code, 0, "stderr={}", bare_clone.stderr);
@@ -911,7 +1137,10 @@ fn m3_git_fetch_prune_and_push_atomic_and_force_with_lease() {
     );
 
     // Re-fetch `-p -q` so remote-tracking refs are up to date again.
-    assert_eq!(run_oz(&work_dir, &["git", "fetch", "-p", "-q"], &[]).code, 0);
+    assert_eq!(
+        run_oz(&work_dir, &["git", "fetch", "-p", "-q"], &[]).code,
+        0
+    );
 
     // 2. `oz git push -u origin feat/stack --atomic --json`
     assert_eq!(
@@ -923,11 +1152,21 @@ fn m3_git_fetch_prune_and_push_atomic_and_force_with_lease() {
         run_oz(&work_dir, &["git", "commit", "-m", "feat: stack v1"], &[]).code,
         0
     );
-    let stack_v1 = sys_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let stack_v1 = sys_git(&work_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     let push_atomic = run_oz(
         &work_dir,
-        &["git", "push", "-u", "origin", "feat/stack", "--atomic", "--json"],
+        &[
+            "git",
+            "push",
+            "-u",
+            "origin",
+            "feat/stack",
+            "--atomic",
+            "--json",
+        ],
         &[],
     );
     assert_eq!(
@@ -963,7 +1202,9 @@ fn m3_git_fetch_prune_and_push_atomic_and_force_with_lease() {
         .code,
         0
     );
-    let stack_v2 = sys_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let stack_v2 = sys_git(&work_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     assert_ne!(stack_v1, stack_v2);
 
     let rejected_non_ff = run_oz(&work_dir, &["git", "push", "--json"], &[]);
@@ -1036,7 +1277,14 @@ fn m3_git_fetch_prune_and_push_atomic_and_force_with_lease() {
     let explicit_lease_arg = format!("--force-with-lease=feat/stack:{teammate_oid}");
     let explicit_lease_ok = run_oz(
         &work_dir,
-        &["git", "push", "origin", "feat/stack", &explicit_lease_arg, "--json"],
+        &[
+            "git",
+            "push",
+            "origin",
+            "feat/stack",
+            &explicit_lease_arg,
+            "--json",
+        ],
         &[],
     );
     assert_eq!(
@@ -1092,10 +1340,21 @@ fn m3_git_commit_ssh_signing_and_native_amend_change_id() {
     );
 
     // 1. `oz git commit -S -m "..."` signs natively and passes `/usr/bin/git verify-commit`!
-    fs::write(repo_dir.join("signed.rs"), "pub fn verified() -> bool { true }\n").unwrap();
+    fs::write(
+        repo_dir.join("signed.rs"),
+        "pub fn verified() -> bool { true }\n",
+    )
+    .unwrap();
     let signed_out = run_oz(
         &repo_dir,
-        &["git", "commit", "-S", "-m", "feat: ssh signed commit", "--json"],
+        &[
+            "git",
+            "commit",
+            "-S",
+            "-m",
+            "feat: ssh signed commit",
+            "--json",
+        ],
         &[],
     );
     assert_eq!(
@@ -1132,7 +1391,11 @@ fn m3_git_commit_ssh_signing_and_native_amend_change_id() {
     // 2. `oz git add` + `oz git commit --amend --no-edit` honors virtual `pinned_paths`,
     // preserves `HEAD`'s message + `Change-Id:`, and never touches `.git/index.lock`!
     fs::write(repo_dir.join("pinned_amend.rs"), "pub fn pinned() {}\n").unwrap();
-    fs::write(repo_dir.join("unpinned_dirty.rs"), "pub fn keep_dirty() {}\n").unwrap();
+    fs::write(
+        repo_dir.join("unpinned_dirty.rs"),
+        "pub fn keep_dirty() {}\n",
+    )
+    .unwrap();
     assert_eq!(
         run_oz(&repo_dir, &["git", "add", "pinned_amend.rs"], &[]).code,
         0
@@ -1240,13 +1503,20 @@ fn m3_git_commit_agent_provenance_notes() {
         &[],
     );
     assert_eq!(human_commit.code, 0, "stderr={}", human_commit.stderr);
-    assert!(human_commit.json.unwrap()["data"].get("provenance").is_none());
+    assert!(
+        human_commit.json.unwrap()["data"]
+            .get("provenance")
+            .is_none()
+    );
     let no_note = Command::new(sys_git_bin())
         .args(["notes", "--ref=ai", "show", "HEAD"])
         .current_dir(&repo_dir)
         .output()
         .unwrap();
-    assert!(!no_note.status.success(), "human commit should not create refs/notes/ai");
+    assert!(
+        !no_note.status.success(),
+        "human commit should not create refs/notes/ai"
+    );
 
     // 2. `oz --agent git commit -m "..."` writes `refs/notes/ai` readable by `git notes --ref=ai show HEAD`!
     fs::write(
@@ -1276,7 +1546,10 @@ fn m3_git_commit_agent_provenance_notes() {
         agent_commit.stdout, agent_commit.stderr
     );
     let ac_json = agent_commit.json.expect("agent commit json");
-    assert_eq!(ac_json["data"]["provenance"]["session_id"], "sess-m3-shim-01");
+    assert_eq!(
+        ac_json["data"]["provenance"]["session_id"],
+        "sess-m3-shim-01"
+    );
     assert_eq!(ac_json["data"]["provenance"]["model"], "claude-opus-4-6");
 
     let note_raw = sys_git(&repo_dir, &["notes", "--ref=ai", "show", "HEAD"]);
@@ -1298,7 +1571,13 @@ fn m3_git_commit_agent_provenance_notes() {
     fs::write(repo_dir.join("env_agent.rs"), "pub const X: usize = 7;\n").unwrap();
     let env_commit = run_oz(
         &repo_dir,
-        &["git", "commit", "-m", "feat: env detected agent commit", "--json"],
+        &[
+            "git",
+            "commit",
+            "-m",
+            "feat: env detected agent commit",
+            "--json",
+        ],
         &[
             ("CLAUDE_CODE_SESSION_ID", "claude-auto-77"),
             ("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
@@ -1351,13 +1630,18 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
         ],
     );
     sys_git(&repo_dir, &["commit", "-m", "add tracked + submodule"]);
-    let head_oid2 = sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    let head_oid2 = sys_git(&repo_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     assert_ne!(head_oid, head_oid2);
 
     // Dirty tracked file, staged file via `oz git add`, untracked file, ignored file, and bumped submodule
     fs::write(repo_dir.join("tracked.txt"), "line1\nline2\n").unwrap();
     fs::write(repo_dir.join("staged.txt"), "staged\n").unwrap();
-    assert_eq!(run_oz(&repo_dir, &["git", "add", "staged.txt"], &[]).code, 0);
+    assert_eq!(
+        run_oz(&repo_dir, &["git", "add", "staged.txt"], &[]).code,
+        0
+    );
     fs::write(repo_dir.join("untracked.txt"), "untracked\n").unwrap();
     fs::write(repo_dir.join("debug.log"), "ignored\n").unwrap();
     sys_git(&repo_dir, &["-C", "deps/sub", "checkout", "-q", &sub_v2]);
@@ -1396,12 +1680,19 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
     );
     assert!(recs.contains(&"1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 staged.txt"), "recs={recs:?}");
     assert!(recs.contains(&"? untracked.txt"), "recs={recs:?}");
-    assert!(!recs.iter().any(|r| r.contains("debug.log")), "recs={recs:?}");
+    assert!(
+        !recs.iter().any(|r| r.contains("debug.log")),
+        "recs={recs:?}"
+    );
 
     // 2. `--porcelain --null` (v1 NUL-terminated)
     let st_v1z = run_oz(&repo_dir, &["git", "status", "--porcelain", "--null"], &[]);
     assert_eq!(st_v1z.code, 0);
-    let v1_recs: Vec<&str> = st_v1z.stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    let v1_recs: Vec<&str> = st_v1z
+        .stdout
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .collect();
     assert!(v1_recs.contains(&" M tracked.txt"), "{v1_recs:?}");
     assert!(v1_recs.contains(&"A  staged.txt"), "{v1_recs:?}");
     assert!(v1_recs.contains(&"?? untracked.txt"), "{v1_recs:?}");
@@ -1413,13 +1704,21 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
         &[],
     );
     assert_eq!(diff_num.code, 0);
-    let d_recs: Vec<&str> = diff_num.stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    let d_recs: Vec<&str> = diff_num
+        .stdout
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .collect();
     assert!(d_recs.contains(&"1\t0\ttracked.txt"), "{d_recs:?}");
     assert!(!d_recs.iter().any(|r| r.contains("deps/sub")), "{d_recs:?}");
 
     let diff_short = run_oz(&repo_dir, &["git", "diff", "--shortstat"], &[]);
     assert_eq!(diff_short.code, 0);
-    assert!(diff_short.stdout.contains("changed,"), "{}", diff_short.stdout);
+    assert!(
+        diff_short.stdout.contains("changed,"),
+        "{}",
+        diff_short.stdout
+    );
 
     let diff_quiet = run_oz(&repo_dir, &["git", "diff", "--quiet"], &[]);
     assert_eq!(diff_quiet.code, 1);
@@ -1463,10 +1762,7 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
         &[],
     );
     assert_eq!(ci_miss_json.code, 1);
-    assert_eq!(
-        ci_miss_json.json.unwrap()["error"]["code"],
-        "check_failed"
-    );
+    assert_eq!(ci_miss_json.json.unwrap()["error"]["code"], "check_failed");
 
     // Piped stdin to `oz git check-ignore -z --stdin` MUST pass stdin cleanly even when non-TTY
     let mut child = Command::new(oz_bin())
@@ -1502,7 +1798,10 @@ fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
 
     let repo_dir = tmp.path().join("repo");
     init_repo(&repo_dir);
-    sys_git(&repo_dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    sys_git(
+        &repo_dir,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
     sys_git(&repo_dir, &["push", "-u", "origin", "main"]);
 
     let husky_dir = repo_dir.join(".husky/_");
@@ -1514,7 +1813,11 @@ fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
     fs::set_permissions(&pre_commit, fs::Permissions::from_mode(0o755)).unwrap();
 
     let pre_push = husky_dir.join("pre-push");
-    fs::write(&pre_push, "#!/bin/sh\necho 'push gate failed' >&2\nexit 1\n").unwrap();
+    fs::write(
+        &pre_push,
+        "#!/bin/sh\necho 'push gate failed' >&2\nexit 1\n",
+    )
+    .unwrap();
     fs::set_permissions(&pre_push, fs::Permissions::from_mode(0o755)).unwrap();
 
     fs::write(repo_dir.join("feat.txt"), "hello\n").unwrap();
@@ -1539,7 +1842,11 @@ fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
         &["commit", "--no-verify", "-m", "feat: bypass", "--json"],
         &[],
     );
-    assert_eq!(c_ok.code, 0, "stdout={} stderr={}", c_ok.stdout, c_ok.stderr);
+    assert_eq!(
+        c_ok.code, 0,
+        "stdout={} stderr={}",
+        c_ok.stdout, c_ok.stderr
+    );
 
     // 3. `oz git -nm "..."` honors combined `-n` bypass on shim
     fs::write(repo_dir.join("feat2.txt"), "two\n").unwrap();
@@ -1566,8 +1873,14 @@ fn oz_commit_and_oz_push_hooks_json_exit_1_and_no_verify() {
         &["push", "origin", "main", "--no-verify", "--json"],
         &[],
     );
-    assert_eq!(p_ok.code, 0, "stdout={} stderr={}", p_ok.stdout, p_ok.stderr);
-    let head_local = sys_git(&repo_dir, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        p_ok.code, 0,
+        "stdout={} stderr={}",
+        p_ok.stdout, p_ok.stderr
+    );
+    let head_local = sys_git(&repo_dir, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     assert_eq!(
         sys_git(&bare, &["rev-parse", "refs/heads/main"]).trim(),
         head_local
@@ -1691,26 +2004,44 @@ fn oz_clone_and_push_enterprise_ssh_config_and_insteadof_e2e() {
     // 2. Commit inside `~/work/app` inherits `includeIf gitdir:~/work/` user.email!
     fs::write(clone_dest.join("work.txt"), "enterprise commit\n").unwrap();
     let comm = run_oz(&clone_dest, &["commit", "-m", "feat: enterprise"], &env);
-    assert_eq!(comm.code, 0, "stdout={} stderr={}", comm.stdout, comm.stderr);
+    assert_eq!(
+        comm.code, 0,
+        "stdout={} stderr={}",
+        comm.stdout, comm.stderr
+    );
     let author_email = sys_git(&clone_dest, &["log", "-1", "--pretty=%ae"]);
     assert_eq!(author_email.trim(), "corp@enterprise.test");
 
     // 3. `oz push` rewrites `gh:app.git` via `pushInsteadOf` -> `ssh://corp-push/app.git` (`Port=2223`, `User=pushuser`)
     let pushed = run_oz(&clone_dest, &["push", "origin", "main"], &env);
-    assert_eq!(pushed.code, 0, "stdout={} stderr={}", pushed.stdout, pushed.stderr);
+    assert_eq!(
+        pushed.code, 0,
+        "stdout={} stderr={}",
+        pushed.stdout, pushed.stderr
+    );
 
-    let pushed_oid = sys_git(&push_bare, &["rev-parse", "refs/heads/main"]).trim().to_string();
-    let local_oid = sys_git(&clone_dest, &["rev-parse", "HEAD"]).trim().to_string();
+    let pushed_oid = sys_git(&push_bare, &["rev-parse", "refs/heads/main"])
+        .trim()
+        .to_string();
+    let local_oid = sys_git(&clone_dest, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     assert_eq!(pushed_oid, local_oid);
 
     let ssh_calls = fs::read_to_string(&ssh_log).unwrap();
-    assert!(ssh_calls.contains("SOCK=/tmp/fake-enterprise-agent.sock"), "{ssh_calls}");
+    assert!(
+        ssh_calls.contains("SOCK=/tmp/fake-enterprise-agent.sock"),
+        "{ssh_calls}"
+    );
     assert!(ssh_calls.contains("-F "), "{ssh_calls}");
     assert!(ssh_calls.contains("HostName=127.0.0.1"), "{ssh_calls}");
     assert!(ssh_calls.contains("User=fetchuser"), "{ssh_calls}");
     assert!(ssh_calls.contains("Port=2222"), "{ssh_calls}");
     assert!(ssh_calls.contains("IdentitiesOnly=yes"), "{ssh_calls}");
-    assert!(ssh_calls.contains("ProxyJump=jumpbox.corp.internal"), "{ssh_calls}");
+    assert!(
+        ssh_calls.contains("ProxyJump=jumpbox.corp.internal"),
+        "{ssh_calls}"
+    );
     assert!(ssh_calls.contains("User=pushuser"), "{ssh_calls}");
     assert!(ssh_calls.contains("Port=2223"), "{ssh_calls}");
 }

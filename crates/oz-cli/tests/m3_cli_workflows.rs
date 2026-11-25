@@ -575,7 +575,11 @@ fn commit_sign_verify_commit_and_amend_preserves_change_id() {
     );
 
     // 1. Signed commit via `oz commit --sign --signing-key <key>`
-    fs::write(repo_dir.join("auth.rs"), "pub fn login() -> bool {\n    true\n}\n").unwrap();
+    fs::write(
+        repo_dir.join("auth.rs"),
+        "pub fn login() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
     let c1 = run_oz(
         &repo_dir,
         &[
@@ -939,13 +943,7 @@ fn clone_partial_fetch_undo_and_push_atomic_force_with_lease_stale_rejection() {
     let push1 = run_oz(
         &cloned_dir,
         &[
-            "push",
-            "origin",
-            "feat-a",
-            "feat-b",
-            "--atomic",
-            "-u",
-            "--json",
+            "push", "origin", "feat-a", "feat-b", "--atomic", "-u", "--json",
         ],
         &[],
     );
@@ -992,7 +990,10 @@ fn clone_partial_fetch_undo_and_push_atomic_force_with_lease_stale_rejection() {
     );
     fs::write(seed_dir.join("concurrent.txt"), "teammate push\n").unwrap();
     sys_git(&seed_dir, &["add", "concurrent.txt"]);
-    sys_git(&seed_dir, &["commit", "-m", "feat: concurrent remote update"]);
+    sys_git(
+        &seed_dir,
+        &["commit", "-m", "feat: concurrent remote update"],
+    );
     sys_git(&seed_dir, &["push", "origin", "feat-b"]);
 
     fs::write(cloned_dir.join("b.txt"), "branch b v3 local\n").unwrap();
@@ -1032,6 +1033,50 @@ fn clone_partial_fetch_undo_and_push_atomic_force_with_lease_stale_rejection() {
     );
 }
 
+struct RepoVfsCleanupGuard {
+    repo_root: PathBuf,
+}
+
+impl RepoVfsCleanupGuard {
+    fn new(repo_root: PathBuf) -> Self {
+        Self { repo_root }
+    }
+}
+
+impl Drop for RepoVfsCleanupGuard {
+    fn drop(&mut self) {
+        let git_dir = self.repo_root.join(".git");
+        let mut mounts_to_clean = Vec::new();
+        let ws_root = git_dir.join("ozone/ws");
+        if let Ok(entries) = fs::read_dir(&ws_root) {
+            for entry in entries.flatten() {
+                let mj = entry.path().join("mount.json");
+                if let Ok(raw) = fs::read_to_string(&mj)
+                    && let Ok(rec) = serde_json::from_str::<oz_core::MountRecord>(&raw)
+                {
+                    let _ = oz_vfsd::unmount_via_daemon(&git_dir, &rec.workspace, true);
+                    mounts_to_clean.push(rec.mount_point);
+                }
+            }
+        }
+        if git_dir.is_dir() {
+            let _ = oz_vfsd::shutdown_daemon(&git_dir);
+        }
+        #[cfg(target_os = "linux")]
+        for mp in &mounts_to_clean {
+            let _ = Command::new("fusermount3")
+                .args(["-u", "-z", "--"])
+                .arg(mp)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = mounts_to_clean;
+    }
+}
+
 // ============================================================================
 // Test 4: `oz pr create`, `oz pr stack`, `oz ci`, and `oz sync`
 // ============================================================================
@@ -1050,6 +1095,9 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
     sys_git(&bare_dir, &["config", "receive.advertiseAtomic", "true"]);
 
     let repo_dir = tmp.path().join("rocket");
+    // RAII guard declared after `tmp` so FUSE workspaces are unmounted before `TempDir::drop`,
+    // even on test panic or early return.
+    let _vfs_guard = RepoVfsCleanupGuard::new(repo_dir.clone());
     init_ozone_repo(&repo_dir);
     let bare_url = format!("file://{}", bare_dir.display());
     sys_git(&repo_dir, &["remote", "add", "origin", &bare_url]);
@@ -1070,7 +1118,13 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
     let sp1 = run_oz(
         &repo_dir,
         &[
-            "ws", "spawn", "ws-1", "--branch", "feat-1", "--no-warm", "--json",
+            "ws",
+            "spawn",
+            "ws-1",
+            "--branch",
+            "feat-1",
+            "--no-warm",
+            "--json",
         ],
         &gh_env,
     );
@@ -1078,14 +1132,22 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
     let ws1_path = PathBuf::from(sp1.unwrap_json()["data"]["worktree_path"].as_str().unwrap());
 
     fs::write(ws1_path.join("feat1.rs"), "pub fn f1() -> u32 { 1 }\n").unwrap();
-    let c1 = run_oz(&ws1_path, &["commit", "-m", "feat: part 1", "--json"], &gh_env);
+    let c1 = run_oz(
+        &ws1_path,
+        &["commit", "-m", "feat: part 1", "--json"],
+        &gh_env,
+    );
     assert_eq!(c1.code, 0);
     let cid1 = c1.unwrap_json()["data"]["change_id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let pr1 = run_oz(&ws1_path, &["pr", "create", "--base", "main", "--json"], &gh_env);
+    let pr1 = run_oz(
+        &ws1_path,
+        &["pr", "create", "--base", "main", "--json"],
+        &gh_env,
+    );
     assert_eq!(pr1.code, 0, "stderr: {}", pr1.stderr);
     let pr1_json = pr1.unwrap_json();
     assert_eq!(pr1_json["ok"], true);
@@ -1102,7 +1164,14 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
     let sp2 = run_oz(
         &repo_dir,
         &[
-            "ws", "spawn", "ws-2", "--branch", "feat-2", "--from", "feat-1", "--no-warm",
+            "ws",
+            "spawn",
+            "ws-2",
+            "--branch",
+            "feat-2",
+            "--from",
+            "feat-1",
+            "--no-warm",
             "--json",
         ],
         &gh_env,
@@ -1111,14 +1180,22 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
     let ws2_path = PathBuf::from(sp2.unwrap_json()["data"]["worktree_path"].as_str().unwrap());
 
     fs::write(ws2_path.join("feat2.rs"), "pub fn f2() -> u32 { 2 }\n").unwrap();
-    let c2 = run_oz(&ws2_path, &["commit", "-m", "feat: part 2", "--json"], &gh_env);
+    let c2 = run_oz(
+        &ws2_path,
+        &["commit", "-m", "feat: part 2", "--json"],
+        &gh_env,
+    );
     assert_eq!(c2.code, 0);
     let feat2_sha = c2.unwrap_json()["data"]["commit_oid"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let pr_stack_out = run_oz(&ws2_path, &["pr", "stack", "--base", "main", "--json"], &gh_env);
+    let pr_stack_out = run_oz(
+        &ws2_path,
+        &["pr", "stack", "--base", "main", "--json"],
+        &gh_env,
+    );
     assert_eq!(pr_stack_out.code, 0, "stderr: {}", pr_stack_out.stderr);
     let ps_json = pr_stack_out.unwrap_json();
     assert_eq!(ps_json["ok"], true);
@@ -1243,7 +1320,10 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
         &["clone", &bare_url, merger_clone.to_str().unwrap()],
     );
     sys_git(&merger_clone, &["config", "user.name", "GitHub Merge"]);
-    sys_git(&merger_clone, &["config", "user.email", "noreply@github.com"]);
+    sys_git(
+        &merger_clone,
+        &["config", "user.email", "noreply@github.com"],
+    );
     sys_git(
         &merger_clone,
         &["merge", "--no-ff", "origin/feat-1", "-m", "Merge PR #1"],
@@ -1334,10 +1414,9 @@ fn agent_setup_all_and_check_is_idempotent_and_non_destructive() {
     assert!(repo_dir.join(".windsurf/rules/oz.md").is_file());
     assert!(repo_dir.join(".agent/skills/oz/SKILL.md").is_file());
 
-    let claude_settings: Value = serde_json::from_str(
-        &fs::read_to_string(repo_dir.join(".claude/settings.json")).unwrap(),
-    )
-    .unwrap();
+    let claude_settings: Value =
+        serde_json::from_str(&fs::read_to_string(repo_dir.join(".claude/settings.json")).unwrap())
+            .unwrap();
     assert_eq!(
         claude_settings["permissions"]["allow"][0],
         "Bash(cargo test:*)"
@@ -1358,7 +1437,12 @@ fn agent_setup_all_and_check_is_idempotent_and_non_destructive() {
     let post_json = post_check.unwrap_json();
     assert!(post_json["data"]["created"].as_array().unwrap().is_empty());
     assert!(post_json["data"]["updated"].as_array().unwrap().is_empty());
-    assert!(!post_json["data"]["unchanged"].as_array().unwrap().is_empty());
+    assert!(
+        !post_json["data"]["unchanged"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // ============================================================================
@@ -1377,7 +1461,12 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     init_ozone_repo(&repo_dir);
     sys_git(
         &repo_dir,
-        &["remote", "add", "origin", "https://github.com/acme/mcp-app.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/mcp-app.git",
+        ],
     );
 
     fs::write(
@@ -1415,9 +1504,9 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     fn rpc(
         stdin: &mut std::process::ChildStdin,
         stdout: &mut StdBufReader<std::process::ChildStdout>,
-        req: Value,
+        req: &Value,
     ) -> Value {
-        writeln!(stdin, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        writeln!(stdin, "{}", serde_json::to_string(req).unwrap()).unwrap();
         stdin.flush().unwrap();
         let mut line = String::new();
         let n = stdout.read_line(&mut line).unwrap();
@@ -1429,7 +1518,7 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     let init_resp = rpc(
         &mut child_stdin,
         &mut child_stdout,
-        json!({
+        &json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
@@ -1444,7 +1533,8 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     writeln!(
         child_stdin,
         "{}",
-        serde_json::to_string(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})).unwrap()
+        serde_json::to_string(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .unwrap()
     )
     .unwrap();
     child_stdin.flush().unwrap();
@@ -1453,7 +1543,7 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     let list_resp = rpc(
         &mut child_stdin,
         &mut child_stdout,
-        json!({
+        &json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/list",
@@ -1479,14 +1569,17 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
         "oz_restore",
         "oz_show",
     ] {
-        assert!(tool_names.contains(&expected), "missing MCP tool {expected}");
+        assert!(
+            tool_names.contains(&expected),
+            "missing MCP tool {expected}"
+        );
     }
 
     // 3. oz_status
     let status_resp = rpc(
         &mut child_stdin,
         &mut child_stdout,
-        json!({
+        &json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
@@ -1494,8 +1587,12 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
         }),
     );
     assert_eq!(status_resp["result"]["isError"], false);
-    let status_payload: Value =
-        serde_json::from_str(status_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let status_payload: Value = serde_json::from_str(
+        status_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(status_payload["changes"][0]["id"], "f1");
     assert_eq!(status_payload["changes"][0]["hunks"][0]["id"], "h1a");
     assert_eq!(status_payload["changes"][0]["hunks"][1]["id"], "h1b");
@@ -1504,7 +1601,7 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     let commit_resp = rpc(
         &mut child_stdin,
         &mut child_stdout,
-        json!({
+        &json!({
             "jsonrpc": "2.0",
             "id": 4,
             "method": "tools/call",
@@ -1518,8 +1615,12 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
         }),
     );
     assert_eq!(commit_resp["result"]["isError"], false);
-    let commit_payload: Value =
-        serde_json::from_str(commit_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let commit_payload: Value = serde_json::from_str(
+        commit_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(commit_payload["ok"], true);
     assert_eq!(commit_payload["remaining_dirty_count"], 1);
     let mcp_commit_oid = commit_payload["commit_oid"].as_str().unwrap().to_string();
@@ -1582,7 +1683,7 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     let ci_resp = rpc(
         &mut child_stdin,
         &mut child_stdout,
-        json!({
+        &json!({
             "jsonrpc": "2.0",
             "id": 5,
             "method": "tools/call",
@@ -1651,7 +1752,12 @@ fn doctor_json_verifies_ssh_signing_and_github_auth_fields() {
     .unwrap();
     sys_git(
         &repo_dir,
-        &["remote", "add", "origin", "https://github.com/acme/rocket.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/rocket.git",
+        ],
     );
 
     let secret_tok = "ghp_super_secret_doctor_token_987654";
@@ -1739,7 +1845,13 @@ fn non_interactive_usage_envelopes_default_clone_dir_and_explicit_lease_spec() {
     // 4. Unknown `--harness` returns exit code 2 with `oz.v1` JSON envelope; valid subset works cleanly.
     let bad_harness = run_oz(
         &derived_repo,
-        &["agent", "setup", "--harness", "not-a-real-harness", "--json"],
+        &[
+            "agent",
+            "setup",
+            "--harness",
+            "not-a-real-harness",
+            "--json",
+        ],
         &[],
     );
     assert_eq!(bad_harness.code, 2);
@@ -1767,12 +1879,20 @@ fn non_interactive_usage_envelopes_default_clone_dir_and_explicit_lease_spec() {
 
     // 5. Explicit `--force-with-lease=main:<oid>` succeeds when matching and rejects non-FF without lease!
     let old_main_oid = sys_git(&bare_dir, &["rev-parse", "refs/heads/main"]);
-    sys_git(&seed, &["commit", "--allow-empty", "-m", "chore: advance remote"]);
+    sys_git(
+        &seed,
+        &["commit", "--allow-empty", "-m", "chore: advance remote"],
+    );
     sys_git(&seed, &["push", "origin", "main"]);
     let actual_remote_oid = sys_git(&bare_dir, &["rev-parse", "refs/heads/main"]);
 
     assert_eq!(
-        run_oz(&derived_repo, &["commit", "-m", "feat: local diverged", "--json"], &[]).code,
+        run_oz(
+            &derived_repo,
+            &["commit", "-m", "feat: local diverged", "--json"],
+            &[]
+        )
+        .code,
         0
     );
 
