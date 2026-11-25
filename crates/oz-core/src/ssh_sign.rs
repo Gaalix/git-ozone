@@ -58,7 +58,7 @@ const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 
 /// Encodes `data` as standard RFC 4648 Base64 with `=` padding.
 #[must_use]
-pub fn base64_encode(data: &[u8]) -> String {
+fn base64_encode(data: &[u8]) -> String {
     base64_encode_inner(data, true)
 }
 

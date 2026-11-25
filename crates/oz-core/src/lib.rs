@@ -88,8 +88,6 @@ pub use repo::{
     CliInvocation, MountHealth, OzoneLayout, OzoneRepo, SiblingOzPath, find_git_ozone_on_path,
     is_enotconn, parse_oz_workspace_path, probe_mount_health_os,
 };
-#[doc(hidden)]
-pub use ssh_sign::base64_encode;
 pub use ssh_sign::{
     CommitSignatureVerification, Ed25519SigningKey, Ed25519VerifyingKey, GIT_SSHSIG_NAMESPACE,
     OpenSshPrivateKey, OpenSshPublicKey, ParsedSshSignature, SSHSIG_ARMOR_FOOTER,

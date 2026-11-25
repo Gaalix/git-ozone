@@ -3,18 +3,21 @@ name = "oz-github"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benchmarks/"]
 description = "Pure-Rust Git wire protocol, SSH signing, and GitHub stacked PR / CI workflows"
 
 [dependencies]
-base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 gix.workspace = true
-gix-credentials.workspace = true
 gix-pack.workspace = true
 gix-packetline.workspace = true
-gix-protocol.workspace = true
 gix-transport.workspace = true
 http.workspace = true
 oz-core.workspace = true
@@ -25,7 +28,12 @@ oz-warm.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

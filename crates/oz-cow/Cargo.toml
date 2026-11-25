@@ -3,6 +3,12 @@ name = "oz-cow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benchmarks/"]
 description = "Tiered cross-platform Copy-on-Write workspace backend trait and filesystem detection"
 
 [dependencies]
@@ -19,8 +25,10 @@ rayon.workspace = true
 reflink-copy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -39,6 +39,7 @@
 //!      `oz_agent::blame_file` proving exact agent vs. human line attribution -> `oz_undo`
 //!      via MCP stdio.
 
+use base64::Engine;
 use oz_agent::{
     AGENTS_MD_END_MARKER, AGENTS_MD_START_MARKER, AgentHarness, AgentSetupOptions, BlameOptions,
     McpServer, OZ_CHECKPOINT_HOOK_CMD, blame_file, format_blame_report, read_provenance_note,
@@ -46,7 +47,7 @@ use oz_agent::{
 };
 use oz_core::{
     BackendKind, CommitOptions, MountRecord, OZ_SCHEMA_V1, OzError, OzoneRepo, SSHSIG_ARMOR_HEADER,
-    base64_encode, commit_changes, compute_status, verify_commit_signature_with_allowed_signers,
+    commit_changes, compute_status, verify_commit_signature_with_allowed_signers,
 };
 use oz_cow::{SpawnWorkspaceOptions, SpawnedWorkspaceInfo, list_workspaces, spawn_workspace};
 use oz_github::{
@@ -1871,7 +1872,7 @@ async fn handle_unified_http_conn(
     };
     let expected_basic = format!(
         "Basic {}",
-        base64_encode(format!("x-access-token:{expected_token}").as_bytes())
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{expected_token}"))
     );
     let expected_bearer = format!("Bearer {expected_token}");
     let auth_ok = headers

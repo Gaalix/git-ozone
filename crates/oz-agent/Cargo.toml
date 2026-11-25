@@ -3,6 +3,12 @@ name = "oz-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benchmarks/"]
 description = "Agent harness setup, MCP stdio server, and refs/notes/ai provenance"
 
 [dependencies]
@@ -15,8 +21,10 @@ oz-oplog.workspace = true
 oz-warm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

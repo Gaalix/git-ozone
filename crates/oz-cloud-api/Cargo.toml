@@ -3,14 +3,21 @@ name = "oz-cloud-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benchmarks/"]
 description = "Open-core OSS trait seams for Ozone Cloud extensions"
 
 [dependencies]
 chrono.workspace = true
 oz-core.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+
+[lints]
+workspace = true

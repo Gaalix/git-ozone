@@ -3,6 +3,12 @@ name = "oz-oplog"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benchmarks/"]
 description = "Append-only MVCC operation log, checkpoints, and sub-10ms undo/redo"
 
 [dependencies]
@@ -14,7 +20,6 @@ oz-core.workspace = true
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 ulid.workspace = true
 walkdir.workspace = true
 
@@ -24,3 +29,6 @@ libc.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

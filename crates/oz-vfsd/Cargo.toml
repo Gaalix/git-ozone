@@ -3,6 +3,12 @@ name = "oz-vfsd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benchmarks/"]
 description = "Background VFS daemon and IPC protocol for FUSE3 (Linux ext4) and ProjFS (Windows NTFS)"
 
 [lib]
@@ -20,7 +26,6 @@ libc.workspace = true
 oz-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 walkdir.workspace = true
 
@@ -29,3 +34,6 @@ fuser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true
