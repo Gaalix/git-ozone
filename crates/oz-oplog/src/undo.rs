@@ -603,7 +603,13 @@ fn apply_and_record_transition(
     )?;
 
     if !touched_paths.is_empty() {
-        sync_git_index_diff(repo, gix_repo, dst.base_tree, &touched_paths)?;
+        sync_git_index_diff(
+            repo,
+            gix_repo,
+            dst.base_tree,
+            &dst.dirty_files,
+            &touched_paths,
+        )?;
     }
 
     let op_id = new_op_id();

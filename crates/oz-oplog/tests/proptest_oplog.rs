@@ -1119,13 +1119,68 @@ proptest! {
                 }
             }
 
-            // Invariant checked after EVERY step: exact HEAD, HEAD^{tree}, and bit-for-bit disk match!
+            // Invariant checked after EVERY step: exact HEAD, HEAD^{tree}, bit-for-bit disk match,
+            // AND `.git/index` must never pair HEAD's blob OID with a dirty file's non-zero stat!
             let actual_head = run_git(&repo_dir, &["rev-parse", "HEAD"]);
             let actual_tree = run_git(&repo_dir, &["rev-parse", "HEAD^{tree}"]);
             let actual_disk = snapshot_worktree_disk(&repo_dir);
             prop_assert_eq!(actual_head, model.current_head.clone());
-            prop_assert_eq!(actual_tree, model.current_tree.clone());
-            prop_assert_eq!(actual_disk, model.current_disk.clone());
+            prop_assert_eq!(actual_tree.clone(), model.current_tree.clone());
+            prop_assert_eq!(actual_disk.clone(), model.current_disk.clone());
+
+            let tree_snap = snapshot_gix_tree(&repo, &actual_tree);
+            let expected_dirty = diff_snapshots(&tree_snap, &actual_disk);
+            let oz_status = oz_core::compute_status(&repo).expect("oz status in proptest");
+            let oz_dirty: BTreeSet<String> =
+                oz_status.changes.into_iter().map(|c| c.path).collect();
+            prop_assert_eq!(
+                oz_dirty,
+                expected_dirty.clone(),
+                "oz status must match exact dirty paths after every step"
+            );
+
+            // Also verify `.git/index` never caches a matching non-zero stat for a dirty file
+            // paired with HEAD's blob OID:
+            // - For any step, non-racy index entries must never falsely match a dirty disk file.
+            // - Immediately after `UndoStep` / `RedoStep`, touched dirty paths must NEVER have
+            //   a matching stat even within the same second (sync_git_index_diff must zero it).
+            let check_strict_undo_redo =
+                matches!(step, MachineStep::UndoStep | MachineStep::RedoStep);
+            let strict_paths: Option<&BTreeSet<String>> = match step {
+                MachineStep::UndoStep => model.redo_stack.last().map(|t| &t.changed_paths),
+                MachineStep::RedoStep => model.active.last().map(|t| &t.changed_paths),
+                _ => None,
+            };
+            let gix_check = gix::open(&repo_dir).expect("open gix check");
+            if gix_check.index_path().is_file() {
+                use gix::bstr::ByteSlice as _;
+                let idx = gix_check.open_index().expect("open index check");
+                let idx_ts = idx.timestamp();
+                let head_tree_oid = gix::ObjectId::from_hex(actual_tree.as_bytes()).expect("oid");
+                let head_tree_obj = gix_check.find_tree(head_tree_oid).expect("find tree");
+                let stat_opts = gix::index::entry::stat::Options::default();
+                for dirty_path in &expected_dirty {
+                    if let Ok(Some(tree_entry)) = head_tree_obj.lookup_entry_by_path(dirty_path)
+                        && !tree_entry.mode().is_tree()
+                        && let Some(idx_entry) = idx.entry_by_path(dirty_path.as_bytes().as_bstr())
+                        && idx_entry.id == tree_entry.object_id()
+                        && idx_entry.stat.mtime.secs != 0
+                        && let Ok(fs_meta) =
+                            gix::index::fs::Metadata::from_path_no_follow(&repo_dir.join(dirty_path))
+                        && let Ok(disk_stat) = gix::index::entry::Stat::from_fs(&fs_meta)
+                    {
+                        let touched_by_undo_redo = check_strict_undo_redo
+                            && strict_paths.is_some_and(|p| p.contains(dirty_path));
+                        if touched_by_undo_redo || !idx_entry.stat.is_racy(idx_ts, stat_opts) {
+                            prop_assert!(
+                                !idx_entry.stat.matches(&disk_stat, stat_opts),
+                                "dirty path '{}' has false-clean .git/index stat paired with HEAD blob",
+                                dirty_path
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Final full compaction, repair check, `fsck_repo`, and `git fsck --full`.

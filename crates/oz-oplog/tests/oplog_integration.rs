@@ -1526,3 +1526,369 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
         "feat/undo-sw"
     );
 }
+
+fn backdate_file(path: &Path, secs_ago: u64) {
+    let target = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
+    let file = fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open file for backdate");
+    file.set_modified(target).expect("set_modified");
+}
+
+fn git_status_porcelain(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir)
+        .output()
+        .expect("git status --porcelain");
+    assert!(
+        out.status.success(),
+        "git status --porcelain failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn oz_commit_with_oplog(
+    repo: &OzoneRepo,
+    opts: &oz_core::CommitOptions,
+) -> (oz_core::CommitOutcome, OpLogEntry) {
+    let pre_status = oz_core::compute_status(repo).expect("pre status");
+    let label = if opts.amend {
+        "oz commit --amend"
+    } else {
+        "oz commit"
+    };
+    let tx = oz_oplog::MutationTransaction::begin(
+        repo,
+        label,
+        agent_actor(repo.workspace.as_deref()),
+        Some(&pre_status.changes),
+    )
+    .expect("begin commit tx");
+    let outcome = oz_core::commit_changes(repo, opts).expect("commit_changes");
+    let entry = if outcome.remaining_dirty_count == 0 {
+        tx.finish_with_message(repo, Some(&outcome.message), Some(&[]))
+            .expect("finish clean commit tx")
+    } else {
+        let post_status = oz_core::compute_status(repo).expect("post status");
+        tx.finish_with_message(repo, Some(&outcome.message), Some(&post_status.changes))
+            .expect("finish partial commit tx")
+    };
+    (outcome, entry)
+}
+
+#[test]
+fn undo_after_commit_preserves_dirty_visibility_for_same_and_diff_size_edits_and_redo() {
+    use gix::bstr::ByteSlice as _;
+
+    for (label, v2_content) in [
+        ("same-size", "world\n"),
+        ("different-size", "world-much-longer-edited-content\n"),
+    ] {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo_dir = tmp.path().join(format!("repo-{label}"));
+        fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-b", "main"]);
+        run_git(&repo_dir, &["config", "user.name", "Ozone Test"]);
+        run_git(&repo_dir, &["config", "user.email", "test@ozone.dev"]);
+        run_git(&repo_dir, &["config", "core.autocrlf", "false"]);
+
+        let repo = OzoneRepo::discover(Some(&repo_dir)).expect("discover unborn");
+
+        // Step a: create `a.txt` and commit via `oz commit` flow.
+        fs::write(repo_dir.join("a.txt"), "hello\n").expect("write v1");
+        backdate_file(&repo_dir.join("a.txt"), 20);
+        let (c1, _) = oz_commit_with_oplog(&repo, &oz_core::CommitOptions::new("c1"));
+        let head_c1_blob = run_git(&repo_dir, &["rev-parse", "HEAD:a.txt"]);
+
+        // Step b: edit `a.txt`, backdate mtime to stay strictly older than `.git/index`
+        // (bypassing racy-git just like real user edits), and commit again.
+        fs::write(repo_dir.join("a.txt"), v2_content).expect("write v2");
+        backdate_file(&repo_dir.join("a.txt"), 10);
+        let (c2, _) = oz_commit_with_oplog(&repo, &oz_core::CommitOptions::new("c2"));
+        let head_c2_blob = run_git(&repo_dir, &["rev-parse", "HEAD:a.txt"]);
+        assert_ne!(head_c1_blob, head_c2_blob, "{label}: blobs must differ");
+
+        // Step c: run `oz undo`.
+        let undo_out = undo(&repo, 1usize, agent_actor(None)).expect("undo c2");
+        assert_eq!(
+            undo_out.restored_files, 0,
+            "{label}: disk already matches pre-commit edit so 0 files needed rewriting"
+        );
+        assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c1.commit_oid);
+        assert_eq!(
+            fs::read_to_string(repo_dir.join("a.txt")).unwrap(),
+            v2_content,
+            "{label}: working tree keeps pre-commit edit"
+        );
+        assert_eq!(
+            run_git(&repo_dir, &["show", "HEAD:a.txt"]),
+            "hello",
+            "{label}: HEAD restored to c1"
+        );
+
+        // Verify `.git/index` entry has old blob OID with ZEROED stat (not edited file's stat!).
+        let gix_repo = gix::open(&repo_dir).expect("open gix");
+        let idx = gix_repo.open_index().expect("open index");
+        let entry = idx
+            .entry_by_path("a.txt".as_bytes().as_bstr())
+            .expect("a.txt in index");
+        assert_eq!(entry.id.to_hex().to_string(), head_c1_blob);
+        assert_eq!(
+            entry.stat,
+            gix::index::entry::Stat::default(),
+            "{label}: .git/index must not pair old blob with edited file's stat"
+        );
+        let ls_debug = run_git(&repo_dir, &["ls-files", "--debug", "-s", "a.txt"]);
+        assert!(
+            ls_debug.contains(&head_c1_blob) && ls_debug.contains("size: 0"),
+            "{label}: unexpected git ls-files --debug output:\n{ls_debug}"
+        );
+
+        // BOTH `oz status` and `git status --porcelain` MUST report `a.txt` as modified!
+        let oz_st = oz_core::compute_status(&repo).expect("oz status after undo");
+        assert_eq!(
+            oz_st.changes.len(),
+            1,
+            "{label}: oz status hid modified a.txt after oz undo: {oz_st:?}"
+        );
+        assert_eq!(oz_st.changes[0].path, "a.txt");
+        assert_eq!(oz_st.changes[0].kind, ChangeKind::Modified);
+
+        assert_eq!(
+            git_status_porcelain(&repo_dir),
+            " M a.txt\n",
+            "{label}: git status --porcelain disagreed after oz undo"
+        );
+        assert_eq!(
+            run_git(&repo_dir, &["diff", "--cached", "--name-only"]),
+            "",
+            "{label}: nothing should be staged after oz undo"
+        );
+
+        // Step d: `oz redo` restores commit c2 cleanly and both statuses agree on clean!
+        redo(&repo, agent_actor(None)).expect("redo c2");
+        assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2.commit_oid);
+        assert_eq!(
+            fs::read_to_string(repo_dir.join("a.txt")).unwrap(),
+            v2_content
+        );
+        let oz_st_redo = oz_core::compute_status(&repo).expect("oz status after redo");
+        assert!(
+            oz_st_redo.is_clean(),
+            "{label}: expected clean oz status after redo: {oz_st_redo:?}"
+        );
+        assert_eq!(
+            git_status_porcelain(&repo_dir),
+            "",
+            "{label}: expected clean git status after redo"
+        );
+        let idx_redo = gix_repo.open_index().expect("open index after redo");
+        let entry_redo = idx_redo
+            .entry_by_path("a.txt".as_bytes().as_bstr())
+            .expect("a.txt in index after redo");
+        assert_eq!(entry_redo.id.to_hex().to_string(), head_c2_blob);
+        assert_eq!(entry_redo.stat.size, v2_content.len() as u32);
+
+        // Step e: second `oz undo` followed by re-committing via `oz commit` must work cleanly!
+        undo(&repo, 1usize, agent_actor(None)).expect("second undo");
+        let oz_st_undo2 = oz_core::compute_status(&repo).expect("oz status after second undo");
+        assert_eq!(oz_st_undo2.changes.len(), 1);
+        assert_eq!(oz_st_undo2.changes[0].path, "a.txt");
+        assert_eq!(git_status_porcelain(&repo_dir), " M a.txt\n");
+
+        let (c2_retry, _) = oz_commit_with_oplog(&repo, &oz_core::CommitOptions::new("c2-retry"));
+        assert_eq!(
+            run_git(&repo_dir, &["rev-parse", "HEAD"]),
+            c2_retry.commit_oid
+        );
+        assert!(
+            oz_core::compute_status(&repo)
+                .expect("final oz status")
+                .is_clean()
+        );
+        assert_eq!(git_status_porcelain(&repo_dir), "");
+    }
+}
+
+#[test]
+fn undo_and_redo_after_partial_hunk_commit_and_amend_keep_index_accurate() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("repo-partial-amend");
+    let orig_lines: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    let (repo, c1_hex) = init_repo_with_commit(&repo_dir, &[("a.txt", &orig_lines)]);
+
+    // Edit two separated hunks (h1a and h1b) and backdate mtime.
+    let mut edited: Vec<String> = (1..=20).map(|i| format!("line {i}\n")).collect();
+    edited[1] = "line 2 hunk A modified\n".to_string();
+    edited[17] = "line 18 hunk B modified\n".to_string();
+    let edited_content = edited.concat();
+    fs::write(repo_dir.join("a.txt"), &edited_content).expect("write two hunks");
+    backdate_file(&repo_dir.join("a.txt"), 10);
+
+    // Partial hunk commit (`--pick h1a`) leaves `h1b` dirty on disk.
+    let partial_opts = oz_core::CommitOptions::new("partial h1a").with_pick(["h1a"]);
+    let (c2, _) = oz_commit_with_oplog(&repo, &partial_opts);
+    assert_eq!(c2.remaining_dirty_count, 1);
+
+    let st_after_partial = oz_core::compute_status(&repo).expect("status after partial");
+    assert_eq!(st_after_partial.changes.len(), 1);
+    assert_eq!(st_after_partial.changes[0].hunks.len(), 1);
+    assert_eq!(git_status_porcelain(&repo_dir), " M a.txt\n");
+
+    // Undo partial commit: HEAD back to c1, BOTH hunks visible in `oz status` and `git status`!
+    undo(&repo, 1usize, agent_actor(None)).expect("undo partial commit");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c1_hex);
+    let st_after_undo = oz_core::compute_status(&repo).expect("status after undo partial");
+    assert_eq!(st_after_undo.changes.len(), 1);
+    assert_eq!(
+        st_after_undo.changes[0].hunks.len(),
+        2,
+        "both hunks must be visible after undoing partial commit"
+    );
+    assert_eq!(git_status_porcelain(&repo_dir), " M a.txt\n");
+
+    // Redo partial commit: HEAD back to c2, remaining hunk `h1b` MUST STILL be visible!
+    redo(&repo, agent_actor(None)).expect("redo partial commit");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2.commit_oid);
+    let st_after_redo = oz_core::compute_status(&repo).expect("status after redo partial");
+    assert_eq!(st_after_redo.changes.len(), 1);
+    assert_eq!(
+        st_after_redo.changes[0].hunks.len(),
+        1,
+        "remaining uncommitted hunk must not be hidden after redoing partial commit"
+    );
+    assert_eq!(git_status_porcelain(&repo_dir), " M a.txt\n");
+
+    // Amend c2 to include `h1b`, then undo and redo the amend.
+    backdate_file(&repo_dir.join("a.txt"), 10);
+    let amend_opts = oz_core::CommitOptions::new("amend full").with_amend(true);
+    let (c2_amended, _) = oz_commit_with_oplog(&repo, &amend_opts);
+    assert!(oz_core::compute_status(&repo).unwrap().is_clean());
+    assert_eq!(git_status_porcelain(&repo_dir), "");
+
+    undo(&repo, 1usize, agent_actor(None)).expect("undo amend");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2.commit_oid);
+    let st_undo_amend = oz_core::compute_status(&repo).expect("status after undo amend");
+    assert_eq!(st_undo_amend.changes.len(), 1);
+    assert_eq!(st_undo_amend.changes[0].hunks.len(), 1);
+    assert_eq!(git_status_porcelain(&repo_dir), " M a.txt\n");
+
+    redo(&repo, agent_actor(None)).expect("redo amend");
+    assert_eq!(
+        run_git(&repo_dir, &["rev-parse", "HEAD"]),
+        c2_amended.commit_oid
+    );
+    assert!(oz_core::compute_status(&repo).unwrap().is_clean());
+    assert_eq!(git_status_porcelain(&repo_dir), "");
+}
+
+#[test]
+fn undo_after_switch_force_reset_hard_and_mode_commit_keep_index_accurate() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("repo-other-ops");
+    let (repo, c1_hex) = init_repo_with_commit(&repo_dir, &[("a.txt", "base-v1\n")]);
+
+    // Create branch `feat` with different `a.txt`, then switch back to `main`.
+    run_git(&repo_dir, &["checkout", "-b", "feat"]);
+    fs::write(repo_dir.join("a.txt"), "feat-v2-longer\n").unwrap();
+    backdate_file(&repo_dir.join("a.txt"), 20);
+    run_git(&repo_dir, &["add", "a.txt"]);
+    run_git(&repo_dir, &["commit", "-m", "feat c2"]);
+    run_git(&repo_dir, &["checkout", "main"]);
+
+    // 1. Dirty `a.txt` on `main`, force-switch to `feat` via `oz_core::switch_branch` + OpLog,
+    //    then `oz undo` -> dirty edit MUST remain visible in both `oz status` and `git status`!
+    fs::write(repo_dir.join("a.txt"), "local-dirty-work-before-switch\n").unwrap();
+    backdate_file(&repo_dir.join("a.txt"), 10);
+    let sw_pre = oz_core::compute_status(&repo).expect("pre switch status");
+    let sw_tx = oz_oplog::MutationTransaction::begin_watching_all_branches(
+        &repo,
+        "oz switch -f feat",
+        agent_actor(None),
+        Some(&sw_pre.changes),
+    )
+    .expect("begin switch tx");
+    let sw_opts = oz_core::SwitchOptions {
+        target: Some("feat".to_string()),
+        force: true,
+        ..oz_core::SwitchOptions::default()
+    };
+    oz_core::switch_branch(&repo, &sw_opts).expect("switch -f feat");
+    sw_tx.finish(&repo, None).expect("finish switch tx");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("a.txt")).unwrap(),
+        "feat-v2-longer\n"
+    );
+
+    undo(&repo, 1usize, agent_actor(None)).expect("undo switch -f");
+    assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c1_hex);
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("a.txt")).unwrap(),
+        "local-dirty-work-before-switch\n"
+    );
+    // Backdate restored file to ensure non-racy stat check cannot hide it.
+    backdate_file(&repo_dir.join("a.txt"), 10);
+    let st_after_sw_undo = oz_core::compute_status(&repo).expect("status after switch undo");
+    assert_eq!(st_after_sw_undo.changes.len(), 1);
+    assert_eq!(st_after_sw_undo.changes[0].path, "a.txt");
+    assert_eq!(git_status_porcelain(&repo_dir), " M a.txt\n");
+
+    redo(&repo, agent_actor(None)).expect("redo switch -f");
+    let repo_feat = OzoneRepo::discover(Some(&repo_dir)).expect("discover after switch redo");
+    assert_eq!(repo_feat.branch.as_deref(), Some("feat"));
+    assert!(oz_core::compute_status(&repo_feat).unwrap().is_clean());
+    assert_eq!(git_status_porcelain(&repo_dir), "");
+
+    // 2. Dirty `a.txt` on `feat`, run `git reset --hard HEAD~1` wrapped in OpLog, then `oz undo`!
+    fs::write(repo_dir.join("a.txt"), "wip-before-reset-hard\n").unwrap();
+    backdate_file(&repo_dir.join("a.txt"), 10);
+    let rst_tx = oz_oplog::MutationTransaction::begin_watching_all_branches(
+        &repo_feat,
+        "oz git reset --hard HEAD~1",
+        agent_actor(None),
+        None,
+    )
+    .expect("begin reset tx");
+    run_git(&repo_dir, &["reset", "--hard", "HEAD~1"]);
+    rst_tx.finish(&repo_feat, None).expect("finish reset tx");
+
+    undo(&repo_feat, 1usize, agent_actor(None)).expect("undo reset --hard");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("a.txt")).unwrap(),
+        "wip-before-reset-hard\n"
+    );
+    backdate_file(&repo_dir.join("a.txt"), 10);
+    let st_after_rst_undo = oz_core::compute_status(&repo_feat).expect("status after reset undo");
+    assert_eq!(st_after_rst_undo.changes.len(), 1);
+    assert_eq!(st_after_rst_undo.changes[0].path, "a.txt");
+    assert_eq!(git_status_porcelain(&repo_dir), " M a.txt\n");
+
+    // 3. Unix executable-bit-only commit -> `oz undo` -> `oz redo`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = repo_dir.join("tool.sh");
+        fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        backdate_file(&script, 20);
+        let _ = oz_commit_with_oplog(&repo_feat, &oz_core::CommitOptions::new("add tool.sh"));
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        backdate_file(&script, 10);
+        let _ = oz_commit_with_oplog(&repo_feat, &oz_core::CommitOptions::new("chmod +x tool.sh"));
+
+        undo(&repo_feat, 1usize, agent_actor(None)).expect("undo chmod commit");
+        let st_mode_undo = oz_core::compute_status(&repo_feat).expect("status after mode undo");
+        assert_eq!(st_mode_undo.changes.len(), 1);
+        assert_eq!(st_mode_undo.changes[0].path, "tool.sh");
+        assert_eq!(git_status_porcelain(&repo_dir), " M tool.sh\n");
+
+        redo(&repo_feat, agent_actor(None)).expect("redo chmod commit");
+        assert!(oz_core::compute_status(&repo_feat).unwrap().is_clean());
+        assert_eq!(git_status_porcelain(&repo_dir), "");
+    }
+}

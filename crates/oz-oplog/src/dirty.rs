@@ -643,10 +643,27 @@ fn snapshot_from_standard_workdir(
                 return Ok(Some(ScanItem::Deleted(rel.clone())));
             }
 
-            if let (Some(idx_ts), Some((idx_oid, idx_mode, idx_stat))) =
-                (index_timestamp, index_lookup.get(rel))
+            #[cfg(unix)]
+            let disk_mode_matches = {
+                use std::os::unix::fs::PermissionsExt;
+                let disk_mode = if meta.permissions().mode() & 0o111 != 0 {
+                    MODE_EXEC
+                } else {
+                    MODE_BLOB
+                };
+                disk_mode == *tree_mode
+            };
+            #[cfg(not(unix))]
+            let disk_mode_matches = true;
+
+            if !meta.file_type().is_symlink()
+                && *tree_mode != MODE_LINK
+                && disk_mode_matches
+                && let (Some(idx_ts), Some((idx_oid, idx_mode, idx_stat))) =
+                    (index_timestamp, index_lookup.get(rel))
                 && idx_oid == tree_oid
                 && idx_mode == tree_mode
+                && idx_stat.mtime.secs != 0
                 && !idx_stat.is_racy(idx_ts, stat_opts)
                 && let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(&disk_path)
                 && let Ok(disk_stat) = gix::index::entry::Stat::from_fs(&fs_meta)
@@ -1139,11 +1156,18 @@ pub(crate) fn make_ws_snapshot(post: SnapshotSlice, pre: Option<SnapshotSlice>) 
 
 /// Patches ONLY mismatched paths from `changed_paths` inside `.git/index` (or
 /// `.git/worktrees/<ws>/index`) to match `target_tree_id`, keeping system `git status`
-/// accurate after `oz undo` / `oz redo` without rewriting `.git/index` on dirty-only checkpoints.
+/// and `oz status` accurate after `oz undo` / `oz redo` without rewriting `.git/index`
+/// on dirty-only checkpoints.
+///
+/// Any path present in `dst_dirty_files` differs from `target_tree_id` on disk and MUST
+/// receive a zeroed [`gix::index::entry::Stat::default()`] (never `Stat::from_fs`),
+/// otherwise `.git/index` would pair the target tree's blob OID with the edited file's
+/// stat and hide uncommitted edits from both `git status` and `oz status`.
 pub(crate) fn sync_git_index_diff(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     target_tree_id: ObjectId,
+    dst_dirty_files: &[DirtyFileSnapshot],
     changed_paths: &BTreeSet<String>,
 ) -> Result<()> {
     if changed_paths.is_empty() || (repo.workspace.is_some() && !repo.is_linked_worktree) {
@@ -1173,8 +1197,18 @@ pub(crate) fn sync_git_index_diff(
         .find_tree(target_tree_id)
         .map_err(|err| OzError::Git(err.to_string()))?;
 
-    let mut patch_paths: Vec<(&str, Option<(ObjectId, gix::index::entry::Mode)>)> = Vec::new();
+    let dst_dirty_paths: HashSet<&str> = dst_dirty_files.iter().map(|d| d.path.as_str()).collect();
+    let stat_opts = gix::index::entry::stat::Options::default();
+
+    struct IndexPatch<'a> {
+        rel: &'a str,
+        target: Option<(ObjectId, gix::index::entry::Mode)>,
+        is_dirty: bool,
+    }
+
+    let mut patch_paths: Vec<IndexPatch<'_>> = Vec::new();
     for rel in changed_paths {
+        let is_dirty = dst_dirty_paths.contains(rel.as_str());
         let target = match dst_tree
             .lookup_entry_by_path(rel.as_str())
             .map_err(|err| OzError::Git(err.to_string()))?
@@ -1189,7 +1223,7 @@ pub(crate) fn sync_git_index_diff(
             index.entry_by_path_and_stage(bstr, gix::index::entry::Stage::Unconflicted);
         let matches = match (target, unconflicted) {
             (Some((oid, mode)), Some(entry)) => {
-                entry.id == oid
+                let meta_matches = entry.id == oid
                     && entry.mode == mode
                     && index
                         .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Base)
@@ -1199,13 +1233,36 @@ pub(crate) fn sync_git_index_diff(
                         .is_none()
                     && index
                         .entry_by_path_and_stage(bstr, gix::index::entry::Stage::Theirs)
-                        .is_none()
+                        .is_none();
+                if !meta_matches {
+                    false
+                } else if is_dirty && entry.stat.mtime.secs != 0 {
+                    // If the existing cached stat for this dirty file could falsely match
+                    // disk (e.g. same-second same-size overwrite), force zeroing its stat.
+                    let disk_path = repo.workdir_path.join(rel);
+                    let risks_false_clean =
+                        gix::index::fs::Metadata::from_path_no_follow(&disk_path)
+                            .ok()
+                            .and_then(|meta| gix::index::entry::Stat::from_fs(&meta).ok())
+                            .is_some_and(|disk_stat| {
+                                (entry.stat.mtime.secs == disk_stat.mtime.secs
+                                    && entry.stat.size == disk_stat.size)
+                                    || entry.stat.matches(&disk_stat, stat_opts)
+                            });
+                    !risks_false_clean
+                } else {
+                    true
+                }
             }
             (None, None) => index.entry_by_path(bstr).is_none(),
             _ => false,
         };
         if !matches {
-            patch_paths.push((rel.as_str(), target));
+            patch_paths.push(IndexPatch {
+                rel: rel.as_str(),
+                target,
+                is_dirty,
+            });
         }
     }
 
@@ -1214,23 +1271,32 @@ pub(crate) fn sync_git_index_diff(
     }
 
     if !patch_paths.is_empty() {
-        let patch_set: BTreeSet<&str> = patch_paths.iter().map(|(p, _)| *p).collect();
+        let patch_set: BTreeSet<&str> = patch_paths.iter().map(|p| p.rel).collect();
         index.remove_tree();
         index.remove_entries(|_, path, _| patch_set.contains(path.to_str_lossy().as_ref()));
 
-        for (rel, target) in patch_paths {
-            if let Some((object_id, mode)) = target {
-                let disk_path = repo.workdir_path.join(rel);
-                let stat = gix::index::fs::Metadata::from_path_no_follow(&disk_path)
-                    .ok()
-                    .and_then(|meta| gix::index::entry::Stat::from_fs(&meta).ok())
-                    .unwrap_or_default();
+        for patch in patch_paths {
+            if let Some((object_id, mode)) = patch.target {
+                let stat = if patch.is_dirty
+                    || mode == gix::index::entry::Mode::COMMIT
+                    || mode == gix::index::entry::Mode::SYMLINK
+                {
+                    // File on disk differs from `target_tree_id` (or is a gitlink/symlink):
+                    // keep stat zeroed so `git status` and `oz status` never mark it clean.
+                    gix::index::entry::Stat::default()
+                } else {
+                    let disk_path = repo.workdir_path.join(patch.rel);
+                    gix::index::fs::Metadata::from_path_no_follow(&disk_path)
+                        .ok()
+                        .and_then(|meta| gix::index::entry::Stat::from_fs(&meta).ok())
+                        .unwrap_or_default()
+                };
                 index.dangerously_push_entry(
                     stat,
                     object_id,
                     gix::index::entry::Flags::empty(),
                     mode,
-                    rel.as_bytes().as_bstr(),
+                    patch.rel.as_bytes().as_bstr(),
                 );
             }
         }
@@ -1340,5 +1406,204 @@ pub(crate) fn read_ref_oid_hex(
             }
         },
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, SystemTime};
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: stdout={}, stderr={}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn backdate_file(path: &Path, secs_ago: u64) {
+        let target = SystemTime::now() - Duration::from_secs(secs_ago);
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open file for set_modified");
+        file.set_modified(target).expect("set_modified");
+    }
+
+    #[test]
+    fn sync_git_index_diff_zeroes_stat_for_dirty_target_and_stamps_clean_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "user.email", "test@ozone.dev"]);
+        git(&dir, &["config", "core.autocrlf", "false"]);
+
+        fs::write(dir.join("a.txt"), "hello\n").unwrap();
+        fs::write(dir.join("clean.txt"), "clean-v1\n").unwrap();
+        backdate_file(&dir.join("a.txt"), 20);
+        backdate_file(&dir.join("clean.txt"), 20);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-m", "c1"]);
+        let t1_hex = git(&dir, &["rev-parse", "HEAD^{tree}"]);
+        let a_b1_hex = git(&dir, &["rev-parse", "HEAD:a.txt"]);
+
+        fs::write(dir.join("a.txt"), "edited-much-longer\n").unwrap();
+        fs::write(dir.join("clean.txt"), "clean-v2\n").unwrap();
+        backdate_file(&dir.join("a.txt"), 10);
+        backdate_file(&dir.join("clean.txt"), 10);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-m", "c2"]);
+
+        // Simulate `oz undo` where `clean.txt` was restored back to `clean-v1\n`,
+        // while `a.txt` intentionally keeps its pre-commit dirty edit on disk.
+        fs::write(dir.join("clean.txt"), "clean-v1\n").unwrap();
+        backdate_file(&dir.join("clean.txt"), 15);
+
+        let repo = OzoneRepo::discover(Some(&dir)).expect("discover");
+        let gix_repo = open_gix_for_workspace(&repo).expect("open gix");
+        let t1_oid = parse_oid(&t1_hex).expect("t1");
+        let a_b2_oid = compute_blob_oid(gix_repo.object_hash(), b"edited-much-longer\n")
+            .unwrap()
+            .to_hex()
+            .to_string();
+
+        let dst_dirty = vec![DirtyFileSnapshot {
+            path: "a.txt".to_string(),
+            state: DirtyFileState::Present {
+                blob_oid: a_b2_oid,
+                mode: MODE_BLOB,
+            },
+        }];
+        let changed: BTreeSet<String> = ["a.txt", "clean.txt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        sync_git_index_diff(&repo, &gix_repo, t1_oid, &dst_dirty, &changed).expect("sync index");
+
+        let idx = gix_repo.open_index().expect("open index");
+        let a_entry = idx
+            .entry_by_path("a.txt".as_bytes().as_bstr())
+            .expect("a.txt in index");
+        assert_eq!(a_entry.id.to_hex().to_string(), a_b1_hex);
+        assert_eq!(
+            a_entry.stat,
+            gix::index::entry::Stat::default(),
+            "dirty target path must have zeroed stat in .git/index"
+        );
+
+        let clean_entry = idx
+            .entry_by_path("clean.txt".as_bytes().as_bstr())
+            .expect("clean.txt in index");
+        assert_ne!(
+            clean_entry.stat.mtime.secs, 0,
+            "clean restored path should cache disk stat"
+        );
+        assert_eq!(clean_entry.stat.size, "clean-v1\n".len() as u32);
+    }
+
+    #[test]
+    fn sync_git_index_diff_invalidates_matching_stat_on_same_oid_dirty_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "user.email", "test@ozone.dev"]);
+
+        fs::write(dir.join("a.txt"), "hello\n").unwrap();
+        backdate_file(&dir.join("a.txt"), 10);
+        let original_mtime = fs::metadata(dir.join("a.txt")).unwrap().modified().unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-m", "c1"]);
+
+        // Overwrite `a.txt` with same byte length and preserve the exact coarse mtime
+        // to simulate a same-second same-size rewrite while `.git/index` still holds c1's OID.
+        fs::write(dir.join("a.txt"), "world\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(dir.join("a.txt"))
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        let repo = OzoneRepo::discover(Some(&dir)).expect("discover");
+        let gix_repo = open_gix_for_workspace(&repo).expect("open gix");
+        let (_, _, base_tree) = resolve_workspace_head(&repo, &gix_repo).expect("head");
+        let world_oid = compute_blob_oid(gix_repo.object_hash(), b"world\n")
+            .unwrap()
+            .to_hex()
+            .to_string();
+
+        let dst_dirty = vec![DirtyFileSnapshot {
+            path: "a.txt".to_string(),
+            state: DirtyFileState::Present {
+                blob_oid: world_oid,
+                mode: MODE_BLOB,
+            },
+        }];
+        let changed: BTreeSet<String> = ["a.txt".to_string()].into_iter().collect();
+
+        sync_git_index_diff(&repo, &gix_repo, base_tree, &dst_dirty, &changed).expect("sync index");
+
+        let idx = gix_repo.open_index().expect("open index");
+        let entry = idx
+            .entry_by_path("a.txt".as_bytes().as_bstr())
+            .expect("a.txt entry");
+        assert_eq!(
+            entry.stat,
+            gix::index::entry::Stat::default(),
+            "same-OID dirty entry whose cached stat risked false-clean must be zeroed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_from_standard_workdir_detects_mode_change_even_with_cached_stat() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "user.email", "test@ozone.dev"]);
+
+        let script = dir.join("run.sh");
+        fs::write(&script, "#!/bin/sh\necho ok\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        backdate_file(&script, 10);
+        git(&dir, &["add", "run.sh"]);
+        git(&dir, &["commit", "-m", "c1"]);
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        backdate_file(&script, 10);
+
+        let repo = OzoneRepo::discover(Some(&dir)).expect("discover");
+        let gix_repo = open_gix_for_workspace(&repo).expect("open gix");
+        let (_, _, base_tree_id) = resolve_workspace_head(&repo, &gix_repo).expect("head");
+        let dirty = scan_dirty_files(&repo, &gix_repo, base_tree_id, None).expect("scan");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].path, "run.sh");
+        assert!(matches!(
+            dirty[0].state,
+            DirtyFileState::Present {
+                mode: MODE_EXEC,
+                ..
+            }
+        ));
     }
 }
