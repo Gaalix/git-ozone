@@ -75,6 +75,7 @@ fn init_sample_repo() -> (TempDir, PathBuf) {
     git_ok(&repo, &["init", "-b", "main"]);
     git_ok(&repo, &["config", "user.name", "Test Agent"]);
     git_ok(&repo, &["config", "user.email", "agent@example.com"]);
+    git_ok(&repo, &["config", "core.autocrlf", "false"]);
 
     fs::write(
         repo.join("tvva-ui/app.ts"),
@@ -211,7 +212,8 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     let merge_out = run_oz(&repo, &["merge", "origin/main", "--json"]);
     assert!(
         merge_out.status.success(),
-        "oz merge failed: {}",
+        "oz merge failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&merge_out.stdout),
         String::from_utf8_lossy(&merge_out.stderr)
     );
     let merge_json: Value = serde_json::from_slice(&merge_out.stdout).unwrap();
@@ -230,7 +232,8 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     let undo_out = run_oz(&repo, &["undo", "--json"]);
     assert!(
         undo_out.status.success(),
-        "oz undo failed: {}",
+        "oz undo failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&undo_out.stdout),
         String::from_utf8_lossy(&undo_out.stderr)
     );
     assert_eq!(git_ok(&repo, &["rev-parse", "HEAD"]), pre_merge_feat_oid);
@@ -252,7 +255,8 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     let wt_merge = run_oz(&linked_wt, &["merge", "origin/main", "--json"]);
     assert!(
         wt_merge.status.success(),
-        "linked worktree oz merge failed: {}",
+        "linked worktree oz merge failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&wt_merge.stdout),
         String::from_utf8_lossy(&wt_merge.stderr)
     );
     assert!(linked_wt.join("src/main_extra.rs").is_file());
@@ -269,7 +273,8 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     );
     assert!(
         push_multi.status.success(),
-        "multi-refspec oz push failed: {}",
+        "multi-refspec oz push failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&push_multi.stdout),
         String::from_utf8_lossy(&push_multi.stderr)
     );
     let push_json: Value = serde_json::from_slice(&push_multi.stdout).unwrap();
