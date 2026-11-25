@@ -1872,7 +1872,8 @@ async fn handle_unified_http_conn(
     };
     let expected_basic = format!(
         "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{expected_token}"))
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("x-access-token:{expected_token}"))
     );
     let expected_bearer = format!("Bearer {expected_token}");
     let auth_ok = headers

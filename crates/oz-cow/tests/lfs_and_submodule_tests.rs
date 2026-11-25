@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
 use oz_core::{BackendKind, OzError, OzoneRepo, compute_status};
+use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
 use oz_warm::resolve_or_capture_baseline;
 use std::fs;
 use std::path::Path;
@@ -69,7 +69,11 @@ fn spawn_workspace_smudges_git_lfs_and_creates_gitlink_dirs_across_cas_and_basel
     let lfs_payload: Vec<u8> = (0..1024u32).flat_map(|i| i.to_le_bytes()).collect();
     fs::write(repo_dir.join("weights.bin"), &lfs_payload).unwrap();
     fs::write(repo_dir.join("crlf.txt"), b"one\r\ntwo\r\n").unwrap();
-    fs::write(repo_dir.join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\ncrlf.txt text eol=crlf\n").unwrap();
+    fs::write(
+        repo_dir.join(".gitattributes"),
+        "*.bin filter=lfs diff=lfs merge=lfs -text\ncrlf.txt text eol=crlf\n",
+    )
+    .unwrap();
     run_git_isolated(&repo_dir, &fake_home, &["add", "."]);
     run_git_isolated(&repo_dir, &fake_home, &["commit", "-m", "init lfs + sub"]);
 

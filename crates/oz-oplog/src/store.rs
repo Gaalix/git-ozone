@@ -23,10 +23,7 @@ pub(crate) fn process_oplog_mutex(oplog_dir: &Path) -> Arc<Mutex<()>> {
     let mut map = map_mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Arc::clone(
-        map.entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(()))),
-    )
+    Arc::clone(map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
 }
 
 /// Returns `.git/ozone/oplog/ops/`.
@@ -206,7 +203,9 @@ pub fn load_entry(layout: &OzoneLayout, op_id: &str) -> Result<OpLogEntry> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(OzError::InvalidUsage {
                 message: format!("operation '{op_id}' not found in oplog"),
-                recovery: vec!["Inspect available operations in .git/ozone/oplog/ops/.".to_string()],
+                recovery: vec![
+                    "Inspect available operations in .git/ozone/oplog/ops/.".to_string(),
+                ],
             });
         }
         Err(err) => return Err(OzError::Io(err)),

@@ -101,7 +101,11 @@ impl GitConfigContext {
     fn effective_home(&self) -> Option<PathBuf> {
         self.home_dir
             .clone()
-            .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            })
             .or_else(|| {
                 std::env::var_os("USERPROFILE")
                     .filter(|v| !v.is_empty())
@@ -229,16 +233,15 @@ impl GitConfig {
         if let Some(env_file) = explicit_git_config {
             cfg.load_file_if_exists(&env_file, ctx, 0)?;
         } else {
-            let common_or_git_dir = ctx
-                .git_common_dir
-                .as_deref()
-                .or(ctx.git_dir.as_deref());
+            let common_or_git_dir = ctx.git_common_dir.as_deref().or(ctx.git_dir.as_deref());
             if let Some(common_dir) = common_or_git_dir {
                 let local_cfg = common_dir.join("config");
                 cfg.load_file_if_exists(&local_cfg, ctx, 0)?;
             }
 
-            if cfg.get_bool("extensions", None, "worktreeconfig").unwrap_or(false)
+            if cfg
+                .get_bool("extensions", None, "worktreeconfig")
+                .unwrap_or(false)
                 && let Some(git_dir) = ctx.git_dir.as_deref()
             {
                 let wt_cfg = git_dir.join("config.worktree");
@@ -300,7 +303,12 @@ impl GitConfig {
 
     /// Returns the last configured raw value (`None` if unset; `Some(None)` if valueless bool).
     #[must_use]
-    pub fn get_raw(&self, section: &str, subsection: Option<&str>, key: &str) -> Option<Option<&str>> {
+    pub fn get_raw(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Option<Option<&str>> {
         let sec = section.to_ascii_lowercase();
         let k = key.to_ascii_lowercase();
         self.entries
@@ -598,7 +606,10 @@ impl GitConfig {
             };
             self.entries.push(entry);
 
-            if depth < MAX_INCLUDE_DEPTH && key == "path" && let Some(inc_raw) = value.as_deref() {
+            if depth < MAX_INCLUDE_DEPTH
+                && key == "path"
+                && let Some(inc_raw) = value.as_deref()
+            {
                 let should_include = if section == "include" && subsection.is_none() {
                     true
                 } else if section == "includeif"
@@ -610,7 +621,8 @@ impl GitConfig {
                 };
 
                 if should_include && !inc_raw.is_empty() {
-                    let inc_path = resolve_include_path(inc_raw, base_dir, self.home_dir.as_deref());
+                    let inc_path =
+                        resolve_include_path(inc_raw, base_dir, self.home_dir.as_deref());
                     self.load_file_if_exists(&inc_path, ctx, depth + 1)?;
                 }
             }
@@ -666,15 +678,17 @@ impl GitConfig {
         if let Ok(count_str) = std::env::var("GIT_CONFIG_COUNT")
             && !count_str.trim().is_empty()
         {
-            let count: usize = count_str
-                .trim()
-                .parse()
-                .map_err(|_| invalid_cfg(None, format!("invalid GIT_CONFIG_COUNT '{count_str}'")))?;
+            let count: usize = count_str.trim().parse().map_err(|_| {
+                invalid_cfg(None, format!("invalid GIT_CONFIG_COUNT '{count_str}'"))
+            })?;
             for idx in 0..count {
                 let key_var = format!("GIT_CONFIG_KEY_{idx}");
                 let val_var = format!("GIT_CONFIG_VALUE_{idx}");
                 let key = std::env::var(&key_var).map_err(|_| {
-                    invalid_cfg(None, format!("missing {key_var} while GIT_CONFIG_COUNT={count}"))
+                    invalid_cfg(
+                        None,
+                        format!("missing {key_var} while GIT_CONFIG_COUNT={count}"),
+                    )
                 })?;
                 let val = std::env::var(&val_var).unwrap_or_default();
                 self.apply_override(&key, &val)?;
@@ -824,10 +838,16 @@ fn join_logical_lines(input: &str) -> Vec<String> {
     out
 }
 
-fn parse_section_header(line: &str, source_path: Option<&Path>) -> Result<(String, Option<String>)> {
-    let after_open = line
-        .strip_prefix('[')
-        .ok_or_else(|| invalid_cfg(source_path, format!("invalid git config section header: {line}")))?;
+fn parse_section_header(
+    line: &str,
+    source_path: Option<&Path>,
+) -> Result<(String, Option<String>)> {
+    let after_open = line.strip_prefix('[').ok_or_else(|| {
+        invalid_cfg(
+            source_path,
+            format!("invalid git config section header: {line}"),
+        )
+    })?;
 
     let mut chars = after_open.chars().peekable();
     let mut section = String::new();
@@ -914,7 +934,10 @@ fn parse_section_header(line: &str, source_path: Option<&Path>) -> Result<(Strin
         while let Some(ch) = chars.next() {
             if ch == '\\' {
                 let esc = chars.next().ok_or_else(|| {
-                    invalid_cfg(source_path, format!("dangling escape in git config header: {line}"))
+                    invalid_cfg(
+                        source_path,
+                        format!("dangling escape in git config header: {line}"),
+                    )
                 })?;
                 sub.push(esc);
             } else if ch == '"' {
@@ -1022,7 +1045,10 @@ fn parse_config_value(raw: &str, source_path: Option<&Path>) -> Result<String> {
         }
         if ch == '\\' {
             let esc = chars.next().ok_or_else(|| {
-                invalid_cfg(source_path, format!("dangling escape in git config value: {raw}"))
+                invalid_cfg(
+                    source_path,
+                    format!("dangling escape in git config value: {raw}"),
+                )
             })?;
             let decoded = match esc {
                 'n' => '\n',
@@ -1183,12 +1209,9 @@ fn match_gitdir_condition(
     }
 
     let mut candidates = Vec::new();
-    for maybe_dir in [
-        ctx.git_dir.as_deref(),
-        ctx.git_common_dir.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
+    for maybe_dir in [ctx.git_dir.as_deref(), ctx.git_common_dir.as_deref()]
+        .into_iter()
+        .flatten()
     {
         candidates.push(normalize_slashes(&maybe_dir.to_string_lossy()));
         if let Ok(canon) = fs::canonicalize(maybe_dir) {

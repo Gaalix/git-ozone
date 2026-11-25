@@ -266,12 +266,8 @@ fn commit_changes_inner(
             .map_err(|err| OzError::Git(err.to_string()))?;
         let parents: Vec<gix::ObjectId> = decoded.parents().collect();
         let raw_msg = decoded.message.to_str_lossy().into_owned();
-        let existing_change_id =
-            find_existing_change_id(raw_msg.trim_end_matches(['\r', '\n']));
-        let author = decoded
-            .author()
-            .ok()
-            .and_then(|a| a.to_owned().ok());
+        let existing_change_id = find_existing_change_id(raw_msg.trim_end_matches(['\r', '\n']));
+        let author = decoded.author().ok().and_then(|a| a.to_owned().ok());
         Some(AmendedHeadInfo {
             parents,
             message: raw_msg,
@@ -319,8 +315,7 @@ fn commit_changes_inner(
 
     run_pre_commit(repo, &git_cfg, &hook_env, opts.no_verify)?;
 
-    let attr_resolver =
-        build_repo_attribute_resolver(repo, &gix_repo, ctx.head.tree_id, &git_cfg)?;
+    let attr_resolver = build_repo_attribute_resolver(repo, &gix_repo, ctx.head.tree_id, &git_cfg)?;
 
     let mut prepared_edits = Vec::with_capacity(selection.len());
     let mut partial_hunk_paths = Vec::new();
@@ -356,8 +351,8 @@ fn commit_changes_inner(
                 }
             }
             FileSelection::Hunks(selected_hunk_indices) => {
-                let all_selected = selected_hunk_indices.len() == change.hunks.len()
-                    && !change.hunks.is_empty();
+                let all_selected =
+                    selected_hunk_indices.len() == change.hunks.len() && !change.hunks.is_empty();
 
                 if raw.disk_kind == Some(EntryKind::Commit)
                     || (all_selected && raw.kind != ChangeKind::Deleted)
@@ -587,7 +582,14 @@ fn commit_changes_inner(
     } else {
         ("message", None)
     };
-    run_prepare_commit_msg(repo, &git_cfg, &hook_env, &editmsg_path, msg_source, msg_sha)?;
+    run_prepare_commit_msg(
+        repo,
+        &git_cfg,
+        &hook_env,
+        &editmsg_path,
+        msg_source,
+        msg_sha,
+    )?;
     run_commit_msg(repo, &git_cfg, &hook_env, &editmsg_path, opts.no_verify)?;
     let raw_message = fs::read_to_string(&editmsg_path)?;
 
@@ -703,12 +705,16 @@ fn commit_changes_inner(
 
     // Clear virtual `pinned_paths` (`.git/ozone/state/<ws>.json` or `.git/ozone/pinned_main.json`).
     let clear_all_pinned = (opts.pick.is_empty() && opts.exclude.is_empty()) || ignore_pinned;
-    clear_pinned_paths_if_present(repo, &committed_paths, &partial_hunk_paths, clear_all_pinned)?;
+    clear_pinned_paths_if_present(
+        repo,
+        &committed_paths,
+        &partial_hunk_paths,
+        clear_all_pinned,
+    )?;
 
     let _ = run_post_commit(repo, &git_cfg, &hook_env);
 
-    let remaining_dirty_count =
-        (ctx.changes.len() - selection.len()) + partial_hunk_paths.len();
+    let remaining_dirty_count = (ctx.changes.len() - selection.len()) + partial_hunk_paths.len();
 
     Ok(CommitOutcome {
         commit_oid: commit_id.to_hex().to_string(),
@@ -775,8 +781,12 @@ fn resolve_selection(
             }
             if !matched {
                 return Err(OzError::InvalidUsage {
-                    message: format!("--pick target '{raw_target}' did not match any dirty file or hunk"),
-                    recovery: vec!["Run `oz status` or `oz diff` to list valid file and hunk IDs.".to_string()],
+                    message: format!(
+                        "--pick target '{raw_target}' did not match any dirty file or hunk"
+                    ),
+                    recovery: vec![
+                        "Run `oz status` or `oz diff` to list valid file and hunk IDs.".to_string(),
+                    ],
                 });
             }
         }
@@ -838,8 +848,12 @@ fn resolve_selection(
             }
             if !matched_any_in_status {
                 return Err(OzError::InvalidUsage {
-                    message: format!("--exclude target '{raw_target}' did not match any dirty file or hunk"),
-                    recovery: vec!["Run `oz status` or `oz diff` to list valid file and hunk IDs.".to_string()],
+                    message: format!(
+                        "--exclude target '{raw_target}' did not match any dirty file or hunk"
+                    ),
+                    recovery: vec![
+                        "Run `oz status` or `oz diff` to list valid file and hunk IDs.".to_string(),
+                    ],
                 });
             }
         }
@@ -900,7 +914,10 @@ fn prepare_full_entry_edit(
     let resolved_attrs = attr_resolver.resolve(&raw.path);
 
     let (bytes, reported_size_bytes) = if entry_kind == EntryKind::Link {
-        (read_disk_bytes(&disk_path, Some(EntryKind::Link))?, file_len)
+        (
+            read_disk_bytes(&disk_path, Some(EntryKind::Link))?,
+            file_len,
+        )
     } else if resolved_attrs.filter_driver().is_some() {
         let raw_bytes = read_disk_bytes(&disk_path, Some(entry_kind))?;
         let cleaned = clean_blob_bytes(
@@ -1122,7 +1139,11 @@ fn resolve_signing_key_spec(
     {
         return k.to_string();
     }
-    if let Some(k) = git_cfg.signing_key().map(str::trim).filter(|k| !k.is_empty()) {
+    if let Some(k) = git_cfg
+        .signing_key()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
         return k.to_string();
     }
     if let Some(k) = gix_repo
@@ -1246,23 +1267,18 @@ fn verify_commit_signature_inner<C: CommitOidArg + ?Sized>(
 
     let parsed = verify_sshsig(&unsigned_payload, &armored_sig, GIT_SSHSIG_NAMESPACE)?;
 
-    let configured_allowed = explicit_allowed_signers
-        .map(Path::to_path_buf)
-        .or_else(|| {
-            gix_repo
-                .config_snapshot()
-                .string("gpg.ssh.allowedSignersFile")
-                .map(|v| expand_tilde_path(&v.to_str_lossy()))
-                .filter(|p| p.is_file())
-        });
+    let configured_allowed = explicit_allowed_signers.map(Path::to_path_buf).or_else(|| {
+        gix_repo
+            .config_snapshot()
+            .string("gpg.ssh.allowedSignersFile")
+            .map(|v| expand_tilde_path(&v.to_str_lossy()))
+            .filter(|p| p.is_file())
+    });
 
     let (allowed_signer_matched, matched_principal) = if let Some(ref as_path) = configured_allowed
     {
-        let (matched, principal) = match_allowed_signers_file(
-            as_path,
-            &parsed.public_key,
-            committer_email.as_deref(),
-        )?;
+        let (matched, principal) =
+            match_allowed_signers_file(as_path, &parsed.public_key, committer_email.as_deref())?;
         if explicit_allowed_signers.is_some() && !matched {
             return Err(OzError::CheckFailed {
                 message: format!(
@@ -1325,10 +1341,7 @@ fn is_trailer_line(line: &str) -> bool {
     let Some((key, _val)) = line.split_once(": ") else {
         return false;
     };
-    !key.is_empty()
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 fn update_git_index(
@@ -1356,10 +1369,7 @@ fn update_git_index(
             .index_from_tree(&ctx.head.tree_id)
             .map_err(|err| OzError::Git(err.to_string()))?
     } else {
-        gix::index::File::from_state(
-            gix::index::State::new(gix_repo.object_hash()),
-            index_path,
-        )
+        gix::index::File::from_state(gix::index::State::new(gix_repo.object_hash()), index_path)
     };
 
     index.remove_tree();
@@ -1631,9 +1641,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
         ".{}.tmp.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("state"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
         ulid::Ulid::generate()
     ));
     let json = serde_json::to_string_pretty(value)?;
@@ -1665,7 +1673,9 @@ mod tests {
 
         let with_trailer = "feat: existing\n\nSigned-off-by: Bot <bot@oz.dev>";
         let (msg3, cid3) = ensure_change_id_trailer(with_trailer, tree, &[], &sig);
-        assert!(msg3.contains(&format!("Signed-off-by: Bot <bot@oz.dev>\nChange-Id: {cid3}\n")));
+        assert!(msg3.contains(&format!(
+            "Signed-off-by: Bot <bot@oz.dev>\nChange-Id: {cid3}\n"
+        )));
 
         let already = "feat: keep\n\nChange-Id: I0123456789abcdef0123456789abcdef01234567\n";
         let (msg4, cid4) = ensure_change_id_trailer(already, tree, &[], &sig);

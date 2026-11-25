@@ -234,7 +234,12 @@ fn handle_conn(stream: &mut std::net::TcpStream, state: &Arc<Mutex<MockState>>) 
         return;
     }
 
-    if method == "GET" && tail.len() == 4 && tail[0] == "actions" && tail[1] == "jobs" && tail[3] == "logs" {
+    if method == "GET"
+        && tail.len() == 4
+        && tail[0] == "actions"
+        && tail[1] == "jobs"
+        && tail[3] == "logs"
+    {
         let job_id: u64 = tail[2].parse().unwrap_or(0);
         let bytes = st.job_logs.get(&job_id).cloned().unwrap_or_default();
         write_http(stream, "200 OK", "text/plain", &bytes);
@@ -293,14 +298,25 @@ fn init_repo(dir: &Path, branch: &str, remote_url: &str) -> String {
     run_git(dir, &["rev-parse", "HEAD"])
 }
 
-fn make_check(id: u64, name: &str, status: &str, conclusion: Option<&str>, run_id: u64, job_id: u64) -> GitHubCheckRun {
+fn make_check(
+    id: u64,
+    name: &str,
+    status: &str,
+    conclusion: Option<&str>,
+    run_id: u64,
+    job_id: u64,
+) -> GitHubCheckRun {
     GitHubCheckRun {
         id,
         name: name.to_string(),
         status: status.to_string(),
         conclusion: conclusion.map(str::to_string),
-        details_url: Some(format!("https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}")),
-        html_url: Some(format!("https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}")),
+        details_url: Some(format!(
+            "https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}"
+        )),
+        html_url: Some(format!(
+            "https://github.com/acme/rocket/actions/runs/{run_id}/job/{job_id}"
+        )),
         output: GitHubCheckRunOutput::default(),
     }
 }
@@ -308,7 +324,11 @@ fn make_check(id: u64, name: &str, status: &str, conclusion: Option<&str>, run_i
 #[test]
 fn cli_ci_watch_pass_fail_fast_job_drilldown_and_flag_validation() {
     let tmp = TempDir::new().expect("tmp");
-    let sha = init_repo(tmp.path(), "feat/watch", "https://github.com/acme/rocket.git");
+    let sha = init_repo(
+        tmp.path(),
+        "feat/watch",
+        "https://github.com/acme/rocket.git",
+    );
 
     // 1. Flag validation: --watch + --job -> exit 2
     let out = Command::new(oz_bin())
@@ -407,7 +427,9 @@ fn cli_ci_watch_pass_fail_fast_job_drilldown_and_flag_validation() {
     assert_eq!(v["data"]["watch"]["stopped_early"], true);
     assert_eq!(v["data"]["checks"][0]["job_id"], 701);
     assert_eq!(v["data"]["checks"][0]["run_id"], 900);
-    let recoveries = v["recovery_commands"].as_array().expect("recovery_commands");
+    let recoveries = v["recovery_commands"]
+        .as_array()
+        .expect("recovery_commands");
     assert!(
         recoveries
             .iter()
@@ -420,7 +442,15 @@ fn cli_ci_watch_pass_fail_fast_job_drilldown_and_flag_validation() {
         .current_dir(tmp.path())
         .env("GITHUB_TOKEN", "test-tok")
         .env("OZ_GITHUB_API_URL", mock_fail.base_url())
-        .args(["ci", "--job", "701", "--raw", "--max-excerpt-lines", "2", "--json"])
+        .args([
+            "ci",
+            "--job",
+            "701",
+            "--raw",
+            "--max-excerpt-lines",
+            "2",
+            "--json",
+        ])
         .output()
         .expect("oz ci --job");
     assert_eq!(job_out.status.code(), Some(0));
@@ -438,7 +468,14 @@ fn cli_ci_watch_pass_fail_fast_job_drilldown_and_flag_validation() {
         steps: vec![
             MockStep { check_runs: vec![] },
             MockStep {
-                check_runs: vec![make_check(1, "cargo test", "completed", Some("success"), 901, 710)],
+                check_runs: vec![make_check(
+                    1,
+                    "cargo test",
+                    "completed",
+                    Some("success"),
+                    901,
+                    710,
+                )],
             },
         ],
         calls: 0,
@@ -466,7 +503,11 @@ fn cli_ci_watch_pass_fail_fast_job_drilldown_and_flag_validation() {
 #[test]
 fn mcp_oz_ci_logs_supports_bounded_wait_and_job_drilldown() {
     let tmp = TempDir::new().expect("tmp");
-    let sha = init_repo(tmp.path(), "feat/mcp-watch", "https://github.com/acme/rocket.git");
+    let sha = init_repo(
+        tmp.path(),
+        "feat/mcp-watch",
+        "https://github.com/acme/rocket.git",
+    );
 
     let mut jobs_by_id = HashMap::new();
     jobs_by_id.insert(
@@ -487,7 +528,10 @@ fn mcp_oz_ci_logs_supports_bounded_wait_and_job_drilldown() {
         },
     );
     let mut job_logs = HashMap::new();
-    job_logs.insert(812, b"2026-11-24T09:00:00Z error: needless_return\n".to_vec());
+    job_logs.insert(
+        812,
+        b"2026-11-24T09:00:00Z error: needless_return\n".to_vec(),
+    );
 
     let mock = MockGitHub::start(MockState {
         steps: vec![
@@ -495,7 +539,14 @@ fn mcp_oz_ci_logs_supports_bounded_wait_and_job_drilldown() {
                 check_runs: vec![make_check(1, "clippy", "in_progress", None, 920, 812)],
             },
             MockStep {
-                check_runs: vec![make_check(1, "clippy", "completed", Some("success"), 920, 812)],
+                check_runs: vec![make_check(
+                    1,
+                    "clippy",
+                    "completed",
+                    Some("success"),
+                    920,
+                    812,
+                )],
             },
         ],
         calls: 0,
@@ -600,7 +651,14 @@ fn cli_push_watch_pushes_and_watches_pushed_sha() {
         steps: vec![
             MockStep { check_runs: vec![] },
             MockStep {
-                check_runs: vec![make_check(1, "ci-build", "completed", Some("success"), 950, 850)],
+                check_runs: vec![make_check(
+                    1,
+                    "ci-build",
+                    "completed",
+                    Some("success"),
+                    950,
+                    850,
+                )],
             },
         ],
         calls: 0,

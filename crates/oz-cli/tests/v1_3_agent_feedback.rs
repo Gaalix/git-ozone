@@ -105,22 +105,51 @@ fn cli_parses_all_v1_3_commands_and_flags() {
     );
     assert!(
         Cli::try_parse_from([
-            "oz", "pr", "edit", "3340", "--title", "Updated", "--body-file", "-", "--base", "main",
+            "oz",
+            "pr",
+            "edit",
+            "3340",
+            "--title",
+            "Updated",
+            "--body-file",
+            "-",
+            "--base",
+            "main",
             "--ready"
         ])
         .is_ok()
     );
     assert!(
-        Cli::try_parse_from(["oz", "pr", "reply", "3347", "t1", "-m", "Fixed", "--resolve"])
-            .is_ok()
+        Cli::try_parse_from([
+            "oz",
+            "pr",
+            "reply",
+            "3347",
+            "t1",
+            "-m",
+            "Fixed",
+            "--resolve"
+        ])
+        .is_ok()
     );
     assert!(Cli::try_parse_from(["oz", "pr", "resolve", "3347", "t1", "--unresolve"]).is_ok());
-    assert!(Cli::try_parse_from(["oz", "pr", "status", "--pr", "3338,3339,3340", "--json"]).is_ok());
+    assert!(
+        Cli::try_parse_from(["oz", "pr", "status", "--pr", "3338,3339,3340", "--json"]).is_ok()
+    );
     assert!(Cli::try_parse_from(["oz", "pr", "view", "3338", "--brief", "--json"]).is_ok());
     assert!(Cli::try_parse_from(["oz", "pr", "view", "3338", "--no-body", "--no-files"]).is_ok());
     assert!(
-        Cli::try_parse_from(["oz", "pr", "create", "--title", "T", "--body-file", "-", "--no-push"])
-            .is_ok()
+        Cli::try_parse_from([
+            "oz",
+            "pr",
+            "create",
+            "--title",
+            "T",
+            "--body-file",
+            "-",
+            "--no-push"
+        ])
+        .is_ok()
     );
     assert!(
         Cli::try_parse_from([
@@ -132,29 +161,41 @@ fn cli_parses_all_v1_3_commands_and_flags() {
     assert!(
         Cli::try_parse_from(["oz", "issue", "comment", "3344", "--body", "42 open deals"]).is_ok()
     );
+    assert!(Cli::try_parse_from(["oz", "issue", "comment", "3344", "--body-file", "-"]).is_ok());
     assert!(
-        Cli::try_parse_from(["oz", "issue", "comment", "3344", "--body-file", "-"]).is_ok()
-    );
-    assert!(
-        Cli::try_parse_from(["oz", "ci", "--runs", "--branch", "main", "--limit", "5", "--json"])
-            .is_ok()
+        Cli::try_parse_from([
+            "oz", "ci", "--runs", "--branch", "main", "--limit", "5", "--json"
+        ])
+        .is_ok()
     );
     assert!(Cli::try_parse_from(["oz", "ci", "--pr", "3338,3339", "--verbose", "--json"]).is_ok());
     assert!(
         Cli::try_parse_from([
-            "oz", "grep", "-n", "alpha|beta", "--exclude", "*.json", "--max-line-len", "80"
+            "oz",
+            "grep",
+            "-n",
+            "alpha|beta",
+            "--exclude",
+            "*.json",
+            "--max-line-len",
+            "80"
         ])
         .is_ok()
     );
     assert!(
         Cli::try_parse_from(["oz", "log", "-n", "3", "--oneline", "HEAD", "origin/main"]).is_ok()
     );
-    assert!(
-        Cli::try_parse_from(["oz", "log", "--oneline", "--left-right", "main...HEAD"]).is_ok()
-    );
+    assert!(Cli::try_parse_from(["oz", "log", "--oneline", "--left-right", "main...HEAD"]).is_ok());
     assert!(
         Cli::try_parse_from([
-            "oz", "log", "--grep", "cleos", "-i", "--no-notes", "--format", "fuller"
+            "oz",
+            "log",
+            "--grep",
+            "cleos",
+            "-i",
+            "--no-notes",
+            "--format",
+            "fuller"
         ])
         .is_ok()
     );
@@ -165,7 +206,10 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
     let (_tmp, repo) = init_sample_repo();
 
     // 1. `oz grep -n` (no-op), `--exclude`, `--max-line-len`, and `\|` BRE hint
-    let grep_n = run_oz(&repo, &["grep", "-n", "alpha|beta", "--exclude", "*.json", "--json"]);
+    let grep_n = run_oz(
+        &repo,
+        &["grep", "-n", "alpha|beta", "--exclude", "*.json", "--json"],
+    );
     assert!(
         grep_n.status.success(),
         "oz grep -n failed: {}",
@@ -183,7 +227,10 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
     );
 
     // Without --exclude, giant JSON line is truncated to --max-line-len 80
-    let grep_trunc = run_oz(&repo, &["grep", "workflow", "--max-line-len", "80", "--json"]);
+    let grep_trunc = run_oz(
+        &repo,
+        &["grep", "workflow", "--max-line-len", "80", "--json"],
+    );
     assert!(grep_trunc.status.success());
     let trunc_json: Value = serde_json::from_slice(&grep_trunc.stdout).unwrap();
     assert_eq!(trunc_json["data"]["lines_truncated"], 1);
@@ -207,7 +254,10 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
     // 2. Multi-rev `oz log`, symmetric `A...B --left-right`, `-i`, `--no-notes`, `--format fuller`
     git_ok(&repo, &["checkout", "-b", "feat/side"]);
     fs::write(repo.join("src/side.ts"), "export const SIDE = 1;\n").unwrap();
-    let commit_out = run_oz(&repo, &["commit", "-m", "feat(cleos): add side module", "--json"]);
+    let commit_out = run_oz(
+        &repo,
+        &["commit", "-m", "feat(cleos): add side module", "--json"],
+    );
     assert!(
         commit_out.status.success(),
         "oz commit failed: {}",
@@ -220,7 +270,10 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
     git_ok(&repo, &["commit", "-m", "chore: advance main"]);
 
     // Multi-rev log accepts two branches!
-    let log_multi = run_oz(&repo, &["log", "-n", "5", "--oneline", "HEAD", "feat/side", "--json"]);
+    let log_multi = run_oz(
+        &repo,
+        &["log", "-n", "5", "--oneline", "HEAD", "feat/side", "--json"],
+    );
     assert!(
         log_multi.status.success(),
         "multi-rev oz log failed: {}",
@@ -239,7 +292,13 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
     // Symmetric diff `main...feat/side --left-right`
     let log_sym = run_oz(
         &repo,
-        &["log", "--oneline", "--left-right", "main...feat/side", "--json"],
+        &[
+            "log",
+            "--oneline",
+            "--left-right",
+            "main...feat/side",
+            "--json",
+        ],
     );
     assert!(
         log_sym.status.success(),
@@ -249,13 +308,29 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
     let sym_json: Value = serde_json::from_slice(&log_sym.stdout).unwrap();
     let sym_commits = sym_json["data"]["commits"].as_array().unwrap();
     assert_eq!(sym_commits.len(), 2);
-    assert!(sym_commits.iter().any(|c| c["side"] == "left" && c["subject"] == "chore: advance main"));
-    assert!(sym_commits.iter().any(|c| c["side"] == "right" && c["subject"] == "feat(cleos): add side module"));
+    assert!(
+        sym_commits
+            .iter()
+            .any(|c| c["side"] == "left" && c["subject"] == "chore: advance main")
+    );
+    assert!(
+        sym_commits
+            .iter()
+            .any(|c| c["side"] == "right" && c["subject"] == "feat(cleos): add side module")
+    );
 
     // `-i` case-insensitive grep + `--no-notes` hides AI provenance + `--format fuller`
     let log_i = run_oz(
         &repo,
-        &["log", "feat/side", "--grep", "CLEOS", "-i", "--no-notes", "--oneline"],
+        &[
+            "log",
+            "feat/side",
+            "--grep",
+            "CLEOS",
+            "-i",
+            "--no-notes",
+            "--oneline",
+        ],
     );
     assert!(log_i.status.success());
     let log_i_txt = String::from_utf8_lossy(&log_i.stdout);
@@ -265,7 +340,10 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
         "--no-notes must suppress [AI:...] badge: {log_i_txt}"
     );
 
-    let log_fuller = run_oz(&repo, &["log", "feat/side", "-n", "1", "--format", "fuller"]);
+    let log_fuller = run_oz(
+        &repo,
+        &["log", "feat/side", "-n", "1", "--format", "fuller"],
+    );
     assert!(log_fuller.status.success());
     let fuller_txt = String::from_utf8_lossy(&log_fuller.stdout);
     assert!(fuller_txt.contains("AuthorDate:"));
@@ -286,8 +364,16 @@ fn grep_log_and_show_ergonomics_work_end_to_end() {
 #[test]
 fn cas_hardlink_keeps_pnpm_metadata_writable_and_seeds_nested_workspaces() {
     let (_tmp, repo) = init_sample_repo();
-    fs::write(repo.join("package.json"), "{\"name\":\"monorepo\",\"private\":true}\n").unwrap();
-    fs::write(repo.join("pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n").unwrap();
+    fs::write(
+        repo.join("package.json"),
+        "{\"name\":\"monorepo\",\"private\":true}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\n",
+    )
+    .unwrap();
     fs::create_dir_all(repo.join("packages/api")).unwrap();
     fs::write(
         repo.join("packages/api/package.json"),
@@ -303,15 +389,31 @@ fn cas_hardlink_keeps_pnpm_metadata_writable_and_seeds_nested_workspaces() {
     fs::create_dir_all(repo.join("node_modules/lodash")).unwrap();
     fs::create_dir_all(repo.join("packages/api/node_modules/.bin")).unwrap();
 
-    fs::write(repo.join("node_modules/.modules.yaml"), "storeDir: /store\n").unwrap();
+    fs::write(
+        repo.join("node_modules/.modules.yaml"),
+        "storeDir: /store\n",
+    )
+    .unwrap();
     fs::write(
         repo.join("node_modules/.pnpm-workspace-state-v1.json"),
         "{\"version\":1}\n",
     )
     .unwrap();
-    fs::write(repo.join("node_modules/.pnpm/lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
-    fs::write(repo.join("node_modules/.bin/jest"), "#!/bin/sh\necho jest\n").unwrap();
-    fs::write(repo.join("node_modules/lodash/index.js"), "module.exports = {};\n").unwrap();
+    fs::write(
+        repo.join("node_modules/.pnpm/lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("node_modules/.bin/jest"),
+        "#!/bin/sh\necho jest\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("node_modules/lodash/index.js"),
+        "module.exports = {};\n",
+    )
+    .unwrap();
     fs::write(
         repo.join("packages/api/node_modules/.modules.yaml"),
         "hoistPattern: []\n",
@@ -320,7 +422,14 @@ fn cas_hardlink_keeps_pnpm_metadata_writable_and_seeds_nested_workspaces() {
 
     let spawn = run_oz(
         &repo,
-        &["ws", "spawn", "pnpm-ws", "--backend", "cas_hardlink", "--json"],
+        &[
+            "ws",
+            "spawn",
+            "pnpm-ws",
+            "--backend",
+            "cas_hardlink",
+            "--json",
+        ],
     );
     assert!(
         spawn.status.success(),
@@ -361,7 +470,15 @@ fn cas_hardlink_keeps_pnpm_metadata_writable_and_seeds_nested_workspaces() {
 #[test]
 fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     let (_tmp, repo) = init_sample_repo();
-    git_ok(&repo, &["remote", "add", "origin", "https://github.com/acme/demo.git"]);
+    git_ok(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/demo.git",
+        ],
+    );
     let local_main_sha = git_ok(&repo, &["rev-parse", "main"]);
     // Put local checkout on an unrelated feature branch to verify `oz ci --json` envelope accuracy!
     git_ok(&repo, &["checkout", "-b", "fix/unrelated-local-branch"]);
@@ -723,24 +840,26 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
                 ("GET", p)
                     if p == "/repos/acme/demo/commits/main/check-runs"
                         || p == format!("/repos/acme/demo/commits/{sha_main}/check-runs") =>
-                (
-                    "200 OK",
-                    serde_json::to_vec(&json!({
-                        "total_count": 1,
-                        "check_runs": [
-                            GitHubCheckRun {
-                                id: 301,
-                                name: "ci".to_string(),
-                                status: "completed".to_string(),
-                                conclusion: Some("success".to_string()),
-                                details_url: None,
-                                html_url: None,
-                                output: GitHubCheckRunOutput::default(),
-                            }
-                        ]
-                    }))
-                    .unwrap(),
-                ),
+                {
+                    (
+                        "200 OK",
+                        serde_json::to_vec(&json!({
+                            "total_count": 1,
+                            "check_runs": [
+                                GitHubCheckRun {
+                                    id: 301,
+                                    name: "ci".to_string(),
+                                    status: "completed".to_string(),
+                                    conclusion: Some("success".to_string()),
+                                    details_url: None,
+                                    html_url: None,
+                                    output: GitHubCheckRunOutput::default(),
+                                }
+                            ]
+                        }))
+                        .unwrap(),
+                    )
+                }
                 ("GET", "/repos/acme/demo/actions/runs") => (
                     "200 OK",
                     serde_json::to_vec(&json!({
@@ -800,7 +919,16 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     // 2. `oz pr reply 3340 t1 -m "Fixed" --resolve --json`
     let reply = run_oz_env(
         &repo,
-        &["pr", "reply", "3340", "t1", "-m", "Fixed in commit", "--resolve", "--json"],
+        &[
+            "pr",
+            "reply",
+            "3340",
+            "t1",
+            "-m",
+            "Fixed in commit",
+            "--resolve",
+            "--json",
+        ],
         &envs,
     );
     assert!(
@@ -843,7 +971,10 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     );
     assert!(edit.status.success());
     let edit_json: Value = serde_json::from_slice(&edit.stdout).unwrap();
-    assert_eq!(edit_json["data"]["pull_request"]["title"], "feat: Updated Cleos title");
+    assert_eq!(
+        edit_json["data"]["pull_request"]["title"],
+        "feat: Updated Cleos title"
+    );
     assert_eq!(
         edit_json["data"]["pull_request"]["body"],
         "Updated body with `backticks` and $VARS"
@@ -859,21 +990,34 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     // 6. `oz pr list --state merged --search cleos --json` & `oz issue list` & `oz issue comment`
     let pr_list = run_oz_env(
         &repo,
-        &["pr", "list", "--state", "merged", "--search", "cleos", "--json"],
+        &[
+            "pr", "list", "--state", "merged", "--search", "cleos", "--json",
+        ],
         &envs,
     );
     assert!(pr_list.status.success());
     let pr_list_json: Value = serde_json::from_slice(&pr_list.stdout).unwrap();
     assert_eq!(pr_list_json["data"]["pull_requests"][0]["number"], 3089);
 
-    let issue_list = run_oz_env(&repo, &["issue", "list", "--search", "cleos", "--json"], &envs);
+    let issue_list = run_oz_env(
+        &repo,
+        &["issue", "list", "--search", "cleos", "--json"],
+        &envs,
+    );
     assert!(issue_list.status.success());
     let issue_list_json: Value = serde_json::from_slice(&issue_list.stdout).unwrap();
     assert_eq!(issue_list_json["data"]["issues"][0]["number"], 3344);
 
     let issue_cmt = run_oz_env(
         &repo,
-        &["issue", "comment", "3344", "--body", "Open deals: 42", "--json"],
+        &[
+            "issue",
+            "comment",
+            "3344",
+            "--body",
+            "Open deals: 42",
+            "--json",
+        ],
         &envs,
     );
     assert!(issue_cmt.status.success());
@@ -882,7 +1026,11 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     assert_eq!(issue_cmt_json["data"]["comment"]["body"], "Open deals: 42");
 
     // 7. `oz pr status --pr 3340,3341 --json`
-    let pr_st = run_oz_env(&repo, &["pr", "status", "--pr", "3340,3341", "--json"], &envs);
+    let pr_st = run_oz_env(
+        &repo,
+        &["pr", "status", "--pr", "3340,3341", "--json"],
+        &envs,
+    );
     assert!(pr_st.status.success());
     let pr_st_json: Value = serde_json::from_slice(&pr_st.stdout).unwrap();
     assert!(pr_st_json["branch"].is_null());
@@ -911,7 +1059,10 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     assert!(ci_multi_json["data"]["reports"][0].get("checks").is_none());
     assert_eq!(ci_multi_json["data"]["reports"][1]["passed_count"], 1);
     assert_eq!(
-        ci_multi_json["data"]["reports"][1]["checks"].as_array().unwrap().len(),
+        ci_multi_json["data"]["reports"][1]["checks"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
 
@@ -938,7 +1089,11 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     assert_eq!(ci_main_json["data"]["passed_count"], 1);
 
     // 10. `oz ci --runs --branch main --json` lists runs across all workflows
-    let ci_runs = run_oz_env(&repo, &["ci", "--runs", "--branch", "main", "--json"], &envs);
+    let ci_runs = run_oz_env(
+        &repo,
+        &["ci", "--runs", "--branch", "main", "--json"],
+        &envs,
+    );
     assert!(ci_runs.status.success());
     let ci_runs_json: Value = serde_json::from_slice(&ci_runs.stdout).unwrap();
     assert_eq!(ci_runs_json["branch"], "main");

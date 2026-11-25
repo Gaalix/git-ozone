@@ -118,17 +118,17 @@ pub fn issue_view(repo: &OzoneRepo, opts: &IssueViewOptions) -> Result<IssueView
             ),
             recovery: vec!["Verify `git remote -v` points to a GitHub repository.".to_string()],
         })?;
-    let repo_name = opts
-        .repo_override
-        .clone()
-        .or(remote.repo)
-        .ok_or_else(|| OzError::InvalidUsage {
-            message: format!(
-                "remote '{}' does not contain a GitHub repository name",
-                remote.sanitized_url
-            ),
-            recovery: vec!["Verify `git remote -v` points to a GitHub repository.".to_string()],
-        })?;
+    let repo_name =
+        opts.repo_override
+            .clone()
+            .or(remote.repo)
+            .ok_or_else(|| OzError::InvalidUsage {
+                message: format!(
+                    "remote '{}' does not contain a GitHub repository name",
+                    remote.sanitized_url
+                ),
+                recovery: vec!["Verify `git remote -v` points to a GitHub repository.".to_string()],
+            })?;
 
     let issue = client.get_issue(&owner, &repo_name, opts.number)?;
     let is_pull_request = issue.pull_request.is_some();
@@ -238,16 +238,14 @@ pub fn issue_list(repo: &OzoneRepo, opts: &IssueListOptions) -> Result<IssueList
             recovery: vec!["oz issue list --state open".to_string()],
         });
     }
-    let limit = if opts.limit == 0 { 20 } else { opts.limit.min(100) };
+    let limit = if opts.limit == 0 {
+        20
+    } else {
+        opts.limit.min(100)
+    };
 
-    let use_search = opts
-        .search
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty())
-        || opts
-            .author
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty());
+    let use_search = opts.search.as_deref().is_some_and(|s| !s.trim().is_empty())
+        || opts.author.as_deref().is_some_and(|s| !s.trim().is_empty());
 
     let raw_issues = if use_search {
         let mut q_parts = vec![format!("repo:{owner}/{repo_name}"), "is:issue".to_string()];
@@ -387,17 +385,17 @@ pub fn issue_comment(repo: &OzoneRepo, opts: &IssueCommentOptions) -> Result<Iss
             ),
             recovery: vec!["Verify `git remote -v` points to a GitHub repository.".to_string()],
         })?;
-    let repo_name = opts
-        .repo_override
-        .clone()
-        .or(remote.repo)
-        .ok_or_else(|| OzError::InvalidUsage {
-            message: format!(
-                "remote '{}' does not contain a GitHub repository name",
-                remote.sanitized_url
-            ),
-            recovery: vec!["Verify `git remote -v` points to a GitHub repository.".to_string()],
-        })?;
+    let repo_name =
+        opts.repo_override
+            .clone()
+            .or(remote.repo)
+            .ok_or_else(|| OzError::InvalidUsage {
+                message: format!(
+                    "remote '{}' does not contain a GitHub repository name",
+                    remote.sanitized_url
+                ),
+                recovery: vec!["Verify `git remote -v` points to a GitHub repository.".to_string()],
+            })?;
 
     let created = client.create_issue_comment(&owner, &repo_name, opts.number, &opts.body)?;
     Ok(IssueCommentOutcome {
@@ -426,7 +424,8 @@ mod tests {
         let b = parse_issue_target("#3311").unwrap();
         assert_eq!((b.owner, b.repo, b.number), (None, None, 3311));
 
-        let c = parse_issue_target("https://github.com/acme/demo/issues/3311#issuecomment-1").unwrap();
+        let c =
+            parse_issue_target("https://github.com/acme/demo/issues/3311#issuecomment-1").unwrap();
         assert_eq!(
             (c.owner.as_deref(), c.repo.as_deref(), c.number),
             (Some("acme"), Some("demo"), 3311)

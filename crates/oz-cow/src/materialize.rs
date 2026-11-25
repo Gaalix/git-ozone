@@ -95,7 +95,9 @@ pub fn compute_tree_delta(
                     if !entry_mode.is_tree()
                         && let Ok(rel) = std::str::from_utf8(location.as_ref())
                     {
-                        delta.upserts.push((rel.to_string(), id.detach(), entry_mode));
+                        delta
+                            .upserts
+                            .push((rel.to_string(), id.detach(), entry_mode));
                     }
                 }
                 Change::Deletion {
@@ -300,8 +302,7 @@ pub(crate) fn reconcile_attributes_and_gitlinks_in_dir(
     dst_root: &Path,
 ) -> Result<()> {
     let git_cfg = load_git_config_for_cow(repo, git_common_dir)?;
-    let attr_resolver =
-        AttributeResolver::for_tree(repo, Some(tree_id), git_common_dir, &git_cfg)?;
+    let attr_resolver = AttributeResolver::for_tree(repo, Some(tree_id), git_common_dir, &git_cfg)?;
 
     let tree = repo
         .find_tree(tree_id)
@@ -312,8 +313,7 @@ pub(crate) fn reconcile_attributes_and_gitlinks_in_dir(
         .files()
         .map_err(|e| OzError::Git(e.to_string()))?;
 
-    let needs_file_checks =
-        attr_resolver.may_have_rules() || git_cfg.autocrlf() == AutoCrlf::True;
+    let needs_file_checks = attr_resolver.may_have_rules() || git_cfg.autocrlf() == AutoCrlf::True;
     let mut jobs = Vec::new();
 
     for entry in entries {
@@ -361,8 +361,14 @@ pub(crate) fn reconcile_attributes_and_gitlinks_in_dir(
         if std::fs::symlink_metadata(&dst).is_ok() {
             let _ = std::fs::remove_file(&dst);
         }
-        let smudged =
-            smudge_blob_bytes(&rel, &blob.data, &resolved, &git_cfg, dst_root, git_common_dir)?;
+        let smudged = smudge_blob_bytes(
+            &rel,
+            &blob.data,
+            &resolved,
+            &git_cfg,
+            dst_root,
+            git_common_dir,
+        )?;
         std::fs::write(&dst, &smudged)?;
         apply_git_mode(&dst, mode.is_executable())?;
     }
@@ -404,7 +410,10 @@ fn build_delta_attribute_resolver(
             }
             let rel = entry.filepath.to_str_lossy();
             if rel == ".gitattributes" || rel.ends_with("/.gitattributes") {
-                let dir = rel.strip_suffix("/.gitattributes").unwrap_or("").to_string();
+                let dir = rel
+                    .strip_suffix("/.gitattributes")
+                    .unwrap_or("")
+                    .to_string();
                 if let Ok(blob) = repo.find_blob(entry.oid) {
                     per_dir.insert(dir, String::from_utf8_lossy(&blob.data).into_owned());
                 }
@@ -414,7 +423,11 @@ fn build_delta_attribute_resolver(
 
     // Overlay `.gitattributes` files already present in `dst_root`.
     if dst_root.is_dir() {
-        for entry in WalkDir::new(dst_root).follow_links(false).into_iter().flatten() {
+        for entry in WalkDir::new(dst_root)
+            .follow_links(false)
+            .into_iter()
+            .flatten()
+        {
             if entry.file_name() == ".git" {
                 continue;
             }
@@ -424,7 +437,10 @@ fn build_delta_attribute_resolver(
                 && let Ok(raw) = std::fs::read_to_string(entry.path())
             {
                 let rel_s = rel.to_string_lossy().replace('\\', "/");
-                let dir = rel_s.strip_suffix("/.gitattributes").unwrap_or("").to_string();
+                let dir = rel_s
+                    .strip_suffix("/.gitattributes")
+                    .unwrap_or("")
+                    .to_string();
                 per_dir.insert(dir, raw);
             }
         }
@@ -432,8 +448,14 @@ fn build_delta_attribute_resolver(
 
     // Highest-priority target-tree `.gitattributes` from this delta's upserts.
     for (rel, oid, mode) in upserts {
-        if !mode.is_commit() && !mode.is_tree() && (rel == ".gitattributes" || rel.ends_with("/.gitattributes")) {
-            let dir = rel.strip_suffix("/.gitattributes").unwrap_or("").to_string();
+        if !mode.is_commit()
+            && !mode.is_tree()
+            && (rel == ".gitattributes" || rel.ends_with("/.gitattributes"))
+        {
+            let dir = rel
+                .strip_suffix("/.gitattributes")
+                .unwrap_or("")
+                .to_string();
             let blob = repo
                 .find_blob(*oid)
                 .map_err(|e| OzError::Git(e.to_string()))?;
@@ -511,25 +533,31 @@ pub fn clone_dir_with_reflink(src_root: &Path, dst_root: &Path) -> Result<()> {
             created_dirs.insert(parent.to_path_buf());
         }
         let meta = std::fs::symlink_metadata(entry.path())?;
-        jobs.push((entry.path().to_path_buf(), dst, entry.path_is_symlink(), meta));
+        jobs.push((
+            entry.path().to_path_buf(),
+            dst,
+            entry.path_is_symlink(),
+            meta,
+        ));
     }
 
-    jobs.par_iter().try_for_each(|(src, dst, is_symlink, meta)| -> Result<()> {
-        if *is_symlink {
-            copy_symlink(src, dst)?;
-            return Ok(());
-        }
-        if meta.is_file() {
-            if std::fs::symlink_metadata(dst).is_ok() {
-                let _ = std::fs::remove_file(dst);
+    jobs.par_iter()
+        .try_for_each(|(src, dst, is_symlink, meta)| -> Result<()> {
+            if *is_symlink {
+                copy_symlink(src, dst)?;
+                return Ok(());
             }
-            reflink_copy::reflink(src, dst)?;
-            std::fs::set_permissions(dst, meta.permissions())?;
-            let ft = metadata_modified_filetime(meta);
-            let _ = set_file_mtime_compat(dst, ft);
-        }
-        Ok(())
-    })
+            if meta.is_file() {
+                if std::fs::symlink_metadata(dst).is_ok() {
+                    let _ = std::fs::remove_file(dst);
+                }
+                reflink_copy::reflink(src, dst)?;
+                std::fs::set_permissions(dst, meta.permissions())?;
+                let ft = metadata_modified_filetime(meta);
+                let _ = set_file_mtime_compat(dst, ft);
+            }
+            Ok(())
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,7 +713,12 @@ pub fn materialize_cas_workspace(
                     meta,
                 ));
             } else {
-                source_jobs.push((entry.path().to_path_buf(), dst, entry.path_is_symlink(), meta));
+                source_jobs.push((
+                    entry.path().to_path_buf(),
+                    dst,
+                    entry.path_is_symlink(),
+                    meta,
+                ));
             }
         }
     }
@@ -736,15 +769,18 @@ pub fn materialize_cas_workspace(
                     .map(|c| c.digest.as_str());
                 let digest = link_file_via_cas(src, dst, meta, cas_dir, cached_hex)?;
                 if cached_hex.is_none() && cache_path.is_some() {
-                    new_digests.lock().expect("digest cache lock poisoned").push((
-                        rel_key.clone(),
-                        CachedCasDigest {
-                            size: meta.len(),
-                            mtime_secs: ft.unix_seconds(),
-                            mtime_nsecs: ft.nanoseconds(),
-                            digest,
-                        },
-                    ));
+                    new_digests
+                        .lock()
+                        .expect("digest cache lock poisoned")
+                        .push((
+                            rel_key.clone(),
+                            CachedCasDigest {
+                                size: meta.len(),
+                                mtime_secs: ft.unix_seconds(),
+                                mtime_nsecs: ft.nanoseconds(),
+                                digest,
+                            },
+                        ));
                 }
             }
             Ok(())
@@ -855,10 +891,7 @@ fn collect_warm_root_names(req: &SpawnRequest, git_common_dir: &Path) -> HashSet
 #[must_use]
 pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
     let rel_posix = rel.to_string_lossy().replace('\\', "/");
-    let file_name = rel
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let file_name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
     if matches!(
         file_name,

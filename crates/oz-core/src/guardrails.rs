@@ -14,12 +14,8 @@ use std::fs;
 use std::path::Path;
 
 /// Allowed non-secret `.env.*` template filenames.
-const ALLOWED_ENV_TEMPLATES: &[&str] = &[
-    ".env.example",
-    ".env.sample",
-    ".env.template",
-    ".env.dist",
-];
+const ALLOWED_ENV_TEMPLATES: &[&str] =
+    &[".env.example", ".env.sample", ".env.template", ".env.dist"];
 
 /// Category of pre-commit guardrail violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -214,12 +210,8 @@ pub fn check_guardrails(
     }
 
     let primary_kind = findings[0].kind.as_str().to_string();
-    let has_content_violation = findings
-        .iter()
-        .any(|f| f.kind != GuardrailKind::OutOfScope);
-    let has_scope_violation = findings
-        .iter()
-        .any(|f| f.kind == GuardrailKind::OutOfScope);
+    let has_content_violation = findings.iter().any(|f| f.kind != GuardrailKind::OutOfScope);
+    let has_scope_violation = findings.iter().any(|f| f.kind == GuardrailKind::OutOfScope);
 
     let summary = findings
         .iter()
@@ -289,13 +281,13 @@ pub fn check_workspace_guardrails(repo: &OzoneRepo, opts: &GuardrailOptions) -> 
         let disk_path = ctx.source.disk_path(&raw.path);
         let meta = fs::symlink_metadata(&disk_path)?;
         let len = meta.len();
-        let content = if len > max_blob_bytes && raw.disk_kind != Some(gix::objs::tree::EntryKind::Link)
-        {
-            // Avoid loading a multi-gigabyte file into RAM just to reject it.
-            Vec::new()
-        } else {
-            read_disk_bytes(&disk_path, raw.disk_kind)?
-        };
+        let content =
+            if len > max_blob_bytes && raw.disk_kind != Some(gix::objs::tree::EntryKind::Link) {
+                // Avoid loading a multi-gigabyte file into RAM just to reject it.
+                Vec::new()
+            } else {
+                read_disk_bytes(&disk_path, raw.disk_kind)?
+            };
 
         owned.push(OwnedTarget {
             path: raw.path.clone(),
@@ -382,10 +374,9 @@ fn has_aws_access_key(bytes: &[u8]) -> bool {
             continue;
         }
         let body = &bytes[i + PREFIX.len()..i + total_len];
-        let body_ok = body
-            .iter()
-            .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'Z'));
-        let after_ok = i + total_len == bytes.len() || !bytes[i + total_len].is_ascii_alphanumeric();
+        let body_ok = body.iter().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'Z'));
+        let after_ok =
+            i + total_len == bytes.len() || !bytes[i + total_len].is_ascii_alphanumeric();
         if body_ok && after_ok {
             return true;
         }
@@ -405,7 +396,8 @@ fn has_github_classic_pat(bytes: &[u8]) -> bool {
         }
         let body = &bytes[i + PREFIX.len()..i + total_len];
         let body_ok = body.iter().all(|b| b.is_ascii_alphanumeric());
-        let after_ok = i + total_len == bytes.len() || !bytes[i + total_len].is_ascii_alphanumeric();
+        let after_ok =
+            i + total_len == bytes.len() || !bytes[i + total_len].is_ascii_alphanumeric();
         if body_ok && after_ok {
             return true;
         }
@@ -454,7 +446,11 @@ mod tests {
         let aws = concat!("AWS_KEY=", "AKIA", "1234567890ABCDEF");
         assert_eq!(detect_secret_in_line(aws), Some("aws_access_key"));
 
-        let ghp = concat!("token = \"", "ghp_", "abcdefghijklmnopqrstuvwxyz0123456789\"");
+        let ghp = concat!(
+            "token = \"",
+            "ghp_",
+            "abcdefghijklmnopqrstuvwxyz0123456789\""
+        );
         assert_eq!(detect_secret_in_line(ghp), Some("github_classic_pat"));
 
         let pat = concat!("PAT=", "github_pat_", "11AAAAAA_testtoken");

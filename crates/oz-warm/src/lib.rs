@@ -274,7 +274,16 @@ fn detect_nested_workspace_node_modules(repo_root: &Path) -> Vec<String> {
             let name = e.file_name().to_string_lossy();
             !matches!(
                 name.as_ref(),
-                ".git" | ".ozone" | "node_modules" | "target" | ".venv" | ".next" | ".turbo" | ".vite" | "dist" | "build"
+                ".git"
+                    | ".ozone"
+                    | "node_modules"
+                    | "target"
+                    | ".venv"
+                    | ".next"
+                    | ".turbo"
+                    | ".vite"
+                    | "dist"
+                    | "build"
             )
         });
 

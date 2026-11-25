@@ -16,8 +16,8 @@ use oz_github::{
     CiQueryOptions, GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput, GitHubClient,
     GitHubJobStep, GitHubPrRef, GitHubPullRequest, GitHubWorkflowRun, OZ_STACK_END, OZ_STACK_START,
     PrCreateOptions, PrStackOptions, SyncOptions, TokenDiscoveryOptions, TokenSource,
-    discover_github_token_with_options, pr_create, pr_stack, probe_github_auth,
-    query_ci_status, query_git_credential_fill, sync_repo,
+    discover_github_token_with_options, pr_create, pr_stack, probe_github_auth, query_ci_status,
+    query_git_credential_fill, sync_repo,
 };
 use oz_oplog::{ActorInfo, ActorKind, checkpoint};
 use oz_warm::find_baseline;
@@ -102,7 +102,9 @@ impl MockGitHubState {
 }
 
 async fn spawn_mock_github_api(state: Arc<Mutex<MockGitHubState>>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock api");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock api");
     let addr = listener.local_addr().expect("local_addr");
 
     tokio::spawn(async move {
@@ -292,9 +294,7 @@ fn route_mock_github(
                 }
             } else if method == "PATCH" {
                 let val: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
-                let new_base_sha = val["base"]
-                    .as_str()
-                    .map(|b| st.resolve_branch_sha(b));
+                let new_base_sha = val["base"].as_str().map(|b| st.resolve_branch_sha(b));
                 if let Some(pr) = st.prs.iter_mut().find(|p| p.number == num) {
                     if let Some(t) = val["title"].as_str() {
                         pr.title = t.to_string();
@@ -384,11 +384,7 @@ fn route_mock_github(
             && tail[0] == "actions"
             && tail[1] == "jobs"
             && let Ok(job_id) = tail[2].parse::<u64>()
-            && let Some(job) = st
-                .jobs_by_run
-                .values()
-                .flatten()
-                .find(|j| j.id == job_id)
+            && let Some(job) = st.jobs_by_run.values().flatten().find(|j| j.id == job_id)
         {
             return (
                 "200 OK",
@@ -734,8 +730,11 @@ async fn end_to_end_pr_create_3_branch_pr_stack_sync_retarget_gc_rebase_and_ci_l
         },
     )
     .expect("spawn ws-stack-1");
-    std::fs::write(ws1.workspace.workspace_path.join("part1.rs"), "pub const P1: u8 = 1;\n")
-        .expect("write part1.rs");
+    std::fs::write(
+        ws1.workspace.workspace_path.join("part1.rs"),
+        "pub const P1: u8 = 1;\n",
+    )
+    .expect("write part1.rs");
     let ws1_oz = OzoneRepo::discover(Some(&ws1.workspace.workspace_path)).expect("discover ws1");
     // Record a checkpoint on `ws-stack-1` so we can verify `oz sync` prunes merged checkpoints!
     let cp_out = checkpoint(
@@ -770,8 +769,11 @@ async fn end_to_end_pr_create_3_branch_pr_stack_sync_retarget_gc_rebase_and_ci_l
         },
     )
     .expect("spawn ws-stack-2");
-    std::fs::write(ws2.workspace.workspace_path.join("part2.rs"), "pub const P2: u8 = 2;\n")
-        .expect("write part2.rs");
+    std::fs::write(
+        ws2.workspace.workspace_path.join("part2.rs"),
+        "pub const P2: u8 = 2;\n",
+    )
+    .expect("write part2.rs");
     let ws2_oz = OzoneRepo::discover(Some(&ws2.workspace.workspace_path)).expect("discover ws2");
     let c_s2 = commit_changes(
         &ws2_oz,
@@ -796,8 +798,11 @@ async fn end_to_end_pr_create_3_branch_pr_stack_sync_retarget_gc_rebase_and_ci_l
         },
     )
     .expect("spawn ws-stack-3");
-    std::fs::write(ws3.workspace.workspace_path.join("part3.rs"), "pub const P3: u8 = 3;\n")
-        .expect("write part3.rs");
+    std::fs::write(
+        ws3.workspace.workspace_path.join("part3.rs"),
+        "pub const P3: u8 = 3;\n",
+    )
+    .expect("write part3.rs");
     let ws3_oz = OzoneRepo::discover(Some(&ws3.workspace.workspace_path)).expect("discover ws3");
     let c_s3 = commit_changes(
         &ws3_oz,
@@ -888,7 +893,10 @@ async fn end_to_end_pr_create_3_branch_pr_stack_sync_retarget_gc_rebase_and_ci_l
         &[
             "commit",
             "-m",
-            &format!("feat(stack): part 1 auth model (#{pr_s1_num})\n\nChange-Id: {}", c_s1.change_id),
+            &format!(
+                "feat(stack): part 1 auth model (#{pr_s1_num})\n\nChange-Id: {}",
+                c_s1.change_id
+            ),
         ],
     );
     let new_remote_main = run_git(&merger, &["rev-parse", "HEAD"]);
@@ -948,7 +956,11 @@ async fn end_to_end_pr_create_3_branch_pr_stack_sync_retarget_gc_rebase_and_ci_l
     }
 
     // Verify (c) Merged CoW workspace `ws-stack-1` was GC'd, `stack-1` branch deleted, AND checkpoint pruned!
-    assert!(sync_out.removed_workspaces.contains(&"ws-stack-1".to_string()));
+    assert!(
+        sync_out
+            .removed_workspaces
+            .contains(&"ws-stack-1".to_string())
+    );
     assert!(!ws1.workspace.workspace_path.exists());
     assert!(
         sync_out
@@ -1302,7 +1314,13 @@ async fn sync_repo_merge_commit_rebases_via_oz_integrate_and_preserves_untouched
     run_git(&merger, &["checkout", "main"]);
     run_git(
         &merger,
-        &["merge", "--no-ff", "origin/s1", "-m", "Merge pull request #1 from acme/s1"],
+        &[
+            "merge",
+            "--no-ff",
+            "origin/s1",
+            "-m",
+            "Merge pull request #1 from acme/s1",
+        ],
     );
     let merged_main_oid = run_git(&merger, &["rev-parse", "HEAD"]);
     run_git(&merger, &["push", "origin", "main"]);
@@ -1333,9 +1351,12 @@ async fn sync_repo_merge_commit_rebases_via_oz_integrate_and_preserves_untouched
     assert_eq!(sync_out.retargeted_prs[0].head_branch, "s2");
     assert_eq!(sync_out.retargeted_prs[0].new_base, "main");
     assert!(sync_out.removed_workspaces.contains(&"ws-s1".to_string()));
-    assert!(!sync_out.removed_workspaces.contains(&"ws-untouched".to_string()));
+    assert!(
+        !sync_out
+            .removed_workspaces
+            .contains(&"ws-untouched".to_string())
+    );
     assert!(ws_untouched.workspace.workspace_path.is_dir());
     assert!(sync_out.rebased_branches.contains(&"s2".to_string()));
     assert_eq!(run_git(&repo_dir, &["rev-parse", "s2^"]), merged_main_oid);
 }
-

@@ -577,12 +577,16 @@ pub(crate) fn materialize_integrate_sandbox(
 
     let baseline_root = find_warm_baseline_root(repo, gix_repo, hint_commit);
     if let Some(ref b_root) = baseline_root {
-        let probe =
-            detect_filesystem_with_ozone(&repo.repo_root, Some(&repo.layout.ozone_dir))?;
+        let probe = detect_filesystem_with_ozone(&repo.repo_root, Some(&repo.layout.ozone_dir))?;
         if probe.reflink_supported {
             clone_dir_with_reflink(b_root, sandbox_dir)?;
             if let Some(base_tree_id) = resolve_baseline_tree_id(gix_repo, b_root) {
-                apply_tree_delta_with_cleanup(gix_repo, base_tree_id, candidate_tree_id, sandbox_dir)?;
+                apply_tree_delta_with_cleanup(
+                    gix_repo,
+                    base_tree_id,
+                    candidate_tree_id,
+                    sandbox_dir,
+                )?;
             } else {
                 materialize_tree_from_odb(gix_repo, candidate_tree_id, sandbox_dir)?;
             }
@@ -803,11 +807,7 @@ fn is_path_prefix(parent: &str, child: &str) -> bool {
 }
 
 /// Builds `gix::merge::blob::builtin_driver::text::Labels` from static/borrowed strings.
-pub(crate) fn merge_labels<'a>(
-    ancestor: &'a str,
-    ours: &'a str,
-    theirs: &'a str,
-) -> Labels<'a> {
+pub(crate) fn merge_labels<'a>(ancestor: &'a str, ours: &'a str, theirs: &'a str) -> Labels<'a> {
     Labels {
         ancestor: Some(ancestor.as_bytes().as_bstr()),
         current: Some(ours.as_bytes().as_bstr()),
@@ -933,7 +933,9 @@ fn describe_conflict(
                 }
                 "overlapping content modification".to_string()
             }
-            Resolution::OursModifiedTheirsRenamedAndChangedThenRename { final_location, .. } => {
+            Resolution::OursModifiedTheirsRenamedAndChangedThenRename {
+                final_location, ..
+            } => {
                 let p = final_location
                     .as_ref()
                     .map(|b| b.to_str_lossy().into_owned())
@@ -1184,7 +1186,9 @@ pub(crate) fn verify_and_build_resolved_tree(
     } else if let Some(ref st) = session.stack_rebase {
         &st.conflict_merged_tree_oid
     } else {
-        return Err(OzError::Other("corrupt integration session state".to_string()));
+        return Err(OzError::Other(
+            "corrupt integration session state".to_string(),
+        ));
     };
     let base_merged_tree_id = parse_oid(base_tree_hex)?;
 
@@ -1479,7 +1483,10 @@ fn is_ignored_in_sandbox(search: &gix::ignore::Search, rel: &str, is_dir: bool) 
 fn read_disk_bytes_and_kind(path: &Path, meta: &fs::Metadata) -> Result<(Vec<u8>, EntryKind)> {
     if meta.file_type().is_symlink() {
         let target = fs::read_link(path)?;
-        return Ok((target.as_os_str().as_encoded_bytes().to_vec(), EntryKind::Link));
+        return Ok((
+            target.as_os_str().as_encoded_bytes().to_vec(),
+            EntryKind::Link,
+        ));
     }
     let bytes = fs::read(path)?;
     #[cfg(unix)]
@@ -1549,7 +1556,9 @@ pub(crate) fn run_verify_command(sandbox_dir: &Path, verify_cmd: &str) -> Result
 
     let output = cmd.output().map_err(|err| OzError::CheckFailed {
         message: format!("failed to execute --verify command '{verify_cmd}': {err}"),
-        recovery: vec!["Check the --verify command syntax and executable availability.".to_string()],
+        recovery: vec![
+            "Check the --verify command syntax and executable availability.".to_string(),
+        ],
     })?;
 
     if !output.status.success() {
@@ -1628,7 +1637,9 @@ pub(crate) fn write_workspace_state_atomic(path: &Path, state: &WorkspaceState) 
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
         ".tmp_{}_{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("ws.json"),
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ws.json"),
         std::process::id()
     ));
     let bytes = serde_json::to_vec_pretty(state)?;

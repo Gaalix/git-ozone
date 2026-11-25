@@ -140,7 +140,11 @@ pub fn resolve_ssh_host_with_context(
     }
 
     // Expand SSH % tokens (%h, %p, %r, %%) and ~/ after primary HostName/User/Port settle.
-    finalize_ssh_tokens(&mut resolved, ctx.home_dir.as_deref(), ctx.ssh_auth_sock.as_deref());
+    finalize_ssh_tokens(
+        &mut resolved,
+        ctx.home_dir.as_deref(),
+        ctx.ssh_auth_sock.as_deref(),
+    );
     resolved
 }
 
@@ -215,15 +219,11 @@ pub fn format_openssh_command(
         parts.push("-o".to_string());
         parts.push(shell_quote(&format!("HostName={hn}")));
     }
-    if !url_has_user
-        && let Some(ref u) = resolved.user
-    {
+    if !url_has_user && let Some(ref u) = resolved.user {
         parts.push("-o".to_string());
         parts.push(shell_quote(&format!("User={u}")));
     }
-    if !url_has_port
-        && let Some(p) = resolved.port
-    {
+    if !url_has_port && let Some(p) = resolved.port {
         parts.push("-o".to_string());
         parts.push(shell_quote(&format!("Port={p}")));
     }
@@ -445,9 +445,7 @@ fn finalize_ssh_tokens(
 
     out.effective_agent_sock = match out.identity_agent.as_deref() {
         Some(val) if val.eq_ignore_ascii_case("none") => None,
-        Some(val) if val.eq_ignore_ascii_case("SSH_AUTH_SOCK") => {
-            ssh_auth_sock.map(PathBuf::from)
-        }
+        Some(val) if val.eq_ignore_ascii_case("SSH_AUTH_SOCK") => ssh_auth_sock.map(PathBuf::from),
         Some(env_ref) if env_ref.starts_with('$') => std::env::var(&env_ref[1..])
             .ok()
             .filter(|v| !v.is_empty())
@@ -457,13 +455,7 @@ fn finalize_ssh_tokens(
     };
 }
 
-fn expand_ssh_tokens(
-    raw: &str,
-    orig_host: &str,
-    hostname: &str,
-    port: &str,
-    user: &str,
-) -> String {
+fn expand_ssh_tokens(raw: &str, orig_host: &str, hostname: &str, port: &str, user: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -750,22 +742,22 @@ Host *
         );
         assert_eq!(
             ghe.identity_files,
-            vec![
-                home.join(".ssh/id_alias_sk"),
-                home.join(".ssh/id_fallback")
-            ]
+            vec![home.join(".ssh/id_alias_sk"), home.join(".ssh/id_fallback")]
         );
-        assert_eq!(ghe.effective_agent_sock, Some(PathBuf::from("/tmp/agent.sock")));
+        assert_eq!(
+            ghe.effective_agent_sock,
+            Some(PathBuf::from("/tmp/agent.sock"))
+        );
 
         // 2. Wildcard + Include + %r token expansion
         let corp = resolve_ssh_host_with_context("code.corp.internal", &ctx);
         assert_eq!(corp.user.as_deref(), Some("corp-git"));
         assert_eq!(corp.port, Some(2222));
-        assert_eq!(corp.proxy_jump.as_deref(), Some("bastion.corp.internal:2200"));
         assert_eq!(
-            corp.identity_files[0],
-            home.join(".ssh/id_corp_corp-git")
+            corp.proxy_jump.as_deref(),
+            Some("bastion.corp.internal:2200")
         );
+        assert_eq!(corp.identity_files[0], home.join(".ssh/id_corp_corp-git"));
 
         // 3. Negated `!bastion.corp.internal` skips wildcard rule and hits `Host *`
         let bastion = resolve_ssh_host_with_context("bastion.corp.internal", &ctx);
@@ -788,14 +780,23 @@ Host *
             ..Default::default()
         };
         let cmd_defaults = format_openssh_command(&resolved, false, false);
-        assert!(cmd_defaults.contains("HostName=github.com"), "{cmd_defaults}");
+        assert!(
+            cmd_defaults.contains("HostName=github.com"),
+            "{cmd_defaults}"
+        );
         assert!(cmd_defaults.contains("User=git"), "{cmd_defaults}");
         assert!(cmd_defaults.contains("Port=2222"), "{cmd_defaults}");
         assert!(cmd_defaults.contains("ProxyJump=bastion"), "{cmd_defaults}");
 
         let cmd_url_overrides = format_openssh_command(&resolved, true, true);
-        assert!(!cmd_url_overrides.contains("User=git"), "{cmd_url_overrides}");
-        assert!(!cmd_url_overrides.contains("Port=2222"), "{cmd_url_overrides}");
+        assert!(
+            !cmd_url_overrides.contains("User=git"),
+            "{cmd_url_overrides}"
+        );
+        assert!(
+            !cmd_url_overrides.contains("Port=2222"),
+            "{cmd_url_overrides}"
+        );
 
         resolved.pkcs11_provider = Some("/usr/lib/opensc-pkcs11.so".to_string());
         let cmd_hw = format_openssh_command(&resolved, false, false);

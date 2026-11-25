@@ -8,7 +8,10 @@
 
 use base64::Engine;
 use gix::prelude::Find;
-use oz_core::{CommitOptions, OzError, OzoneRepo, commit_changes, create_or_reset_local_branch, switch_branch, SwitchOptions};
+use oz_core::{
+    CommitOptions, OzError, OzoneRepo, SwitchOptions, commit_changes, create_or_reset_local_branch,
+    switch_branch,
+};
 use oz_github::{
     CloneOptions, FetchOptions, ForceLeaseSpec, HttpAuthScheme, PushOptions, clone_repo,
     fetch_remote, push_refs,
@@ -59,7 +62,10 @@ fn seed_bare_remote(root: &Path) -> (PathBuf, String, String, String) {
     std::fs::create_dir_all(&bare_dir).expect("mkdir bare");
     run_git(&bare_dir, &["init", "--bare", "-b", "main"]);
     run_git(&bare_dir, &["config", "uploadpack.allowfilter", "true"]);
-    run_git(&bare_dir, &["config", "uploadpack.allowanysha1inwant", "true"]);
+    run_git(
+        &bare_dir,
+        &["config", "uploadpack.allowanysha1inwant", "true"],
+    );
     run_git(&bare_dir, &["config", "http.receivepack", "true"]);
     run_git(&bare_dir, &["config", "receive.advertiseAtomic", "true"]);
 
@@ -78,8 +84,11 @@ fn seed_bare_remote(root: &Path) -> (PathBuf, String, String, String) {
     std::fs::remove_file(seed_work.join("legacy.bin")).expect("rm legacy.bin");
     std::fs::create_dir_all(seed_work.join("src")).expect("mkdir src");
     std::fs::write(seed_work.join("README.md"), "# Ozone Wire v2\n").expect("write readme");
-    std::fs::write(seed_work.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n")
-        .expect("write lib.rs");
+    std::fs::write(
+        seed_work.join("src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .expect("write lib.rs");
     run_git(&seed_work, &["add", "-A"]);
     run_git(&seed_work, &["commit", "-m", "feat: initial active tree"]);
     let main_tip = run_git(&seed_work, &["rev-parse", "HEAD"]);
@@ -110,16 +119,16 @@ fn local_bare_partial_clone_fetch_prune_and_push_atomic_with_lease() {
 
     // 1. Partial clone (`--filter=blob:none`) over Wire Protocol v2!
     let clone_dst = tmp.path().join("cloned-partial");
-    let mut clone_opts = CloneOptions::new(
-        format!("file://{}", bare_dir.display()),
-        &clone_dst,
-    );
+    let mut clone_opts = CloneOptions::new(format!("file://{}", bare_dir.display()), &clone_dst);
     clone_opts.filter = Some("blob:none".to_string());
 
     let clone_out = clone_repo(&clone_opts, test_actor()).expect("partial clone_repo");
     assert_eq!(clone_out.protocol_version, 2);
     assert!(clone_out.partial_clone);
-    assert!(clone_out.filter_negotiated, "server must negotiate filter blob:none");
+    assert!(
+        clone_out.filter_negotiated,
+        "server must negotiate filter blob:none"
+    );
     assert_eq!(clone_out.branch.as_deref(), Some("main"));
     assert_eq!(clone_out.head_oid.as_deref(), Some(main_tip.as_str()));
     assert!(clone_out.op_id.is_some());
@@ -168,7 +177,11 @@ fn local_bare_partial_clone_fetch_prune_and_push_atomic_with_lease() {
         .expect("op present");
     let op_entry = load_entry(&oz_repo.layout, &head_op).expect("load op entry");
     assert!(op_entry.ref_deltas.contains_key("refs/heads/main"));
-    assert!(op_entry.ref_deltas.contains_key("refs/remotes/origin/feat/alpha"));
+    assert!(
+        op_entry
+            .ref_deltas
+            .contains_key("refs/remotes/origin/feat/alpha")
+    );
 
     // 2. Clone with explicit `--branch feat/alpha`.
     let branch_clone_dst = tmp.path().join("cloned-branch");
@@ -234,7 +247,10 @@ fn local_bare_partial_clone_fetch_prune_and_push_atomic_with_lease() {
         ],
     );
     run_git(&side_work, &["config", "user.name", "Concurrent Agent"]);
-    run_git(&side_work, &["config", "user.email", "concurrent@ozone.dev"]);
+    run_git(
+        &side_work,
+        &["config", "user.email", "concurrent@ozone.dev"],
+    );
     run_git(&side_work, &["checkout", "feat/work"]);
     std::fs::write(side_work.join("work.txt"), "concurrent remote update\n").expect("write side");
     run_git(&side_work, &["add", "work.txt"]);
@@ -432,7 +448,8 @@ async fn handle_smart_http_conn(
     // Check `Authorization` header (`Basic base64("x-access-token:<tok>")` or `Bearer <tok>`).
     let expected_basic = format!(
         "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{expected_token}"))
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("x-access-token:{expected_token}"))
     );
     let expected_bearer = format!("Bearer {expected_token}");
     let auth_ok = headers
@@ -453,17 +470,19 @@ async fn handle_smart_http_conn(
 
     if method == "GET" && path.ends_with("/info/refs") {
         let service = query
-            .and_then(|q| {
-                q.split('&')
-                    .find_map(|kv| kv.strip_prefix("service="))
-            })
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("service=")))
             .unwrap_or_default();
         let subcmd = match service {
             "git-upload-pack" => "upload-pack",
             "git-receive-pack" => "receive-pack",
             _ => {
-                write_http_response(&mut write_half, "400 Bad Request", "text/plain", b"bad service")
-                    .await?;
+                write_http_response(
+                    &mut write_half,
+                    "400 Bad Request",
+                    "text/plain",
+                    b"bad service",
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -542,11 +561,7 @@ async fn read_http_body<R: AsyncBufReadExt + Unpin>(
         loop {
             let mut size_line = String::new();
             reader.read_line(&mut size_line).await?;
-            let hex_part = size_line
-                .trim()
-                .split(';')
-                .next()
-                .unwrap_or("0");
+            let hex_part = size_line.trim().split(';').next().unwrap_or("0");
             let chunk_len = usize::from_str_radix(hex_part, 16).unwrap_or(0);
             if chunk_len == 0 {
                 let mut crlf = String::new();
@@ -602,7 +617,10 @@ async fn smart_http_clone_partial_fetch_and_push_atomic_with_auth() {
     let mut bad_opts = CloneOptions::new(&remote_url, &unauth_dst);
     bad_opts.auth_token = Some("wrong_token".to_string());
     let bad_err = clone_repo(&bad_opts, test_actor()).expect_err("wrong token must fail");
-    assert!(matches!(bad_err, OzError::CheckFailed { .. } | OzError::Git(_)));
+    assert!(matches!(
+        bad_err,
+        OzError::CheckFailed { .. } | OzError::Git(_)
+    ));
 
     // 2. Authenticated partial clone (`--filter=blob:none`) over Smart HTTP v2!
     let http_dst = tmp.path().join("http-cloned");
@@ -702,9 +720,7 @@ async fn smart_http_clone_partial_fetch_and_push_atomic_with_auth() {
         &PushOptions {
             remote: Some("origin".to_string()),
             refspecs: vec!["http-stack-2".to_string()],
-            lease_specs: vec![ForceLeaseSpec::parse(&format!(
-                "http-stack-2:{main_tip}"
-            ))],
+            lease_specs: vec![ForceLeaseSpec::parse(&format!("http-stack-2:{main_tip}"))],
             auth_token: Some(secret.to_string()),
             ..Default::default()
         },
@@ -800,7 +816,8 @@ fn clone_empty_unborn_remote_push_initial_commit_and_delete_remote_branch() {
     );
 
     // 3. Push a temporary branch and then delete it remotely with `delete: true`!
-    create_or_reset_local_branch(&oz_repo, "temp-branch", Some("main")).expect("create temp-branch");
+    create_or_reset_local_branch(&oz_repo, "temp-branch", Some("main"))
+        .expect("create temp-branch");
     let _ = push_refs(
         &oz_repo,
         &PushOptions {
@@ -831,4 +848,3 @@ fn clone_empty_unborn_remote_push_initial_commit_and_delete_remote_branch() {
     let refs_now = run_git(&empty_bare, &["for-each-ref", "--format=%(refname)"]);
     assert!(!refs_now.contains("refs/heads/temp-branch"));
 }
-

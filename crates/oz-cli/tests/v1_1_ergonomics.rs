@@ -12,7 +12,9 @@
 
 use clap::Parser;
 use oz_cli::Cli;
-use oz_github::{GitHubPrRef, GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestReview, GitHubUser};
+use oz_github::{
+    GitHubPrRef, GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestReview, GitHubUser,
+};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -69,13 +71,21 @@ fn init_sample_repo() -> (TempDir, PathBuf) {
     git_ok(&repo, &["config", "user.name", "Test Agent"]);
     git_ok(&repo, &["config", "user.email", "agent@example.com"]);
 
-    fs::write(repo.join("sub/dir/alpha.txt"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
+    fs::write(
+        repo.join("sub/dir/alpha.txt"),
+        "line1\nline2\nline3\nline4\nline5\n",
+    )
+    .unwrap();
     fs::write(repo.join("other/beta.txt"), "hello world\n").unwrap();
     fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-m", "chore: initial commit"]);
 
-    fs::write(repo.join("sub/dir/alpha.txt"), "line1\nline2_v2\nline3\nline4\nline5\n").unwrap();
+    fs::write(
+        repo.join("sub/dir/alpha.txt"),
+        "line1\nline2_v2\nline3\nline4\nline5\n",
+    )
+    .unwrap();
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-m", "feat: update alpha seenToken"]);
 
@@ -88,14 +98,76 @@ fn init_sample_repo() -> (TempDir, PathBuf) {
 
 #[test]
 fn cli_and_mcp_flag_parity_parse_cleanly() {
-    assert!(Cli::try_parse_from(["oz", "log", "--pickaxe", "foo", "--grep-diff", "bar", "--rev", "HEAD", "--", "src/"]).is_ok());
-    assert!(Cli::try_parse_from(["oz", "log", "-n", "10", "--oneline", "--", "tvva-foreman/"]).is_ok());
-    assert!(Cli::try_parse_from(["oz", "ws", "spawn", "pr-1", "--backend", "cas_hardlink", "--from", "HEAD", "--branch", "feat/x"]).is_ok());
-    assert!(Cli::try_parse_from(["oz", "diff", "--stat", "--exclude", "pnpm-lock.yaml", "--line-numbers"]).is_ok());
+    assert!(
+        Cli::try_parse_from([
+            "oz",
+            "log",
+            "--pickaxe",
+            "foo",
+            "--grep-diff",
+            "bar",
+            "--rev",
+            "HEAD",
+            "--",
+            "src/"
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from(["oz", "log", "-n", "10", "--oneline", "--", "tvva-foreman/"]).is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "oz",
+            "ws",
+            "spawn",
+            "pr-1",
+            "--backend",
+            "cas_hardlink",
+            "--from",
+            "HEAD",
+            "--branch",
+            "feat/x"
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "oz",
+            "diff",
+            "--stat",
+            "--exclude",
+            "pnpm-lock.yaml",
+            "--line-numbers"
+        ])
+        .is_ok()
+    );
     assert!(Cli::try_parse_from(["oz", "status", "--hunks"]).is_ok());
-    assert!(Cli::try_parse_from(["oz", "show", "HEAD:Cargo.toml", "--lines", "1..20", "--line-numbers"]).is_ok());
+    assert!(
+        Cli::try_parse_from([
+            "oz",
+            "show",
+            "HEAD:Cargo.toml",
+            "--lines",
+            "1..20",
+            "--line-numbers"
+        ])
+        .is_ok()
+    );
     assert!(Cli::try_parse_from(["oz", "rev-parse", "--short", "HEAD"]).is_ok());
-    assert!(Cli::try_parse_from(["oz", "pr", "review", "42", "--comment", "--inline", "a.rs:10=ok", "--dry-run"]).is_ok());
+    assert!(
+        Cli::try_parse_from([
+            "oz",
+            "pr",
+            "review",
+            "42",
+            "--comment",
+            "--inline",
+            "a.rs:10=ok",
+            "--dry-run"
+        ])
+        .is_ok()
+    );
 }
 
 #[test]
@@ -113,31 +185,53 @@ fn status_collapses_large_hunk_lists_and_diff_handles_excludes_and_line_numbers(
         modified_lines[idx] = format!("row {} MOD\n", idx + 1);
     }
     fs::write(repo.join("pnpm-lock.yaml"), modified_lines.concat()).unwrap();
-    fs::write(repo.join("sub/dir/alpha.txt"), "line1\nline2_dirty\nline3\nline4\nline5\n").unwrap();
+    fs::write(
+        repo.join("sub/dir/alpha.txt"),
+        "line1\nline2_dirty\nline3\nline4\nline5\n",
+    )
+    .unwrap();
 
     // Default `oz status` collapses >5 hunks into `(8 hunks: hXa..hXh)`
     let st_compact = run_oz(&repo, &["status"]);
     assert!(st_compact.status.success());
     let st_text = String::from_utf8_lossy(&st_compact.stdout);
-    assert!(st_text.contains("8 hunks:"), "expected collapsed hunks in:\n{st_text}");
-    assert!(!st_text.contains("h1c, h1d") && !st_text.contains("h2c, h2d"), "should not enumerate all 8 hunks:\n{st_text}");
+    assert!(
+        st_text.contains("8 hunks:"),
+        "expected collapsed hunks in:\n{st_text}"
+    );
+    assert!(
+        !st_text.contains("h1c, h1d") && !st_text.contains("h2c, h2d"),
+        "should not enumerate all 8 hunks:\n{st_text}"
+    );
 
     // `oz status --hunks` lists all hunks inline
     let st_full = run_oz(&repo, &["status", "--hunks"]);
     assert!(st_full.status.success());
     let st_full_text = String::from_utf8_lossy(&st_full.stdout);
-    assert!(st_full_text.contains("hunks: "), "expected full hunk list in:\n{st_full_text}");
+    assert!(
+        st_full_text.contains("hunks: "),
+        "expected full hunk list in:\n{st_full_text}"
+    );
 
     // `oz diff --stat -- ':!pnpm-lock.yaml'` must show alpha.txt (NOT 0 files!)
     let diff_neg = run_oz(&repo, &["diff", "--stat", "--", ":!pnpm-lock.yaml"]);
     assert!(diff_neg.status.success());
     let diff_neg_text = String::from_utf8_lossy(&diff_neg.stdout);
-    assert!(diff_neg_text.contains("sub/dir/alpha.txt"), "expected alpha.txt in:\n{diff_neg_text}");
-    assert!(!diff_neg_text.contains("pnpm-lock.yaml"), "lockfile should be excluded:\n{diff_neg_text}");
+    assert!(
+        diff_neg_text.contains("sub/dir/alpha.txt"),
+        "expected alpha.txt in:\n{diff_neg_text}"
+    );
+    assert!(
+        !diff_neg_text.contains("pnpm-lock.yaml"),
+        "lockfile should be excluded:\n{diff_neg_text}"
+    );
     assert!(diff_neg_text.contains("1 file(s) changed"));
 
     // `oz diff --exclude pnpm-lock.yaml --line-numbers` renders explicit old/new line numbers
-    let diff_num = run_oz(&repo, &["diff", "--exclude", "pnpm-lock.yaml", "--line-numbers"]);
+    let diff_num = run_oz(
+        &repo,
+        &["diff", "--exclude", "pnpm-lock.yaml", "--line-numbers"],
+    );
     assert!(diff_num.status.success());
     let diff_num_text = String::from_utf8_lossy(&diff_num.stdout);
     assert!(diff_num_text.contains("   2      | -line2_v2"));
@@ -150,8 +244,16 @@ fn status_collapses_large_hunk_lists_and_diff_handles_excludes_and_line_numbers(
     let lines = v["data"]["files"][0]["hunks"][0]["lines"]
         .as_array()
         .unwrap();
-    assert!(lines.iter().any(|l| l["kind"] == "add" && l["new_line"] == 2 && l.get("old_line").is_none()));
-    assert!(lines.iter().any(|l| l["kind"] == "delete" && l["old_line"] == 2 && l.get("new_line").is_none()));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["kind"] == "add" && l["new_line"] == 2 && l.get("old_line").is_none())
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["kind"] == "delete" && l["old_line"] == 2 && l.get("new_line").is_none())
+    );
 
     // Unknown pathspec magic fails loudly
     let bad = run_oz(&repo, &["diff", "--stat", "--", ":(bogus)pnpm-lock.yaml"]);
@@ -164,23 +266,44 @@ fn log_paths_aliases_show_blob_rev_parse_and_ws_spawn_backend() {
 
     // `oz log -n 10 --oneline -- sub/dir/` filters to the 2 commits touching sub/dir/
     let log_dir = run_oz(&repo, &["log", "-n", "10", "--oneline", "--", "sub/dir/"]);
-    assert!(log_dir.status.success(), "stderr: {}", String::from_utf8_lossy(&log_dir.stderr));
+    assert!(
+        log_dir.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&log_dir.stderr)
+    );
     let log_dir_text = String::from_utf8_lossy(&log_dir.stdout);
     assert!(log_dir_text.contains("update alpha"));
     assert!(log_dir_text.contains("initial commit"));
-    assert!(!log_dir_text.contains("update beta"), "unrelated commit leaked:\n{log_dir_text}");
+    assert!(
+        !log_dir_text.contains("update beta"),
+        "unrelated commit leaked:\n{log_dir_text}"
+    );
 
     // `oz log --pickaxe` & `--rev HEAD`
-    let log_pickaxe = run_oz(&repo, &["log", "--oneline", "--rev", "HEAD", "--pickaxe", "line2_v2"]);
-    assert!(log_pickaxe.status.success(), "stderr: {}", String::from_utf8_lossy(&log_pickaxe.stderr));
+    let log_pickaxe = run_oz(
+        &repo,
+        &["log", "--oneline", "--rev", "HEAD", "--pickaxe", "line2_v2"],
+    );
+    assert!(
+        log_pickaxe.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&log_pickaxe.stderr)
+    );
     let pickaxe_text = String::from_utf8_lossy(&log_pickaxe.stdout);
     assert!(pickaxe_text.contains("update alpha"));
     assert!(!pickaxe_text.contains("update beta"));
 
     // `oz show HEAD:sub/dir/alpha.txt --lines 2..4` reads blob without touching working tree
     fs::write(repo.join("sub/dir/alpha.txt"), "LOCAL DIRTY EDIT\n").unwrap();
-    let blob_out = run_oz(&repo, &["show", "HEAD:sub/dir/alpha.txt", "--lines", "2..4"]);
-    assert!(blob_out.status.success(), "stderr: {}", String::from_utf8_lossy(&blob_out.stderr));
+    let blob_out = run_oz(
+        &repo,
+        &["show", "HEAD:sub/dir/alpha.txt", "--lines", "2..4"],
+    );
+    assert!(
+        blob_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&blob_out.stderr)
+    );
     let blob_text = String::from_utf8_lossy(&blob_out.stdout);
     assert!(blob_text.contains("   2 | line2_v2\n"));
     assert!(blob_text.contains("   4 | line4\n"));
@@ -209,7 +332,10 @@ fn log_paths_aliases_show_blob_rev_parse_and_ws_spawn_backend() {
 
     let rp_short = run_oz(&repo, &["rev-parse", "--short=10", "HEAD"]);
     assert!(rp_short.status.success());
-    assert_eq!(String::from_utf8_lossy(&rp_short.stdout).trim(), &head_sha[..10]);
+    assert_eq!(
+        String::from_utf8_lossy(&rp_short.stdout).trim(),
+        &head_sha[..10]
+    );
 
     let rp_branch = run_oz(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert!(rp_branch.status.success());
@@ -231,18 +357,39 @@ fn log_paths_aliases_show_blob_rev_parse_and_ws_spawn_backend() {
             "--no-warm",
         ],
     );
-    assert!(ws.status.success(), "stderr: {}", String::from_utf8_lossy(&ws.stderr));
+    assert!(
+        ws.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ws.stderr)
+    );
     let ws_text = String::from_utf8_lossy(&ws.stdout);
-    assert!(ws_text.contains("clean @ "), "expected clean @ oid in:\n{ws_text}");
-    assert!(ws_text.contains("cas_hardlink"), "expected cas_hardlink in:\n{ws_text}");
+    assert!(
+        ws_text.contains("clean @ "),
+        "expected clean @ oid in:\n{ws_text}"
+    );
+    assert!(
+        ws_text.contains("cas_hardlink"),
+        "expected cas_hardlink in:\n{ws_text}"
+    );
 
-    let _ = run_oz(&repo, &["ws", "rm", "pr-isolated", "--force", "--delete-branch"]);
+    let _ = run_oz(
+        &repo,
+        &["ws", "rm", "pr-isolated", "--force", "--delete-branch"],
+    );
 }
 
 #[test]
 fn pr_view_diff_read_and_review_against_mock_github_api() {
     let (_tmp, repo) = init_sample_repo();
-    git_ok(&repo, &["remote", "add", "origin", "https://github.com/acme/demo.git"]);
+    git_ok(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/demo.git",
+        ],
+    );
 
     let posted_reviews: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let posted_reviews_srv = Arc::clone(&posted_reviews);
@@ -319,37 +466,57 @@ fn pr_view_diff_read_and_review_against_mock_github_api() {
                 ),
             }];
 
-            let (status, content_type, resp_body): (&str, &str, Vec<u8>) =
-                if method == "GET" && path == "/repos/acme/demo/pulls/3293" {
-                    ("200 OK", "application/json", serde_json::to_vec(&pr).unwrap())
-                } else if method == "GET" && path.starts_with("/repos/acme/demo/pulls/3293/files") {
-                    ("200 OK", "application/json", serde_json::to_vec(&files).unwrap())
-                } else if method == "GET" && path.starts_with("/repos/acme/demo/pulls/3293/reviews") {
-                    ("200 OK", "application/json", b"[]".to_vec())
-                } else if method == "GET" && path.starts_with("/repos/acme/demo/contents/src/index.ts") {
-                    (
-                        "200 OK",
-                        "application/octet-stream",
-                        b"l1\nl2\nl3\nl4\nl5\n".to_vec(),
-                    )
-                } else if method == "POST" && path == "/repos/acme/demo/pulls/3293/reviews" {
-                    let val: Value = serde_json::from_slice(&body_bytes).unwrap();
-                    posted_reviews_srv.lock().unwrap().push(val);
-                    let rev = GitHubPullRequestReview {
-                        id: 777,
-                        state: "COMMENTED".to_string(),
-                        body: Some("Looks solid".to_string()),
-                        html_url: Some("https://github.com/acme/demo/pull/3293#pullrequestreview-777".to_string()),
-                        commit_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-                        submitted_at: None,
-                        user: Some(GitHubUser {
-                            login: "reviewer".to_string(),
-                        }),
-                    };
-                    ("200 OK", "application/json", serde_json::to_vec(&rev).unwrap())
-                } else {
-                    ("404 Not Found", "application/json", b"{\"message\":\"not found\"}".to_vec())
+            let (status, content_type, resp_body): (&str, &str, Vec<u8>) = if method == "GET"
+                && path == "/repos/acme/demo/pulls/3293"
+            {
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::to_vec(&pr).unwrap(),
+                )
+            } else if method == "GET" && path.starts_with("/repos/acme/demo/pulls/3293/files") {
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::to_vec(&files).unwrap(),
+                )
+            } else if method == "GET" && path.starts_with("/repos/acme/demo/pulls/3293/reviews") {
+                ("200 OK", "application/json", b"[]".to_vec())
+            } else if method == "GET" && path.starts_with("/repos/acme/demo/contents/src/index.ts")
+            {
+                (
+                    "200 OK",
+                    "application/octet-stream",
+                    b"l1\nl2\nl3\nl4\nl5\n".to_vec(),
+                )
+            } else if method == "POST" && path == "/repos/acme/demo/pulls/3293/reviews" {
+                let val: Value = serde_json::from_slice(&body_bytes).unwrap();
+                posted_reviews_srv.lock().unwrap().push(val);
+                let rev = GitHubPullRequestReview {
+                    id: 777,
+                    state: "COMMENTED".to_string(),
+                    body: Some("Looks solid".to_string()),
+                    html_url: Some(
+                        "https://github.com/acme/demo/pull/3293#pullrequestreview-777".to_string(),
+                    ),
+                    commit_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                    submitted_at: None,
+                    user: Some(GitHubUser {
+                        login: "reviewer".to_string(),
+                    }),
                 };
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::to_vec(&rev).unwrap(),
+                )
+            } else {
+                (
+                    "404 Not Found",
+                    "application/json",
+                    b"{\"message\":\"not found\"}".to_vec(),
+                )
+            };
 
             let header = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -368,7 +535,11 @@ fn pr_view_diff_read_and_review_against_mock_github_api() {
 
     // 1. `oz pr view 3293`
     let view = run_oz_env(&repo, &["pr", "view", "3293"], &envs);
-    assert!(view.status.success(), "stderr: {}", String::from_utf8_lossy(&view.stderr));
+    assert!(
+        view.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&view.stderr)
+    );
     let view_txt = String::from_utf8_lossy(&view.stdout);
     assert!(view_txt.contains("PR #3293 [open] feat: consultation stage"));
     assert!(view_txt.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
@@ -376,14 +547,26 @@ fn pr_view_diff_read_and_review_against_mock_github_api() {
 
     // 2. `oz pr diff 3293` (line numbers enabled by default!)
     let diff = run_oz_env(&repo, &["pr", "diff", "3293"], &envs);
-    assert!(diff.status.success(), "stderr: {}", String::from_utf8_lossy(&diff.stderr));
+    assert!(
+        diff.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
     let diff_txt = String::from_utf8_lossy(&diff.stdout);
     assert!(diff_txt.contains(" 396  396 |  const a = 1;"));
     assert!(diff_txt.contains("      398 | +const c = 4;"));
 
     // 3. `oz pr read 3293 src/index.ts --lines 2..4` (remote GitHub contents fallback)
-    let read = run_oz_env(&repo, &["pr", "read", "3293", "src/index.ts", "--lines", "2..4"], &envs);
-    assert!(read.status.success(), "stderr: {}", String::from_utf8_lossy(&read.stderr));
+    let read = run_oz_env(
+        &repo,
+        &["pr", "read", "3293", "src/index.ts", "--lines", "2..4"],
+        &envs,
+    );
+    assert!(
+        read.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
     let read_txt = String::from_utf8_lossy(&read.stdout);
     assert!(read_txt.contains("   2 | l2\n"));
     assert!(read_txt.contains("   4 | l4\n"));
@@ -392,13 +575,26 @@ fn pr_view_diff_read_and_review_against_mock_github_api() {
     // 4. `oz pr review 3293` with invalid line fails locally BEFORE posting
     let bad_rev = run_oz_env(
         &repo,
-        &["pr", "review", "3293", "--comment", "--inline", "src/index.ts:999=Nope"],
+        &[
+            "pr",
+            "review",
+            "3293",
+            "--comment",
+            "--inline",
+            "src/index.ts:999=Nope",
+        ],
         &envs,
     );
     assert!(!bad_rev.status.success());
     let bad_err = String::from_utf8_lossy(&bad_rev.stderr);
-    assert!(bad_err.contains("outside PR #3293 diff hunks"), "stderr:\n{bad_err}");
-    assert!(posted_reviews.lock().unwrap().is_empty(), "must not POST on invalid line");
+    assert!(
+        bad_err.contains("outside PR #3293 diff hunks"),
+        "stderr:\n{bad_err}"
+    );
+    assert!(
+        posted_reviews.lock().unwrap().is_empty(),
+        "must not POST on invalid line"
+    );
 
     // 5. `oz pr review 3293` with valid inline comment auto-fills commit_id & POSTs
     let ok_rev = run_oz_env(
@@ -415,10 +611,17 @@ fn pr_view_diff_read_and_review_against_mock_github_api() {
         ],
         &envs,
     );
-    assert!(ok_rev.status.success(), "stderr: {}", String::from_utf8_lossy(&ok_rev.stderr));
+    assert!(
+        ok_rev.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ok_rev.stderr)
+    );
     let posted = posted_reviews.lock().unwrap();
     assert_eq!(posted.len(), 1);
-    assert_eq!(posted[0]["commit_id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    assert_eq!(
+        posted[0]["commit_id"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
     assert_eq!(posted[0]["event"], "COMMENT");
     assert_eq!(posted[0]["comments"][0]["path"], "src/index.ts");
     assert_eq!(posted[0]["comments"][0]["line"], 398);

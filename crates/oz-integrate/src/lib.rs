@@ -25,9 +25,8 @@ pub use resolve::{
     active_session, continue_session, resolve_conflict,
 };
 pub use sandbox::{
-    ConflictSideRef, IntegrateSessionState, IntegrationMode, IntegrationSession,
-    RebasedCommitInfo, ResolvedIntegrateSource, StackRebaseSessionState, StackedBranchPlan,
-    StoredConflict, TakeSide,
+    ConflictSideRef, IntegrateSessionState, IntegrationMode, IntegrationSession, RebasedCommitInfo,
+    ResolvedIntegrateSource, StackRebaseSessionState, StackedBranchPlan, StoredConflict, TakeSide,
 };
 pub use stack::{
     RebasedBranchOutcome, StackBranchStatus, StackCommitSummary, StackRebaseOptions,

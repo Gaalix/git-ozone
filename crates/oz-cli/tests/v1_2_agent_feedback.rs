@@ -91,7 +91,9 @@ fn init_sample_repo() -> (TempDir, PathBuf) {
 
 #[test]
 fn cli_parses_all_new_agent_workflow_commands() {
-    assert!(Cli::try_parse_from(["oz", "pr", "comments", "3320", "--unresolved", "--json"]).is_ok());
+    assert!(
+        Cli::try_parse_from(["oz", "pr", "comments", "3320", "--unresolved", "--json"]).is_ok()
+    );
     assert!(Cli::try_parse_from(["oz", "pr", "view", "3320", "--comments", "--json"]).is_ok());
     assert!(Cli::try_parse_from(["oz", "issue", "view", "3311", "--comments", "--json"]).is_ok());
     assert!(
@@ -118,15 +120,24 @@ fn cli_parses_all_new_agent_workflow_commands() {
         ])
         .is_ok()
     );
-    assert!(Cli::try_parse_from(["oz", "merge", "origin/main", "--no-ff", "-m", "merge main"]).is_ok());
+    assert!(
+        Cli::try_parse_from(["oz", "merge", "origin/main", "--no-ff", "-m", "merge main"]).is_ok()
+    );
     assert!(Cli::try_parse_from(["oz", "merge", "--ff-only", "origin/main"]).is_ok());
     assert!(Cli::try_parse_from(["oz", "merge", "--continue"]).is_ok());
     assert!(Cli::try_parse_from(["oz", "merge", "--abort"]).is_ok());
     assert!(Cli::try_parse_from(["oz", "branch", "-a", "--json"]).is_ok());
     assert!(Cli::try_parse_from(["oz", "branch", "-r", "--json"]).is_ok());
     assert!(
-        Cli::try_parse_from(["oz", "grep", "consultation", "origin/main", "--", "tvva-ui/"])
-            .is_ok()
+        Cli::try_parse_from([
+            "oz",
+            "grep",
+            "consultation",
+            "origin/main",
+            "--",
+            "tvva-ui/"
+        ])
+        .is_ok()
     );
     assert!(Cli::try_parse_from(["oz", "push", "origin", "b1", "b2", "b3"]).is_ok());
 }
@@ -135,7 +146,10 @@ fn cli_parses_all_new_agent_workflow_commands() {
 fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     let (tmp, repo) = init_sample_repo();
     let bare_remote = tmp.path().join("origin.git");
-    git_ok(tmp.path(), &["init", "--bare", bare_remote.to_str().unwrap()]);
+    git_ok(
+        tmp.path(),
+        &["init", "--bare", bare_remote.to_str().unwrap()],
+    );
     git_ok(
         &repo,
         &["remote", "add", "origin", bare_remote.to_str().unwrap()],
@@ -166,7 +180,14 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     git_ok(&repo, &["checkout", "feat/pr-1"]);
     let grep_rev = run_oz(
         &repo,
-        &["grep", "consultation_v2", "origin/main", "--json", "--", "tvva-ui/"],
+        &[
+            "grep",
+            "consultation_v2",
+            "origin/main",
+            "--json",
+            "--",
+            "tvva-ui/",
+        ],
     );
     assert!(
         grep_rev.status.success(),
@@ -190,12 +211,14 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     assert!(br_all.status.success());
     let br_all_json: Value = serde_json::from_slice(&br_all.stdout).unwrap();
     let branches = br_all_json["data"]["branches"].as_array().unwrap();
-    assert!(branches.iter().any(|b| b["name"] == "feat/pr-1" && b["is_remote"] == false));
     assert!(
         branches
             .iter()
-            .any(|b| b["name"] == "origin/main" && b["is_remote"] == true && b["head_oid"] == main_oid)
+            .any(|b| b["name"] == "feat/pr-1" && b["is_remote"] == false)
     );
+    assert!(branches.iter().any(|b| b["name"] == "origin/main"
+        && b["is_remote"] == true
+        && b["head_oid"] == main_oid));
 
     let br_rem = run_oz(&repo, &["branch", "-r", "--json"]);
     assert!(br_rem.status.success());
@@ -206,7 +229,10 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
 
     // `oz merge --ff-only origin/main` must refuse diverged branches.
     let ff_fail = run_oz(&repo, &["merge", "--ff-only", "origin/main", "--json"]);
-    assert!(!ff_fail.status.success(), "--ff-only must fail on diverged branch");
+    assert!(
+        !ff_fail.status.success(),
+        "--ff-only must fail on diverged branch"
+    );
 
     // `oz merge origin/main` creates a 2-parent append-only merge commit and is OpLog-reversible!
     let merge_out = run_oz(&repo, &["merge", "origin/main", "--json"]);
@@ -269,7 +295,14 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
     git_ok(&repo, &["branch", "feat/pr-3", "feat/pr-1"]);
     let push_multi = run_oz(
         &repo,
-        &["push", "origin", "feat/pr-1", "feat/pr-2", "feat/pr-3", "--json"],
+        &[
+            "push",
+            "origin",
+            "feat/pr-1",
+            "feat/pr-2",
+            "feat/pr-3",
+            "--json",
+        ],
     );
     assert!(
         push_multi.status.success(),
@@ -278,7 +311,10 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
         String::from_utf8_lossy(&push_multi.stderr)
     );
     let push_json: Value = serde_json::from_slice(&push_multi.stdout).unwrap();
-    assert_eq!(push_json["data"]["pushed_refs"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        push_json["data"]["pushed_refs"].as_array().unwrap().len(),
+        3
+    );
     assert_eq!(
         git_ok(&bare_remote, &["rev-parse", "refs/heads/feat/pr-1"]),
         pre_merge_feat_oid
@@ -296,7 +332,15 @@ fn merge_branch_remotes_grep_and_multi_refspec_push_work_end_to_end() {
 #[test]
 fn pr_comments_issue_view_multi_pr_and_workflow_ci_against_mock_github() {
     let (_tmp, repo) = init_sample_repo();
-    git_ok(&repo, &["remote", "add", "origin", "https://github.com/acme/demo.git"]);
+    git_ok(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/demo.git",
+        ],
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -681,11 +725,18 @@ fn pr_comments_issue_view_multi_pr_and_workflow_ci_against_mock_github() {
         }
     });
 
-    let envs = [("OZ_GITHUB_API_URL", api_base.as_str()), ("GITHUB_TOKEN", "tok")];
+    let envs = [
+        ("OZ_GITHUB_API_URL", api_base.as_str()),
+        ("GITHUB_TOKEN", "tok"),
+    ];
 
     // 1. `oz pr comments 3320 --json` returns review verdict, grouped threads with resolved/outdated, and issue comments.
     let pr_c = run_oz_env(&repo, &["pr", "comments", "3320", "--json"], &envs);
-    assert!(pr_c.status.success(), "stderr: {}", String::from_utf8_lossy(&pr_c.stderr));
+    assert!(
+        pr_c.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pr_c.stderr)
+    );
     let v: Value = serde_json::from_slice(&pr_c.stdout).unwrap();
     assert_eq!(v["data"]["review_decision"], "CHANGES_REQUESTED");
     assert_eq!(v["data"]["total_threads"], 2);
@@ -698,14 +749,22 @@ fn pr_comments_issue_view_multi_pr_and_workflow_ci_against_mock_github() {
     assert_eq!(otel_thread["comments"].as_array().unwrap().len(), 2);
 
     // 2. `oz pr comments 3320 --unresolved --json` filters out resolved threads.
-    let pr_u = run_oz_env(&repo, &["pr", "comments", "3320", "--unresolved", "--json"], &envs);
+    let pr_u = run_oz_env(
+        &repo,
+        &["pr", "comments", "3320", "--unresolved", "--json"],
+        &envs,
+    );
     assert!(pr_u.status.success());
     let vu: Value = serde_json::from_slice(&pr_u.stdout).unwrap();
     assert_eq!(vu["data"]["total_threads"], 1);
     assert_eq!(vu["data"]["threads"][0]["path"], "src/otel.ts");
 
     // 3. `oz pr view 3320 --comments --json` includes threads & conversation comments too.
-    let pr_v = run_oz_env(&repo, &["pr", "view", "3320", "--comments", "--json"], &envs);
+    let pr_v = run_oz_env(
+        &repo,
+        &["pr", "view", "3320", "--comments", "--json"],
+        &envs,
+    );
     assert!(pr_v.status.success());
     let vv: Value = serde_json::from_slice(&pr_v.stdout).unwrap();
     assert_eq!(vv["data"]["review_decision"], "CHANGES_REQUESTED");
@@ -715,13 +774,26 @@ fn pr_comments_issue_view_multi_pr_and_workflow_ci_against_mock_github() {
     // 4. `oz issue view` supports both number and pasted GitHub URL via REST.
     let iss = run_oz_env(
         &repo,
-        &["issue", "view", "https://github.com/acme/demo/issues/3311", "--comments", "--json"],
+        &[
+            "issue",
+            "view",
+            "https://github.com/acme/demo/issues/3311",
+            "--comments",
+            "--json",
+        ],
         &envs,
     );
-    assert!(iss.status.success(), "stderr: {}", String::from_utf8_lossy(&iss.stderr));
+    assert!(
+        iss.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&iss.stderr)
+    );
     let vi: Value = serde_json::from_slice(&iss.stdout).unwrap();
     assert_eq!(vi["data"]["issue"]["number"], 3311);
-    assert_eq!(vi["data"]["issue"]["title"], "Bug: duplicate otel decorator");
+    assert_eq!(
+        vi["data"]["issue"]["title"],
+        "Bug: duplicate otel decorator"
+    );
     assert_eq!(vi["data"]["comments"][0]["body"], "Confirmed on staging.");
 
     // 5. `oz ci --pr 3320,3321 --json` aggregates multiple PRs in one call.
@@ -735,12 +807,19 @@ fn pr_comments_issue_view_multi_pr_and_workflow_ci_against_mock_github() {
     assert_eq!(vm["data"]["overall_status"], "failing");
 
     // 6. `oz ci --workflow sentry-release.yaml --json` and display-name lookup `"Sentry Release"`.
-    let wf = run_oz_env(&repo, &["ci", "--workflow", "sentry-release.yaml", "--json"], &envs);
+    let wf = run_oz_env(
+        &repo,
+        &["ci", "--workflow", "sentry-release.yaml", "--json"],
+        &envs,
+    );
     assert!(!wf.status.success());
     let vw: Value = serde_json::from_slice(&wf.stdout).unwrap();
     assert_eq!(vw["data"]["overall_status"], "failing");
     assert_eq!(vw["data"]["runs"][0]["run_id"], 888);
-    assert_eq!(vw["data"]["runs"][0]["jobs"][0]["failing_step"], "Upload sourcemaps");
+    assert_eq!(
+        vw["data"]["runs"][0]["jobs"][0]["failing_step"],
+        "Upload sourcemaps"
+    );
     assert!(
         vw["data"]["runs"][0]["jobs"][0]["log_excerpt"]
             .as_str()
@@ -748,7 +827,11 @@ fn pr_comments_issue_view_multi_pr_and_workflow_ci_against_mock_github() {
             .contains("SENTRY_AUTH_TOKEN missing")
     );
 
-    let wf_by_name = run_oz_env(&repo, &["ci", "--workflow", "Sentry Release", "--json"], &envs);
+    let wf_by_name = run_oz_env(
+        &repo,
+        &["ci", "--workflow", "Sentry Release", "--json"],
+        &envs,
+    );
     let vwn: Value = serde_json::from_slice(&wf_by_name.stdout).unwrap();
     assert_eq!(vwn["data"]["workflow_id"], "4242");
     assert_eq!(vwn["data"]["runs"][0]["run_id"], 888);

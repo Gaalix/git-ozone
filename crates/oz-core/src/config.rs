@@ -618,14 +618,23 @@ key = "~/.ssh/local_ed25519"
     #[test]
     fn default_and_layered_custom_aliases() {
         let defaults = OzoneConfig::default();
-        assert_eq!(defaults.aliases.get("st").map(String::as_str), Some("status"));
-        assert_eq!(defaults.aliases.get("ci").map(String::as_str), Some("commit"));
+        assert_eq!(
+            defaults.aliases.get("st").map(String::as_str),
+            Some("status")
+        );
+        assert_eq!(
+            defaults.aliases.get("ci").map(String::as_str),
+            Some("commit")
+        );
         assert_eq!(
             defaults.aliases.get("co").map(String::as_str),
             Some("git checkout")
         );
         assert_eq!(defaults.aliases.get("lg").map(String::as_str), Some("log"));
-        assert_eq!(defaults.aliases.get("br").map(String::as_str), Some("branch"));
+        assert_eq!(
+            defaults.aliases.get("br").map(String::as_str),
+            Some("branch")
+        );
 
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().join("aliased-app");

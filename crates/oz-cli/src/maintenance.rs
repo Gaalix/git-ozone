@@ -98,7 +98,12 @@ pub(crate) fn handle_fsck(
 ) -> ExitCode {
     let query_res: Result<(OzoneRepo, FsckReport)> = (|| {
         let repo = OzoneRepo::discover(directory)?;
-        let report = fsck_repo(&repo, &FsckOptions { repair: args.repair })?;
+        let report = fsck_repo(
+            &repo,
+            &FsckOptions {
+                repair: args.repair,
+            },
+        )?;
         Ok((repo, report))
     })();
 

@@ -4,24 +4,24 @@
 //! Workspace lifecycle management: `spawn_workspace`, `list_workspaces`,
 //! `remove_workspace`, and `gc_workspaces`.
 
-use crate::backends::{backend_for_kind, remove_dir_if_exists};
 #[cfg(target_os = "linux")]
 use crate::backends::Fuse3VfsBackend;
 #[cfg(target_os = "windows")]
 use crate::backends::ProjFsVfsBackend;
+use crate::backends::{backend_for_kind, remove_dir_if_exists};
 use crate::detect::select_backend_fast;
 use crate::materialize::reconcile_attributes_and_gitlinks_in_dir;
 use crate::{SpawnRequest, SpawnedWorkspace};
 use chrono::Utc;
 use globset::Glob;
 use oz_core::{
-    BackendKind, MountHealth, MountRecord, OzError, OzoneLayout, OzoneRepo, Result,
-    WorkspaceState, probe_mount_health_os, validate_workspace_name,
+    BackendKind, MountHealth, MountRecord, OzError, OzoneLayout, OzoneRepo, Result, WorkspaceState,
+    probe_mount_health_os, validate_workspace_name,
 };
 use oz_warm::{
     BaselineSource, apply_baseline_mtimes, compute_changed_paths_between_commits,
-    find_nearest_prior_baseline, gc_baselines, is_repo_quiescent, resolve_or_capture_baseline,
-    detect_warm_targets,
+    detect_warm_targets, find_nearest_prior_baseline, gc_baselines, is_repo_quiescent,
+    resolve_or_capture_baseline,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::BufWriter;
@@ -462,12 +462,16 @@ pub fn remove_workspace(
     let wt_git_dir = repo.git_common_dir.join("worktrees").join(name);
 
     let state: Option<WorkspaceState> = if state_path.is_file() {
-        Some(serde_json::from_str(&std::fs::read_to_string(&state_path)?)?)
+        Some(serde_json::from_str(&std::fs::read_to_string(
+            &state_path,
+        )?)?)
     } else {
         None
     };
     let mount_rec: Option<MountRecord> = if mount_path.is_file() {
-        Some(serde_json::from_str(&std::fs::read_to_string(&mount_path)?)?)
+        Some(serde_json::from_str(&std::fs::read_to_string(
+            &mount_path,
+        )?)?)
     } else {
         None
     };
@@ -566,10 +570,7 @@ pub fn remove_workspace(
 
 /// Prunes missing/orphaned workspaces and workspaces whose feature branches have merged into
 /// `target_branch` (defaulting to `main` or the repository's current branch).
-pub fn gc_workspaces(
-    repo: &OzoneRepo,
-    opts: &GcWorkspacesOptions,
-) -> Result<GcWorkspacesReport> {
+pub fn gc_workspaces(repo: &OzoneRepo, opts: &GcWorkspacesOptions) -> Result<GcWorkspacesReport> {
     let summaries = list_workspaces(repo)?;
     let mut report = GcWorkspacesReport::default();
 
@@ -696,9 +697,13 @@ fn prepare_branch_target(
     let checked_out = collect_checked_out_branches(gix_repo, git_common_dir)?;
     if checked_out.contains(branch_ref_name) {
         return Err(OzError::Conflict {
-            message: format!("branch '{branch_ref_name}' is already checked out in another worktree"),
+            message: format!(
+                "branch '{branch_ref_name}' is already checked out in another worktree"
+            ),
             conflicts: Vec::new(),
-            recovery: vec!["Pass --branch <new-branch> to spawn on a dedicated branch.".to_string()],
+            recovery: vec![
+                "Pass --branch <new-branch> to spawn on a dedicated branch.".to_string(),
+            ],
         });
     }
 
@@ -853,7 +858,8 @@ fn create_colocated_worktree_metadata(
         if std::fs::create_dir_all(&cache_dir).is_ok() {
             static IDX_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let seq = IDX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp_cache = cache_dir.join(format!(".tmp_{tree_hex}_{}_{}", std::process::id(), seq));
+            let tmp_cache =
+                cache_dir.join(format!(".tmp_{tree_hex}_{}_{}", std::process::id(), seq));
             if std::fs::copy(&index_path, &tmp_cache).is_ok() {
                 if std::fs::rename(&tmp_cache, &cached_index).is_err() {
                     let _ = std::fs::remove_file(&tmp_cache);

@@ -142,86 +142,89 @@ pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOut
         });
     }
 
-    let (desired_branch, target_commit, branch_ref_op, created_branch) =
-        if let Some(ref new_br) = opts.create_branch {
-            let full_name = branch_full_name(new_br)?;
-            let existing = gix_repo
-                .try_find_reference(full_name.as_bstr())
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            if existing.is_some() && !opts.reset_existing_branch {
-                return Err(OzError::InvalidUsage {
-                    message: format!("a branch named '{new_br}' already exists"),
-                    recovery: vec![format!("Use `oz git switch {new_br}` or `-C {new_br}`.")],
-                });
-            }
-            if existing.is_some()
-                && let Some(other_wt) = find_worktree_using_branch(repo, &full_name)?
-            {
-                return Err(OzError::Conflict {
-                    message: format!(
-                        "branch '{new_br}' is already checked out in worktree '{other_wt}'"
-                    ),
-                    conflicts: Vec::new(),
-                    recovery: vec!["Switch to a different branch name.".to_string()],
-                });
-            }
+    let (desired_branch, target_commit, branch_ref_op, created_branch) = if let Some(ref new_br) =
+        opts.create_branch
+    {
+        let full_name = branch_full_name(new_br)?;
+        let existing = gix_repo
+            .try_find_reference(full_name.as_bstr())
+            .map_err(|err| OzError::Git(err.to_string()))?;
+        if existing.is_some() && !opts.reset_existing_branch {
+            return Err(OzError::InvalidUsage {
+                message: format!("a branch named '{new_br}' already exists"),
+                recovery: vec![format!("Use `oz git switch {new_br}` or `-C {new_br}`.")],
+            });
+        }
+        if existing.is_some()
+            && let Some(other_wt) = find_worktree_using_branch(repo, &full_name)?
+        {
+            return Err(OzError::Conflict {
+                message: format!(
+                    "branch '{new_br}' is already checked out in worktree '{other_wt}'"
+                ),
+                conflicts: Vec::new(),
+                recovery: vec!["Switch to a different branch name.".to_string()],
+            });
+        }
 
-            let start_spec = opts.target.as_deref().unwrap_or("HEAD");
-            let start_oid = resolve_commit_oid(&gix_repo, start_spec)?;
-            let prev = if opts.reset_existing_branch {
-                PreviousValue::Any
-            } else {
-                PreviousValue::MustNotExist
-            };
-            (
-                Some(new_br.clone()),
-                start_oid,
-                Some((full_name, start_oid, prev)),
-                existing.is_none(),
-            )
+        let start_spec = opts.target.as_deref().unwrap_or("HEAD");
+        let start_oid = resolve_commit_oid(&gix_repo, start_spec)?;
+        let prev = if opts.reset_existing_branch {
+            PreviousValue::Any
         } else {
-            let spec = opts.target.as_deref().ok_or_else(|| OzError::InvalidUsage {
+            PreviousValue::MustNotExist
+        };
+        (
+            Some(new_br.clone()),
+            start_oid,
+            Some((full_name, start_oid, prev)),
+            existing.is_none(),
+        )
+    } else {
+        let spec = opts
+            .target
+            .as_deref()
+            .ok_or_else(|| OzError::InvalidUsage {
                 message: "missing branch or commit argument".to_string(),
                 recovery: vec!["Pass a branch name, e.g. `oz git switch <branch>`.".to_string()],
             })?;
 
-            let candidate_ref = format!("refs/heads/{spec}");
-            if !opts.detach
-                && let Some(mut reference) = gix_repo
-                    .try_find_reference(&candidate_ref)
-                    .map_err(|err| OzError::Git(err.to_string()))?
-            {
-                let full_name = branch_full_name(spec)?;
-                if let Some(other_wt) = find_worktree_using_branch(repo, &full_name)? {
-                    return Err(OzError::Conflict {
-                        message: format!(
-                            "branch '{spec}' is already checked out in worktree '{other_wt}'"
-                        ),
-                        conflicts: Vec::new(),
-                        recovery: vec![
-                            "Work inside that worktree or create a new branch with `-c`."
-                                .to_string(),
-                        ],
-                    });
-                }
-                let oid = reference
-                    .peel_to_commit()
-                    .map_err(|err| OzError::Git(err.to_string()))?
-                    .id;
-                (Some(spec.to_string()), oid, None, false)
-            } else {
-                let oid = resolve_commit_oid(&gix_repo, spec)?;
-                if !opts.detach && !opts.allow_detached_commit {
-                    return Err(OzError::InvalidUsage {
-                        message: format!(
-                            "'{spec}' is not a local branch; pass `--detach` to check out a commit"
-                        ),
-                        recovery: vec![format!("oz git switch --detach {spec}")],
-                    });
-                }
-                (None, oid, None, false)
+        let candidate_ref = format!("refs/heads/{spec}");
+        if !opts.detach
+            && let Some(mut reference) = gix_repo
+                .try_find_reference(&candidate_ref)
+                .map_err(|err| OzError::Git(err.to_string()))?
+        {
+            let full_name = branch_full_name(spec)?;
+            if let Some(other_wt) = find_worktree_using_branch(repo, &full_name)? {
+                return Err(OzError::Conflict {
+                    message: format!(
+                        "branch '{spec}' is already checked out in worktree '{other_wt}'"
+                    ),
+                    conflicts: Vec::new(),
+                    recovery: vec![
+                        "Work inside that worktree or create a new branch with `-c`.".to_string(),
+                    ],
+                });
             }
-        };
+            let oid = reference
+                .peel_to_commit()
+                .map_err(|err| OzError::Git(err.to_string()))?
+                .id;
+            (Some(spec.to_string()), oid, None, false)
+        } else {
+            let oid = resolve_commit_oid(&gix_repo, spec)?;
+            if !opts.detach && !opts.allow_detached_commit {
+                return Err(OzError::InvalidUsage {
+                    message: format!(
+                        "'{spec}' is not a local branch; pass `--detach` to check out a commit"
+                    ),
+                    recovery: vec![format!("oz git switch --detach {spec}")],
+                });
+            }
+            (None, oid, None, false)
+        }
+    };
 
     let target_tree = gix_repo
         .find_commit(target_commit)
@@ -630,8 +633,14 @@ fn compute_tree_delta(
     let lhs_iter = gix::objs::TreeRefIter::from_bytes(&lhs_tree.data, lhs_tree.id.kind());
     let rhs_iter = gix::objs::TreeRefIter::from_bytes(&rhs_tree.data, rhs_tree.id.kind());
 
-    gix::diff::tree(lhs_iter, rhs_iter, &mut state, &gix_repo.objects, &mut recorder)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    gix::diff::tree(
+        lhs_iter,
+        rhs_iter,
+        &mut state,
+        &gix_repo.objects,
+        &mut recorder,
+    )
+    .map_err(|err| OzError::Git(err.to_string()))?;
 
     let mut ops = Vec::new();
     for change in recorder.records {

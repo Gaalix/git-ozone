@@ -43,9 +43,7 @@ pub fn generate_windows_startup_cmd(vfsd_bin: &Path, git_dir: &Path) -> String {
     let bin_s = sanitize_cmd_arg(vfsd_bin.as_os_str());
     let git_s = sanitize_cmd_arg(git_dir.as_os_str());
     let sock_s = sanitize_cmd_arg(sock_path.as_os_str());
-    format!(
-        "@echo off\r\n\"{bin_s}\" --git-dir \"{git_s}\" --socket \"{sock_s}\" --foreground\r\n"
-    )
+    format!("@echo off\r\n\"{bin_s}\" --git-dir \"{git_s}\" --socket \"{sock_s}\" --foreground\r\n")
 }
 
 fn sanitize_cmd_arg(raw: &OsStr) -> String {
@@ -71,10 +69,11 @@ where
         "Run in an elevated (Administrator) PowerShell: {PROJFS_ENABLE_POWERSHELL_CMD}"
     )];
 
-    let output = run_powershell(PROJFS_ENABLE_POWERSHELL_CMD).map_err(|err| OzError::CheckFailed {
-        message: format!("failed to execute PowerShell to enable Client-ProjFS: {err}"),
-        recovery: recovery.clone(),
-    })?;
+    let output =
+        run_powershell(PROJFS_ENABLE_POWERSHELL_CMD).map_err(|err| OzError::CheckFailed {
+            message: format!("failed to execute PowerShell to enable Client-ProjFS: {err}"),
+            recovery: recovery.clone(),
+        })?;
 
     if output.status.success() {
         return Ok(true);
@@ -202,9 +201,11 @@ mod tests {
         match err {
             OzError::CheckFailed { message, recovery } => {
                 assert!(message.contains("requires elevation"));
-                assert!(recovery
-                    .iter()
-                    .any(|r| r.contains(PROJFS_ENABLE_POWERSHELL_CMD)));
+                assert!(
+                    recovery
+                        .iter()
+                        .any(|r| r.contains(PROJFS_ENABLE_POWERSHELL_CMD))
+                );
             }
             other => panic!("expected CheckFailed, got {other:?}"),
         }

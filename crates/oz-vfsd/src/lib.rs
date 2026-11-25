@@ -38,7 +38,9 @@ pub use projfs::{
     system_time_to_filetime, unix_to_filetime,
 };
 pub use protocol::{DirtyPathEntry, MountInfo, MountSpec, VfsRequest, VfsResponse, encode_line};
-pub use server::{VfsDaemon, run_daemon, run_global_daemon, run_tcp_daemon, validate_global_mount_spec};
+pub use server::{
+    VfsDaemon, run_daemon, run_global_daemon, run_tcp_daemon, validate_global_mount_spec,
+};
 pub use systemd::{
     GLOBAL_SYSTEMD_UNIT_NAME, generate_global_systemd_user_unit, generate_systemd_user_unit,
     install_global_systemd_user_unit, install_global_systemd_user_unit_in,

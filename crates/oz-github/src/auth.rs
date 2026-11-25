@@ -403,12 +403,14 @@ pub fn resolve_repo_remote(
     api_url_override: Option<&str>,
 ) -> Result<ParsedGitRemote> {
     let remote = remote_name.unwrap_or("origin");
-    let raw_url = read_remote_url_from_repo(repo, remote, false)?.ok_or_else(|| {
-        OzError::InvalidUsage {
-            message: format!("remote '{remote}' is not configured in {}", repo.repo_root.display()),
+    let raw_url =
+        read_remote_url_from_repo(repo, remote, false)?.ok_or_else(|| OzError::InvalidUsage {
+            message: format!(
+                "remote '{remote}' is not configured in {}",
+                repo.repo_root.display()
+            ),
             recovery: vec![format!("git remote add {remote} <url>")],
-        }
-    })?;
+        })?;
     let mut parsed = parse_git_remote(&raw_url, api_url_override)?;
     if parsed.scheme == RemoteScheme::Ssh
         && let Some(ref alias_host) = parsed.host
@@ -422,12 +424,8 @@ pub fn resolve_repo_remote(
                 let env_api = std::env::var("OZ_GITHUB_API_URL")
                     .ok()
                     .filter(|s| !s.trim().is_empty());
-                parsed.api_base_url = compute_api_base_url(
-                    parsed.scheme,
-                    Some(&real_host),
-                    None,
-                    env_api.as_deref(),
-                );
+                parsed.api_base_url =
+                    compute_api_base_url(parsed.scheme, Some(&real_host), None, env_api.as_deref());
             }
         }
     }
@@ -725,18 +723,19 @@ fn candidate_gh_hosts_paths(opts: &TokenDiscoveryOptions) -> Vec<PathBuf> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
-        paths.push(PathBuf::from(&home).join(".config").join("gh").join("hosts.yml"));
+        paths.push(
+            PathBuf::from(&home)
+                .join(".config")
+                .join("gh")
+                .join("hosts.yml"),
+        );
     }
 
     if let Some(appdata) = lookup_env(opts, "APPDATA")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
-        paths.push(
-            PathBuf::from(appdata)
-                .join("GitHub CLI")
-                .join("hosts.yml"),
-        );
+        paths.push(PathBuf::from(appdata).join("GitHub CLI").join("hosts.yml"));
     }
 
     paths
@@ -862,10 +861,7 @@ fn strip_yaml_comment(line: &str) -> &str {
         match ch {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single && !prev_backslash => in_double = !in_double,
-            '#' if !in_single
-                && !in_double
-                && (idx == 0 || line[..idx].ends_with([' ', '\t'])) =>
-            {
+            '#' if !in_single && !in_double && (idx == 0 || line[..idx].ends_with([' ', '\t'])) => {
                 return &line[..idx];
             }
             _ => {}

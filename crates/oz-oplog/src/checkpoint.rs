@@ -4,15 +4,13 @@
 //! Sub-10 ms dirty working-tree checkpointing into `.git/objects/` + `refs/ozone/checkpoints/<ws>`.
 
 use crate::dirty::{
-    SnapshotSlice, build_dirty_tree, ensure_mount_healthy, make_ws_snapshot, open_gix_for_workspace,
-    parse_oid, read_ref_oid_hex, resolve_workspace_head, scan_dirty_files,
+    SnapshotSlice, build_dirty_tree, ensure_mount_healthy, make_ws_snapshot,
+    open_gix_for_workspace, parse_oid, read_ref_oid_hex, resolve_workspace_head, scan_dirty_files,
     sync_workspace_state_file, workspace_key,
 };
 use crate::new_op_id;
 use crate::store::{append_entry, ensure_oplog_dirs, walk_entries_rev};
-use crate::types::{
-    ActorInfo, CheckpointOutcome, OpKind, OpLogEntry, RefDelta, WsSnapshot,
-};
+use crate::types::{ActorInfo, CheckpointOutcome, OpKind, OpLogEntry, RefDelta, WsSnapshot};
 use chrono::Utc;
 use gix::refs::FullName;
 use gix::refs::transaction::{PreviousValue, RefEdit};

@@ -38,8 +38,7 @@ pub(crate) fn ensure_mount_healthy(repo: &OzoneRepo) -> Result<()> {
             workspace: workspace_key(repo).to_string(),
             path: repo.workdir_path.clone(),
             errno: Some(107),
-            message: "workspace FUSE mount returned ENOTCONN; remount before operating"
-                .to_string(),
+            message: "workspace FUSE mount returned ENOTCONN; remount before operating".to_string(),
         });
     }
     Ok(())
@@ -136,7 +135,10 @@ pub(crate) fn entry_kind_from_mode(mode: u32) -> EntryKind {
 /// Normalizes a repo-relative path string to forward-slash separators without leading `./`.
 pub(crate) fn normalize_rel_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    normalized.strip_prefix("./").unwrap_or(&normalized).to_string()
+    normalized
+        .strip_prefix("./")
+        .unwrap_or(&normalized)
+        .to_string()
 }
 
 fn path_to_rel_string(rel: &Path) -> Option<String> {
@@ -411,10 +413,7 @@ fn snapshot_single_disk_path(
         Ok(meta) if !meta.is_dir() => {
             let (bytes, mode) = read_disk_blob_and_mode(&disk_path, &meta)?;
             let blob_oid = write_blob_if_needed(gix_repo, &bytes)?;
-            map.insert(
-                rel.to_string(),
-                DirtyFileState::Present { blob_oid, mode },
-            );
+            map.insert(rel.to_string(), DirtyFileState::Present { blob_oid, mode });
         }
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -836,8 +835,14 @@ fn tree_diff_paths(
     let lhs_iter = gix::objs::TreeRefIter::from_bytes(&lhs_tree.data, lhs_tree.id.kind());
     let rhs_iter = gix::objs::TreeRefIter::from_bytes(&rhs_tree.data, rhs_tree.id.kind());
 
-    gix::diff::tree(lhs_iter, rhs_iter, &mut state, &gix_repo.objects, &mut recorder)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    gix::diff::tree(
+        lhs_iter,
+        rhs_iter,
+        &mut state,
+        &gix_repo.objects,
+        &mut recorder,
+    )
+    .map_err(|err| OzError::Git(err.to_string()))?;
 
     for change in recorder.records {
         match change {
@@ -943,26 +948,24 @@ fn write_resolved_leaf(
     let disk_path = repo.workdir_path.join(rel_path);
 
     match leaf {
-        ResolvedLeaf::Absent => {
-            match fs::symlink_metadata(&disk_path) {
-                Ok(meta) => {
-                    if meta.is_dir() {
-                        fs::remove_dir_all(&disk_path)?;
-                    } else {
-                        fs::remove_file(&disk_path)?;
-                    }
-                    prune_empty_parents(&repo.workdir_path, &disk_path);
-                    Ok(true)
+        ResolvedLeaf::Absent => match fs::symlink_metadata(&disk_path) {
+            Ok(meta) => {
+                if meta.is_dir() {
+                    fs::remove_dir_all(&disk_path)?;
+                } else {
+                    fs::remove_file(&disk_path)?;
                 }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::NotFound
-                        || err.kind() == std::io::ErrorKind::NotADirectory =>
-                {
-                    Ok(false)
-                }
-                Err(err) => Err(OzError::Io(err)),
+                prune_empty_parents(&repo.workdir_path, &disk_path);
+                Ok(true)
             }
-        }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(OzError::Io(err)),
+        },
         ResolvedLeaf::File { oid, mode } => {
             // Fast check if file on disk already matches exact OID and mode.
             if let Ok(meta) = fs::symlink_metadata(&disk_path)
@@ -1079,10 +1082,14 @@ pub(crate) fn snapshots_match(
     if base_a != base_b {
         return false;
     }
-    let map_a: BTreeMap<&str, &DirtyFileState> =
-        dirty_a.iter().map(|d| (d.path.as_str(), &d.state)).collect();
-    let map_b: BTreeMap<&str, &DirtyFileState> =
-        dirty_b.iter().map(|d| (d.path.as_str(), &d.state)).collect();
+    let map_a: BTreeMap<&str, &DirtyFileState> = dirty_a
+        .iter()
+        .map(|d| (d.path.as_str(), &d.state))
+        .collect();
+    let map_b: BTreeMap<&str, &DirtyFileState> = dirty_b
+        .iter()
+        .map(|d| (d.path.as_str(), &d.state))
+        .collect();
     map_a == map_b
 }
 
@@ -1099,27 +1106,21 @@ pub(crate) struct SnapshotSlice {
 /// Builds a complete [`WsSnapshot`] from pre/post [`SnapshotSlice`] states.
 pub(crate) fn make_ws_snapshot(post: SnapshotSlice, pre: Option<SnapshotSlice>) -> WsSnapshot {
     let post_detached = post.branch.is_none();
-    let (
-        pre_base_tree,
-        pre_dirty_tree,
-        pre_dirty_files,
-        pre_head_commit,
-        pre_branch,
-        pre_detached,
-    ) = match pre {
-        Some(p) => {
-            let detached = p.branch.is_none();
-            (
-                Some(p.base_tree.to_hex().to_string()),
-                p.dirty_tree.map(|id| id.to_hex().to_string()),
-                p.dirty_files,
-                p.head_commit.map(|id| id.to_hex().to_string()),
-                p.branch,
-                detached,
-            )
-        }
-        None => (None, None, Vec::new(), None, None, false),
-    };
+    let (pre_base_tree, pre_dirty_tree, pre_dirty_files, pre_head_commit, pre_branch, pre_detached) =
+        match pre {
+            Some(p) => {
+                let detached = p.branch.is_none();
+                (
+                    Some(p.base_tree.to_hex().to_string()),
+                    p.dirty_tree.map(|id| id.to_hex().to_string()),
+                    p.dirty_files,
+                    p.head_commit.map(|id| id.to_hex().to_string()),
+                    p.branch,
+                    detached,
+                )
+            }
+            None => (None, None, Vec::new(), None, None, false),
+        };
     WsSnapshot {
         base_tree: post.base_tree.to_hex().to_string(),
         dirty_tree: post.dirty_tree.map(|id| id.to_hex().to_string()),
@@ -1320,7 +1321,10 @@ pub(crate) fn sync_workspace_state_file(
 }
 
 /// Checks if `gix_repo` currently holds a ref target (hex string) for `ref_name`.
-pub(crate) fn read_ref_oid_hex(gix_repo: &gix::Repository, ref_name: &str) -> Result<Option<String>> {
+pub(crate) fn read_ref_oid_hex(
+    gix_repo: &gix::Repository,
+    ref_name: &str,
+) -> Result<Option<String>> {
     match gix_repo
         .try_find_reference(ref_name)
         .map_err(|err| OzError::Git(err.to_string()))?

@@ -8,9 +8,9 @@ pub mod detect;
 pub mod lifecycle;
 pub mod materialize;
 
-pub use backends::{CasHardlinkBackend, backend_for_kind, prepare_vfs_seed_layer};
 #[cfg(target_os = "macos")]
 pub use backends::ClonefileBackend;
+pub use backends::{CasHardlinkBackend, backend_for_kind, prepare_vfs_seed_layer};
 #[cfg(target_os = "linux")]
 pub use backends::{FicloneBackend, Fuse3VfsBackend};
 #[cfg(target_os = "windows")]

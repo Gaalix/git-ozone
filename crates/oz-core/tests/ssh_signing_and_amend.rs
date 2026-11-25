@@ -72,7 +72,12 @@ fn init_repo_with_user(dir: &Path, email: &str) {
     git(dir, &["config", "user.email", email]);
 }
 
-fn generate_ed25519_keypair(dir: &Path, filename: &str, passphrase: &str, comment: &str) -> (PathBuf, PathBuf) {
+fn generate_ed25519_keypair(
+    dir: &Path,
+    filename: &str,
+    passphrase: &str,
+    comment: &str,
+) -> (PathBuf, PathBuf) {
     let priv_path = dir.join(filename);
     let pub_path = dir.join(format!("{filename}.pub"));
     ssh_keygen(&[
@@ -141,8 +146,7 @@ fn pure_rust_signed_commits_pass_both_ssh_keygen_y_verify_and_git_verify_commit(
     fs::create_dir_all(&key_dir).expect("mkdir keys");
 
     let signer_email = "signer@ozone.dev";
-    let (priv_path, pub_path) =
-        generate_ed25519_keypair(&key_dir, "id_ed25519", "", signer_email);
+    let (priv_path, pub_path) = generate_ed25519_keypair(&key_dir, "id_ed25519", "", signer_email);
 
     // 1. Verify OpenSSH key parsing and SHA256:<base64-no-pad> fingerprint match `ssh-keygen -lf`
     let parsed_priv = OpenSshPrivateKey::from_file(&priv_path).expect("parse ssh-keygen privkey");
@@ -291,12 +295,9 @@ fn pure_rust_signed_commits_pass_both_ssh_keygen_y_verify_and_git_verify_commit(
     assert_eq!(oz_ver.allowed_signer_matched, Some(true));
     assert_eq!(oz_ver.matched_principal.as_deref(), Some(signer_email));
 
-    let oz_ver_head = verify_commit_signature_with_allowed_signers(
-        &repo_after,
-        "HEAD",
-        &allowed_signers,
-    )
-    .expect("oz verify HEAD with allowed_signers");
+    let oz_ver_head =
+        verify_commit_signature_with_allowed_signers(&repo_after, "HEAD", &allowed_signers)
+            .expect("oz verify HEAD with allowed_signers");
     assert_eq!(oz_ver_head.commit_oid, out.commit_oid);
 
     // 7. Bidirectional check: C `git commit -S` signed commit verified by pure-Rust `oz-core`!
@@ -306,16 +307,16 @@ fn pure_rust_signed_commits_pass_both_ssh_keygen_y_verify_and_git_verify_commit(
     );
     fs::write(repo_root.join("cgit.rs"), "pub fn from_c_git() {}\n").unwrap();
     git(&repo_root, &["add", "cgit.rs"]);
-    git(&repo_root, &["commit", "-S", "-m", "feat: signed by system git"]);
+    git(
+        &repo_root,
+        &["commit", "-S", "-m", "feat: signed by system git"],
+    );
     let cgit_oid = git(&repo_root, &["rev-parse", "HEAD"]).trim().to_string();
 
     let repo_cgit = OzoneRepo::discover(Some(&repo_root)).expect("discover after c git");
-    let cgit_ver = verify_commit_signature_with_allowed_signers(
-        &repo_cgit,
-        &cgit_oid,
-        &allowed_signers,
-    )
-    .expect("pure-Rust oz-core must verify commits signed by system git");
+    let cgit_ver =
+        verify_commit_signature_with_allowed_signers(&repo_cgit, &cgit_oid, &allowed_signers)
+            .expect("pure-Rust oz-core must verify commits signed by system git");
     assert!(cgit_ver.valid);
     assert_eq!(cgit_ver.fingerprint, expected_fp);
 }
@@ -328,7 +329,8 @@ fn auto_signing_config_precedence_doctor_helper_and_encrypted_or_rsa_errors() {
 
     let email = "dev@ozone.dev";
     let (ed_priv, ed_pub) = generate_ed25519_keypair(&key_dir, "ed_unenc", "", email);
-    let (enc_priv, _) = generate_ed25519_keypair(&key_dir, "ed_encrypted", "secret-passphrase", email);
+    let (enc_priv, _) =
+        generate_ed25519_keypair(&key_dir, "ed_encrypted", "secret-passphrase", email);
 
     let rsa_priv = key_dir.join("id_rsa");
     ssh_keygen(&[
@@ -416,8 +418,11 @@ fn auto_signing_config_precedence_doctor_helper_and_encrypted_or_rsa_errors() {
     assert_eq!(doc_toml.key_source.as_deref(), Some("ozone_config"));
 
     fs::write(repo_root.join("from_toml.txt"), "signed via .ozone.toml\n").unwrap();
-    let toml_out =
-        commit_changes(&repo_toml, &CommitOptions::new("feat: signed via ozone.toml")).unwrap();
+    let toml_out = commit_changes(
+        &repo_toml,
+        &CommitOptions::new("feat: signed via ozone.toml"),
+    )
+    .unwrap();
     assert!(toml_out.signed);
     git(&repo_root, &["verify-commit", &toml_out.commit_oid]);
 
@@ -475,7 +480,10 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
     let allowed_signers = tmp.path().join("allowed_signers");
     fs::write(
         &allowed_signers,
-        format!("{email} {}\n", fs::read_to_string(&pub_path).unwrap().trim()),
+        format!(
+            "{email} {}\n",
+            fs::read_to_string(&pub_path).unwrap().trim()
+        ),
     )
     .unwrap();
 
@@ -502,8 +510,11 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
     assert_eq!(unborn_err.exit_code(), ExitCode::UsageOrGuardrail);
 
     // 1. Create initial root commit and amend it (root commit has 0 parents -> amended still has 0 parents!)
-    let c1 = commit_changes(&unborn_repo, &CommitOptions::new("feat: initial root commit"))
-        .expect("initial commit");
+    let c1 = commit_changes(
+        &unborn_repo,
+        &CommitOptions::new("feat: initial root commit"),
+    )
+    .expect("initial commit");
     assert!(c1.parent_oid.is_none());
     assert!(!c1.amended);
     let root_cid = c1.change_id.clone();
@@ -521,7 +532,10 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
         c1_amended.change_id, root_cid,
         "amending root commit must preserve Change-Id"
     );
-    assert_eq!(git(&repo_root, &["rev-list", "--count", "HEAD"]).trim(), "1");
+    assert_eq!(
+        git(&repo_root, &["rev-list", "--count", "HEAD"]).trim(),
+        "1"
+    );
 
     // 2. Create second commit with multi-section file so we can test surgical hunk `--pick` & `--exclude` amend
     let base_file = (1..=20)
@@ -531,7 +545,10 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
     let repo = OzoneRepo::discover(Some(&repo_root)).unwrap();
     let c2 = commit_changes(&repo, &CommitOptions::new("feat: add multi.txt")).unwrap();
     let c2_cid = c2.change_id.clone();
-    assert_eq!(c2.parent_oid.as_deref(), Some(c1_amended.commit_oid.as_str()));
+    assert_eq!(
+        c2.parent_oid.as_deref(),
+        Some(c1_amended.commit_oid.as_str())
+    );
 
     // 2a. Clean-tree message-only amend + empty-message amend preserve Change-Id and tree
     let repo = OzoneRepo::discover(Some(&repo_root)).unwrap();
@@ -557,8 +574,16 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
     let mut lines: Vec<String> = (1..=20).map(|i| format!("line {i:02}")).collect();
     lines[1] = "line 02 AMENDED HUNK A".to_string();
     lines[18] = "line 19 UNCOMMITTED HUNK B".to_string();
-    fs::write(repo_root.join("multi.txt"), format!("{}\n", lines.join("\n"))).unwrap();
-    fs::write(repo_root.join("extra.txt"), "extra file included in amend\n").unwrap();
+    fs::write(
+        repo_root.join("multi.txt"),
+        format!("{}\n", lines.join("\n")),
+    )
+    .unwrap();
+    fs::write(
+        repo_root.join("extra.txt"),
+        "extra file included in amend\n",
+    )
+    .unwrap();
     fs::write(repo_root.join("unwanted.txt"), "leave uncommitted\n").unwrap();
 
     let repo = OzoneRepo::discover(Some(&repo_root)).unwrap();
@@ -586,7 +611,10 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
         Some(c1_amended.commit_oid.as_str())
     );
     assert_eq!(c2_surgical.remaining_dirty_count, 2);
-    assert_eq!(git(&repo_root, &["rev-list", "--count", "HEAD"]).trim(), "2");
+    assert_eq!(
+        git(&repo_root, &["rev-list", "--count", "HEAD"]).trim(),
+        "2"
+    );
 
     // Verify HEAD tree contains hunk A + extra.txt + a.rs, NOT hunk B or unwanted.txt
     let committed_multi = git(&repo_root, &["show", "HEAD:multi.txt"]);
@@ -628,7 +656,10 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
     fs::remove_file(repo_root.join("unwanted.txt")).unwrap();
 
     // 3. Amend a 2-parent merge commit and verify both parents are preserved!
-    git(&repo_root, &["checkout", "-b", "side", &c1_amended.commit_oid]);
+    git(
+        &repo_root,
+        &["checkout", "-b", "side", &c1_amended.commit_oid],
+    );
     fs::write(repo_root.join("side.rs"), "pub fn side() {}\n").unwrap();
     git(&repo_root, &["add", "side.rs"]);
     git(&repo_root, &["commit", "-m", "feat: side branch"]);
@@ -636,7 +667,10 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
 
     git(&repo_root, &["checkout", "main"]);
     let main_before_merge = git(&repo_root, &["rev-parse", "HEAD"]).trim().to_string();
-    git(&repo_root, &["merge", "--no-ff", "side", "-m", "Merge branch 'side'"]);
+    git(
+        &repo_root,
+        &["merge", "--no-ff", "side", "-m", "Merge branch 'side'"],
+    );
 
     let repo_merge = OzoneRepo::discover(Some(&repo_root)).unwrap();
     let amended_merge = commit_changes(
@@ -681,7 +715,8 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
         );
     }
     let inline_key_spec = format!("key::{}", fs::read_to_string(&pub_path).unwrap().trim());
-    let parsed_inline = OpenSshPublicKey::parse_openssh(&inline_key_spec).expect("parse inline key::");
+    let parsed_inline =
+        OpenSshPublicKey::parse_openssh(&inline_key_spec).expect("parse inline key::");
     assert!(parsed_inline.fingerprint_sha256().starts_with("SHA256:"));
 
     // 4. Legacy M1/M2 JSON deserialization backwards-compatibility check for `CommitOutcome`
@@ -695,7 +730,8 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
         "committed_paths": ["a.rs"],
         "remaining_dirty_count": 0
     }"#;
-    let legacy: CommitOutcome = serde_json::from_str(legacy_json).expect("deserialize M1/M2 outcome");
+    let legacy: CommitOutcome =
+        serde_json::from_str(legacy_json).expect("deserialize M1/M2 outcome");
     assert!(!legacy.signed);
     assert!(legacy.signature_fingerprint.is_none());
     assert!(!legacy.amended);

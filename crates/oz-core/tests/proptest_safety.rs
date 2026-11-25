@@ -131,7 +131,12 @@ fn snapshot_worktree(root: &Path) -> BTreeMap<String, WorktreeEntry> {
                     };
                     #[cfg(not(unix))]
                     let target_bytes = target.to_string_lossy().as_bytes().to_vec();
-                    out.insert(rel, WorktreeEntry::Symlink { target: target_bytes });
+                    out.insert(
+                        rel,
+                        WorktreeEntry::Symlink {
+                            target: target_bytes,
+                        },
+                    );
                 } else if ft.is_file() {
                     #[cfg(unix)]
                     let executable = {
@@ -272,11 +277,18 @@ fn arb_entry_for_path(path: &'static str) -> BoxedStrategy<WorktreeEntry> {
             })
             .boxed()
     } else {
-        (any::<bool>(), proptest::collection::vec("[a-zA-Z0-9 _\n]{1,24}", 1..=5))
+        (
+            any::<bool>(),
+            proptest::collection::vec("[a-zA-Z0-9 _\n]{1,24}", 1..=5),
+        )
             .prop_map(move |(exec, lines)| {
                 let mut content = lines.join("\n");
                 content.push('\n');
-                let executable = if path.ends_with(".sh") { exec } else { exec && path.contains("core") };
+                let executable = if path.ends_with(".sh") {
+                    exec
+                } else {
+                    exec && path.contains("core")
+                };
                 WorktreeEntry::File {
                     bytes: content.into_bytes(),
                     executable,
@@ -288,10 +300,21 @@ fn arb_entry_for_path(path: &'static str) -> BoxedStrategy<WorktreeEntry> {
 
 #[derive(Debug, Clone)]
 enum FileMutation {
-    Upsert { path: &'static str, entry: WorktreeEntry },
-    Delete { path: &'static str },
-    Rename { from: &'static str, to: &'static str, new_bytes: Option<Vec<u8>> },
-    ToggleExec { path: &'static str },
+    Upsert {
+        path: &'static str,
+        entry: WorktreeEntry,
+    },
+    Delete {
+        path: &'static str,
+    },
+    Rename {
+        from: &'static str,
+        to: &'static str,
+        new_bytes: Option<Vec<u8>>,
+    },
+    ToggleExec {
+        path: &'static str,
+    },
 }
 
 fn arb_initial_tree() -> BoxedStrategy<BTreeMap<String, WorktreeEntry>> {
@@ -311,27 +334,34 @@ fn arb_initial_tree() -> BoxedStrategy<BTreeMap<String, WorktreeEntry>> {
         .collect();
     strats
         .prop_map(|items| items.into_iter().collect::<BTreeMap<_, _>>())
-        .prop_map(|map| {
-            map.into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect()
-        })
+        .prop_map(|map| map.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
         .boxed()
 }
 
 fn arb_mutation_batch() -> BoxedStrategy<Vec<FileMutation>> {
     let path_strat = proptest::sample::select(FILE_PATHS);
     let mut_strat = prop_oneof![
+        path_strat.clone().prop_flat_map(|p| arb_entry_for_path(p)
+            .prop_map(move |entry| FileMutation::Upsert { path: p, entry })),
         path_strat
             .clone()
-            .prop_flat_map(|p| arb_entry_for_path(p).prop_map(move |entry| FileMutation::Upsert { path: p, entry })),
-        path_strat.clone().prop_map(|path| FileMutation::Delete { path }),
+            .prop_map(|path| FileMutation::Delete { path }),
         (
             proptest::sample::select(&["README.md", "café/résumé.txt", "nested/sub/bin.dat"][..]),
-            proptest::sample::select(&["dir_αβγ/файл.md", "emoji_🚀/note.bin", "src/nested/deep/core.rs"][..]),
+            proptest::sample::select(
+                &[
+                    "dir_αβγ/файл.md",
+                    "emoji_🚀/note.bin",
+                    "src/nested/deep/core.rs"
+                ][..]
+            ),
             proptest::option::of(proptest::collection::vec(any::<u8>(), 4..=32)),
         )
-            .prop_map(|(from, to, new_bytes)| FileMutation::Rename { from, to, new_bytes }),
+            .prop_map(|(from, to, new_bytes)| FileMutation::Rename {
+                from,
+                to,
+                new_bytes
+            }),
         proptest::sample::select(&["scripts/deploy.sh", "src/nested/deep/core.rs"][..])
             .prop_map(|path| FileMutation::ToggleExec { path }),
     ];
@@ -342,7 +372,11 @@ fn apply_mutation(dir: &Path, m: &FileMutation) {
     match m {
         FileMutation::Upsert { path, entry } => write_worktree_entry(dir, path, entry),
         FileMutation::Delete { path } => remove_worktree_path(dir, path),
-        FileMutation::Rename { from, to, new_bytes } => {
+        FileMutation::Rename {
+            from,
+            to,
+            new_bytes,
+        } => {
             let from_full = dir.join(from);
             if let Ok(meta) = fs::symlink_metadata(&from_full)
                 && meta.is_file()

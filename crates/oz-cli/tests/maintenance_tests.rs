@@ -152,11 +152,23 @@ fn gc_dry_run_and_retention_preserves_head_active_undo_chain_and_objects() {
 
     // 1. Old superseded checkpoints on `default` (50 days & 45 days old).
     fs::write(repo_dir.join("lib.rs"), "pub fn v() -> i32 { 2 }\n").unwrap();
-    let cp_old_1 = checkpoint(&repo, "oz checkpoint", Some("old-1"), actor_default.clone(), None)
-        .expect("cp_old_1");
+    let cp_old_1 = checkpoint(
+        &repo,
+        "oz checkpoint",
+        Some("old-1"),
+        actor_default.clone(),
+        None,
+    )
+    .expect("cp_old_1");
     fs::write(repo_dir.join("lib.rs"), "pub fn v() -> i32 { 3 }\n").unwrap();
-    let cp_old_2 = checkpoint(&repo, "oz checkpoint", Some("old-2"), actor_default.clone(), None)
-        .expect("cp_old_2");
+    let cp_old_2 = checkpoint(
+        &repo,
+        "oz checkpoint",
+        Some("old-2"),
+        actor_default.clone(),
+        None,
+    )
+    .expect("cp_old_2");
 
     // 2. Entry for an inactive/removed workspace `ws-dead` (50 days old) -> should be pruned.
     let dead_entry = OpLogEntry {
@@ -253,8 +265,15 @@ fn gc_dry_run_and_retention_preserves_head_active_undo_chain_and_objects() {
     rewrite_entry_timestamp(&repo.layout, &undo_recent.op_id, 2);
 
     // Dry-run first: must NOT remove anything.
-    let dry = run_oz(&repo_dir, &["gc", "--oplog-days", "30", "--dry-run", "--json"]);
-    assert_eq!(dry.code, 0, "dry-run failed: {}\n{}", dry.stdout, dry.stderr);
+    let dry = run_oz(
+        &repo_dir,
+        &["gc", "--oplog-days", "30", "--dry-run", "--json"],
+    );
+    assert_eq!(
+        dry.code, 0,
+        "dry-run failed: {}\n{}",
+        dry.stdout, dry.stderr
+    );
     let dj = dry.json.expect("dry json");
     assert_oz_v1_envelope(&dj, true);
     assert!(dj["op_id"].is_null(), "oz gc has op_id=null");
@@ -272,7 +291,10 @@ fn gc_dry_run_and_retention_preserves_head_active_undo_chain_and_objects() {
         "latest active forward op on default must be protected"
     );
     assert!(predicted_removed.contains(&dead_op.op_id));
-    assert!(!predicted_removed.contains(&idle_op.op_id), "active ws latest protected");
+    assert!(
+        !predicted_removed.contains(&idle_op.op_id),
+        "active ws latest protected"
+    );
     assert!(
         !predicted_removed.contains(&cp_undone_target.op_id),
         "undo target protected by closure"
@@ -349,7 +371,8 @@ fn gc_dry_run_and_retention_preserves_head_active_undo_chain_and_objects() {
     );
 
     // Undoing back across `cp_undone_target` and `cp_old_2` STILL WORKS after `cp_old_1` was GC'd!
-    undo(&repo, UndoTarget::Steps(1), actor_default.clone()).expect("undo cp_undone_target after gc");
+    undo(&repo, UndoTarget::Steps(1), actor_default.clone())
+        .expect("undo cp_undone_target after gc");
     assert_eq!(
         fs::read_to_string(repo_dir.join("lib.rs")).unwrap(),
         "pub fn v() -> i32 { 3 }\n"
@@ -366,7 +389,11 @@ fn gc_dry_run_and_retention_preserves_head_active_undo_chain_and_objects() {
 
     // Both `oz fsck --json` and `git fsck --full` pass!
     let fsck = run_oz(&repo_dir, &["fsck", "--json"]);
-    assert_eq!(fsck.code, 0, "fsck after gc failed: {}\n{}", fsck.stdout, fsck.stderr);
+    assert_eq!(
+        fsck.code, 0,
+        "fsck after gc failed: {}\n{}",
+        fsck.stdout, fsck.stderr
+    );
     assert_oz_v1_envelope(&fsck.json.expect("fsck json"), true);
     assert_git_fsck_clean(&repo_dir);
 
@@ -393,7 +420,10 @@ fn fsck_non_repo_and_clean_repo_checks() {
     let repo_dir = tmp.path().join("clean-repo");
     init_test_repo(&repo_dir);
     let clean_repo = OzoneRepo::discover(Some(&repo_dir)).expect("discover clean");
-    clean_repo.layout.ensure_initialized().expect("init clean ozone");
+    clean_repo
+        .layout
+        .ensure_initialized()
+        .expect("init clean ozone");
     let cp_out = run_oz(&repo_dir, &["checkpoint", "-m", "clean cp", "--json"]);
     assert_eq!(
         cp_out.code, 0,
@@ -402,7 +432,11 @@ fn fsck_non_repo_and_clean_repo_checks() {
     );
 
     let clean = run_oz(&repo_dir, &["fsck", "--json"]);
-    assert_eq!(clean.code, 0, "clean fsck failed: {}\n{}", clean.stdout, clean.stderr);
+    assert_eq!(
+        clean.code, 0,
+        "clean fsck failed: {}\n{}",
+        clean.stdout, clean.stderr
+    );
     let cj = clean.json.expect("clean json");
     assert_oz_v1_envelope(&cj, true);
     assert_eq!(cj["data"]["healthy"], true);
@@ -422,7 +456,11 @@ fn fsck_detects_and_repairs_broken_oplog_interrupted_txns_and_orphans_without_de
     repo.layout.ensure_initialized().expect("init ozone");
 
     // User working-tree files (tracked edit + untracked unicode + symlink + binary) that MUST survive!
-    fs::write(repo_dir.join("lib.rs"), "pub fn v() -> i32 { 99 } // user edit\n").unwrap();
+    fs::write(
+        repo_dir.join("lib.rs"),
+        "pub fn v() -> i32 { 99 } // user edit\n",
+    )
+    .unwrap();
     fs::create_dir_all(repo_dir.join("café")).unwrap();
     fs::write(repo_dir.join("café/notes.txt"), "important user notes\n").unwrap();
     fs::write(repo_dir.join("blob.bin"), [0u8, 1, 2, 255, 0, 42]).unwrap();
@@ -440,19 +478,31 @@ fn fsck_detects_and_repairs_broken_oplog_interrupted_txns_and_orphans_without_de
     let cp2 = checkpoint(&repo, "oz checkpoint", Some("cp2"), actor.clone(), None).expect("cp2");
 
     // Break `oplog/HEAD` to point to `cp1` so `cp2` becomes unlinked, and inject a corrupt op file.
-    fs::write(repo.layout.oplog_dir().join("HEAD"), format!("{}\n", cp1.op_id)).unwrap();
     fs::write(
-        repo.layout.oplog_dir().join("ops/op_01BAD000000000000000000000.json"),
+        repo.layout.oplog_dir().join("HEAD"),
+        format!("{}\n", cp1.op_id),
+    )
+    .unwrap();
+    fs::write(
+        repo.layout
+            .oplog_dir()
+            .join("ops/op_01BAD000000000000000000000.json"),
         "{not valid json",
     )
     .unwrap();
 
     // Inject interrupted transaction files & staging dirs.
     fs::write(repo.layout.oplog_dir().join(".tmp.12345.0"), "partial").unwrap();
-    fs::write(repo.layout.state_dir().join(".ghost.json.tmp.999"), "partial").unwrap();
+    fs::write(
+        repo.layout.state_dir().join(".ghost.json.tmp.999"),
+        "partial",
+    )
+    .unwrap();
     fs::create_dir_all(repo.layout.ozone_dir.join("integrate")).unwrap();
     fs::write(
-        repo.layout.ozone_dir.join("integrate/.tmp_session_999.json"),
+        repo.layout
+            .ozone_dir
+            .join("integrate/.tmp_session_999.json"),
         "{}",
     )
     .unwrap();
@@ -559,7 +609,10 @@ fn fsck_detects_and_repairs_broken_oplog_interrupted_txns_and_orphans_without_de
     .unwrap();
 
     // Inject orphaned warm baseline (commit OID does not exist in Git ODB).
-    let orphan_bl = repo.layout.baselines_dir().join("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    let orphan_bl = repo
+        .layout
+        .baselines_dir()
+        .join("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
     fs::create_dir_all(orphan_bl.join("root")).unwrap();
     fs::write(
         orphan_bl.join("metadata.json"),
@@ -612,7 +665,11 @@ fn fsck_detects_and_repairs_broken_oplog_interrupted_txns_and_orphans_without_de
 
     // 3. Verify `oz fsck --json` now passes cleanly!
     let post = run_oz(&repo_dir, &["fsck", "--json"]);
-    assert_eq!(post.code, 0, "post-repair fsck failed: {}\n{}", post.stdout, post.stderr);
+    assert_eq!(
+        post.code, 0,
+        "post-repair fsck failed: {}\n{}",
+        post.stdout, post.stderr
+    );
     let post_j = post.json.expect("post json");
     assert_oz_v1_envelope(&post_j, true);
     assert_eq!(post_j["data"]["healthy"], true);
@@ -670,7 +727,11 @@ fn fsck_detects_corrupt_git_object_via_git_fsck() {
     let blob_oid = run_git(&repo_dir, &["rev-parse", "HEAD:lib.rs"]);
     let (prefix, rest) = blob_oid.split_at(2);
     let obj_path = repo_dir.join(".git/objects").join(prefix).join(rest);
-    assert!(obj_path.is_file(), "loose object must exist at {}", obj_path.display());
+    assert!(
+        obj_path.is_file(),
+        "loose object must exist at {}",
+        obj_path.display()
+    );
 
     // Make writable and truncate the loose Git blob object to simulate disk corruption.
     let mut perms = fs::metadata(&obj_path).unwrap().permissions();

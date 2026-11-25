@@ -9,9 +9,8 @@ use oz_core::{
     WorkspaceState,
 };
 use oz_oplog::{
-    ActorInfo, ActorKind, DirtyFileState, OpKind, OpLogEntry, UndoTarget, append_entry,
-    checkpoint, list_entries, load_entry, new_op_id, read_head_op_id, record_mutation, redo,
-    undo,
+    ActorInfo, ActorKind, DirtyFileState, OpKind, OpLogEntry, UndoTarget, append_entry, checkpoint,
+    list_entries, load_entry, new_op_id, read_head_op_id, record_mutation, redo, undo,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -87,17 +86,15 @@ fn commit_via_gix(
         .expect("committer");
 
     let ref_name = format!("refs/heads/{branch}");
-    let (parent_commits, base_tree) = match gix_repo
-        .try_find_reference(&ref_name)
-        .expect("find ref")
-    {
-        Some(mut r) => {
-            let commit = r.peel_to_commit().expect("peel commit");
-            let tree = commit.tree_id().expect("tree id").detach();
-            (vec![commit.id], tree)
-        }
-        None => (Vec::new(), ObjectId::empty_tree(gix_repo.object_hash())),
-    };
+    let (parent_commits, base_tree) =
+        match gix_repo.try_find_reference(&ref_name).expect("find ref") {
+            Some(mut r) => {
+                let commit = r.peel_to_commit().expect("peel commit");
+                let tree = commit.tree_id().expect("tree id").detach();
+                (vec![commit.id], tree)
+            }
+            None => (Vec::new(), ObjectId::empty_tree(gix_repo.object_hash())),
+        };
 
     let mut editor = gix_repo.edit_tree(base_tree).expect("edit tree");
     for (rel, content) in writes {
@@ -170,7 +167,11 @@ fn checkpoint_then_dirty_edit_then_undo_and_redo_restores_exact_state() {
     let gix_repo = gix::open(&repo_dir).expect("open gix");
     let dirty_tree_id = ObjectId::from_hex(cp.dirty_tree.as_bytes()).expect("hex");
     let tree = gix_repo.find_tree(dirty_tree_id).expect("find dirty tree");
-    assert!(tree.lookup_entry_by_path("pre_dirty.txt").unwrap().is_some());
+    assert!(
+        tree.lookup_entry_by_path("pre_dirty.txt")
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         gix_repo
             .find_reference(&cp.checkpoint_ref)
@@ -199,7 +200,10 @@ fn checkpoint_then_dirty_edit_then_undo_and_redo_restores_exact_state() {
     // Undo rewinds back to checkpoint state!
     let undo_out = undo(&repo, UndoTarget::Steps(1), agent_actor(None)).expect("undo");
     assert_eq!(undo_out.entry.kind, OpKind::Undo);
-    assert_eq!(undo_out.entry.inverse_of.as_deref(), Some(cp.op_id.as_str()));
+    assert_eq!(
+        undo_out.entry.inverse_of.as_deref(),
+        Some(cp.op_id.as_str())
+    );
     assert_eq!(
         fs::read_to_string(repo_dir.join("a.txt")).expect("read a"),
         "checkpoint-v1\n"
@@ -262,17 +266,29 @@ fn chained_checkpoints_and_multistep_undo_redo() {
 
     // Step 1 undo rewinds un-checkpointed v2 -> cp2 (v1).
     undo(&repo, UndoTarget::Steps(1), agent_actor(None)).expect("undo to cp2");
-    assert_eq!(fs::read_to_string(repo_dir.join("file.txt")).unwrap(), "v1\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("file.txt")).unwrap(),
+        "v1\n"
+    );
 
     // Step 2 undo undoes cp2 -> cp1 (v0).
     undo(&repo, UndoTarget::Steps(1), agent_actor(None)).expect("undo cp2 to cp1");
-    assert_eq!(fs::read_to_string(repo_dir.join("file.txt")).unwrap(), "v0\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("file.txt")).unwrap(),
+        "v0\n"
+    );
 
     // Redo twice brings back v1 then v2.
     redo(&repo, agent_actor(None)).expect("redo 1");
-    assert_eq!(fs::read_to_string(repo_dir.join("file.txt")).unwrap(), "v1\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("file.txt")).unwrap(),
+        "v1\n"
+    );
     redo(&repo, agent_actor(None)).expect("redo 2");
-    assert_eq!(fs::read_to_string(repo_dir.join("file.txt")).unwrap(), "v2\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("file.txt")).unwrap(),
+        "v2\n"
+    );
 
     let entries = list_entries(&repo.layout).expect("list");
     assert_eq!(entries[0].op_id, cp1.op_id);
@@ -314,17 +330,28 @@ fn commit_via_gix_record_mutation_undo_and_redo() {
     let c2_hex = c2_id.to_hex().to_string();
     assert_eq!(mutate_entry.kind, OpKind::Mutate);
     assert_eq!(
-        mutate_entry.ref_deltas.get("refs/heads/main").expect("delta").old.as_deref(),
+        mutate_entry
+            .ref_deltas
+            .get("refs/heads/main")
+            .expect("delta")
+            .old
+            .as_deref(),
         Some(c1_hex.as_str())
     );
     assert_eq!(
-        mutate_entry.ref_deltas.get("refs/heads/main").expect("delta").new.as_deref(),
+        mutate_entry
+            .ref_deltas
+            .get("refs/heads/main")
+            .expect("delta")
+            .new
+            .as_deref(),
         Some(c2_hex.as_str())
     );
     assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2_hex);
 
     // Undo commit: moves `refs/heads/main` back to C1 AND restores working-tree files!
-    let undo_out = undo(&repo, mutate_entry.op_id.as_str(), agent_actor(None)).expect("undo commit");
+    let undo_out =
+        undo(&repo, mutate_entry.op_id.as_str(), agent_actor(None)).expect("undo commit");
     assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c1_hex);
     assert_eq!(
         fs::read_to_string(repo_dir.join("src/lib.rs")).unwrap(),
@@ -358,7 +385,13 @@ fn undo_detects_cas_ref_conflict_without_corrupting_files() {
     let (repo, _) = init_repo_with_commit(&repo_dir, &[("a.txt", "v1\n")]);
 
     let (_, m1) = record_mutation(&repo, "oz commit v2", agent_actor(None), None, || {
-        Ok(commit_via_gix(&repo_dir, "main", "v2", &[("a.txt", "v2\n")], &[]))
+        Ok(commit_via_gix(
+            &repo_dir,
+            "main",
+            "v2",
+            &[("a.txt", "v2\n")],
+            &[],
+        ))
     })
     .expect("m1");
 
@@ -368,7 +401,10 @@ fn undo_detects_cas_ref_conflict_without_corrupting_files() {
     let err = undo(&repo, m1.op_id.as_str(), agent_actor(None)).expect_err("CAS conflict");
     assert!(matches!(err, OzError::Conflict { .. }), "got {err:?}");
     // Ref & working tree untouched.
-    assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c3.to_hex().to_string());
+    assert_eq!(
+        run_git(&repo_dir, &["rev-parse", "HEAD"]),
+        c3.to_hex().to_string()
+    );
     assert_eq!(fs::read_to_string(repo_dir.join("a.txt")).unwrap(), "v3\n");
 }
 
@@ -400,7 +436,11 @@ fn unborn_initial_commit_undo_and_redo() {
         None
     );
     assert_eq!(
-        m1.ref_deltas.get("refs/heads/main").expect("delta").new.as_deref(),
+        m1.ref_deltas
+            .get("refs/heads/main")
+            .expect("delta")
+            .new
+            .as_deref(),
         Some(c1.to_hex().to_string().as_str())
     );
 
@@ -410,7 +450,10 @@ fn unborn_initial_commit_undo_and_redo() {
         .current_dir(&repo_dir)
         .output()
         .expect("rev-parse");
-    assert!(!rev_parse.status.success(), "branch ref deleted back to unborn");
+    assert!(
+        !rev_parse.status.success(),
+        "branch ref deleted back to unborn"
+    );
     assert_eq!(
         fs::read_to_string(repo_dir.join("hello.txt")).unwrap(),
         "before-commit\n"
@@ -549,13 +592,34 @@ fn fuse_fast_path_and_workspace_state_sync_and_dirty_override() {
         .iter()
         .map(|d| (d.path.as_str(), &d.state))
         .collect();
-    assert!(!dirty_map.contains_key("src/clean.rs"), "clean upper file ignored");
-    assert!(!dirty_map.contains_key("debug.log"), "gitignored upper file ignored");
-    assert!(matches!(dirty_map.get("src/mod.rs"), Some(DirtyFileState::Present { .. })));
-    assert!(matches!(dirty_map.get("src/added.rs"), Some(DirtyFileState::Present { .. })));
-    assert!(matches!(dirty_map.get("opaque_dir/fresh.rs"), Some(DirtyFileState::Present { .. })));
-    assert_eq!(dirty_map.get("src/deleted.rs"), Some(&&DirtyFileState::Deleted));
-    assert_eq!(dirty_map.get("opaque_dir/old_a.rs"), Some(&&DirtyFileState::Deleted));
+    assert!(
+        !dirty_map.contains_key("src/clean.rs"),
+        "clean upper file ignored"
+    );
+    assert!(
+        !dirty_map.contains_key("debug.log"),
+        "gitignored upper file ignored"
+    );
+    assert!(matches!(
+        dirty_map.get("src/mod.rs"),
+        Some(DirtyFileState::Present { .. })
+    ));
+    assert!(matches!(
+        dirty_map.get("src/added.rs"),
+        Some(DirtyFileState::Present { .. })
+    ));
+    assert!(matches!(
+        dirty_map.get("opaque_dir/fresh.rs"),
+        Some(DirtyFileState::Present { .. })
+    ));
+    assert_eq!(
+        dirty_map.get("src/deleted.rs"),
+        Some(&&DirtyFileState::Deleted)
+    );
+    assert_eq!(
+        dirty_map.get("opaque_dir/old_a.rs"),
+        Some(&&DirtyFileState::Deleted)
+    );
     assert_eq!(
         dirty_map.get("opaque_dir/sub/old_b.rs"),
         Some(&&DirtyFileState::Deleted)
@@ -662,8 +726,14 @@ fn workspace_isolation_undo_in_one_workspace_does_not_touch_another() {
 
     // Undo in workspace A ONLY undoes workspace A, leaving workspace B untouched.
     undo(&repo_a, 1usize, agent_actor(Some("ws-a"))).unwrap();
-    assert_eq!(fs::read_to_string(ws_a_dir.join("shared.txt")).unwrap(), "base\n");
-    assert_eq!(fs::read_to_string(ws_b_dir.join("shared.txt")).unwrap(), "edited-b\n");
+    assert_eq!(
+        fs::read_to_string(ws_a_dir.join("shared.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(
+        fs::read_to_string(ws_b_dir.join("shared.txt")).unwrap(),
+        "edited-b\n"
+    );
 }
 
 #[test]
@@ -682,8 +752,11 @@ fn sub_10ms_checkpoint_undo_redo_on_1500_file_repo() {
         fs::create_dir_all(&sub).expect("mkdir mod");
         for f in 0..50 {
             let file_path = sub.join(format!("file_{f:02}.rs"));
-            fs::write(&file_path, format!("pub const V_{d}_{f}: usize = {};\n", d * 50 + f))
-                .expect("write tracked");
+            fs::write(
+                &file_path,
+                format!("pub const V_{d}_{f}: usize = {};\n", d * 50 + f),
+            )
+            .expect("write tracked");
         }
     }
     run_git(&repo_dir, &["add", "."]);
@@ -692,9 +765,16 @@ fn sub_10ms_checkpoint_undo_redo_on_1500_file_repo() {
     // Touch 3 files and check timing with `dirty_override` (O(dirty_files) CLI fast path)
     // AND check timing of `Mutate` + `undo` + `redo`!
     let repo = OzoneRepo::discover(Some(&repo_dir)).expect("discover big repo");
-    fs::write(repo_dir.join("pkg/mod_05/file_10.rs"), "pub const EDITED: usize = 999;\n")
-        .expect("edit 1");
-    fs::write(repo_dir.join("pkg/mod_12/new_file.rs"), "pub fn added() {}\n").expect("add 1");
+    fs::write(
+        repo_dir.join("pkg/mod_05/file_10.rs"),
+        "pub const EDITED: usize = 999;\n",
+    )
+    .expect("edit 1");
+    fs::write(
+        repo_dir.join("pkg/mod_12/new_file.rs"),
+        "pub fn added() {}\n",
+    )
+    .expect("add 1");
 
     let dirty_override = vec![
         FileChange {
@@ -746,13 +826,14 @@ fn sub_10ms_checkpoint_undo_redo_on_1500_file_repo() {
         &repo_dir,
         "main",
         "fast commit",
-        &[("pkg/mod_05/file_10.rs", "pub const COMMITTED: usize = 777;\n")],
+        &[(
+            "pkg/mod_05/file_10.rs",
+            "pub const COMMITTED: usize = 777;\n",
+        )],
         &[],
     );
     let remaining_dirty = vec![dirty_override[1].clone()];
-    let m1 = tx
-        .finish(&repo, Some(&remaining_dirty))
-        .expect("finish tx");
+    let m1 = tx.finish(&repo, Some(&remaining_dirty)).expect("finish tx");
 
     let t_undo = Instant::now();
     undo(&repo, m1.op_id.as_str(), agent_actor(None)).expect("undo");
@@ -923,7 +1004,11 @@ fn eight_thread_concurrent_oplog_append_stress_test() {
     assert_eq!(unique_created.len(), total, "all op_ids unique");
 
     let listed = list_entries(&repo.layout).expect("list entries");
-    assert_eq!(listed.len(), total, "all {total} concurrent entries discoverable from HEAD");
+    assert_eq!(
+        listed.len(),
+        total,
+        "all {total} concurrent entries discoverable from HEAD"
+    );
 
     let head = read_head_op_id(&repo.layout)
         .expect("read head")
@@ -1030,14 +1115,25 @@ fn preserves_executable_modes_and_symlinks_across_checkpoint_undo_redo() {
     fs::write(&link_path, "not a symlink").unwrap();
 
     undo(&repo, 1usize, agent_actor(None)).expect("undo");
-    assert_eq!(fs::metadata(&script).unwrap().permissions().mode() & 0o111, 0o111);
+    assert_eq!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o111,
+        0o111
+    );
     let link_meta = fs::symlink_metadata(&link_path).unwrap();
     assert!(link_meta.file_type().is_symlink());
     assert_eq!(fs::read_link(&link_path).unwrap(), Path::new("run.sh"));
 
     redo(&repo, agent_actor(None)).expect("redo");
-    assert_eq!(fs::metadata(&script).unwrap().permissions().mode() & 0o111, 0);
-    assert!(!fs::symlink_metadata(&link_path).unwrap().file_type().is_symlink());
+    assert_eq!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o111,
+        0
+    );
+    assert!(
+        !fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(fs::read_to_string(&link_path).unwrap(), "not a symlink");
 }
 
@@ -1119,11 +1215,17 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
     .expect("begin tx_a");
 
     // While ws-a is in-flight, ws-b concurrently commits on feat/b!
-    let (cb1_id, entry_b) = record_mutation(&repo_b, "oz commit -m feat-b", agent_actor(Some("ws-b")), None, || {
-        let oid = commit_via_gix(&repo_dir, "feat/b", "feat-b", &[("b.txt", "b1\n")], &[]);
-        fs::write(ws_b_dir.join("b.txt"), "b1\n").unwrap();
-        Ok(oid)
-    })
+    let (cb1_id, entry_b) = record_mutation(
+        &repo_b,
+        "oz commit -m feat-b",
+        agent_actor(Some("ws-b")),
+        None,
+        || {
+            let oid = commit_via_gix(&repo_dir, "feat/b", "feat-b", &[("b.txt", "b1\n")], &[]);
+            fs::write(ws_b_dir.join("b.txt"), "b1\n").unwrap();
+            Ok(oid)
+        },
+    )
     .expect("record ws-b mutation");
     let cb1_hex = cb1_id.to_hex().to_string();
     assert!(entry_b.ref_deltas.contains_key("refs/heads/feat/b"));
@@ -1150,8 +1252,14 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
 
     // Undoing ws-a rolls back feat/a without touching or conflicting with feat/b!
     undo(&repo_a, 1usize, agent_actor(Some("ws-a"))).expect("undo ws-a");
-    assert_eq!(run_git(&repo_dir, &["rev-parse", "refs/heads/feat/a"]), c0_hex);
-    assert_eq!(run_git(&repo_dir, &["rev-parse", "refs/heads/feat/b"]), cb1_hex);
+    assert_eq!(
+        run_git(&repo_dir, &["rev-parse", "refs/heads/feat/a"]),
+        c0_hex
+    );
+    assert_eq!(
+        run_git(&repo_dir, &["rev-parse", "refs/heads/feat/b"]),
+        cb1_hex
+    );
     assert!(!ws_a_dir.join("a.txt").exists());
     assert_eq!(fs::read_to_string(ws_b_dir.join("b.txt")).unwrap(), "b1\n");
 }
@@ -1187,7 +1295,11 @@ fn fuse_fast_path_prunes_ignored_dir_with_many_files_under_10ms() {
     for i in 0..2000 {
         fs::write(target_deps.join(format!("crate_{i:04}.rlib")), "artifact").unwrap();
     }
-    fs::write(upper_dir.join("src/lib.rs"), "pub fn ok() -> bool { false }\n").unwrap();
+    fs::write(
+        upper_dir.join("src/lib.rs"),
+        "pub fn ok() -> bool { false }\n",
+    )
+    .unwrap();
 
     let mr = MountRecord {
         schema_version: MountRecord::CURRENT_SCHEMA_VERSION,
@@ -1217,11 +1329,20 @@ fn fuse_fast_path_prunes_ignored_dir_with_many_files_under_10ms() {
     let fuse_repo = OzoneRepo::discover(Some(&ws_workdir)).unwrap();
 
     let t0 = Instant::now();
-    let cp = checkpoint(&fuse_repo, "oz checkpoint", None, agent_actor(Some(ws_name)), None)
-        .expect("checkpoint");
+    let cp = checkpoint(
+        &fuse_repo,
+        "oz checkpoint",
+        None,
+        agent_actor(Some(ws_name)),
+        None,
+    )
+    .expect("checkpoint");
     let elapsed = t0.elapsed();
 
-    eprintln!("FUSE checkpoint with 2000 ignored target/ files: {:?}", elapsed);
+    eprintln!(
+        "FUSE checkpoint with 2000 ignored target/ files: {:?}",
+        elapsed
+    );
     assert_eq!(cp.dirty_file_count, 1);
     assert_eq!(
         cp.entry.ws_snapshots[ws_name].dirty_files[0].path,
@@ -1287,7 +1408,10 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
     assert!(!repo_dir.join("added_in_c2.rs").exists());
     assert!(!repo_dir.join("untracked_wip.txt").exists());
     assert!(!repo_dir.join("untracked_dir/nested.txt").exists());
-    assert_eq!(fs::read_to_string(repo_dir.join("mod_01/f_05.rs")).unwrap(), "// 1 5\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("mod_01/f_05.rs")).unwrap(),
+        "// 1 5\n"
+    );
 
     let t0 = Instant::now();
     undo(&repo, 1usize, agent_actor(None)).expect("undo reset+clean");
@@ -1295,22 +1419,25 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
     eprintln!("1200-file reset --hard + clean -fd undo took {:?}", elapsed);
 
     assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2_oid);
-    assert_eq!(fs::read_to_string(repo_dir.join("added_in_c2.rs")).unwrap(), "pub fn c2() {}\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("added_in_c2.rs")).unwrap(),
+        "pub fn c2() {}\n"
+    );
     assert_eq!(
         fs::read_to_string(repo_dir.join("mod_01/f_05.rs")).unwrap(),
         "// uncommitted edit\n"
     );
-    assert_eq!(fs::read_to_string(repo_dir.join("untracked_wip.txt")).unwrap(), "wip data\n");
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("untracked_wip.txt")).unwrap(),
+        "wip data\n"
+    );
     assert_eq!(
         fs::read_to_string(repo_dir.join("untracked_dir/nested.txt")).unwrap(),
         "nested wip\n"
     );
     assert!(repo_dir.join("keep.log").is_file());
     let budget = sub10ms_budget();
-    assert!(
-        elapsed < budget,
-        "undo took {elapsed:?} (>= {budget:?})"
-    );
+    assert!(elapsed < budget, "undo took {elapsed:?} (>= {budget:?})");
 
     // 2. Verify WindowsProjFs WorkspaceState without mount.json still triggers O(dirty) fast path!
     let ws_name = "projfs-fast";
@@ -1349,8 +1476,14 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
     .unwrap();
 
     let projfs_repo = OzoneRepo::discover(Some(&ws_workdir)).unwrap();
-    let cp = checkpoint(&projfs_repo, "oz checkpoint", None, agent_actor(Some(ws_name)), None)
-        .expect("projfs checkpoint");
+    let cp = checkpoint(
+        &projfs_repo,
+        "oz checkpoint",
+        None,
+        agent_actor(Some(ws_name)),
+        None,
+    )
+    .expect("projfs checkpoint");
     assert_eq!(cp.dirty_file_count, 1);
     assert_eq!(
         cp.entry.ws_snapshots[ws_name].dirty_files[0].path,
@@ -1367,18 +1500,29 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
     .expect("begin switch tx");
     run_git(&repo_dir, &["checkout", "-b", "feat/undo-sw"]);
     sw_tx.finish(&repo, None).expect("finish switch tx");
-    assert_eq!(run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/undo-sw");
+    assert_eq!(
+        run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/undo-sw"
+    );
 
     undo(&repo, 1usize, agent_actor(None)).expect("undo switch -c");
-    assert_eq!(run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert_eq!(
+        run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main"
+    );
     let show_feat = Command::new("git")
         .args(["rev-parse", "--verify", "refs/heads/feat/undo-sw"])
         .current_dir(&repo_dir)
         .output()
         .unwrap();
-    assert!(!show_feat.status.success(), "created branch should be deleted on undo");
+    assert!(
+        !show_feat.status.success(),
+        "created branch should be deleted on undo"
+    );
 
     redo(&repo, agent_actor(None)).expect("redo switch -c");
-    assert_eq!(run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/undo-sw");
+    assert_eq!(
+        run_git(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/undo-sw"
+    );
 }
-

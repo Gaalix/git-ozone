@@ -4,22 +4,22 @@
 //! Integration tests for `oz-cow` backends, empirical reflink probing, CAS hardlink isolation,
 //! workspace lifecycle management, and `Fuse3VfsBackend` Unix socket IPC.
 
-use oz_core::{BackendKind, MountHealth, OzoneConfig, OzoneRepo};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use oz_core::MountRecord;
+use oz_core::{BackendKind, MountHealth, OzoneConfig, OzoneRepo};
+#[cfg(target_os = "linux")]
+use oz_cow::Fuse3VfsBackend;
+#[cfg(target_os = "windows")]
+use oz_cow::ProjFsVfsBackend;
 use oz_cow::{
     CasHardlinkBackend, GcWorkspacesOptions, RemoveWorkspaceOptions, SpawnRequest,
     SpawnWorkspaceOptions, WorkspaceBackend, backend_for_kind, detect_filesystem_with_ozone,
     gc_workspaces, list_workspaces, prepare_vfs_seed_layer, probe_ozone_reflink, remove_workspace,
     spawn_workspace,
 };
-#[cfg(target_os = "linux")]
-use oz_cow::Fuse3VfsBackend;
-#[cfg(target_os = "windows")]
-use oz_cow::ProjFsVfsBackend;
-use oz_vfsd::{MountSpec, OverlayMountConfig, ProjFsLayerEngine};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use oz_vfsd::{MountInfo, VfsRequest, VfsResponse, encode_line};
+use oz_vfsd::{MountSpec, OverlayMountConfig, ProjFsLayerEngine};
 use oz_warm::capture_baseline;
 use std::path::Path;
 use std::process::Command;
@@ -110,11 +110,8 @@ fn cas_hardlink_backend_hardlinks_readonly_deps_and_never_hardlinks_editable_sou
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
     )
     .expect("write Cargo.toml");
-    std::fs::write(
-        repo_root.join("package.json"),
-        "{\"name\":\"app\"}\n",
-    )
-    .expect("write package.json");
+    std::fs::write(repo_root.join("package.json"), "{\"name\":\"app\"}\n")
+        .expect("write package.json");
     std::fs::write(
         repo_root.join("src/main.rs"),
         "fn main() { println!(\"hello\"); }\n",
@@ -131,7 +128,8 @@ fn cas_hardlink_backend_hardlinks_readonly_deps_and_never_hardlinks_editable_sou
     std::fs::create_dir_all(rlib_path.parent().expect("parent")).expect("mkdir deps");
     std::fs::create_dir_all(npm_path.parent().expect("parent")).expect("mkdir npm");
     std::fs::write(&rlib_path, b"rlib-payload-bytes").expect("write rlib");
-    std::fs::set_permissions(&rlib_path, std::fs::Permissions::from_mode(0o444)).expect("chmod rlib");
+    std::fs::set_permissions(&rlib_path, std::fs::Permissions::from_mode(0o444))
+        .expect("chmod rlib");
     std::fs::write(&npm_path, b"module.exports = 42;\n").expect("write npm");
     std::fs::set_permissions(&npm_path, std::fs::Permissions::from_mode(0o555)).expect("chmod npm");
 
@@ -207,8 +205,11 @@ fn workspace_lifecycle_spawns_10_workspaces_creates_real_branches_and_removes_cl
         "[package]\nname = \"mono\"\nversion = \"0.1.0\"\n",
     )
     .expect("write Cargo.toml");
-    std::fs::write(repo_root.join("src/lib.rs"), "pub fn ok() -> bool { true }\n")
-        .expect("write lib.rs");
+    std::fs::write(
+        repo_root.join("src/lib.rs"),
+        "pub fn ok() -> bool { true }\n",
+    )
+    .expect("write lib.rs");
 
     let init_oid = init_repo(&repo_root);
 
@@ -242,7 +243,11 @@ fn workspace_lifecycle_spawns_10_workspaces_creates_real_branches_and_removes_cl
         assert_eq!(spawned.workspace.workspace_path, expected_ws_path);
         assert!(expected_ws_path.join(".git").is_file());
         assert!(expected_ws_path.join("src/lib.rs").is_file());
-        assert!(expected_ws_path.join("target/debug/deps/libbig.rlib").is_file());
+        assert!(
+            expected_ws_path
+                .join("target/debug/deps/libbig.rlib")
+                .is_file()
+        );
 
         // Real branch and colocated .git/worktrees/<ws>/{HEAD,commondir,gitdir,index}.
         let wt_dir = repo.git_common_dir.join("worktrees").join(&ws_name);
@@ -265,7 +270,10 @@ fn workspace_lifecycle_spawns_10_workspaces_creates_real_branches_and_removes_cl
         let mut rf = gix_r
             .find_reference(&format!("refs/heads/{branch_name}"))
             .expect("branch exists");
-        assert_eq!(rf.peel_to_id().expect("peel").to_hex().to_string(), init_oid);
+        assert_eq!(
+            rf.peel_to_id().expect("peel").to_hex().to_string(),
+            init_oid
+        );
 
         let discovered_ws = OzoneRepo::discover(Some(&expected_ws_path)).expect("discover ws");
         assert_eq!(discovered_ws.workspace.as_deref(), Some(ws_name.as_str()));
@@ -291,13 +299,18 @@ fn workspace_lifecycle_spawns_10_workspaces_creates_real_branches_and_removes_cl
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let ino1 = std::fs::metadata(dir.path().join("mono.oz/agent-1/target/debug/deps/libbig.rlib"))
-            .expect("meta 1")
-            .ino();
-        let ino10 =
-            std::fs::metadata(dir.path().join("mono.oz/agent-10/target/debug/deps/libbig.rlib"))
-                .expect("meta 10")
-                .ino();
+        let ino1 = std::fs::metadata(
+            dir.path()
+                .join("mono.oz/agent-1/target/debug/deps/libbig.rlib"),
+        )
+        .expect("meta 1")
+        .ino();
+        let ino10 = std::fs::metadata(
+            dir.path()
+                .join("mono.oz/agent-10/target/debug/deps/libbig.rlib"),
+        )
+        .expect("meta 10")
+        .ino();
         assert_eq!(ino1, ino10);
     }
 
@@ -308,7 +321,10 @@ fn workspace_lifecycle_spawns_10_workspaces_creates_real_branches_and_removes_cl
         .current_dir(&ws1)
         .output()
         .expect("git rev-parse");
-    assert_eq!(String::from_utf8_lossy(&git_branch.stdout).trim(), "feat/agent-1");
+    assert_eq!(
+        String::from_utf8_lossy(&git_branch.stdout).trim(),
+        "feat/agent-1"
+    );
 
     let listed = list_workspaces(&repo).expect("list workspaces");
     assert_eq!(listed.len(), 10);
@@ -501,7 +517,9 @@ fn fuse3_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_unix_listener
     let requests = seen_requests.lock().expect("lock");
     assert_eq!(requests.len(), 2);
     assert!(matches!(&requests[0], VfsRequest::Mount { .. }));
-    assert!(matches!(&requests[1], VfsRequest::Unmount { workspace, force: true, .. } if workspace == "agent-vfs"));
+    assert!(
+        matches!(&requests[1], VfsRequest::Unmount { workspace, force: true, .. } if workspace == "agent-vfs")
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -543,7 +561,10 @@ fn windows_projfs_backend_availability_and_shared_seed_layer() {
         };
         match err {
             oz_core::OzError::InvalidUsage { message, .. } => {
-                assert_eq!(message, "windows_proj_fs backend is only available on Windows");
+                assert_eq!(
+                    message,
+                    "windows_proj_fs backend is only available on Windows"
+                );
             }
             other => panic!("expected InvalidUsage, got {other:?}"),
         }
@@ -705,7 +726,10 @@ fn concurrent_workspace_spawns_reuse_index_and_cas_digest_cache_safely() {
         .git_common_dir
         .join("ozone/cas")
         .join(format!(".digests_{commit_oid}.json"));
-    assert!(cas_digest_file.is_file(), "CAS digest cache should be persisted");
+    assert!(
+        cas_digest_file.is_file(),
+        "CAS digest cache should be persisted"
+    );
 
     // All 8 workspaces share the exact same CAS inode for `libshared.rlib` and distinct inodes for `src/lib.rs`.
     let first_dep_ino = std::fs::metadata(
@@ -727,7 +751,10 @@ fn concurrent_workspace_spawns_reuse_index_and_cas_digest_cache_safely() {
         let src_ino = std::fs::metadata(ws_path.join("src/lib.rs"))
             .expect("src meta")
             .ino();
-        assert!(src_inos.insert(src_ino), "editable source files must have distinct inodes");
+        assert!(
+            src_inos.insert(src_ino),
+            "editable source files must have distinct inodes"
+        );
     }
 }
 
@@ -867,5 +894,7 @@ fn projfs_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_tcp_listener
     let requests = seen_requests.lock().expect("lock");
     assert_eq!(requests.len(), 2);
     assert!(matches!(&requests[0], VfsRequest::Mount { .. }));
-    assert!(matches!(&requests[1], VfsRequest::Unmount { workspace, force: true, .. } if workspace == "agent-win"));
+    assert!(
+        matches!(&requests[1], VfsRequest::Unmount { workspace, force: true, .. } if workspace == "agent-win")
+    );
 }

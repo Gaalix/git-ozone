@@ -120,7 +120,9 @@ pub fn integrate(
     let Some((_, original_into_oid)) = resolve_local_branch(&gix_repo, &into_branch)? else {
         return Err(OzError::InvalidUsage {
             message: format!("target branch '{into_branch}' does not exist"),
-            recovery: vec![format!("Create '{into_branch}' or pass --into <existing-branch>.")],
+            recovery: vec![format!(
+                "Create '{into_branch}' or pass --into <existing-branch>."
+            )],
         });
     };
     let original_into_tree = commit_tree_id(&gix_repo, original_into_oid)?;
@@ -177,7 +179,9 @@ pub fn continue_integration_with_verify(
         return Err(OzError::InvalidUsage {
             message: "active conflict session belongs to `oz stack rebase`, not `oz integrate`"
                 .to_string(),
-            recovery: vec!["Run `oz stack rebase --continue` or `oz integrate --abort`.".to_string()],
+            recovery: vec![
+                "Run `oz stack rebase --continue` or `oz integrate --abort`.".to_string(),
+            ],
         });
     }
     let state = session.integrate.as_ref().ok_or_else(|| {
@@ -389,10 +393,7 @@ fn run_merge_pipeline(
     }
 
     if merged_sources.is_empty() {
-        let _ = cleanup_session_and_sandbox(
-            main_repo,
-            existing_sandbox.map(|(p, _)| p),
-        );
+        let _ = cleanup_session_and_sandbox(main_repo, existing_sandbox.map(|(p, _)| p));
         return Ok(IntegrateOutcome {
             into_branch: ctx.into_branch.clone(),
             previous_oid: ctx.original_into_oid.to_hex().to_string(),
@@ -592,7 +593,11 @@ fn finalize_integration(
         main_status.as_ref().map(|s| s.changes.as_slice())
     };
 
-    let cmd_str = format!("oz integrate {} --into {}", merged_sources.join(" "), ctx.into_branch);
+    let cmd_str = format!(
+        "oz integrate {} --into {}",
+        merged_sources.join(" "),
+        ctx.into_branch
+    );
     let tx = MutationTransaction::begin_watching_all_branches(
         tx_repo,
         cmd_str,
@@ -842,7 +847,6 @@ fn create_merge_commit(
         _ => format!("Merge '{source_name}' into {into_branch}"),
     };
     let parents = [first_parent, second_parent];
-    let (final_msg, _change_id) =
-        preserve_or_add_change_id(&base_msg, tree_id, &parents, &author);
+    let (final_msg, _change_id) = preserve_or_add_change_id(&base_msg, tree_id, &parents, &author);
     write_commit_in_odb(gix_repo, &author, &committer, &final_msg, tree_id, &parents)
 }

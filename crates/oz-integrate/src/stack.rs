@@ -12,8 +12,7 @@ use crate::sandbox::{
     integrate_sandbox_path, is_ancestor, load_session, materialize_integrate_sandbox, merge_labels,
     normalize_branch_short, open_gix_with_fallback, parse_oid, preserve_or_add_change_id,
     resolve_branch_or_revision, resolve_local_branch, resolve_main_repo, resolve_signatures,
-    save_session,
-    sync_git_index_for_delta, verify_and_build_resolved_tree, write_commit_in_odb,
+    save_session, sync_git_index_for_delta, verify_and_build_resolved_tree, write_commit_in_odb,
     write_workspace_state_atomic,
 };
 use chrono::Utc;
@@ -22,7 +21,7 @@ use gix::hash::ObjectId;
 use gix::merge::tree::TreatAsUnresolved;
 use gix::refs::transaction::{PreviousValue, RefEdit};
 use gix::refs::{FullName, Target};
-use oz_core::{MountHealth, OzError, OzoneRepo, WorkspaceState, compute_status, Result};
+use oz_core::{MountHealth, OzError, OzoneRepo, Result, WorkspaceState, compute_status};
 use oz_cow::list_workspaces;
 use oz_cow::materialize::compute_tree_delta;
 use oz_oplog::{ActorInfo, MutationTransaction};
@@ -137,10 +136,7 @@ pub fn stack_status(repo: &OzoneRepo, onto: Option<&str>) -> Result<StackStatusR
     for (idx, (branch, oid)) in ordered.iter().enumerate() {
         let parent_branch = find_parent_branch_in_list(&gix_repo, *oid, &ordered[..idx])?;
         let parent_oid = match &parent_branch {
-            Some(pb) => ordered
-                .iter()
-                .find(|(b, _)| b == pb)
-                .map(|(_, id)| *id),
+            Some(pb) => ordered.iter().find(|(b, _)| b == pb).map(|(_, id)| *id),
             None => match onto_oid {
                 Some(o_id) => find_merge_base_commit(&gix_repo, o_id, *oid)?,
                 None => None,
@@ -219,11 +215,14 @@ pub fn stack_rebase(
     let Some((_, onto_commit_id)) = resolve_branch_or_revision(&gix_repo, &onto_branch)? else {
         return Err(OzError::InvalidUsage {
             message: format!("target base branch '{onto_branch}' does not exist"),
-            recovery: vec![format!("Create '{onto_branch}' or pass --onto <existing-branch>.")],
+            recovery: vec![format!(
+                "Create '{onto_branch}' or pass --onto <existing-branch>."
+            )],
         });
     };
 
-    let target_branches = resolve_stack_branches_to_rebase(repo, &main_repo, &gix_repo, &onto_branch, opts)?;
+    let target_branches =
+        resolve_stack_branches_to_rebase(repo, &main_repo, &gix_repo, &onto_branch, opts)?;
     if target_branches.is_empty() {
         return Err(OzError::InvalidUsage {
             message: format!("no stacked branches found to rebase onto '{onto_branch}'"),
@@ -241,10 +240,7 @@ pub fn stack_rebase(
         let parent_branch = find_parent_branch_in_list(&gix_repo, *orig_oid, &ordered[..idx])?;
 
         let base_stop = match &parent_branch {
-            Some(pb) => ordered
-                .iter()
-                .find(|(b, _)| b == pb)
-                .map(|(_, id)| *id),
+            Some(pb) => ordered.iter().find(|(b, _)| b == pb).map(|(_, id)| *id),
             None => find_merge_base_commit(&gix_repo, onto_commit_id, *orig_oid)?,
         };
 
@@ -397,9 +393,9 @@ fn execute_stack_rebase_loop(
         let commits_len = state.branches[state.current_branch_index].commits.len();
 
         while state.current_commit_index < commits_len {
-            let orig_commit_hex =
-                state.branches[state.current_branch_index].commits[state.current_commit_index]
-                    .clone();
+            let orig_commit_hex = state.branches[state.current_branch_index].commits
+                [state.current_commit_index]
+                .clone();
             let orig_commit_oid = parse_oid(&orig_commit_hex)?;
             let orig_commit = gix_repo
                 .find_commit(orig_commit_oid)
@@ -422,7 +418,13 @@ fn execute_stack_rebase_loop(
             let short_hex = &orig_commit_hex[..orig_commit_hex.len().min(8)];
             let labels = merge_labels("parent", &state.onto_branch, short_hex);
             let mut outcome = gix_repo
-                .merge_trees(parent_tree, current_onto_tree, commit_tree, labels, merge_opts)
+                .merge_trees(
+                    parent_tree,
+                    current_onto_tree,
+                    commit_tree,
+                    labels,
+                    merge_opts,
+                )
                 .map_err(|err| OzError::Git(err.to_string()))?;
 
             if outcome.has_unresolved_conflicts(TreatAsUnresolved::git()) {
@@ -431,11 +433,8 @@ fn execute_stack_rebase_loop(
                     .write()
                     .map_err(|err| OzError::Git(err.to_string()))?
                     .detach();
-                let (stored_conflicts, conflict_entries) = extract_unresolved_conflicts(
-                    gix_repo,
-                    &outcome.conflicts,
-                    merged_tree_id,
-                )?;
+                let (stored_conflicts, conflict_entries) =
+                    extract_unresolved_conflicts(gix_repo, &outcome.conflicts, merged_tree_id)?;
 
                 let sandbox_dir = integrate_sandbox_path(main_repo)?;
                 materialize_integrate_sandbox(
@@ -676,11 +675,15 @@ fn finalize_stack_rebase(
     )?;
 
     // Single atomic CAS transaction across all stacked `refs/heads/*`.
-    gix_repo.edit_references(ref_edits).map_err(|err| OzError::Conflict {
-        message: format!("atomic CAS ref transaction failed during stack rebase: {err}"),
-        conflicts: Vec::new(),
-        recovery: vec!["Retry `oz stack rebase` after resolving concurrent branch updates.".to_string()],
-    })?;
+    gix_repo
+        .edit_references(ref_edits)
+        .map_err(|err| OzError::Conflict {
+            message: format!("atomic CAS ref transaction failed during stack rebase: {err}"),
+            conflicts: Vec::new(),
+            recovery: vec![
+                "Retry `oz stack rebase` after resolving concurrent branch updates.".to_string(),
+            ],
+        })?;
 
     if let Some((_, old_t, new_t, ref delta)) = main_checked_out_delta {
         apply_tree_delta_with_cleanup(gix_repo, old_t, new_t, &main_repo.repo_root)?;
@@ -741,17 +744,20 @@ fn build_rebased_commit_from_original(
         .map_err(|err| OzError::Git(err.to_string()))?
         .to_owned()
         .map_err(|err| OzError::Git(err.to_string()))?;
-    let orig_msg = orig_commit
-        .message_raw_sloppy()
-        .to_str_lossy()
-        .into_owned();
+    let orig_msg = orig_commit.message_raw_sloppy().to_str_lossy().into_owned();
 
     let (author, committer) = resolve_signatures(gix_repo, actor, Some(orig_author))?;
     let parents = [new_parent_oid];
     let (final_msg, change_id) =
         preserve_or_add_change_id(&orig_msg, new_tree_id, &parents, &author);
-    let new_oid =
-        write_commit_in_odb(gix_repo, &author, &committer, &final_msg, new_tree_id, &parents)?;
+    let new_oid = write_commit_in_odb(
+        gix_repo,
+        &author,
+        &committer,
+        &final_msg,
+        new_tree_id,
+        &parents,
+    )?;
     Ok((new_oid, change_id))
 }
 
@@ -870,7 +876,8 @@ fn sort_branches_topologically(
             if i == j {
                 continue;
             }
-            if branches[i].1 != branches[j].1 && is_ancestor(gix_repo, branches[i].1, branches[j].1)?
+            if branches[i].1 != branches[j].1
+                && is_ancestor(gix_repo, branches[i].1, branches[j].1)?
             {
                 deps[j].push(i);
             }

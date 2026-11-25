@@ -204,12 +204,12 @@ pub fn continue_session(repo: &OzoneRepo, actor: ActorInfo) -> Result<ContinueOu
     };
 
     match session.mode {
-        IntegrationMode::Integrate => {
-            Ok(ContinueOutcome::Integrate(continue_integration(repo, actor)?))
-        }
-        IntegrationMode::StackRebase => Ok(ContinueOutcome::StackRebase(
-            continue_stack_rebase(repo, actor)?,
-        )),
+        IntegrationMode::Integrate => Ok(ContinueOutcome::Integrate(continue_integration(
+            repo, actor,
+        )?)),
+        IntegrationMode::StackRebase => Ok(ContinueOutcome::StackRebase(continue_stack_rebase(
+            repo, actor,
+        )?)),
     }
 }
 
@@ -221,8 +221,7 @@ pub fn abort_integration(repo: &OzoneRepo) -> Result<AbortOutcome> {
     let mode = session.as_ref().map(|s| s.mode);
     let sandbox_hint = session.as_ref().map(|s| s.sandbox_path.as_path());
 
-    let (sandbox_removed, session_removed) =
-        cleanup_session_and_sandbox(&main_repo, sandbox_hint)?;
+    let (sandbox_removed, session_removed) = cleanup_session_and_sandbox(&main_repo, sandbox_hint)?;
 
     Ok(AbortOutcome {
         aborted: sandbox_removed || session_removed,

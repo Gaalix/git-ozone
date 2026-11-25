@@ -119,7 +119,10 @@ fn hooks_husky_lefthook_pre_commit_style_and_no_verify() {
     // 2. Failing commit-msg aborts even if pre-commit passes
     fs::write(repo_dir.join("blocked.txt"), "ok\n").unwrap();
     let err_msg = commit_changes(&repo, &CommitOptions::new("BAD_MSG here")).unwrap_err();
-    assert!(matches!(err_msg, OzError::HookFailed { .. }), "got {err_msg:?}");
+    assert!(
+        matches!(err_msg, OzError::HookFailed { .. }),
+        "got {err_msg:?}"
+    );
     assert_eq!(err_msg.exit_code().as_i32(), 1);
     assert!(err_msg.to_string().contains("commit-msg rejected BAD_MSG"));
 
@@ -149,7 +152,10 @@ fn hooks_husky_lefthook_pre_commit_style_and_no_verify() {
     .unwrap();
     let bypassed_events = fs::read_to_string(&log_file).unwrap();
     let lines: Vec<&str> = bypassed_events.lines().collect();
-    assert!(!lines.iter().any(|l| l.starts_with("pre-commit ")), "{bypassed_events}");
+    assert!(
+        !lines.iter().any(|l| l.starts_with("pre-commit ")),
+        "{bypassed_events}"
+    );
     assert!(!lines.contains(&"commit-msg"), "{bypassed_events}");
     assert!(
         lines.contains(&"prepare-commit-msg message"),
@@ -393,14 +399,16 @@ fn real_git_lfs_track_status_diff_commit_and_missing_filter_safety() {
     assert!(rendered.contains("size 8192"), "{rendered}");
 
     // Removing `filter.lfs.clean` MUST make `oz commit` fail safely instead of committing raw binary!
-    run_git(repo_dir, &["config", "--local", "--unset", "filter.lfs.clean"]);
+    run_git(
+        repo_dir,
+        &["config", "--local", "--unset", "filter.lfs.clean"],
+    );
     // Pass isolated empty global config via `GIT_CONFIG_GLOBAL`? Wait: if user's real ~/.gitconfig
     // has `filter.lfs.clean`, `-c filter.lfs.clean=` overrides it with empty string cleanly!
     let err = commit_changes(
         &repo,
-        &CommitOptions::new("unsafe commit").with_config_overrides(vec![
-            ("filter.lfs.clean".to_string(), String::new()),
-        ]),
+        &CommitOptions::new("unsafe commit")
+            .with_config_overrides(vec![("filter.lfs.clean".to_string(), String::new())]),
     )
     .unwrap_err();
     assert_eq!(err.error_code(), "check_failed", "got {err:?}");

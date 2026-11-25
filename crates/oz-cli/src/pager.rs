@@ -305,7 +305,10 @@ mod tests {
             git_pager_env: None,
             path_env: Some(tmp.path().as_os_str()),
         };
-        assert!(matches!(resolve_pager_spec(base), PagerChoice::Command { .. }));
+        assert!(matches!(
+            resolve_pager_spec(base),
+            PagerChoice::Command { .. }
+        ));
 
         assert_eq!(
             resolve_pager_spec(PagerSelectionInput {

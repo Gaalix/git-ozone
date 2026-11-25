@@ -606,13 +606,7 @@ fn arb_conflict_case() -> BoxedStrategy<ConflictCase> {
                     main_link,
                     feat_link,
                 ),
-                (
-                    main_exec,
-                    feat_exec,
-                    take_side,
-                    disjoint_main_extra,
-                    disjoint_feat_extra,
-                ),
+                (main_exec, feat_exec, take_side, disjoint_main_extra, disjoint_feat_extra),
             )| ConflictCase {
                 base,
                 conflict_kind,

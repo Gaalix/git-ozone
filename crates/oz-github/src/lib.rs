@@ -14,9 +14,9 @@ pub mod wire;
 
 pub use api::{
     ConditionalGet, CreatePullRequestReviewPayload, GitHubActionsJob, GitHubCheckRun,
-    GitHubCheckRunOutput, GitHubClient, GitHubIssue, GitHubIssueComment,
-    GitHubIssuePullRequestRef, GitHubJobStep, GitHubLabel, GitHubMilestone, GitHubPrRef,
-    GitHubPullRequest, GitHubPullRequestComment, GitHubPullRequestFile, GitHubPullRequestReview,
+    GitHubCheckRunOutput, GitHubClient, GitHubIssue, GitHubIssueComment, GitHubIssuePullRequestRef,
+    GitHubJobStep, GitHubLabel, GitHubMilestone, GitHubPrRef, GitHubPullRequest,
+    GitHubPullRequestComment, GitHubPullRequestFile, GitHubPullRequestReview,
     GitHubReviewCommentPayload, GitHubReviewThreadMeta, GitHubSearchIssuesResponse, GitHubUser,
     GitHubWorkflow, GitHubWorkflowRun, UpdatePullRequest,
 };
@@ -27,10 +27,6 @@ pub use auth::{
     parse_git_remote_with_env, probe_github_auth, query_git_credential_fill,
     read_remote_url_from_gix, read_remote_url_from_repo, require_github_token, resolve_repo_remote,
     strip_host_port,
-};
-pub use ssh_config::{
-    ResolvedSshHost, SshConfigSearchContext, build_gix_ssh_options, format_openssh_command,
-    resolve_ssh_host, resolve_ssh_host_with_context,
 };
 pub use ci::{
     CiJobLogOptions, CiJobLogReport, CiQueryOptions, CiReport, CiRunsOptions, CiRunsReport,
@@ -61,14 +57,18 @@ pub use pr::{
     pr_status, pr_view, render_stack_navigation_block, strip_stack_navigation_block,
     upsert_stack_navigation_block, validate_pr_review_comments,
 };
+pub use ssh_config::{
+    ResolvedSshHost, SshConfigSearchContext, build_gix_ssh_options, format_openssh_command,
+    resolve_ssh_host, resolve_ssh_host_with_context,
+};
 pub use sync::{
     PullOptions, PullOutcome, PullStrategy, RetargetedPrSummary, SyncOptions, SyncOutcome,
     pull_current_branch, sync_repo,
 };
 pub use wire::{
     CloneOptions, CloneOutcome, FetchOptions, FetchOutcome, FetchedRefUpdate, ForceLeaseSpec,
-    HttpAuthScheme, PushOptions, PushOutcome, PushedRefUpdate, clone_repo, fetch_remote,
-    push_refs, push_refs_with_options,
+    HttpAuthScheme, PushOptions, PushOutcome, PushedRefUpdate, clone_repo, fetch_remote, push_refs,
+    push_refs_with_options,
 };
 
 use serde::{Deserialize, Serialize};
