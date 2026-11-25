@@ -878,3 +878,104 @@ fn python_venv_normalizes_pyvenv_cfg_activate_long_trampolines_and_editable_pth(
         "unexpected long-tool output: {stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn baseline_capture_isolates_mutable_cargo_metadata_and_local_artifacts_from_repo_target() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = TempDir::new().expect("tempdir");
+    let repo_root = dir.path().join("rust-iso");
+    let ozone_dir = repo_root.join(".git/ozone");
+    std::fs::create_dir_all(repo_root.join("src")).expect("mkdir src");
+    std::fs::write(
+        repo_root.join("Cargo.toml"),
+        "[package]\nname = \"rust-iso\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(repo_root.join("src/lib.rs"), "pub fn v() -> u32 { 1 }\n").expect("write lib");
+
+    let oid = init_repo(&repo_root);
+    std::fs::create_dir_all(&ozone_dir).expect("mkdir ozone");
+
+    let local_hash = "0123456789abcdef";
+    let ext_hash = "fedcba9876543210";
+
+    let fp_file = repo_root.join(format!(
+        "target/debug/.fingerprint/rust-iso-{local_hash}/lib-rust_iso"
+    ));
+    let dep_info = repo_root.join(format!("target/debug/deps/rust_iso-{local_hash}.d"));
+    let local_rlib = repo_root.join(format!("target/debug/deps/librust_iso-{local_hash}.rlib"));
+    let local_test_bin = repo_root.join(format!("target/debug/deps/custom_test-{local_hash}"));
+    let ext_rlib = repo_root.join(format!("target/debug/deps/libserde-{ext_hash}.rlib"));
+    let build_out = repo_root.join(format!("target/debug/build/serde-{ext_hash}/out/gen.rs"));
+    let rustc_info = repo_root.join("target/.rustc_info.json");
+    let doc_lock = repo_root.join("target/doc/.lock");
+
+    for p in [
+        &fp_file,
+        &dep_info,
+        &local_rlib,
+        &local_test_bin,
+        &ext_rlib,
+        &build_out,
+        &rustc_info,
+        &doc_lock,
+    ] {
+        std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir parent");
+    }
+    std::fs::write(&fp_file, b"fp-v1").expect("write fp");
+    std::fs::write(&dep_info, b"target/debug/deps/rust_iso.d: src/lib.rs\n").expect("write .d");
+    std::fs::write(&local_rlib, b"local-rlib-v1").expect("write local rlib");
+    std::fs::write(&local_test_bin, b"local-test-v1").expect("write local test");
+    std::fs::write(&ext_rlib, b"ext-rlib-v1").expect("write ext rlib");
+    std::fs::write(&build_out, b"pub const X: i32 = 1;\n").expect("write build out");
+    std::fs::write(&rustc_info, b"{\"rustc\":\"1\"}\n").expect("write rustc info");
+    std::fs::write(&doc_lock, b"").expect("write doc lock");
+
+    capture_baseline(&repo_root, &ozone_dir, &oid, &OzoneConfig::default())
+        .expect("capture baseline");
+    let base_root = ozone_dir.join("baselines").join(&oid).join("root");
+
+    // Transient `doc/.lock` must be excluded from captured baselines.
+    assert!(!base_root.join("target/doc/.lock").exists());
+
+    // Mutable Cargo metadata & local workspace artifacts must have distinct inodes so rebuilding
+    // in `repo_root` cannot mutate the captured baseline snapshot.
+    for rel in [
+        "target/.rustc_info.json".to_string(),
+        format!("target/debug/.fingerprint/rust-iso-{local_hash}/lib-rust_iso"),
+        format!("target/debug/deps/rust_iso-{local_hash}.d"),
+        format!("target/debug/deps/librust_iso-{local_hash}.rlib"),
+        format!("target/debug/deps/custom_test-{local_hash}"),
+        format!("target/debug/build/serde-{ext_hash}/out/gen.rs"),
+    ] {
+        let repo_ino = std::fs::metadata(repo_root.join(&rel))
+            .expect("repo meta")
+            .ino();
+        let base_ino = std::fs::metadata(base_root.join(&rel))
+            .expect("base meta")
+            .ino();
+        assert_ne!(
+            repo_ino, base_ino,
+            "{rel} must NOT be hardlinked into baseline"
+        );
+    }
+
+    // Mutating repo_root's fingerprint in-place must leave the baseline untouched.
+    std::fs::write(&fp_file, b"fp-v2-mutated").expect("mutate fp");
+    assert_eq!(
+        std::fs::read(base_root.join(format!(
+            "target/debug/.fingerprint/rust-iso-{local_hash}/lib-rust_iso"
+        )))
+        .expect("read base fp"),
+        b"fp-v1"
+    );
+
+    // External third-party `deps/libserde-*.rlib` remains captured cleanly.
+    assert_eq!(
+        std::fs::read(base_root.join(format!("target/debug/deps/libserde-{ext_hash}.rlib")))
+            .expect("read base ext"),
+        b"ext-rlib-v1"
+    );
+}

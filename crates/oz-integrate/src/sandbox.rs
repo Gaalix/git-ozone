@@ -19,6 +19,7 @@ use oz_core::{
 use oz_cow::materialize::{
     TreeDelta, apply_tree_delta_to_dir, clone_dir_with_reflink, compute_tree_delta,
     materialize_cas_workspace, materialize_tree_from_odb, resolve_baseline_tree_id,
+    restore_baseline_mtimes_for_tree,
 };
 use oz_cow::{SpawnRequest, detect_filesystem_with_ozone};
 use oz_oplog::ActorInfo;
@@ -610,6 +611,9 @@ pub(crate) fn materialize_integrate_sandbox(
         };
         let cas_dir = repo.layout.ozone_dir.join("cas");
         materialize_cas_workspace(&req, &cas_dir, &repo.git_common_dir)?;
+        if repo.config.warm.preserve_mtime {
+            restore_baseline_mtimes_for_tree(gix_repo, b_root, candidate_tree_id, sandbox_dir)?;
+        }
         return Ok(());
     }
 

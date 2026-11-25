@@ -13,7 +13,10 @@ use oz_core::{
     AttributeResolver, AutoCrlf, GitConfig, GitConfigContext, OzError, OzoneConfig, Result,
     is_lfs_pointer, normalize_lexical, smudge_blob_bytes,
 };
-use oz_warm::detect_warm_targets;
+use oz_warm::{
+    BaselineMetadata, CargoArtifactDisposition, CargoTargetClassifier, EcosystemKind,
+    apply_baseline_mtimes, detect_warm_targets,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -598,6 +601,39 @@ fn save_cas_digest_cache(path: &Path, map: &HashMap<String, CachedCasDigest>) {
     }
 }
 
+/// Restores baseline tracked-file `mtime`s on paths inside `target_dir` that are unchanged
+/// between `baseline_root`'s commit tree and `candidate_tree_id`, while leaving modified/added
+/// paths at their current (`NOW`) timestamps so Cargo/build tools only recompile changed units.
+pub fn restore_baseline_mtimes_for_tree(
+    gix_repo: &gix::Repository,
+    baseline_root: &Path,
+    candidate_tree_id: gix::ObjectId,
+    target_dir: &Path,
+) -> Result<()> {
+    let Some(meta_path) = baseline_root.parent().map(|p| p.join("metadata.json")) else {
+        return Ok(());
+    };
+    if !meta_path.is_file() {
+        return Ok(());
+    }
+    let Ok(raw) = std::fs::read_to_string(&meta_path) else {
+        return Ok(());
+    };
+    let Ok(baseline_meta) = serde_json::from_str::<BaselineMetadata>(&raw) else {
+        return Ok(());
+    };
+    if baseline_meta.file_mtimes_secs.is_empty() {
+        return Ok(());
+    }
+    let Some(base_tree_id) = resolve_baseline_tree_id(gix_repo, baseline_root) else {
+        return Ok(());
+    };
+    let delta = compute_tree_delta(gix_repo, base_tree_id, candidate_tree_id)?;
+    let changed: HashSet<String> = delta.upserts.into_iter().map(|(rel, _, _)| rel).collect();
+    let _ = apply_baseline_mtimes(target_dir, &baseline_meta, &changed)?;
+    Ok(())
+}
+
 /// Materializes a workspace using the CAS hardlink store (`0444`/`0555`) for immutable cache
 /// dependencies and `rayon` parallel file copy for editable source files (NEVER hardlinking
 /// editable source files!).
@@ -609,7 +645,7 @@ pub fn materialize_cas_workspace(
     std::fs::create_dir_all(&req.target_path)?;
     std::fs::create_dir_all(cas_dir)?;
 
-    let warm_roots = collect_warm_root_names(req, git_common_dir);
+    let (warm_roots, cargo_warm_roots) = collect_warm_root_names(req, git_common_dir);
 
     let mut tracked_from_odb = false;
     if let Some(ref tree_hex) = req.base_tree
@@ -626,6 +662,9 @@ pub fn materialize_cas_workspace(
     if !baseline_dir.is_dir() {
         return Ok(());
     }
+
+    let cargo_classifiers =
+        build_cargo_target_classifiers(&req.repo_root, baseline_dir, &cargo_warm_roots);
 
     let mut created_dirs = HashSet::new();
     created_dirs.insert(req.target_path.clone());
@@ -659,12 +698,32 @@ pub fn materialize_cas_workspace(
                     }
                     continue;
                 }
-                if let Some(parent) = dst.parent()
-                    && !created_dirs.contains(parent)
+                if !entry.path_is_symlink()
+                    && let Some(disp) = classify_cargo_warm_path(rel, &cargo_classifiers)
                 {
-                    std::fs::create_dir_all(parent)?;
-                    created_dirs.insert(parent.to_path_buf());
+                    match disp {
+                        CargoArtifactDisposition::SkipTransientLock => continue,
+                        CargoArtifactDisposition::MutableWritable => {
+                            ensure_parent_dir(&dst, &mut created_dirs)?;
+                            let meta = std::fs::symlink_metadata(entry.path())?;
+                            source_jobs.push((entry.path().to_path_buf(), dst, false, meta));
+                            continue;
+                        }
+                        CargoArtifactDisposition::ImmutableCas => {
+                            ensure_parent_dir(&dst, &mut created_dirs)?;
+                            let meta = std::fs::symlink_metadata(entry.path())?;
+                            dep_jobs.push((
+                                rel.to_string_lossy().into_owned(),
+                                entry.path().to_path_buf(),
+                                dst,
+                                false,
+                                meta,
+                            ));
+                            continue;
+                        }
+                    }
                 }
+                ensure_parent_dir(&dst, &mut created_dirs)?;
                 let meta = std::fs::symlink_metadata(entry.path())?;
                 if !entry.path_is_symlink() && is_mutable_warm_metadata_file(rel) {
                     source_jobs.push((entry.path().to_path_buf(), dst, false, meta));
@@ -697,12 +756,33 @@ pub fn materialize_cas_workspace(
                 }
                 continue;
             }
-            if let Some(parent) = dst.parent()
-                && !created_dirs.contains(parent)
+            if is_warm_dep
+                && !entry.path_is_symlink()
+                && let Some(disp) = classify_cargo_warm_path(rel, &cargo_classifiers)
             {
-                std::fs::create_dir_all(parent)?;
-                created_dirs.insert(parent.to_path_buf());
+                match disp {
+                    CargoArtifactDisposition::SkipTransientLock => continue,
+                    CargoArtifactDisposition::MutableWritable => {
+                        ensure_parent_dir(&dst, &mut created_dirs)?;
+                        let meta = std::fs::symlink_metadata(entry.path())?;
+                        source_jobs.push((entry.path().to_path_buf(), dst, false, meta));
+                        continue;
+                    }
+                    CargoArtifactDisposition::ImmutableCas => {
+                        ensure_parent_dir(&dst, &mut created_dirs)?;
+                        let meta = std::fs::symlink_metadata(entry.path())?;
+                        dep_jobs.push((
+                            rel.to_string_lossy().into_owned(),
+                            entry.path().to_path_buf(),
+                            dst,
+                            false,
+                            meta,
+                        ));
+                        continue;
+                    }
+                }
             }
+            ensure_parent_dir(&dst, &mut created_dirs)?;
             let meta = std::fs::symlink_metadata(entry.path())?;
             if is_warm_dep && (entry.path_is_symlink() || !is_mutable_warm_metadata_file(rel)) {
                 dep_jobs.push((
@@ -861,12 +941,30 @@ fn blake3_file_hex(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn collect_warm_root_names(req: &SpawnRequest, git_common_dir: &Path) -> HashSet<String> {
+fn ensure_parent_dir(dst: &Path, created_dirs: &mut HashSet<PathBuf>) -> Result<()> {
+    if let Some(parent) = dst.parent()
+        && !created_dirs.contains(parent)
+    {
+        std::fs::create_dir_all(parent)?;
+        created_dirs.insert(parent.to_path_buf());
+    }
+    Ok(())
+}
+
+fn collect_warm_root_names(
+    req: &SpawnRequest,
+    git_common_dir: &Path,
+) -> (HashSet<String>, HashSet<String>) {
     let mut roots = HashSet::new();
+    let mut cargo_roots = HashSet::new();
     let cfg = OzoneConfig::load_for_repo(&req.repo_root, &git_common_dir.join("ozone"))
         .unwrap_or_default();
     for target in detect_warm_targets(&req.repo_root, &cfg) {
-        roots.insert(target.relative_path.trim_end_matches('/').to_string());
+        let rel = target.relative_path.trim_end_matches('/').to_string();
+        if matches!(target.ecosystem, EcosystemKind::RustCargo) {
+            cargo_roots.insert(rel.clone());
+        }
+        roots.insert(rel);
     }
     for known in [
         "target",
@@ -881,13 +979,59 @@ fn collect_warm_root_names(req: &SpawnRequest, git_common_dir: &Path) -> HashSet
     ] {
         roots.insert(known.to_string());
     }
-    roots
+    (roots, cargo_roots)
+}
+
+fn build_cargo_target_classifiers(
+    repo_root: &Path,
+    baseline_dir: &Path,
+    cargo_warm_roots: &HashSet<String>,
+) -> Vec<(String, CargoTargetClassifier)> {
+    let mut candidates = cargo_warm_roots.clone();
+    if baseline_dir.join("Cargo.toml").is_file()
+        || repo_root.join("Cargo.toml").is_file()
+        || baseline_dir.join("target/.rustc_info.json").is_file()
+        || baseline_dir.join("target/debug/.fingerprint").is_dir()
+    {
+        candidates.insert("target".to_string());
+    }
+
+    let manifest_roots = [baseline_dir, repo_root];
+    let mut classifiers = Vec::new();
+    let mut sorted: Vec<String> = candidates.into_iter().collect();
+    sorted.sort();
+    for rel_root in sorted {
+        let target_dir = baseline_dir.join(&rel_root);
+        if target_dir.is_dir() {
+            let cls =
+                CargoTargetClassifier::for_target_dir(&manifest_roots, &target_dir, &rel_root);
+            classifiers.push((rel_root, cls));
+        }
+    }
+    // Longest prefix first so nested custom `target-dir` paths match before shorter prefixes.
+    classifiers.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    classifiers
+}
+
+fn classify_cargo_warm_path(
+    rel: &Path,
+    classifiers: &[(String, CargoTargetClassifier)],
+) -> Option<CargoArtifactDisposition> {
+    for (root_rel, cls) in classifiers {
+        if let Ok(rel_in_target) = rel.strip_prefix(root_rel)
+            && !rel_in_target.as_os_str().is_empty()
+        {
+            return Some(cls.classify(rel_in_target));
+        }
+    }
+    None
 }
 
 /// Returns `true` for package-manager / build-tool metadata and shim files inside warm cache
 /// directories (such as `node_modules/.modules.yaml`, `.pnpm-workspace-state-v1.json`,
-/// `node_modules/.bin/*`, `node_modules/.cache/*`, etc.) that MUST be copied writable (unique
-/// inode per workspace) rather than read-only (`0444`) CAS hardlinked.
+/// `node_modules/.bin/*`, `node_modules/.cache/*`, `target/.rustc_info.json`,
+/// `target/**/.fingerprint/**`, `target/**/incremental/**`, `target/**/*.d`, etc.) that MUST
+/// be copied writable (unique inode per workspace) rather than read-only (`0444`) CAS hardlinked.
 #[must_use]
 pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
     let rel_posix = rel.to_string_lossy().replace('\\', "/");
@@ -901,6 +1045,9 @@ pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
             | ".yarn-integrity"
             | ".pnpm-debug.log"
             | "pyvenv.cfg"
+            | ".rustc_info.json"
+            | ".rustdoc_fingerprint.json"
+            | "CACHEDIR.TAG"
     ) {
         return true;
     }
@@ -915,6 +1062,28 @@ pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
         || rel_posix.contains("node_modules/.bin/")
         || rel_posix.contains("node_modules/.cache/")
         || rel_posix.contains(".venv/bin/")
+        || rel_posix.contains("/.fingerprint/")
+        || rel_posix.starts_with(".fingerprint/")
+        || rel_posix.contains("/incremental/")
+        || rel_posix.starts_with("incremental/")
+        || rel_posix.starts_with("target/doc/")
+        || rel_posix.starts_with("target/tmp/")
+    {
+        return true;
+    }
+    if file_name.ends_with(".d")
+        && (rel_posix.starts_with("target/")
+            || rel_posix.contains("/deps/")
+            || rel_posix.contains("/build/")
+            || rel_posix.contains("/examples/"))
+    {
+        return true;
+    }
+    if rel_posix.contains("/build/")
+        && (matches!(
+            file_name,
+            "invoked.timestamp" | "output" | "root-output" | "stderr"
+        ) || rel_posix.contains("/out/"))
     {
         return true;
     }

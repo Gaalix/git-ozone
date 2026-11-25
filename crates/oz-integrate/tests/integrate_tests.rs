@@ -6,7 +6,7 @@
 //! `--verify`, main working-tree + `.git/index` sync, stacked rebasing, and `< 10 ms` undo.
 
 use oz_core::{BackendKind, CommitOptions, OzError, OzoneRepo, commit_changes, compute_status};
-use oz_cow::{SpawnWorkspaceOptions, spawn_workspace};
+use oz_cow::{RemoveWorkspaceOptions, SpawnWorkspaceOptions, remove_workspace, spawn_workspace};
 use oz_integrate::{
     CollisionSeverity, IntegrateOptions, IntegrationGuardrailOptions, IntegrationMode,
     RadarOptions, ResolveOptions, StackRebaseOptions, TakeSide, abort_integration, active_session,
@@ -1393,4 +1393,340 @@ fn integrate_supports_plain_git_branch_names_and_workspace_branch_names() {
         "from ws branch\n"
     );
     assert_eq!(run_git(&repo_root, &["status", "--porcelain"]), "");
+}
+
+struct WorkspaceCleanupGuard<'a> {
+    repo: &'a OzoneRepo,
+    name: String,
+}
+
+impl Drop for WorkspaceCleanupGuard<'_> {
+    fn drop(&mut self) {
+        let _ = remove_workspace(
+            self.repo,
+            &self.name,
+            &RemoveWorkspaceOptions {
+                force: true,
+                delete_branch: false,
+            },
+        );
+    }
+}
+
+fn snapshot_dir_file_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(p);
+            } else if meta.is_file()
+                && let Ok(rel) = p.strip_prefix(root)
+                && let Ok(bytes) = fs::read(&p)
+            {
+                map.insert(rel.to_path_buf(), bytes);
+            }
+        }
+    }
+    map
+}
+
+#[test]
+fn integrate_verify_cargo_test_writes_into_integrate_target_under_cas_and_default_backends() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    // External path crate outside the repo (models immutable third-party dependencies in `target/debug/deps`).
+    let ext_root = tmp.path().join("ext-dep");
+    fs::create_dir_all(ext_root.join("src")).expect("mkdir ext");
+    fs::write(
+        ext_root.join("Cargo.toml"),
+        "[package]\nname = \"ext-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write ext Cargo.toml");
+    fs::write(ext_root.join("src/lib.rs"), "pub fn base() -> i32 { 10 }\n")
+        .expect("write ext lib.rs");
+
+    let repo_root = tmp.path().join("rust-verify-demo");
+    fs::create_dir_all(repo_root.join("crates/corelib/src")).expect("mkdir corelib");
+    fs::create_dir_all(repo_root.join("crates/app/src")).expect("mkdir app src");
+    fs::create_dir_all(repo_root.join("crates/app/tests")).expect("mkdir app tests");
+    fs::write(repo_root.join(".gitignore"), "/target\n").expect("write .gitignore");
+    fs::write(
+        repo_root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    )
+    .expect("write root Cargo.toml");
+    fs::write(
+        repo_root.join("crates/corelib/Cargo.toml"),
+        "[package]\nname = \"corelib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write corelib Cargo.toml");
+    fs::write(
+        repo_root.join("crates/corelib/src/lib.rs"),
+        "pub fn offset() -> i32 { 5 }\n",
+    )
+    .expect("write corelib lib.rs");
+    fs::write(
+        repo_root.join("crates/app/Cargo.toml"),
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"demo-cli\"\npath = \"src/main.rs\"\n\n[dependencies]\ncorelib = {{ path = \"../corelib\" }}\next-dep = {{ path = \"{}\" }}\n",
+            ext_root.display().to_string().replace('\\', "/")
+        ),
+    )
+    .expect("write app Cargo.toml");
+    fs::write(
+        repo_root.join("crates/app/build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("gen.rs"), "pub const MAGIC: i32 = 1;\n").unwrap();
+}
+"#,
+    )
+    .expect("write build.rs");
+    fs::write(
+        repo_root.join("crates/app/src/lib.rs"),
+        r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+pub fn compute() -> i32 { ext_dep::base() + corelib::offset() + MAGIC }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_ok() { assert_eq!(super::compute(), 16); }
+}
+"#,
+    )
+    .expect("write app lib.rs");
+    fs::write(
+        repo_root.join("crates/app/src/main.rs"),
+        "fn main() { println!(\"{}\", app::compute()); }\n",
+    )
+    .expect("write main.rs");
+    fs::write(
+        repo_root.join("crates/app/tests/integ.rs"),
+        "#[test]\nfn integ_ok() { assert_eq!(app::compute(), 16); }\n",
+    )
+    .expect("write integ.rs");
+
+    run_git(&repo_root, &["init", "-b", "main"]);
+    run_git(&repo_root, &["config", "user.name", "Ozone Test"]);
+    run_git(&repo_root, &["config", "user.email", "test@ozone.dev"]);
+
+    // Run real `cargo test` so `target/` is populated realistically, then commit everything including `Cargo.lock`.
+    let init_cargo = Command::new("cargo")
+        .args(["test"])
+        .current_dir(&repo_root)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("initial cargo test");
+    assert!(
+        init_cargo.status.success(),
+        "initial cargo test failed: {}",
+        String::from_utf8_lossy(&init_cargo.stderr)
+    );
+    run_git(&repo_root, &["add", "."]);
+    run_git(&repo_root, &["commit", "-m", "initial rust workspace"]);
+
+    let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover repo");
+    repo.layout.ensure_initialized().expect("init ozone");
+
+    // Snapshot main repo's `target/.rustc_info.json` and `.fingerprint/` before any integration.
+    let main_rustc_info_before =
+        fs::read(repo_root.join("target/.rustc_info.json")).expect("read main rustc info");
+    let main_fp_before = snapshot_dir_file_bytes(&repo_root.join("target/debug/.fingerprint"));
+
+    // 1. Spawn warm workspace under `cas_hardlink`, edit `app` + `build.rs` + `tests/integ.rs`,
+    //    and integrate with `--verify "cargo test"` (NO `--target-dir`!).
+    let mut cas_opts = SpawnWorkspaceOptions::new("agent-cas");
+    cas_opts.backend = Some(BackendKind::CasHardlink);
+    cas_opts.warm = true;
+    let ws_cas = spawn_workspace(&repo, &cas_opts).expect("spawn warm cas workspace");
+    let _guard_cas = WorkspaceCleanupGuard {
+        repo: &repo,
+        name: "agent-cas".to_string(),
+    };
+
+    write_ws_file(
+        &ws_cas.workspace.workspace_path,
+        "crates/app/build.rs",
+        br#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("gen.rs"), "pub const MAGIC: i32 = 7;\n").unwrap();
+}
+"#,
+    );
+    write_ws_file(
+        &ws_cas.workspace.workspace_path,
+        "crates/app/src/lib.rs",
+        br#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+pub fn compute() -> i32 { ext_dep::base() + corelib::offset() + MAGIC }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_ok() { assert_eq!(super::compute(), 22); }
+}
+"#,
+    );
+    write_ws_file(
+        &ws_cas.workspace.workspace_path,
+        "crates/app/tests/integ.rs",
+        b"#[test]\nfn integ_ok() { assert_eq!(app::compute(), 22); }\n",
+    );
+    commit_ws(
+        &ws_cas.workspace.workspace_path,
+        "feat: bump magic to 7",
+        false,
+        false,
+    );
+
+    let cas_dir = repo.layout.ozone_dir.join("cas");
+    let cas_snapshot_before = snapshot_dir_file_bytes(&cas_dir);
+
+    let out_cas = integrate(
+        &repo,
+        &IntegrateOptions {
+            sources: vec!["agent-cas".to_string()],
+            into: Some("main".to_string()),
+            verify_cmd: Some("cargo test".to_string()),
+            ..Default::default()
+        },
+        agent_actor(None),
+    )
+    .expect("oz integrate --verify 'cargo test' must succeed writing into _integrate/target");
+    assert_eq!(out_cas.merged_sources, vec!["agent-cas"]);
+    assert!(
+        !tmp.path().join("rust-verify-demo.oz/_integrate").exists(),
+        "_integrate sandbox must be cleaned up after verification"
+    );
+    assert!(
+        fs::read_to_string(repo_root.join("crates/app/src/lib.rs"))
+            .unwrap()
+            .contains("assert_eq!(super::compute(), 22)")
+    );
+
+    // Prove main repo's `target/` and `.git/ozone/cas/` were NEVER mutated or corrupted!
+    assert_eq!(
+        fs::read(repo_root.join("target/.rustc_info.json")).expect("read main rustc info after"),
+        main_rustc_info_before
+    );
+    assert_eq!(
+        snapshot_dir_file_bytes(&repo_root.join("target/debug/.fingerprint")),
+        main_fp_before,
+        "main repo target/debug/.fingerprint must stay untouched"
+    );
+    let cas_snapshot_after = snapshot_dir_file_bytes(&cas_dir);
+    for (rel, bytes) in &cas_snapshot_before {
+        assert_eq!(
+            cas_snapshot_after.get(rel),
+            Some(bytes),
+            "CAS blob {} must remain immutable",
+            rel.display()
+        );
+    }
+
+    // 2. Verify a broken test change actually fails `--verify "cargo test"` (proving Cargo
+    //    recompiled and executed the candidate tests rather than stale cached binaries).
+    let mut bad_opts = SpawnWorkspaceOptions::new("agent-bad");
+    bad_opts.backend = Some(BackendKind::CasHardlink);
+    bad_opts.warm = true;
+    let ws_bad = spawn_workspace(&repo, &bad_opts).expect("spawn agent-bad");
+    let _guard_bad = WorkspaceCleanupGuard {
+        repo: &repo,
+        name: "agent-bad".to_string(),
+    };
+    write_ws_file(
+        &ws_bad.workspace.workspace_path,
+        "crates/app/src/lib.rs",
+        br#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+pub fn compute() -> i32 { 999 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_ok() { assert_eq!(super::compute(), 22); }
+}
+"#,
+    );
+    commit_ws(
+        &ws_bad.workspace.workspace_path,
+        "broken compute",
+        false,
+        false,
+    );
+    let bad_err = integrate(
+        &repo,
+        &IntegrateOptions {
+            sources: vec!["agent-bad".to_string()],
+            into: Some("main".to_string()),
+            verify_cmd: Some("cargo test".to_string()),
+            ..Default::default()
+        },
+        agent_actor(None),
+    )
+    .expect_err("failing candidate test must fail --verify");
+    assert!(matches!(bad_err, OzError::CheckFailed { .. }));
+
+    // 3. Spawn warm workspace under the host's DEFAULT backend (`backend: None`, e.g. `linux_fuse3`
+    //    on Linux ext4 when oz-vfsd is running, or native CoW/CAS elsewhere), commit an edit,
+    //    and verify `oz integrate --verify "cargo test"` succeeds cleanly without `--target-dir`!
+    let mut def_opts = SpawnWorkspaceOptions::new("agent-default");
+    def_opts.backend = None;
+    def_opts.warm = true;
+    let ws_def = spawn_workspace(&repo, &def_opts).expect("spawn warm default workspace");
+    let _guard_def = WorkspaceCleanupGuard {
+        repo: &repo,
+        name: "agent-default".to_string(),
+    };
+    write_ws_file(
+        &ws_def.workspace.workspace_path,
+        "crates/corelib/src/lib.rs",
+        b"pub fn offset() -> i32 { 15 }\n",
+    );
+    write_ws_file(
+        &ws_def.workspace.workspace_path,
+        "crates/app/src/lib.rs",
+        br#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+pub fn compute() -> i32 { ext_dep::base() + corelib::offset() + MAGIC }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_ok() { assert_eq!(super::compute(), 32); }
+}
+"#,
+    );
+    write_ws_file(
+        &ws_def.workspace.workspace_path,
+        "crates/app/tests/integ.rs",
+        b"#[test]\nfn integ_ok() { assert_eq!(app::compute(), 32); }\n",
+    );
+    commit_ws(
+        &ws_def.workspace.workspace_path,
+        "feat: bump corelib offset to 15",
+        false,
+        false,
+    );
+
+    let out_def = integrate(
+        &repo,
+        &IntegrateOptions {
+            sources: vec!["agent-default".to_string()],
+            into: Some("main".to_string()),
+            verify_cmd: Some("cargo test".to_string()),
+            ..Default::default()
+        },
+        agent_actor(None),
+    )
+    .expect("oz integrate --verify 'cargo test' must succeed with default backend workspace");
+    assert_eq!(out_def.merged_sources, vec!["agent-default"]);
+    assert!(
+        fs::read_to_string(repo_root.join("crates/corelib/src/lib.rs"))
+            .unwrap()
+            .contains("15")
+    );
 }

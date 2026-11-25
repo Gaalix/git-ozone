@@ -898,3 +898,185 @@ fn projfs_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_tcp_listener
         matches!(&requests[1], VfsRequest::Unmount { workspace, force: true, .. } if workspace == "agent-win")
     );
 }
+
+#[test]
+fn cas_hardlink_workspace_runs_cargo_test_with_warm_target_and_preserves_cas_integrity() {
+    let dir = TempDir::new().expect("tempdir");
+
+    // External path crate outside the repo WITH a `build.rs` generating files into `OUT_DIR`
+    // (models third-party registry dependencies like `serde`/`thiserror` whose `.d` files list
+    // `<repo_root>/target/debug/build/.../out/...` alongside external sources).
+    let ext_root = dir.path().join("ext-dep");
+    std::fs::create_dir_all(ext_root.join("src")).expect("mkdir ext");
+    std::fs::write(
+        ext_root.join("Cargo.toml"),
+        "[package]\nname = \"ext-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write ext Cargo.toml");
+    std::fs::write(
+        ext_root.join("build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("ext_gen.rs"), "pub const EXT_BASE: i32 = 40;\n").unwrap();
+}
+"#,
+    )
+    .expect("write ext build.rs");
+    std::fs::write(
+        ext_root.join("src/lib.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/ext_gen.rs\"));\npub fn base() -> i32 { EXT_BASE }\n",
+    )
+    .expect("write ext lib.rs");
+
+    let repo_root = dir.path().join("cargo-cas-app");
+    std::fs::create_dir_all(repo_root.join("crates/app/src")).expect("mkdir app src");
+    std::fs::create_dir_all(repo_root.join("crates/app/tests")).expect("mkdir app tests");
+    std::fs::write(repo_root.join(".gitignore"), "/target\n").expect("write .gitignore");
+    std::fs::write(
+        repo_root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    )
+    .expect("write root Cargo.toml");
+    std::fs::write(
+        repo_root.join("crates/app/Cargo.toml"),
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\next-dep = {{ path = \"{}\" }}\n",
+            ext_root.display().to_string().replace('\\', "/")
+        ),
+    )
+    .expect("write app Cargo.toml");
+    std::fs::write(
+        repo_root.join("crates/app/build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("gen.rs"), "pub const K: i32 = 2;\n").unwrap();
+}
+"#,
+    )
+    .expect("write build.rs");
+    std::fs::write(
+        repo_root.join("crates/app/src/lib.rs"),
+        r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+pub fn answer() -> i32 { ext_dep::base() + K }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn works() { assert_eq!(super::answer(), 42); }
+}
+"#,
+    )
+    .expect("write lib.rs");
+    std::fs::write(
+        repo_root.join("crates/app/tests/integ.rs"),
+        "#[test]\nfn integ_works() { assert_eq!(app::answer(), 42); }\n",
+    )
+    .expect("write integ.rs");
+
+    // Populate a realistic warm `target/` in main repo, then commit `Cargo.lock`.
+    let init_test = Command::new("cargo")
+        .args(["test"])
+        .current_dir(&repo_root)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("initial cargo test");
+    assert!(
+        init_test.status.success(),
+        "initial cargo test failed: {}",
+        String::from_utf8_lossy(&init_test.stderr)
+    );
+    let _oid = init_repo(&repo_root);
+
+    let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover repo");
+    let mut opts1 = SpawnWorkspaceOptions::new("ws-cargo-1");
+    opts1.backend = Some(BackendKind::CasHardlink);
+    let ws1 = spawn_workspace(&repo, &opts1).expect("spawn ws-cargo-1");
+
+    let mut opts2 = SpawnWorkspaceOptions::new("ws-cargo-2");
+    opts2.backend = Some(BackendKind::CasHardlink);
+    let ws2 = spawn_workspace(&repo, &opts2).expect("spawn ws-cargo-2");
+
+    // External third-party `deps/libext_dep-*.rlib` MUST remain 0444 read-only CAS hardlinked
+    // and shared across workspaces on Unix!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let find_ext_rlib = |root: &Path| {
+            std::fs::read_dir(root.join("target/debug/deps"))
+                .expect("read deps")
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|n| n.starts_with("libext_dep-") && n.ends_with(".rlib"))
+                })
+                .expect("libext_dep-*.rlib must exist")
+        };
+        let ext1 = std::fs::metadata(find_ext_rlib(&ws1.workspace.workspace_path)).expect("m1");
+        let ext2 = std::fs::metadata(find_ext_rlib(&ws2.workspace.workspace_path)).expect("m2");
+        assert_eq!(ext1.ino(), ext2.ino(), "external rlib must share CAS inode");
+        assert!(ext1.nlink() >= 3, "external rlib must link through CAS");
+        assert_eq!(ext1.mode() & 0o777, 0o444, "external rlib must stay 0444");
+    }
+
+    // Mutate `crates/app` (including `build.rs` and integration tests) in ws1 and run `cargo test`
+    // writing directly into `<ws1>/target` (NO `--target-dir`!).
+    std::fs::write(
+        ws1.workspace.workspace_path.join("crates/app/build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("gen.rs"), "pub const K: i32 = 10;\n").unwrap();
+}
+"#,
+    )
+    .expect("edit build.rs");
+    std::fs::write(
+        ws1.workspace.workspace_path.join("crates/app/src/lib.rs"),
+        r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+pub fn answer() -> i32 { ext_dep::base() + K }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn works() { assert_eq!(super::answer(), 50); }
+}
+"#,
+    )
+    .expect("edit lib.rs");
+    std::fs::write(
+        ws1.workspace
+            .workspace_path
+            .join("crates/app/tests/integ.rs"),
+        "#[test]\nfn integ_works() { assert_eq!(app::answer(), 50); }\n",
+    )
+    .expect("edit integ.rs");
+
+    let ws1_test = Command::new("cargo")
+        .args(["test"])
+        .current_dir(&ws1.workspace.workspace_path)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("ws1 cargo test");
+    assert!(
+        ws1_test.status.success(),
+        "cargo test inside cas_hardlink workspace failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&ws1_test.stdout),
+        String::from_utf8_lossy(&ws1_test.stderr)
+    );
+
+    // Main repo's `target/` and workspace 2 must remain 100% isolated and passing with old answer (42).
+    let ws2_test = Command::new("cargo")
+        .args(["test"])
+        .current_dir(&ws2.workspace.workspace_path)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("ws2 cargo test");
+    assert!(
+        ws2_test.status.success(),
+        "ws2 cargo test failed: {}",
+        String::from_utf8_lossy(&ws2_test.stderr)
+    );
+}

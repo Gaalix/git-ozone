@@ -13,7 +13,8 @@ use crate::trampoline::{
     rewrite_python_trampoline_bytes, rewrite_pyvenv_cfg_bytes, rewrite_venv_activate_bytes,
 };
 use crate::{
-    BaselineMetadata, EcosystemKind, WarmCacheTarget, detect_warm_targets, is_cargo_lock_filename,
+    BaselineMetadata, CargoArtifactDisposition, CargoTargetClassifier, EcosystemKind,
+    WarmCacheTarget, detect_warm_targets, is_transient_cargo_lock_path,
 };
 use chrono::{DateTime, Utc};
 use filetime::FileTime;
@@ -377,6 +378,7 @@ struct WarmTargetCtx<'a> {
     src_root: &'a Path,
     target_rel_path: &'a str,
     ecosystem: &'a EcosystemKind,
+    cargo_classifier: Option<CargoTargetClassifier>,
 }
 
 #[derive(Debug)]
@@ -399,11 +401,16 @@ fn capture_warm_target(
         return Ok(0);
     }
 
+    let cargo_classifier = matches!(target.ecosystem, EcosystemKind::RustCargo).then(|| {
+        CargoTargetClassifier::for_target_dir(&[repo_root], &src_root, &target.relative_path)
+    });
+
     let ctx = WarmTargetCtx {
         repo_root,
         src_root: &src_root,
         target_rel_path: &target.relative_path,
         ecosystem: &target.ecosystem,
+        cargo_classifier,
     };
 
     let dst_root = staging_root.join(&target.relative_path);
@@ -556,8 +563,12 @@ fn process_warm_file_job(
         return Ok(job.meta.len());
     }
 
-    if is_immutable_cache_artifact(&job.rel_in_target, &job.meta, ctx.ecosystem)
-        && std::fs::hard_link(&job.src, &job.dst).is_ok()
+    if is_immutable_cache_artifact(
+        &job.rel_in_target,
+        &job.meta,
+        ctx.ecosystem,
+        ctx.cargo_classifier.as_ref(),
+    ) && std::fs::hard_link(&job.src, &job.dst).is_ok()
     {
         return Ok(job.meta.len());
     }
@@ -572,23 +583,21 @@ fn is_transient_lock_file(rel: &Path, is_dir: bool) -> bool {
     if is_dir {
         return false;
     }
-    let Some(name) = rel.file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    if is_cargo_lock_filename(name) || name == ".oz-lock" || name.ends_with(".flock") {
-        return true;
-    }
-    let in_incremental = rel
-        .components()
-        .any(|c| matches!(c, Component::Normal(s) if s == "incremental"));
-    in_incremental && (name == "lock" || name.ends_with(".lock"))
+    is_transient_cargo_lock_path(rel)
 }
 
 fn is_immutable_cache_artifact(
     rel_in_target: &Path,
     meta: &Metadata,
     ecosystem: &EcosystemKind,
+    cargo_classifier: Option<&CargoTargetClassifier>,
 ) -> bool {
+    if matches!(ecosystem, EcosystemKind::RustCargo)
+        && let Some(cls) = cargo_classifier
+    {
+        return cls.classify(rel_in_target) == CargoArtifactDisposition::ImmutableCas;
+    }
+
     if is_readonly_mode(meta) {
         return true;
     }
@@ -602,8 +611,6 @@ fn is_immutable_cache_artifact(
         .collect();
 
     match ecosystem {
-        // Cargo's `incremental/` directory uses in-place SQLite/mmap writes and must be copied;
-        // compiled artifacts (`deps/`, `.fingerprint/`, `build/`, `doc/`, binaries) are replaced atomically.
         EcosystemKind::RustCargo => !comps.contains(&"incremental"),
         EcosystemKind::NodeJs => true,
         EcosystemKind::Python => {

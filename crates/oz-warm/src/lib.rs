@@ -4,11 +4,13 @@
 //! Ecosystem warm build/dependency cache detection, baseline capture, and `mtime` preservation.
 
 pub mod baseline;
+pub mod cargo;
 pub mod mtime;
 pub mod quiescent;
 pub mod trampoline;
 
 pub use baseline::{GcReport, capture_baseline, gc_baselines, touch_baseline_lru};
+pub use cargo::{CargoArtifactDisposition, CargoTargetClassifier, is_transient_cargo_lock_path};
 pub use mtime::{MtimeApplyStats, apply_baseline_mtimes, compute_changed_paths_between_commits};
 pub use quiescent::{
     BaselineResolution, BaselineSource, LoadedBaseline, find_baseline, find_nearest_prior_baseline,
