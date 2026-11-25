@@ -1,319 +1,524 @@
 (() => {
-  "use strict";
+  'use strict';
 
-  const INSTALL_SNIPPETS = {
-    shell: {
-      command: "curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash",
-      note: "Detects OS/arch, verifies <code>SHA256SUMS.txt</code>, and installs static binaries. Supports <code>--version</code>, <code>--prefix</code>, and <code>--dry-run</code>."
-    },
-    homebrew: {
-      command: "brew install --formula https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/homebrew/oz.rb",
-      note: "Installs <code>oz</code>, <code>git-ozone</code>, and <code>oz-vfsd</code> on macOS &amp; Linux. Verify with <code>oz doctor</code>."
-    },
-    deb: {
-      command: "curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.1.0/ozone_1.1.0_amd64.deb\nsudo apt install ./ozone_1.1.0_amd64.deb",
-      note: "Debian/Ubuntu <code>.deb</code> (<code>amd64</code> / <code>arm64</code>) with <code>Recommends: fuse3</code>. Installs to <code>/usr/bin/</code>."
-    },
-    winget: {
-      command: "winget install OzoneVCS.Ozone",
-      note: "Installs <code>oz.exe</code>, <code>git-ozone.exe</code>, and <code>oz-vfsd.exe</code> (or use PowerShell installer before winget community PR merge). Run <code>oz setup --enable-projfs</code> on NTFS."
-    },
-    powershell: {
-      command: "irm https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.ps1 | iex",
-      note: "Verifies SHA256 checksum, installs binaries, and updates user <code>PATH</code>. Supports <code>-Version</code>, <code>-Prefix</code>, and <code>-DryRun</code>."
-    },
-    cargo: {
-      command: "cargo install --git https://github.com/Gaalix/git-ozone --locked oz-cli oz-vfsd",
-      note: "Builds from source directly from GitHub, or install pre-built release binaries with <code>cargo binstall --git https://github.com/Gaalix/git-ozone oz-cli</code>."
-    }
-  };
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const pinned = matchMedia('(min-width: 60rem)');
+  const NBSP = ' ';
 
-  const COMPARISONS = {
-    worktrees: {
-      gitMeta: "Cold caches · gigabytes duplicated",
-      gitCode: `# Spawn 2 agent worktrees with warm Rust/Node caches
-git worktree add -b feat/auth ../repo-auth main
-cp -r target node_modules ../repo-auth/   # Minutes + 5 GB copied
+  // One polite live region for results that sighted visitors see change.
+  const live = document.createElement('p');
+  live.className = 'visually-hidden';
+  live.setAttribute('role', 'status');
+  document.body.append(live);
 
-git worktree add -b feat/billing ../repo-billing main
-cp -r target node_modules ../repo-billing/ # Another 5 GB copied
-
-# No path scope guardrails; shared .git/index.lock races`,
-      ozMeta: "Zero-byte CoW · warm caches · scoped",
-      ozCode: `# Spawn isolated CoW workspaces in ../<repo>.oz/<ws>
-oz ws spawn agent-auth \\
-  --branch feat/auth --from main \\
-  --scope "crates/auth/**" --deny "Cargo.lock"
-
-oz ws spawn agent-billing \\
-  --branch feat/billing --from main \\
-  --scope "crates/billing/**" --deny "migrations/**"
-
-# Warm caches cloned via APFS / FICLONE / FUSE3 / ProjFS
-# Deterministic mtime preservation keeps Cargo & tsc warm`,
-      takeaway: "Ozone clones multi-gigabyte build caches via native reflinks or persistent-upperdir VFS without duplicating data blocks or triggering cold rebuilds."
-    },
-    hunk: {
-      gitMeta: "Interactive TTY trap · index.lock",
-      gitCode: `# Interactive staging breaks autonomous agents
-git status
-git add -p crates/auth/src/token.rs   # Blocks on TTY prompt!
-git add crates/auth/src/pkce.rs
-git commit -m "feat(auth): add PKCE verifier"
-# Requires stash/index gymnastics to keep debug edits dirty`,
-      ozMeta: "1 non-interactive command · Change-Id",
-      ozCode: `# Deterministic file [f1] and hunk (h1a) IDs
-oz status --json
-
-# Stage-free partial commit built in RAM via gix
-oz commit -m "feat(auth): add PKCE verifier" --pick f2 h1a
-
-# Guardrails check secrets, conflict markers, >50 MB blobs & scope
-# Appends Change-Id: I<hex>; leaves h1b and f3 dirty in place`,
-      takeaway: "Addressable file and hunk IDs replace interactive `git add -p` and `git stash` with a single deterministic command."
-    },
-    integrate: {
-      gitMeta: "Mutates main · modal MERGE_HEAD",
-      gitCode: `# Merges directly on live working tree; fails mid-way
-git checkout main
-git merge feat/auth feat/billing
-# Leaves conflict markers on main if anything collides
-# No automated test gate before advancing refs/heads/main`,
-      ozMeta: "In-memory merge · --verify gate · sandbox",
-      ozCode: `# Detect overlapping hunks before merge
-oz radar --json
-
-# 100% in-memory 3-way merge + ephemeral _integrate/ test gate
-oz integrate agent-auth agent-billing \\
-  --into main --verify "cargo test"
-
-# If conflicts occur, main stays untouched; resolve deterministically:
-oz resolve c1 --take ours --continue`,
-      takeaway: "`main` and active agent workspaces are never left half-merged; conflicts materialize strictly inside ephemeral `../<repo>.oz/_integrate/`."
-    },
-    undo: {
-      gitMeta: "Reflog archaeology · lost dirty edits",
-      gitCode: `# Uncommitted edits wiped by reset --hard cannot be recovered
-git reflog
-git reset --hard HEAD@{1}
-
-# AI attribution pollutes commit trailers or is lost completely
-git blame crates/auth/src/token.rs`,
-      ozMeta: "< 10 ms MVCC undo · refs/notes/ai",
-      ozCode: `# Lightweight hook checkpoint + instant MVCC rewind
-oz checkpoint -m "before refactor"
-oz undo                # Rewinds refs + dirty tree in < 10 ms
-oz redo                # Even undo is undoable
-
-# Line-level human vs. AI attribution (clean commit messages)
-oz blame crates/auth/src/token.rs --json`,
-      takeaway: "Every mutation and agent PostToolUse hook writes an immutable OpLog entry, while AI session provenance lives cleanly in standard `refs/notes/ai`."
-    }
-  };
-
-  // Real v1.0.0 full-gate benchmark results measured from `benchmarks/results/latest.json`
-  // (commit 4690cbee08b2, 2026-11-21T21:51:45Z, AMD Ryzen 9 7900X, Ubuntu Linux 7.3.0 ext4,
-  // live linux_fuse3 via fusermount3 3.18.3, oz 1.0.0 vs git 2.55.0, jj 0.47.1, worktrunk 0.83.0).
-  const BENCHMARK_DATA = window.OZONE_BENCHMARKS || {
-    measured: true,
-    environment:
-      "AMD Ryzen 9 7900X (24 logical cores, 61.39 GiB RAM) · Ubuntu Linux 7.3.0 (ext4, live linux_fuse3) · oz 1.0.0 vs git 2.55.0, jj 0.47.1 & worktrunk 0.83.0 · 7/7 ROADMAP gates PASS (./benchmarks/run_all.sh --full).",
-    suites: [
-      {
-        title: "20-Agent Worktree Spawn & Disk (5 GB Cache)",
-        target: "51.2x faster · 54,404x less disk",
-        metrics: [
-          { label: "oz ws spawn (linux_fuse3, warm 20/20)", value: "444.5 ms total · 19.8 ms p50/ws" },
-          { label: "git warm copy · jj (cold) · wt (cold)", value: "22.78 s · 2.61 s · 567.8 ms (cold git: 243.9 ms)" },
-          { label: "Extra physical disk (oz vs git warm / cold)", value: "1.84 MiB (97.67 GiB app.) vs 97.96 GiB / 17.03 MiB" }
-        ]
-      },
-      {
-        title: "250k-File Monorepo Status (100% Parity)",
-        target: "30.2x faster vs git · 15.8x vs jj",
-        metrics: [
-          { label: "oz status --json (oz ws linux_fuse3)", value: "4.4 ms dirty · 3.3 ms clean p50" },
-          { label: "oz status --json (regular repo, dirty/clean)", value: "118.3 ms / 117.4 ms p50" },
-          { label: "git status --porcelain · jj status (dirty)", value: "132.1 ms · 69.6 ms p50" }
-        ]
-      },
-      {
-        title: "Agent VCBench (4 Canonical Tasks)",
-        target: "-68.0% cmds · -72.7% tokens",
-        metrics: [
-          { label: "Total non-interactive commands", value: "16 oz vs 50 git (-68.0%)" },
-          { label: "Approx / lexical token overhead", value: "1,163 vs 4,257 (-72.7%) · lex -69.7%" },
-          { label: "Local CLI wall time & tree parity", value: "142.1 ms vs 83.6 ms · 4/4 fsck PASS" }
-        ]
-      },
-      {
-        title: "10-Agent Concurrent Commits (30 Ops)",
-        target: "0% lock errors · git fsck PASS",
-        metrics: [
-          { label: "Distinct-branch commits (+ pack-refs)", value: "oz 0% (389–496 c/s) · git 0% (1,043–1,131 c/s)" },
-          { label: "Shared-worktree .git/index.lock contention", value: "oz 0/30 (0.0%) vs git add 22/30 (73.3%)" },
-          { label: "Integrity verification", value: "30/30 refs + git fsck --full PASS" }
-        ]
+  /* Copy buttons */
+  $$('[data-copy]').forEach((btn) => {
+    const label = btn.textContent;
+    let timer = 0;
+    btn.addEventListener('click', async () => {
+      const source = $(btn.dataset.copy);
+      if (!source) return;
+      const text = source.textContent.trim();
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        const range = document.createRange();
+        range.selectNodeContents(source);
+        const selection = getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
       }
-    ]
+      btn.textContent = copied ? 'Copied' : 'Selected';
+      btn.dataset.state = copied ? 'copied' : 'selected';
+      live.textContent = copied ? 'Command copied' : 'Command selected, press Ctrl+C to copy';
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        btn.textContent = label;
+        delete btn.dataset.state;
+      }, 1600);
+    });
+  });
+
+  /* The benchmark, replayed at the speed it was measured.
+     oz: 444.5 ms in total, the first spawn 79.7 ms (it captures the baseline).
+     git: 22.78 s in total, 1.139 s per worktree plus cache copy. */
+  const race = $('#race');
+  if (race) {
+    const navStatus = $('#nav-status');
+    const replay = $('#race-replay');
+    const CELLS = 20;
+    const specs = {
+      oz: {
+        total: 444.5,
+        first: 79.7,
+        disk: 1.84,
+        unit: 'MiB',
+        time: (ms) => `${ms.toFixed(1)}${NBSP}ms`,
+      },
+      git: {
+        total: 22780,
+        first: 1139,
+        disk: 97.96,
+        unit: 'GiB',
+        time: (ms) => `${(ms / 1000).toFixed(2)}${NBSP}s`,
+      },
+    };
+    const lanes = Object.fromEntries(Object.entries(specs).map(([name, spec]) => {
+      const el = $(`[data-lane="${name}"]`, race);
+      const rest = (spec.total - spec.first) / (CELLS - 1);
+      const ends = Array.from({ length: CELLS }, (_, i) => spec.first + rest * i);
+      return [name, {
+        ...spec,
+        ends,
+        cells: $$('.lane__cells i', el),
+        painted: new Array(CELLS).fill(-1),
+        read: {
+          time: $('[data-read="time"]', el),
+          disk: $('[data-read="disk"]', el),
+          count: $('[data-read="count"]', el),
+        },
+        done: 0,
+        diskNow: 0,
+      }];
+    }));
+
+    const paint = (lane, t) => {
+      let sum = 0;
+      let done = 0;
+      for (let i = 0; i < CELLS; i += 1) {
+        const start = i === 0 ? 0 : lane.ends[i - 1];
+        const p = Math.min(1, Math.max(0, (t - start) / (lane.ends[i] - start)));
+        sum += p;
+        if (p === 1) done += 1;
+        if (lane.painted[i] !== p) {
+          lane.cells[i].style.setProperty('--p', p.toFixed(3));
+          lane.painted[i] = p;
+        }
+      }
+      lane.done = done;
+      lane.diskNow = lane.disk * (sum / CELLS);
+      lane.read.time.textContent = lane.time(Math.min(t, lane.total));
+      lane.read.disk.textContent = `${lane.diskNow.toFixed(2)}${NBSP}${lane.unit}`;
+      lane.read.count.textContent = `${done} of ${CELLS}`;
+    };
+
+    let state = 'idle';
+    let startedAt = 0;
+    let frameId = 0;
+    let inView = true;
+    let statusTimer = 0;
+
+    const showStatus = (text) => {
+      if (!navStatus) return;
+      navStatus.textContent = text;
+      navStatus.classList.toggle('is-on', Boolean(text) && !inView);
+    };
+
+    const finish = () => {
+      cancelAnimationFrame(frameId);
+      state = 'done';
+      race.dataset.state = 'done';
+      paint(lanes.oz, lanes.oz.total);
+      paint(lanes.git, lanes.git.total);
+      replay.textContent = 'Replay';
+      showStatus(`git finished in 22.78${NBSP}s. oz took 444.5${NBSP}ms.`);
+      clearTimeout(statusTimer);
+      statusTimer = setTimeout(() => showStatus(''), 7000);
+    };
+
+    const frame = (now) => {
+      const t = now - startedAt;
+      if (t >= lanes.git.total) {
+        finish();
+        return;
+      }
+      paint(lanes.oz, t);
+      paint(lanes.git, t);
+      const git = lanes.git;
+      showStatus(`git is still copying: ${git.done} of ${CELLS} workspaces, ${git.diskNow.toFixed(1)}${NBSP}GiB`);
+      frameId = requestAnimationFrame(frame);
+    };
+
+    const start = () => {
+      cancelAnimationFrame(frameId);
+      clearTimeout(statusTimer);
+      state = 'running';
+      race.dataset.state = 'running';
+      replay.hidden = false;
+      replay.textContent = 'Skip to result';
+      paint(lanes.oz, 0);
+      paint(lanes.git, 0);
+      // A short beat so the eye is on the figure before the oz lane is over.
+      setTimeout(() => {
+        if (state !== 'running') return;
+        startedAt = performance.now();
+        frameId = requestAnimationFrame(frame);
+      }, 700);
+    };
+
+    replay.addEventListener('click', () => (state === 'running' ? finish() : start()));
+
+    new IntersectionObserver(([entry]) => {
+      inView = entry.isIntersecting;
+      if (navStatus) navStatus.classList.toggle('is-on', !inView && Boolean(navStatus.textContent));
+      if (inView && state === 'idle') {
+        if (reduceMotion.matches) {
+          state = 'done';
+          race.dataset.state = 'done';
+          replay.hidden = false;
+        } else {
+          start();
+        }
+      }
+    }, { threshold: 0.35 }).observe(race);
+  }
+
+  /* Terminal playback: commands type in, output follows. Nothing changes
+     size while it plays, the untyped part of a command is only hidden. */
+  const runs = new WeakMap();
+  const token = (screen) => runs.get(screen) || 0;
+  const cancel = (screen) => runs.set(screen, token(screen) + 1);
+
+  // A command is set as one unbreakable piece per argument, so a line never
+  // breaks inside a flag. Each piece holds a typed part and a hidden rest.
+  const setCommand = (span, text) => {
+    span.dataset.text = text;
+    const parts = [];
+    text.split(' ').forEach((word, i) => {
+      if (i) parts.push(' ');
+      const arg = document.createElement('span');
+      arg.className = 'arg';
+      const typed = document.createElement('span');
+      typed.textContent = word;
+      const rest = document.createElement('span');
+      rest.className = 'cmd__rest';
+      arg.append(typed, rest);
+      parts.push(arg);
+    });
+    span.replaceChildren(...parts);
   };
 
-  function initTheme() {
-    const root = document.documentElement;
-    const toggle = document.getElementById("theme-toggle");
-    const saved = localStorage.getItem("oz-site-theme");
-    const preferred =
-      saved ||
-      (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
-        ? "light"
-        : "dark");
-    root.setAttribute("data-theme", preferred);
-
-    if (toggle) {
-      toggle.addEventListener("click", () => {
-        const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
-        root.setAttribute("data-theme", next);
-        try {
-          localStorage.setItem("oz-site-theme", next);
-        } catch (_) {
-          // Ignore storage quota / private-mode errors
-        }
-      });
-    }
-  }
-
-  function initInstallTabs() {
-    const buttons = document.querySelectorAll("[data-install-tab]");
-    const codeEl = document.getElementById("install-command");
-    const noteEl = document.getElementById("install-note");
-    const copyBtn = document.getElementById("copy-install-btn");
-    const copyStatus = document.getElementById("copy-status");
-
-    function selectTab(key) {
-      const item = INSTALL_SNIPPETS[key];
-      if (!item || !codeEl || !noteEl) return;
-
-      buttons.forEach((btn) => {
-        const active = btn.getAttribute("data-install-tab") === key;
-        btn.classList.toggle("is-active", active);
-        btn.setAttribute("aria-selected", String(active));
-      });
-      codeEl.textContent = item.command;
-      noteEl.innerHTML = item.note;
-    }
-
-    buttons.forEach((btn) => {
-      btn.addEventListener("click", () => selectTab(btn.getAttribute("data-install-tab")));
+  const showTyped = (span, count) => {
+    let seen = 0;
+    $$('.arg', span).forEach((arg) => {
+      const word = arg.textContent;
+      const n = Math.min(word.length, Math.max(0, count - seen));
+      arg.firstChild.textContent = word.slice(0, n);
+      arg.lastChild.textContent = word.slice(n);
+      seen += word.length + 1;
     });
+  };
 
-    if (copyBtn && codeEl) {
-      copyBtn.addEventListener("click", async () => {
-        const text = codeEl.textContent || "";
-        try {
-          await navigator.clipboard.writeText(text);
-          copyBtn.textContent = "Copied!";
-          if (copyStatus) copyStatus.textContent = "Install command copied to clipboard.";
-        } catch (_) {
-          copyBtn.textContent = "Select & Copy";
-        }
-        window.setTimeout(() => {
-          copyBtn.textContent = "Copy";
-        }, 1600);
-      });
+  $$('.cmd__text').forEach((span) => setCommand(span, span.textContent));
+
+  const settle = (blk) => {
+    $$('.is-wait', blk).forEach((el) => el.classList.remove('is-wait'));
+    $$('.cmd__text', blk).forEach((span) => showTyped(span, Infinity));
+  };
+
+  const typeCommand = async (cmd, screen, mine) => {
+    const span = $('.cmd__text', cmd);
+    const length = span.dataset.text.length;
+    const step = Math.max(1, Math.ceil(length / 34));
+    for (let i = 0; i < length; i += step) {
+      if (token(screen) !== mine) return;
+      showTyped(span, i);
+      await wait(16);
     }
+    showTyped(span, Infinity);
+  };
 
-    selectTab("shell");
-  }
+  const scrollTerm = (screen, blk) => {
+    const term = $('.term', screen);
+    term.scrollTo({ top: Math.max(0, blk.offsetTop - 12), behavior: reduceMotion.matches ? 'auto' : 'smooth' });
+  };
 
-  function initComparisonTabs() {
-    const buttons = document.querySelectorAll("[data-compare-tab]");
-    const gitMeta = document.getElementById("compare-git-meta");
-    const gitCode = document.getElementById("compare-git-code");
-    const ozMeta = document.getElementById("compare-oz-meta");
-    const ozCode = document.getElementById("compare-oz-code");
-    const takeaway = document.getElementById("compare-takeaway");
-
-    function selectCompare(key) {
-      const item = COMPARISONS[key];
-      if (!item || !gitCode || !ozCode) return;
-
-      buttons.forEach((btn) => {
-        const active = btn.getAttribute("data-compare-tab") === key;
-        btn.classList.toggle("is-active", active);
-        btn.setAttribute("aria-selected", String(active));
-      });
-
-      if (gitMeta) gitMeta.textContent = item.gitMeta;
-      gitCode.textContent = item.gitCode;
-      if (ozMeta) ozMeta.textContent = item.ozMeta;
-      ozCode.textContent = item.ozCode;
-      if (takeaway) takeaway.textContent = item.takeaway;
+  const playBlocks = async (screen, blocks, follow = true) => {
+    cancel(screen);
+    const mine = token(screen);
+    if (reduceMotion.matches) {
+      blocks.forEach(settle);
+      if (follow && blocks[0]) scrollTerm(screen, blocks[0]);
+      return true;
     }
-
-    buttons.forEach((btn) => {
-      btn.addEventListener("click", () => selectCompare(btn.getAttribute("data-compare-tab")));
+    blocks.forEach((blk) => {
+      settle(blk);
+      $$('.cmd, .out, .note', blk).forEach((el) => el.classList.add('is-wait'));
     });
-
-    selectCompare("worktrees");
-  }
-
-  function renderBenchmarks() {
-    const container = document.getElementById("bench-cards");
-    const banner = document.getElementById("bench-status-banner");
-    if (!container) return;
-
-    if (banner && BENCHMARK_DATA.measured) {
-      banner.classList.add("is-live");
-      const title = document.getElementById("bench-status-title");
-      const detail = document.getElementById("bench-status-detail");
-      if (title) title.textContent = "Live v1.0.0 Measured Benchmark Results";
-      if (detail && BENCHMARK_DATA.environment) {
-        detail.textContent = BENCHMARK_DATA.environment;
+    for (const blk of blocks) {
+      if (follow) scrollTerm(screen, blk);
+      for (const el of $$('.cmd, .out, .note', blk)) {
+        if (token(screen) !== mine) return false;
+        el.classList.remove('is-wait');
+        if (el.classList.contains('cmd')) {
+          await typeCommand(el, screen, mine);
+          await wait(160);
+        } else {
+          await wait(el.classList.contains('note') ? 520 : 240);
+        }
       }
     }
+    return token(screen) === mine;
+  };
 
-    container.textContent = "";
-    BENCHMARK_DATA.suites.forEach((suite) => {
-      const card = document.createElement("article");
-      card.className = "bench-card";
+  /* The pinned session */
+  const moves = $$('.move');
+  const screens = moves.map((move) => $('.screen', move));
+  const played = new WeakSet();
+  const gated = new Map();
 
-      const head = document.createElement("div");
-      head.className = "bench-card-head";
+  screens.forEach((screen) => {
+    const btn = $('[data-advance]', screen);
+    if (!btn || reduceMotion.matches) return;
+    const blocks = $$('.blk[data-gate]', screen);
+    const info = {
+      btn,
+      blocks,
+      labels: btn.dataset.labels.split('|'),
+      max: Math.max(...blocks.map((blk) => Number(blk.dataset.gate))),
+      step: 0,
+      touched: false,
+      timer: 0,
+    };
+    gated.set(screen, info);
+    blocks.forEach((blk) => { blk.hidden = Number(blk.dataset.gate) > 0; });
+    btn.closest('.screen__bar').hidden = false;
+    btn.addEventListener('click', () => advance(screen, true));
+  });
 
-      const h3 = document.createElement("h3");
-      h3.textContent = suite.title;
+  const queueNext = (screen) => {
+    const info = gated.get(screen);
+    if (!info || info.touched || info.step >= info.max) return;
+    clearTimeout(info.timer);
+    info.timer = setTimeout(() => {
+      // Below the pinned layout a new block adds height, so only grow a
+      // terminal the visitor is looking at.
+      const box = screen.getBoundingClientRect();
+      if (pinned.matches || (box.bottom > 0 && box.top < innerHeight)) advance(screen, false);
+    }, 2200);
+  };
 
-      const badge = document.createElement("span");
-      badge.className = "bench-target";
-      badge.textContent = suite.target;
-
-      head.appendChild(h3);
-      head.appendChild(badge);
-      card.appendChild(head);
-
-      suite.metrics.forEach((metric) => {
-        const row = document.createElement("div");
-        row.className = "bench-metric-row";
-
-        const lbl = document.createElement("span");
-        lbl.className = "bench-metric-label";
-        lbl.textContent = metric.label;
-
-        const val = document.createElement("span");
-        val.className = "bench-metric-value";
-        val.textContent = metric.value;
-
-        row.appendChild(lbl);
-        row.appendChild(val);
-        card.appendChild(row);
+  async function advance(screen, byUser) {
+    const info = gated.get(screen);
+    clearTimeout(info.timer);
+    if (byUser) info.touched = true;
+    if (info.step >= info.max) {
+      cancel(screen);
+      info.step = 0;
+      info.blocks.forEach((blk) => {
+        settle(blk);
+        blk.hidden = Number(blk.dataset.gate) > 0;
       });
+      info.btn.textContent = info.labels[0];
+      $('.term', screen).scrollTo({ top: 0 });
+      return;
+    }
+    info.step += 1;
+    info.btn.textContent = info.labels[info.step];
+    const next = info.blocks.filter((blk) => Number(blk.dataset.gate) === info.step);
+    next.forEach((blk) => { blk.hidden = false; });
+    if (await playBlocks(screen, next)) queueNext(screen);
+  }
 
-      container.appendChild(card);
+  const play = async (index) => {
+    const screen = screens[index];
+    if (!screen || played.has(screen)) return;
+    played.add(screen);
+    const first = $$('.blk[data-gate="0"]', screen);
+    // The first blocks start at the top of the terminal, so nothing to follow.
+    if (await playBlocks(screen, first, false)) queueNext(screen);
+  };
+
+  const activate = (index) => {
+    moves.forEach((move, i) => {
+      move.classList.toggle('is-active', i === index);
+      screens[i].classList.toggle('is-active', i === index);
+    });
+    if (pinned.matches) play(index);
+  };
+
+  if (moves.length) {
+    const texts = moves.map((move) => $('.move__text', move));
+    // Whichever move's text crosses the middle of the viewport owns the screen.
+    const atCentre = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) activate(texts.indexOf(entry.target));
+      });
+    }, { rootMargin: '-45% 0px -45% 0px' });
+    texts.forEach((text) => atCentre.observe(text));
+
+    // Below the pinned layout each screen sits under its own text, so it
+    // plays when it comes into view instead.
+    const whenSeen = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting && !pinned.matches) play(screens.indexOf(entry.target));
+      });
+    }, { threshold: 0.3 });
+    screens.forEach((screen) => whenSeen.observe(screen));
+  }
+
+  /* Move 1: pick files and hunks by ID, then commit them. Every result is
+     the output oz printed for that exact combination. */
+  const data = window.OZ_SESSION;
+  const statusOut = $('#pick-status');
+  if (data && statusOut) {
+    const screen = statusOut.closest('.screen');
+    const units = ['f1', 'f2', 'h3a', 'h3b', 'h3c', 'h3d'];
+    const fileHunks = { f3: ['h3a', 'h3b', 'h3c', 'h3d'] };
+    const selected = new Set(['f2', 'h3a', 'h3b', 'h3d']);
+    const message = 'feat(auth): verify PKCE code verifier';
+    const bar = $('#pick-bar');
+    const cmdOut = $('#pick-cmd');
+    const runBtn = $('#pick-run');
+    const result = $('#pick-result');
+    const peekBlock = $('#pick-peek');
+    let ran = false;
+
+    $$('.id', statusOut).forEach((span) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'id';
+      btn.textContent = span.textContent;
+      Object.assign(btn.dataset, span.dataset);
+      span.replaceWith(btn);
+    });
+    const ids = $$('button.id', statusOut);
+
+    const renderDiff = (text) => {
+      const frag = document.createDocumentFragment();
+      text.split('\n').forEach((line, i, all) => {
+        const span = document.createElement('span');
+        if (/^(diff |--- |\+\+\+ |@@)/.test(line)) span.className = 'd-meta';
+        else if (line.startsWith('+')) span.className = 'd-add';
+        else if (line.startsWith('-')) span.className = 'd-del';
+        span.textContent = line + (i < all.length - 1 ? '\n' : '');
+        frag.append(span);
+      });
+      return frag;
+    };
+
+    const peek = (hunk) => {
+      setCommand($('#pick-peek-cmd'), `oz diff ${hunk}`);
+      $('#pick-peek-out').replaceChildren(renderDiff(data.diff[hunk]));
+    };
+
+    const isOn = (pick) => (fileHunks[pick] ? fileHunks[pick].every((h) => selected.has(h)) : selected.has(pick));
+    const key = () => units.filter((unit) => selected.has(unit)).join(' ');
+    const command = () => `oz commit -m "${message}" --pick ${key()}`.trim();
+
+    const sync = () => {
+      ids.forEach((btn) => {
+        btn.setAttribute('aria-pressed', String(isOn(btn.dataset.pick)));
+        btn.disabled = ran;
+      });
+      setCommand(cmdOut, command());
+      cmdOut.classList.toggle('is-wait', ran);
+      runBtn.disabled = !ran && selected.size === 0;
+      runBtn.textContent = ran ? 'Reset' : 'Run commit';
+    };
+
+    ids.forEach((btn) => {
+      btn.setAttribute('aria-label', `${btn.dataset.pick.startsWith('f') ? 'File' : 'Hunk'} ${btn.textContent}`);
+      btn.addEventListener('click', () => {
+        const pick = btn.dataset.pick;
+        const group = fileHunks[pick] || [pick];
+        const turnOff = isOn(pick);
+        group.forEach((unit) => (turnOff ? selected.delete(unit) : selected.add(unit)));
+        if (btn.dataset.peek) peek(btn.dataset.peek);
+        sync();
+      });
+    });
+
+    runBtn.addEventListener('click', () => {
+      if (ran) {
+        ran = false;
+        cancel(screen);
+        settle(result);
+        result.hidden = true;
+        peekBlock.hidden = false;
+        sync();
+        $('.term', screen).scrollTo({ top: 0, behavior: reduceMotion.matches ? 'auto' : 'smooth' });
+        return;
+      }
+      const entry = data.pick[key()];
+      if (!entry) return;
+      ran = true;
+      setCommand($('#pick-result-cmd'), command());
+      // The diff has done its job once the commit runs, and without it the
+      // status and the result fit the terminal with no scrolling.
+      peekBlock.hidden = true;
+      $('#pick-result-out').textContent = entry[0];
+      $('#pick-after-out').textContent = entry[1];
+      result.hidden = false;
+      live.textContent = entry[0];
+      sync();
+      playBlocks(screen, [result]);
+    });
+
+    peek('h3c');
+    result.hidden = true;
+    bar.hidden = false;
+    sync();
+  }
+
+  /* Move 5: dim the lines a person wrote. A view on this page, not an oz flag. */
+  const blameBtn = $('#blame-filter');
+  if (blameBtn) {
+    blameBtn.closest('.screen__bar').hidden = false;
+    blameBtn.addEventListener('click', () => {
+      const on = blameBtn.getAttribute('aria-pressed') !== 'true';
+      blameBtn.setAttribute('aria-pressed', String(on));
+      $('#blame-out').classList.toggle('is-ai-only', on);
     });
   }
 
-  initTheme();
-  initInstallTabs();
-  initComparisonTabs();
-  renderBenchmarks();
+  /* One reveal, used once per block */
+  const reveals = $$('[data-reveal]');
+  if (reveals.length) {
+    const seen = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        entry.target.classList.add('is-in');
+        seen.unobserve(entry.target);
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -6% 0px' });
+    reveals.forEach((el) => seen.observe(el));
+  }
+
+  /* Install methods, preselected for the visitor's system */
+  const sw = $('[data-switch]');
+  if (sw) {
+    const tabs = $$('[role="tab"]', sw);
+    const select = (tab, focus) => {
+      tabs.forEach((other) => {
+        const on = other === tab;
+        other.setAttribute('aria-selected', String(on));
+        other.tabIndex = on ? 0 : -1;
+        document.getElementById(other.getAttribute('aria-controls')).hidden = !on;
+      });
+      if (focus) tab.focus();
+    };
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => select(tab, false));
+      tab.addEventListener('keydown', (event) => {
+        const move = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
+        if (move) {
+          event.preventDefault();
+          select(tabs[(i + move + tabs.length) % tabs.length], true);
+        } else if (event.key === 'Home' || event.key === 'End') {
+          event.preventDefault();
+          select(tabs[event.key === 'Home' ? 0 : tabs.length - 1], true);
+        }
+      });
+    });
+    const platform = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '').toLowerCase();
+    const onWindows = platform.includes('win');
+    select(onWindows ? $('#tab-ps') : tabs[0], false);
+    if (onWindows) $('#hero-cmd').textContent = $('#code-ps').textContent;
+  }
 })();

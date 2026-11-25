@@ -1,306 +1,451 @@
-<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ozone (oz) — Pure-Rust CoW Git Client for the Multi-Agent Era</title>
-  <meta name="description" content="Zero-byte Copy-on-Write workspaces, warm build caches, stage-free hunk commits, sub-10ms undo, collision radar, and MCP — 100% colocated inside standard .git/ repositories.">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ozone: a Git client for running coding agents in parallel</title>
+  <meta name="description" content="Ozone (oz) spawns 20 isolated copy-on-write Git workspaces with warm build caches in under half a second, inside the .git you already have.">
+  <meta name="theme-color" content="#0f1216">
+  <script>document.documentElement.classList.add('js');</script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Host+Grotesk:wght@400;500&family=Atkinson+Hyperlegible+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to content</a>
+  <a class="skip" href="#main">Skip to content</a>
 
-  <header class="site-header">
-    <div class="container header-inner">
-      <a class="brand" href="#top" aria-label="Ozone Home">
-        <span class="brand-mark" aria-hidden="true">O<sub>3</sub></span>
-        <span class="brand-name">ozone</span>
-        <span class="version-pill">v1.1.0</span>
-      </a>
-
-      <nav class="site-nav" aria-label="Primary">
-        <a href="#install">Install</a>
-        <a href="#compare">git vs oz</a>
-        <a href="#architecture">Architecture</a>
+  <header class="nav">
+    <div class="container nav__in">
+      <a class="nav__mark" href="#top" aria-label="Ozone, back to top">Ozone</a>
+      <p class="nav__status" id="nav-status" aria-hidden="true"></p>
+      <nav class="nav__links" aria-label="Primary">
+        <a href="#session">Session</a>
         <a href="#benchmarks">Benchmarks</a>
-        <a href="#docs">Docs</a>
+        <a href="#questions">Questions</a>
         <a href="https://github.com/Gaalix/git-ozone">GitHub</a>
+        <a class="btn btn--quiet btn--nav" href="#install">Install</a>
       </nav>
-
-      <div class="header-actions">
-        <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle color theme" title="Toggle dark/light theme">
-          <span class="theme-icon" aria-hidden="true"></span>
-          <span class="theme-label">Theme</span>
-        </button>
-      </div>
     </div>
   </header>
 
   <main id="main">
-    <section id="top" class="hero">
-      <div class="container">
-        <div class="hero-badges">
-          <span class="badge">Pure Rust &middot; Zero C Bindings</span>
-          <span class="badge">100% Colocated <code>.git/</code></span>
-          <span class="badge">MIT / Apache-2.0</span>
-        </div>
-
-        <h1 class="hero-title">
-          Git speed &amp; zero-byte workspaces for the <span class="accent">multi-agent era</span>.
-        </h1>
-
-        <p class="hero-subtitle">
-          <strong>Ozone (<code>oz</code> / <code>git-ozone</code>)</strong> spawns 20 isolated Copy-on-Write worktrees with warm <code>target/</code>, <code>node_modules/</code>, and <code>.venv/</code> caches in milliseconds — with lock-free MVCC <code>oz undo</code>, stage-free hunk commits, collision radar, GitHub stacked PRs, and built-in <code>oz mcp</code>.
-        </p>
-
-        <div id="install" class="install-card" aria-label="Install Ozone">
-          <div class="install-header">
-            <div class="tab-list" role="tablist" aria-label="Install method">
-              <button class="tab-btn is-active" role="tab" aria-selected="true" data-install-tab="shell" type="button">Linux / macOS</button>
-              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="cargo" type="button">Cargo</button>
-              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="homebrew" type="button">macOS / Brew</button>
-              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="deb" type="button">Ubuntu / .deb</button>
-              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="powershell" type="button">PowerShell</button>
-              <button class="tab-btn" role="tab" aria-selected="false" data-install-tab="winget" type="button">Windows winget</button>
+    <section class="hero" id="top">
+      <div class="container hero__in">
+        <div class="hero__text">
+          <h1>Twenty workspaces in half a second.</h1>
+          <p class="lead">A Git client that gives each coding agent a warm, copy-on-write workspace.</p>
+          <div class="hero__actions">
+            <div class="cmdline">
+              <code class="cmdline__code" id="hero-cmd">curl -fsSL https://<wbr>raw.githubusercontent.com/<wbr>Gaalix/<wbr>git-ozone/<wbr>main/<wbr>packaging/<wbr>install.sh | bash</code>
+              <button class="btn btn--primary" type="button" data-copy="#hero-cmd">Copy</button>
             </div>
-            <button id="copy-install-btn" class="copy-btn" type="button">Copy</button>
-          </div>
-
-          <pre class="install-code"><code id="install-command">curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash</code></pre>
-
-          <div class="install-footer">
-            <span id="install-note" class="install-note">Installs <code>oz</code>, <code>git-ozone</code>, and <code>oz-vfsd</code>. Run <code>oz doctor</code> to verify filesystem &amp; auth readiness.</span>
-            <span id="copy-status" class="sr-only" aria-live="polite"></span>
+            <a class="link" href="https://github.com/Gaalix/git-ozone/blob/main/docs/quickstart.md">Read the quickstart</a>
           </div>
         </div>
 
-        <div class="hero-ctas">
-          <a class="btn btn-primary" href="https://github.com/Gaalix/git-ozone/blob/main/docs/quickstart.md">60-Second Quickstart</a>
-          <a class="btn btn-secondary" href="https://github.com/Gaalix/git-ozone/blob/main/docs/migration-from-git-worktree.md">Migrate from git worktree</a>
-          <a class="btn btn-secondary" href="https://github.com/Gaalix/git-ozone/blob/main/docs/json-schema-reference.md">oz.v1 JSON Schema</a>
+        <figure class="race" id="race" data-slot="hero" data-kind="product" data-alt="The 20-workspace spawn benchmark, replayed at its measured speed">
+          <div class="race__head">
+            <p class="race__title">20 workspaces, each with a 5,000 MiB build cache</p>
+            <button class="btn btn--quiet btn--small" type="button" id="race-replay" hidden>Replay</button>
+          </div>
+
+          <div class="lane lane--oz" data-lane="oz">
+            <p class="lane__name"><code>oz ws spawn</code></p>
+            <div class="lane__cells" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <dl class="lane__read">
+              <div><dt>Time</dt><dd class="reading" data-read="time">444.5 ms</dd></div>
+              <div><dt>Extra disk</dt><dd class="reading" data-read="disk">1.84 MiB</dd></div>
+              <div><dt>Ready</dt><dd class="reading" data-read="count">20 of 20</dd></div>
+            </dl>
+          </div>
+
+          <div class="lane lane--git" data-lane="git">
+            <p class="lane__name"><code>git worktree add</code>, then copy the cache</p>
+            <div class="lane__cells" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <dl class="lane__read">
+              <div><dt>Time</dt><dd class="reading" data-read="time">22.78 s</dd></div>
+              <div><dt>Extra disk</dt><dd class="reading" data-read="disk">97.96 GiB</dd></div>
+              <div><dt>Ready</dt><dd class="reading" data-read="count">20 of 20</dd></div>
+            </dl>
+          </div>
+
+          <figcaption class="race__cap">
+            <span id="race-note">Replayed at the speed it was measured: oz 1.0.0 against git 2.55.0 on ext4.</span>
+            <a class="link" href="#benchmarks">See every number</a>
+          </figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="session" id="session">
+      <div class="container">
+        <header class="head" data-reveal>
+          <h2>Now drive a real session</h2>
+          <p class="lead">Every line is real output from oz 1.1.0 in a scratch repository.</p>
+        </header>
+
+        <div class="moves">
+          <article class="move is-active" data-move="pick">
+            <div class="move__text">
+              <h3>Commit the fix, skip the debug prints</h3>
+              <p>Click file and hunk IDs to pick them. There is no staging area and no patch prompt.</p>
+            </div>
+            <figure class="screen is-active" data-slot="session-pick" data-kind="product" data-alt="oz status and a partial commit by file and hunk ID">
+              <figcaption class="screen__cap">shop-api, branch main</figcaption>
+              <div class="term" tabindex="0" aria-label="Terminal output">
+                <div class="blk" data-gate="0">
+                  <p class="cmd"><span class="cmd__text">oz status</span></p>
+                  <pre class="out" id="pick-status">On branch main
+  [<span class="id" data-pick="f1">f1</span>] M  crates/auth/src/debug.rs (+1/-1) (hunks: <span class="id" data-pick="f1" data-peek="h1a">h1a</span>)
+  [<span class="id" data-pick="f2">f2</span>] A  crates/auth/src/pkce.rs (+22/-0) (hunks: <span class="id" data-pick="f2" data-peek="h2a">h2a</span>)
+  [<span class="id" data-pick="f3">f3</span>] M  crates/auth/src/token.rs (+6/-1) (hunks: <span class="id" data-pick="h3a" data-peek="h3a">h3a</span>, <span class="id" data-pick="h3b" data-peek="h3b">h3b</span>, <span class="id" data-pick="h3c" data-peek="h3c">h3c</span>, <span class="id" data-pick="h3d" data-peek="h3d">h3d</span>)</pre>
+                </div>
+                <div class="blk" id="pick-peek" data-gate="0">
+                  <p class="cmd"><span class="cmd__text" id="pick-peek-cmd">oz diff h3c</span></p>
+                  <pre class="out out--code" id="pick-peek-out"><span class="d-meta">diff --ozone [f3] a/crates/auth/src/token.rs b/crates/auth/src/token.rs
+--- a/crates/auth/src/token.rs
++++ b/crates/auth/src/token.rs
+@@ -21,6 +25,7 @@ [h3c]</span>
+ }
+
+ pub fn is_expired(token: &amp;Token, elapsed: u64) -&gt; bool {
+<span class="d-add">+    eprintln!("DEBUG is_expired elapsed={elapsed}");</span>
+     elapsed &gt;= token.expires_in
+ }</pre>
+                </div>
+                <div class="blk" id="pick-result">
+                  <p class="cmd"><span class="cmd__text" id="pick-result-cmd">oz commit -m "feat(auth): verify PKCE code verifier" --pick f2 h3a h3b h3d</span></p>
+                  <pre class="out" id="pick-result-out">[main 2a0c8c4e2dd7] 2 file(s) committed (2 dirty remaining, Change-Id: I492d3094130c9cf6648aa278085b76f3ffd4f5fd)</pre>
+                  <p class="cmd"><span class="cmd__text">oz status</span></p>
+                  <pre class="out" id="pick-after-out">On branch main
+  [f1] M  crates/auth/src/debug.rs (+1/-1) (hunks: h1a)
+  [f2] M  crates/auth/src/token.rs (+1/-0) (hunks: h2a)</pre>
+                </div>
+              </div>
+              <div class="screen__bar" id="pick-bar" hidden>
+                <code class="screen__next" id="pick-cmd">oz commit -m "feat(auth): verify PKCE code verifier" --pick</code>
+                <button class="btn btn--quiet btn--small" type="button" id="pick-run" disabled>Run commit</button>
+              </div>
+            </figure>
+          </article>
+
+          <article class="move" data-move="undo">
+            <div class="move__text">
+              <h3>Take back a bad refactor</h3>
+              <p>A checkpoint costs milliseconds, so an agent can save one after every tool call.</p>
+            </div>
+            <figure class="screen" data-slot="session-undo" data-kind="product" data-alt="oz checkpoint, a destructive edit, and oz undo restoring two files">
+              <figcaption class="screen__cap">shop-api, branch main</figcaption>
+              <div class="term" tabindex="0" aria-label="Terminal output">
+                <div class="blk" data-gate="0">
+                  <p class="cmd"><span class="cmd__text">oz checkpoint -m "before refactor"</span></p>
+                  <pre class="out">checkpoint op_01M8AAFBA50QRS2962Y8ZGYQNG saved (0 dirty file(s), tree 7412399bf9d8)</pre>
+                </div>
+                <div class="blk" data-gate="1">
+                  <p class="note">An agent deletes pkce.rs and guts the token exchange.</p>
+                  <p class="cmd"><span class="cmd__text">oz status</span></p>
+                  <pre class="out">On branch main
+  [f1] <span class="d-del">D</span>  crates/auth/src/pkce.rs (+0/-22) (hunks: h1a)
+  [f2] M  crates/auth/src/token.rs (+2/-11) (hunks: h2a)</pre>
+                </div>
+                <div class="blk" data-gate="2">
+                  <p class="cmd"><span class="cmd__text">oz undo</span></p>
+                  <pre class="out">undid 1 op(s) -&gt; op_01M8AAFCDFXFTGD1YHENPQK6WB (2 file(s) restored, <span class="hl">3.42 ms</span>)</pre>
+                  <p class="cmd"><span class="cmd__text">oz status</span></p>
+                  <pre class="out">On branch main
+nothing to commit, working tree clean</pre>
+                </div>
+              </div>
+              <div class="screen__bar" hidden>
+                <button class="btn btn--quiet btn--small" type="button" data-advance data-labels="Let the agent refactor|Run oz undo|Start over">Let the agent refactor</button>
+              </div>
+            </figure>
+          </article>
+
+          <article class="move" data-move="radar">
+            <div class="move__text">
+              <h3>Catch a collision before the merge</h3>
+              <p>Each agent works in its own scoped workspace. Radar reads them all at once.</p>
+            </div>
+            <figure class="screen" data-slot="session-radar" data-kind="product" data-alt="Two scoped workspaces, a scope guardrail, and oz radar reporting overlapping hunks">
+              <figcaption class="screen__cap">shop-api, two agent workspaces</figcaption>
+              <div class="term" tabindex="0" aria-label="Terminal output">
+                <div class="blk" data-gate="0">
+                  <p class="cmd"><span class="cmd__text">oz ws spawn agent-auth --from main --scope "crates/auth/**" --deny "Cargo.lock"</span></p>
+                  <pre class="out">spawned workspace 'agent-auth' on branch 'agent-auth' (clean @ 424e2a32e2c2, linux_fuse3, <span class="hl">21.1 ms</span>) -&gt; /home/dev/shop-api.oz/agent-auth</pre>
+                  <p class="cmd"><span class="cmd__text">oz ws spawn agent-billing --from main --scope "crates/billing/**" --deny "Cargo.lock"</span></p>
+                  <pre class="out">spawned workspace 'agent-billing' on branch 'agent-billing' (clean @ 424e2a32e2c2, linux_fuse3, <span class="hl">15.2 ms</span>) -&gt; /home/dev/shop-api.oz/agent-billing</pre>
+                </div>
+                <div class="blk" data-gate="1">
+                  <p class="note">agent-billing also edits a token line that agent-auth has already changed.</p>
+                  <p class="cmd"><span class="cmd__text">oz commit -m "feat(billing): outstanding balance"</span></p>
+                  <pre class="out"><span class="d-del">error: guardrail violation (out_of_scope): 'crates/auth/src/token.rs' is outside workspace allowed scope</span>
+hint: Adjust workspace changes or re-run with --allow-out-of-scope to override.</pre>
+                </div>
+                <div class="blk" data-gate="2">
+                  <p class="cmd"><span class="cmd__text">oz radar</span></p>
+                  <pre class="out">Radar base=main (2 workspace(s) scanned)
+  <span class="hl">[overlapping_hunks]</span> crates/auth/src/token.rs  (agent-auth:9-9, 23-23, agent-billing:23-23) -&gt; Pause agent-billing or serialize integration after agent-auth</pre>
+                </div>
+              </div>
+              <div class="screen__bar" hidden>
+                <button class="btn btn--quiet btn--small" type="button" data-advance data-labels="Let agent-billing stray|Run oz radar|Start over">Let agent-billing stray</button>
+              </div>
+            </figure>
+          </article>
+
+          <article class="move" data-move="integrate">
+            <div class="move__text">
+              <h3>Merge only when the tests pass</h3>
+              <p>Integration runs in memory. The main branch moves only if the verify command exits 0.</p>
+            </div>
+            <figure class="screen" data-slot="session-integrate" data-kind="product" data-alt="oz integrate merging two agent workspaces into main behind a test gate">
+              <figcaption class="screen__cap">shop-api, branch main</figcaption>
+              <div class="term" tabindex="0" aria-label="Terminal output">
+                <div class="blk" data-gate="0">
+                  <p class="cmd"><span class="cmd__text">oz radar</span></p>
+                  <pre class="out">Radar base=main (2 workspace(s) scanned)
+no collisions detected</pre>
+                </div>
+                <div class="blk" data-gate="1">
+                  <p class="cmd"><span class="cmd__text">oz integrate agent-auth agent-billing --into main --verify "cargo test --target-dir verify-target"</span></p>
+                  <pre class="out"><span class="d-add">Integrated [agent-auth, agent-billing] into main (84c4b67b9e58)</span></pre>
+                  <p class="cmd"><span class="cmd__text">oz log --oneline -n 4</span></p>
+                  <pre class="out out--code">* 84c4b67 (HEAD -&gt; main) Merge 'agent-billing' into main
+|\
+* | b5762bb Merge 'agent-auth' into main
+|\|
+| | * a315215 (agent-billing) <span class="who-ai">[AI:cursor]</span> feat(billing): outstanding balance
+| * 09d13b2 (agent-auth) <span class="who-ai">[AI:claude-code]</span> feat(auth): shorten token lifetime to 15 minutes</pre>
+                </div>
+              </div>
+              <div class="screen__bar" hidden>
+                <button class="btn btn--quiet btn--small" type="button" data-advance data-labels="Run oz integrate|Start over">Run oz integrate</button>
+              </div>
+            </figure>
+          </article>
+
+          <article class="move" data-move="blame">
+            <div class="move__text">
+              <h3>See which lines an agent wrote</h3>
+              <p>Authorship lives in <code>refs/notes/ai</code>, where plain git can read it too.</p>
+            </div>
+            <figure class="screen" data-slot="session-blame" data-kind="product" data-alt="oz blame marking each line as written by a person or by an agent">
+              <figcaption class="screen__cap">shop-api, branch main</figcaption>
+              <div class="term" tabindex="0" aria-label="Terminal output">
+                <div class="blk" data-gate="0">
+                  <p class="cmd"><span class="cmd__text">oz blame crates/auth/src/token.rs</span></p>
+                  <pre class="out out--code" id="blame-out"><span class="bl">crates/auth/src/token.rs @ 84c4b67b (42 lines: 39 human, 3 agent / 7.14% AI)</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span> 7 | }</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span> 8 | </span><span class="bl" data-who="ai"><span class="bl__meta">09d13b22 </span><span class="who-ai">[AI:claude-code]</span> <span class="bl__meta">(auth-ttl       2026-11-25) </span> 9 | pub const TTL_SECS: u64 = 900;</span><span class="bl" data-who="ai"><span class="bl__meta">09d13b22 </span><span class="who-ai">[AI:claude-code]</span> <span class="bl__meta">(auth-ttl       2026-11-25) </span>10 | </span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>11 | pub struct Token {</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>12 |     pub access: String,</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>13 |     pub expires_in: u64,</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>14 | }</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>15 | </span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>16 | pub fn exchange(req: &amp;TokenRequest) -&gt; Result&lt;Token, String&gt; {</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>17 |     if req.code.is_empty() {</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>18 |         return Err("missing authorization code".into());</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>19 |     }</span><span class="bl" data-who="human"><span class="bl__meta">d61ce8b1 </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>20 |     if !crate::pkce::is_valid_verifier(&amp;req.code_verifier) {</span><span class="bl" data-who="human"><span class="bl__meta">d61ce8b1 </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>21 |         return Err("invalid PKCE code verifier".into());</span><span class="bl" data-who="human"><span class="bl__meta">d61ce8b1 </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>22 |     }</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>23 |     Ok(Token {</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>24 |         access: format!("tok_{}", req.code),</span><span class="bl" data-who="ai"><span class="bl__meta">09d13b22 </span><span class="who-ai">[AI:claude-code]</span> <span class="bl__meta">(auth-ttl       2026-11-25) </span>25 |         expires_in: TTL_SECS,</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>26 |     })</span><span class="bl" data-who="human"><span class="bl__meta">f37d806e </span><span class="who-human">[human]</span>          <span class="bl__meta">(maintainer     2026-11-25) </span>27 | }</span></pre>
+                </div>
+              </div>
+              <div class="screen__bar" hidden>
+                <button class="btn btn--quiet btn--small" type="button" id="blame-filter" aria-pressed="false">Highlight agent lines</button>
+              </div>
+            </figure>
+          </article>
         </div>
       </div>
     </section>
 
-    <section id="compare" class="section">
+    <section class="bench" id="benchmarks">
       <div class="container">
-        <div class="section-head">
-          <p class="eyebrow">Interactive CLI Comparison</p>
-          <h2>Fewer commands. Zero lock races. Zero interactive traps.</h2>
-          <p class="section-desc">Compare canonical C <code>git</code> workflows against native <code>oz</code> across everyday solo and parallel AI agent tasks.</p>
-        </div>
+        <header class="head head--split" data-reveal>
+          <h2>Measured, with the losses included</h2>
+          <p class="lead">One full run of oz 1.0.0 against git 2.55.0 on a Ryzen 9 7900X.</p>
+        </header>
 
-        <div class="compare-tabs" role="tablist" aria-label="Workflow comparison">
-          <button class="pill-btn is-active" role="tab" aria-selected="true" data-compare-tab="worktrees" type="button">Parallel Worktrees</button>
-          <button class="pill-btn" role="tab" aria-selected="false" data-compare-tab="hunk" type="button">Surgical Hunk Commit</button>
-          <button class="pill-btn" role="tab" aria-selected="false" data-compare-tab="integrate" type="button">Radar &amp; Atomic Merge</button>
-          <button class="pill-btn" role="tab" aria-selected="false" data-compare-tab="undo" type="button">Undo &amp; AI Provenance</button>
-        </div>
-
-        <div class="compare-grid">
-          <article class="code-panel panel-git">
-            <div class="panel-header">
-              <span class="panel-label">Traditional C <code>git</code></span>
-              <span id="compare-git-meta" class="panel-meta">Cold caches &middot; high disk &amp; lock contention</span>
+        <div class="readings" data-reveal>
+          <div class="read read--lead">
+            <p class="read__label">Spawn 20 warm workspaces</p>
+            <p class="read__now">444.5 ms</p>
+            <p class="read__was"><s>22.78 s</s> with git</p>
+            <div class="bars" aria-hidden="true">
+              <span>git</span><i class="bar bar--git"></i>
+              <span>oz</span><i class="bar bar--oz"></i>
             </div>
-            <pre><code id="compare-git-code"></code></pre>
-          </article>
-
-          <article class="code-panel panel-oz">
-            <div class="panel-header">
-              <span class="panel-label">Ozone <code>oz</code></span>
-              <span id="compare-oz-meta" class="panel-meta">Zero-byte CoW &middot; warm caches &middot; scoped</span>
-            </div>
-            <pre><code id="compare-oz-code"></code></pre>
-          </article>
+          </div>
+          <div class="read">
+            <p class="read__label">Extra disk for those 20</p>
+            <p class="read__was"><s>97.96 GiB</s> with git</p>
+            <p class="read__now">1.84 MiB</p>
+          </div>
+          <div class="read">
+            <p class="read__label">Status across 250,000 files</p>
+            <p class="read__was"><s>132.1 ms</s> with git</p>
+            <p class="read__now">4.4 ms</p>
+          </div>
+          <div class="read">
+            <p class="read__label">Lock errors, 10 agents on one index</p>
+            <p class="read__was"><s>22 of 30</s> with git</p>
+            <p class="read__now">0 of 30</p>
+          </div>
         </div>
 
-        <p id="compare-takeaway" class="compare-takeaway"></p>
+        <div class="losses" data-reveal>
+          <table class="table">
+            <caption>Where git is still faster</caption>
+            <thead>
+              <tr><th scope="col">Case</th><th scope="col" class="num">git</th><th scope="col" class="num">oz</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">20 cold worktrees, no build cache</th><td class="num">243.9 ms</td><td class="num">444.5 ms</td></tr>
+              <tr><th scope="row">Tiny commits per second</th><td class="num">1,131</td><td class="num">496</td></tr>
+              <tr><th scope="row">Four agent tasks, local wall time</th><td class="num">83.6 ms</td><td class="num">142.1 ms</td></tr>
+            </tbody>
+          </table>
+          <div class="losses__side">
+            <p>oz journals every change so it can undo it. That is the price.</p>
+            <a class="link" href="https://github.com/Gaalix/git-ozone/blob/main/docs/benchmarks.md">Read the method</a>
+            <code class="chipcode">./benchmarks/run_all.sh --full</code>
+          </div>
+        </div>
       </div>
     </section>
 
-    <section id="architecture" class="section section-alt">
-      <div class="container">
-        <div class="section-head">
-          <p class="eyebrow">Architecture Highlights</p>
-          <h2>Engineered from the filesystem up — in pure Rust.</h2>
-          <p class="section-desc">Zero <code>libgit2</code>, <code>OpenSSL</code>, or <code>libfuse</code> C library dependencies. Static binaries that probe your OS and automatically pick the fastest CoW backend.</p>
+    <section class="agents" id="agents">
+      <div class="container agents__in">
+        <div class="agents__text" data-reveal>
+          <h2>Seven commands become two</h2>
+          <p class="lead">The same selective commit, as an agent has to type it.</p>
+          <dl class="facts">
+            <div><dt>Commands across four agent tasks</dt><dd><s>50</s> 16</dd></div>
+            <div><dt>Tokens spent on them</dt><dd><s>4,257</s> 1,163</dd></div>
+            <div><dt>Harnesses wired by <code>oz agent setup</code></dt><dd class="facts__text">Claude Code, Cursor, Codex CLI, Windsurf, Antigravity</dd></div>
+            <div><dt>Tools served by <code>oz mcp</code></dt><dd>11</dd></div>
+          </dl>
         </div>
 
-        <div class="feature-grid">
-          <article class="feature-card">
-            <h3>Warm Cache &amp; <code>mtime</code> Preservation</h3>
-            <p>Auto-detects Rust (<code>target/</code>), Node/TS (<code>node_modules/</code>, <code>.next/</code>, <code>.turbo/</code>, <code>.vite/</code>), and Python (<code>.venv/</code> with shebang trampolines). Preserves baseline <code>mtime</code> on untouched files so Cargo and <code>tsc</code> hit warm artifacts immediately.</p>
-          </article>
+        <figure class="diff" data-slot="agent-diff" data-kind="product" data-alt="The git commands an agent runs for a selective commit, replaced by two oz commands" data-reveal>
+          <figcaption class="diff__cap"><span>git, 7 commands</span><span>oz, 2 commands</span></figcaption>
+          <ol class="diff__rows">
+            <li class="row--minus"><code>git status</code></li>
+            <li class="row--minus"><code>git diff crates/auth/src/session.rs</code></li>
+            <li class="row--minus"><code>git add crates/auth/src/verifier.rs</code></li>
+            <li class="row--minus"><code>git apply --cached -</code></li>
+            <li class="row--minus"><code>git diff --cached --stat</code></li>
+            <li class="row--minus"><code>git commit -m "feat(auth): honor max clock skew and add PKCE verifier"</code></li>
+            <li class="row--minus"><code>git status</code></li>
+            <li class="row--plus"><code>oz status</code></li>
+            <li class="row--plus"><code>oz commit -m "feat(auth): honor max clock skew and add PKCE verifier" --pick f2 h1a</code></li>
+          </ol>
+        </figure>
+      </div>
+    </section>
 
-          <article class="feature-card">
-            <h3>Lock-Free MVCC OpLog &amp; <code>oz undo</code></h3>
-            <p>Concurrent commits across 10+ workspaces never fail on <code>.git/index.lock</code> or <code>packed-refs.lock</code>. Every mutation and <code>oz checkpoint</code> appends an immutable OpLog entry for sub-10 ms <code>oz undo</code> / <code>oz redo</code>.</p>
-          </article>
-
-          <article class="feature-card">
-            <h3>Addressable IDs &amp; Built-In Guardrails</h3>
-            <p><code>oz status</code> and <code>oz diff</code> assign deterministic file (<code>f1</code>) and hunk (<code>h1a</code>) IDs. <code>oz commit --pick</code> builds trees in RAM while guarding against secrets, conflict markers, <code>&gt; 50 MB</code> blobs, and out-of-scope edits.</p>
-          </article>
-
-          <article class="feature-card">
-            <h3>Built-In <code>oz mcp</code> &amp; 5 Agent Harnesses</h3>
-            <p><code>oz agent setup</code> configures skills/rules and <code>oz checkpoint --quiet</code> hooks for Claude Code, Cursor, Codex CLI, Windsurf, and Antigravity. <code>oz mcp</code> serves 8 structured tools over stdio JSON-RPC 2.0.</p>
-          </article>
-
-          <article class="feature-card">
-            <h3>Native GitHub Stacked PRs &amp; CI Logs</h3>
-            <p>Pure-Rust Wire Protocol v2 (<code>--filter=blob:none</code>, <code>--atomic</code>, <code>--force-with-lease</code>), native Ed25519 SSH signing, <code>oz pr stack</code>, <code>oz sync</code>, and compact <code>oz ci --json</code> error excerpts for self-healing agent loops.</p>
-          </article>
-
-          <article class="feature-card">
-            <h3>Zero Lock-In &amp; <code>oz git</code> Shim</h3>
-            <p>Colocated inside <code>.git/</code> with real named branches and standard <code>refs/notes/ai</code> provenance. Optional <code>alias git="oz git"</code> intercepts 13 hot commands natively and wraps delegated legacy mutations in OpLog undo snapshots.</p>
-          </article>
-        </div>
-
-        <div class="matrix-wrap">
-          <h3 class="matrix-title">Tiered Cross-Platform CoW Matrix</h3>
-          <div class="table-scroll">
-            <table class="data-table">
+    <section class="faq" id="questions">
+      <div class="container faq__in">
+        <header class="head" data-reveal>
+          <h2>Before you install</h2>
+        </header>
+        <div class="faq__rows" data-reveal>
+          <details open>
+            <summary>Do I have to convert my repository?</summary>
+            <p>No. Ozone works inside the <code>.git</code> you already have, so git, gh, your editor and CI keep working.</p>
+          </details>
+          <details>
+            <summary>What if I stop using it?</summary>
+            <p>Delete <code>.git/ozone</code>. Your branches and commits were ordinary Git objects all along.</p>
+          </details>
+          <details>
+            <summary>Which filesystems get zero-copy workspaces?</summary>
+            <table class="table table--fs">
               <thead>
-                <tr>
-                  <th>Platform &amp; Filesystem</th>
-                  <th>Backend</th>
-                  <th>Untouched Disk Overhead</th>
-                  <th>Daemon</th>
-                </tr>
+                <tr><th scope="col">System</th><th scope="col">How oz clones</th><th scope="col">Daemon</th></tr>
               </thead>
               <tbody>
-                <tr>
-                  <td>macOS (<code>APFS</code>)</td>
-                  <td><code>apfs_clonefile</code> (<code>clonefile(2)</code>)</td>
-                  <td>Metadata only (0 data blocks)</td>
-                  <td>None</td>
-                </tr>
-                <tr>
-                  <td>Linux (<code>Btrfs</code>, <code>XFS</code>, <code>bcachefs</code>)</td>
-                  <td><code>linux_ficlone</code> (<code>ioctl(FICLONE)</code>)</td>
-                  <td>Metadata only (0 data blocks)</td>
-                  <td>None</td>
-                </tr>
-                <tr>
-                  <td>Linux (<code>ext4</code> default)</td>
-                  <td><code>linux_fuse3</code> (<code>oz-vfsd</code> + persistent <code>upper/</code>)</td>
-                  <td>0 bytes for untouched files</td>
-                  <td>Auto-managed user daemon</td>
-                </tr>
-                <tr>
-                  <td>Windows 11 (<code>Dev Drive / ReFS</code>)</td>
-                  <td><code>windows_refs_clone</code> (block clone)</td>
-                  <td>Metadata only (0 data blocks)</td>
-                  <td>None</td>
-                </tr>
-                <tr>
-                  <td>Windows 11 (<code>NTFS</code>)</td>
-                  <td><code>windows_proj_fs</code> (<code>oz-vfsd</code> ProjFS)</td>
-                  <td>0 bytes for untouched files</td>
-                  <td>Auto-managed user provider</td>
-                </tr>
-                <tr>
-                  <td>Containers / Fallback</td>
-                  <td><code>cas_hardlink</code> (immutable <code>0444</code>/<code>0555</code> deps)</td>
-                  <td>0 extra blocks for deps</td>
-                  <td>None</td>
-                </tr>
+                <tr><th scope="row">macOS, APFS</th><td><code>clonefile(2)</code></td><td>None</td></tr>
+                <tr><th scope="row">Linux, Btrfs, XFS or bcachefs</th><td><code>FICLONE</code></td><td>None</td></tr>
+                <tr><th scope="row">Linux, ext4</th><td>FUSE3 overlay</td><td>Managed for you</td></tr>
+                <tr><th scope="row">Windows 11, Dev Drive</th><td>ReFS block clone</td><td>None</td></tr>
+                <tr><th scope="row">Windows 11, NTFS</th><td>ProjFS</td><td>Managed for you</td></tr>
+                <tr><th scope="row">Containers</th><td>Hardlinked dependencies</td><td>None</td></tr>
               </tbody>
             </table>
-          </div>
+          </details>
+          <details>
+            <summary>What does it depend on?</summary>
+            <p>Nothing written in C. The binaries are static, pure Rust, with no libgit2, OpenSSL or libfuse.</p>
+          </details>
+          <details>
+            <summary>What does it cost?</summary>
+            <p>Nothing. Ozone is dual-licensed under MIT or Apache-2.0.</p>
+          </details>
         </div>
       </div>
     </section>
 
-    <section id="benchmarks" class="section">
+    <section class="install" id="install">
       <div class="container">
-        <div class="section-head">
-          <p class="eyebrow">Reproducible Benchmarks</p>
-          <h2>Measured honestly against real binaries.</h2>
-          <p class="section-desc">
-            Run <code>./benchmarks/run_all.sh</code> on your own machine to compare release <code>oz</code> vs. C <code>git</code> (and <code>jj</code> / <code>worktrunk</code> / <code>simgit</code> when installed).
-          </p>
-        </div>
+        <header class="head" data-reveal>
+          <h2>Install it in one line</h2>
+        </header>
 
-        <div class="bench-banner is-live" id="bench-status-banner">
-          <span class="status-dot" aria-hidden="true"></span>
-          <div>
-            <strong id="bench-status-title">Live v1.0.0 Full Benchmark Results — 7/7 ROADMAP Gates PASS (commit <code>4690cbee08b2</code>)</strong>
-            <p id="bench-status-detail">
-              Measured via <code>./benchmarks/run_all.sh --full</code> on AMD Ryzen 9 7900X (24 logical cores, 61.39 GiB RAM), Ubuntu Linux 7.3.0 (<code>ext4</code>, live <code>linux_fuse3</code> via <code>fusermount3 3.18.3</code>), comparing <code>oz 1.0.0</code> vs <code>git 2.55.0</code>, <code>jj 0.47.1</code>, and <code>worktrunk 0.83.0</code> across a 5 GB warm cache and 250k-file monorepo.
-            </p>
+        <div class="switch" data-switch data-reveal>
+          <div class="seg" role="tablist" aria-label="Install method">
+            <button type="button" role="tab" id="tab-shell" aria-controls="panel-shell" aria-selected="true">Shell</button>
+            <button type="button" role="tab" id="tab-cargo" aria-controls="panel-cargo" aria-selected="false" tabindex="-1">Cargo</button>
+            <button type="button" role="tab" id="tab-brew" aria-controls="panel-brew" aria-selected="false" tabindex="-1">Homebrew</button>
+            <button type="button" role="tab" id="tab-deb" aria-controls="panel-deb" aria-selected="false" tabindex="-1">Debian</button>
+            <button type="button" role="tab" id="tab-ps" aria-controls="panel-ps" aria-selected="false" tabindex="-1">PowerShell</button>
+            <button type="button" role="tab" id="tab-winget" aria-controls="panel-winget" aria-selected="false" tabindex="-1">winget</button>
           </div>
-        </div>
 
-        <div class="bench-grid" id="bench-cards"></div>
+          <div class="switch__panels">
+            <div class="panel" role="tabpanel" id="panel-shell" aria-labelledby="tab-shell">
+              <code id="code-shell">curl -fsSL https://raw.githubusercontent.com/<wbr>Gaalix/<wbr>git-ozone/<wbr>main/<wbr>packaging/<wbr>install.sh | bash</code>
+              <button class="btn btn--primary" type="button" data-copy="#code-shell">Copy</button>
+            </div>
+            <div class="panel" role="tabpanel" id="panel-cargo" aria-labelledby="tab-cargo">
+              <code id="code-cargo">cargo install --git https://github.com/<wbr>Gaalix/<wbr>git-ozone --locked oz-cli oz-vfsd</code>
+              <button class="btn btn--primary" type="button" data-copy="#code-cargo">Copy</button>
+            </div>
+            <div class="panel" role="tabpanel" id="panel-brew" aria-labelledby="tab-brew">
+              <code id="code-brew">brew install --formula https://raw.githubusercontent.com/<wbr>Gaalix/<wbr>git-ozone/<wbr>main/<wbr>packaging/<wbr>homebrew/<wbr>oz.rb</code>
+              <button class="btn btn--primary" type="button" data-copy="#code-brew">Copy</button>
+            </div>
+            <div class="panel" role="tabpanel" id="panel-deb" aria-labelledby="tab-deb">
+              <code id="code-deb">curl -fsSLO https://github.com/<wbr>Gaalix/<wbr>git-ozone/<wbr>releases/<wbr>download/<wbr>v1.1.0/<wbr>ozone_1.1.0_amd64.deb &amp;&amp; sudo apt install ./<wbr>ozone_1.1.0_amd64.deb</code>
+              <button class="btn btn--primary" type="button" data-copy="#code-deb">Copy</button>
+            </div>
+            <div class="panel" role="tabpanel" id="panel-ps" aria-labelledby="tab-ps">
+              <code id="code-ps">irm https://raw.githubusercontent.com/<wbr>Gaalix/<wbr>git-ozone/<wbr>main/<wbr>packaging/<wbr>install.ps1 | iex</code>
+              <button class="btn btn--primary" type="button" data-copy="#code-ps">Copy</button>
+            </div>
+            <div class="panel" role="tabpanel" id="panel-winget" aria-labelledby="tab-winget">
+              <code id="code-winget">winget install OzoneVCS.Ozone</code>
+              <button class="btn btn--primary" type="button" data-copy="#code-winget">Copy</button>
+            </div>
+          </div>
 
-        <p class="compare-takeaway">
-          <strong>Honest trade-offs:</strong> Raw cold <code>git worktree add</code> without build caches (<code>243.9 ms</code> / <code>12.2 ms</code> per ws) is still faster than warm <code>oz ws spawn</code> (<code>444.5 ms</code> incl. <code>79.7 ms</code> baseline capture), and C <code>git</code> achieves higher raw throughput on tiny 1-file distinct-branch commits (<code>1,131 c/s</code> vs <code>496 c/s</code> due to MVCC OpLog journaling).
-        </p>
-
-        <div class="bench-links">
-          <a class="btn btn-secondary" href="https://github.com/Gaalix/git-ozone/blob/main/docs/benchmarks.md">Read Full v1.0.0 Tables &amp; Methodology</a>
-          <a class="btn btn-secondary" href="https://github.com/Gaalix/git-ozone/blob/main/benchmarks/README.md">Reproduce Locally (run_all.sh)</a>
-        </div>
-      </div>
-    </section>
-
-    <section id="docs" class="section section-alt">
-      <div class="container">
-        <div class="section-head">
-          <p class="eyebrow">Documentation</p>
-          <h2>Everything you need to adopt Ozone cleanly.</h2>
-        </div>
-
-        <div class="docs-grid">
-          <a class="doc-card" href="https://github.com/Gaalix/git-ozone/blob/main/docs/quickstart.md">
-            <h3>Quickstart Guide</h3>
-            <p>Solo workflows, <code>.ozone.toml</code> config, <code>oz agent setup</code> for 5 harnesses, and <code>oz mcp</code>.</p>
-            <span class="doc-link">docs/quickstart.md &rarr;</span>
-          </a>
-
-          <a class="doc-card" href="https://github.com/Gaalix/git-ozone/blob/main/docs/migration-from-git-worktree.md">
-            <h3>Migrating from git worktree</h3>
-            <p>Command mapping table, colocated <code>.git/</code> safety, <code>oz git</code> shim, and zero-lock-in uninstall.</p>
-            <span class="doc-link">docs/migration-from-git-worktree.md &rarr;</span>
-          </a>
-
-          <a class="doc-card" href="https://github.com/Gaalix/git-ozone/blob/main/docs/json-schema-reference.md">
-            <h3>oz.v1 JSON Schema Reference</h3>
-            <p>Envelope contract, exit codes (<code>0</code>/<code>1</code>/<code>2</code>), deterministic IDs, command payloads, and 8 MCP tools.</p>
-            <span class="doc-link">docs/json-schema-reference.md &rarr;</span>
-          </a>
-
-          <a class="doc-card" href="https://github.com/Gaalix/git-ozone/blob/main/ARCHITECTURE.md">
-            <h3>Architecture Specification</h3>
-            <p>Crate boundaries, CoW &amp; VFS durability model, warm caches, MVCC OpLog, and open-core trait seams.</p>
-            <span class="doc-link">ARCHITECTURE.md &rarr;</span>
-          </a>
+          <ol class="next">
+            <li><code>oz doctor</code><span>checks your filesystem, signing key and GitHub login</span></li>
+            <li><code>oz agent setup</code><span>teaches your coding agents to use it</span></li>
+            <li><code>oz ws spawn agent-1 --from main</code><span>opens the first workspace</span></li>
+          </ol>
         </div>
       </div>
     </section>
   </main>
 
-  <footer class="site-footer">
-    <div class="container footer-inner">
-      <div class="footer-brand">
-        <strong>Ozone (<code>oz</code> / <code>git-ozone</code>)</strong>
-        <span>Dual-licensed MIT OR Apache-2.0</span>
-      </div>
-      <div class="footer-links">
+  <footer class="foot">
+    <div class="container foot__in">
+      <p class="foot__letter">Ozone is free software, written in Rust and released under MIT or Apache-2.0. Issues and pull requests are welcome.</p>
+      <p class="foot__sign">Gaalix, <time datetime="2026-11-24">24 November 2026</time>, v1.1.0</p>
+      <nav class="foot__links" aria-label="Project">
         <a href="https://github.com/Gaalix/git-ozone">GitHub</a>
-        <a href="https://github.com/Gaalix/git-ozone/blob/main/README.md">README</a>
-        <a href="https://github.com/Gaalix/git-ozone/blob/main/ROADMAP.md">Roadmap</a>
-        <a href="https://github.com/Gaalix/git-ozone/blob/main/docs/schemas/oz.v1.envelope.schema.json">JSON Schema</a>
-        <a href="https://github.com/Gaalix/git-ozone/blob/main/LICENSE-MIT">MIT</a>
-        <a href="https://github.com/Gaalix/git-ozone/blob/main/LICENSE-APACHE">Apache-2.0</a>
-      </div>
+        <a href="https://github.com/Gaalix/git-ozone/blob/main/docs/quickstart.md">Quickstart</a>
+        <a href="https://github.com/Gaalix/git-ozone/blob/main/docs/migration-from-git-worktree.md">Migrating from git worktree</a>
+        <a href="https://github.com/Gaalix/git-ozone/blob/main/ARCHITECTURE.md">Architecture</a>
+        <a href="https://github.com/Gaalix/git-ozone/blob/main/CHANGELOG.md">Changelog</a>
+        <a href="https://github.com/Gaalix/git-ozone/blob/main/SECURITY.md">Security</a>
+      </nav>
     </div>
   </footer>
 
+  <script>window.hallmarkSlots = (m) => { for (const [k, v] of Object.entries(m)) { const s = document.querySelector(`[data-slot="${k}"]`); if (!s) continue; const im = new Image(); im.src = typeof v === 'string' ? v : v.src; im.alt = (typeof v === 'object' && v.alt) || s.dataset.alt || ''; s.querySelectorAll(':scope > img').forEach((o) => o.remove()); s.prepend(im); } };
+  document.querySelectorAll('[data-slot] img').forEach((i) => { if (i.complete && !i.naturalWidth) i.remove(); else i.addEventListener('error', () => i.remove(), { once: true }); });</script>
+  <script src="session-data.js" defer></script>
   <script src="app.js" defer></script>
 </body>
 </html>
