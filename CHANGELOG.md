@@ -2,22 +2,38 @@
 
 All notable changes to Ozone (`oz` / `git-ozone` / `oz-vfsd`) are documented in this file.
 
-## [Unreleased]
+## [1.2.0] — 2026-11-25
+
+### Features & Workflow Ergonomics
+- **User-Wide Hardened `oz-vfsd` Daemon & Writable Warm Caches (`oz-vfsd`, `oz-cow`, `oz-warm`):** Added user-wide hardened `oz-vfsd` systemd service support and writable `pnpm` monorepo warm-cache materialization (`node_modules/.modules.yaml`, `.pnpm-workspace-state-v1.json`, `node_modules/.bin/*`, and nested workspace `node_modules`) under `cas_hardlink`.
+- **Full GitHub PR & Issue Lifecycle (`oz-github`, `oz-cli`):**
+  - Added `oz pr list`, `oz pr edit`, `oz pr comments <n> [--unresolved]`, `oz pr view <n> [--comments] [--brief|--no-body|--no-files]`, `oz pr reply` (`t1` / `#id` + `--resolve`), `oz pr resolve`, `oz pr status --pr ...`, and `--body-file` support.
+  - Added `oz issue view <n|url> [--comments]`, `oz issue list`, and `oz issue comment` using REST-only endpoints (avoiding deprecated classic `projectCards` GraphQL queries).
+- **Multi-PR / Workflow CI & `watch_superseded` Race Fix (`oz-github`, `oz-cli`):** Fixed the `watch_superseded` race condition in `oz ci --watch`, added multi-PR snapshots (`oz ci --pr 1,2`) and workflow filtering (`oz ci --workflow <file|name> [--watch]`), added cross-workflow `oz ci --runs`, and made `oz ci --json` compact passing checks by default (`--verbose` for full list) with null omission and accurate top-level `branch`/`head_oid` envelopes.
+- **Local VCS & Multi-Branch Ergonomics (`oz-core`, `oz-integrate`, `oz-cli`):**
+  - Added `oz merge <rev>` (`--no-ff`, `--ff-only`, linked worktree sync, and OpLog `oz undo` reversibility).
+  - Added rev-scoped tree `oz grep <pattern> [<rev>] [-- <paths...>]` with `-n`, `--exclude`, `:!` negative pathspecs, `--max-line-len`, and BRE `\|` dialect hints.
+  - Added `oz branch -a` / `-r` (local + remote-tracking branch SHAs), multi-refspec `oz push origin b1 b2 b3`, enhanced `oz log` (multi-rev, `A...B --left-right`, `-i`, `--no-notes`, `--format fuller`), and `oz show <missing-hex-sha>` recovery hints pointing to `oz fetch`.
 
 ### Security & Soundness Hardening
 - **Constant-Time SSH Signing & Secret Zeroization (`oz-core`):** Replaced hand-rolled variable-time Ed25519 and SHA-2 implementations with audited pure-Rust constant-time crates (`ed25519-dalek`, `sha2`, `zeroize`), zeroizing secret key material on drop and removing `Ed25519SigningKey::seed()` from the public API.
 - **Filter Command Injection & Pipe Deadlock Fixes (`oz-core`):** Eliminated Windows `cmd.exe /C` shell interpolation for `.gitattributes` `%f` filters and switched filter stdin writes to concurrent scoped threads so `> 64 KiB` blobs never deadlock.
-- **Hardened `oz-vfsd` IPC & Mount Validation (`oz-vfsd`):** Added per-instance random auth tokens for Windows loopback TCP IPC, fail-closed Unix `peer_cred()` enforcement, owner-verified `0o700` socket parent directories, bounded IPC frame reads (`1 MiB`) and concurrency limits, canonicalized non-symlink + UID-ownership validation for `upper_dir`/`meta_dir`/`baseline_dir`, and `tokio::signal` shutdown handling.
-- **Windows ProjFS FFI & Bounded MCP Framing (`oz-vfsd`, `oz-agent`):** Added compile-time `WinState: Send + Sync` assertions, size-checked `transmute`, buffer bounds checks before `copy_nonoverlapping`, explicit `// SAFETY:` invariants across all `unsafe` blocks, and bounded sync/async MCP header/line/payload framing limits (`4 MiB` line / `16 MiB` message / 32 headers).
+- **Hardened `oz-vfsd` IPC & Mount Validation (`oz-vfsd`):** Added per-instance random auth tokens for Windows loopback TCP IPC (with `WRITE_DAC` permissions on endpoint files), fail-closed Unix `peer_cred()` enforcement, owner-verified `0o700` socket parent directories, bounded IPC frame reads (`1 MiB`) and concurrency limits, canonicalized non-symlink + UID-ownership validation for `upper_dir`/`meta_dir`/`baseline_dir`, and `tokio::signal` shutdown handling.
+- **Windows ProjFS FFI, Workspace Unsafe Lint & Bounded MCP Framing (`oz-vfsd`, `oz-agent`):** Enabled workspace-wide `undocumented_unsafe_blocks = "deny"`, added compile-time `WinState: Send + Sync` assertions, size-checked `transmute`, buffer bounds checks before `copy_nonoverlapping`, explicit `// SAFETY:` invariants across all `unsafe` blocks, and bounded sync/async MCP header/line/payload framing limits (`4 MiB` line / `16 MiB` message / 32 headers).
 
 ### Performance & Concurrency
-- **Lock-Split FUSE3 Overlay (`oz-vfsd`):** Decoupled blocking disk copy-up and directory materialization from short-lived metadata/inode locks and replaced lock-poisoning `.expect()` calls with graceful recovery.
+- **Lock-Split FUSE3 Overlay (`oz-vfsd`):** Decoupled blocking disk copy-up and directory materialization from short-lived metadata/inode locks, serialized `lookup` and `getattr` via shared path locks to prevent inode races, and replaced lock-poisoning `.expect()` calls with graceful recovery.
 - **Async MCP & Pooled GitHub HTTP Client (`oz-agent`, `oz-github`):** Offloaded blocking MCP tool dispatch in `serve_async` via `tokio::task::spawn_blocking` and pooled `reqwest::blocking::Client` in `GitHubClient` with async-runtime-safe off-thread drop handling.
 - **Diff & Hot-Path Optimizations (`oz-core`, `oz-integrate`, `oz-agent`, `oz-oplog`):** Unified diffing onto `gix::diff::blob::imara_diff` to remove duplicate dependency trees, avoided unnecessary allocations in `status.rs`/`daily.rs`/`projfs.rs`, and replaced Unix `kill -0` subprocesses in `oz fsck` with direct `libc::kill(pid, 0)`.
 
+### Bug Fixes
+- **`oz undo` Index Stat-Cache Fix (`oz-oplog`):** Fixed `sync_git_index_diff` unconditionally stamping `Stat::from_fs` onto patched `.git/index` entries when restoring to a target snapshot with dirty files (such as `oz undo` after `oz commit`, `--amend`, `--pick`, `switch -f`, or `reset --hard`). Dirty target paths now receive zeroed `Stat::default()` (and risky same-OID cached stats are invalidated) so working-tree edits are never hidden from `oz status`, `git status`, or subsequent OpLog scans while `oz redo` restores cleanly; hardened `snapshot_from_standard_workdir`'s index stat shortcut to reject zeroed stats, symlinks, and Unix executable-bit mismatches.
+- **Writable Cargo `target/` in `_integrate` & `cas_hardlink` Sandboxes (`oz-warm`, `oz-cow`, `oz-integrate`):** Fixed `oz integrate --verify "cargo test"` (and `oz ws spawn --backend cas_hardlink`) failing with `Permission denied` writing into `target/`. Added `CargoTargetClassifier` (`SkipTransientLock`, `MutableWritable`, `ImmutableCas`) so Cargo fingerprints, `.rustc_info.json`, dep-info `*.d`, `build/**`, `incremental/**`, and local crate outputs are materialized writable while immutable external crate dependency artifacts (including external `build.rs` `OUT_DIR` outputs) remain `0444` CAS-hardlinked; added baseline mtime restoration for integrated trees in `_integrate`.
+- **FUSE3 Test Lifecycle & Teardown (`oz-cli`, `oz-vfsd`):** Added RAII FUSE3 mount teardown across integration test suites to prevent leaked `fuse.ozone` mounts and gated live FUSE3 mount tests cleanly under `NoNewPrivs=1`.
+
 ### Release Engineering, CI & Packaging
 - **Automated Homebrew & `winget` Release Manifests:** Added `packaging/populate-manifests.py` and wired `.github/workflows/release.yml` to generate, strictly validate against `SHA256SUMS.txt`, and publish populated `oz.rb` and `OzoneVCS.Ozone*.yaml` release assets on every tagged release.
-- **Strict Packaging Validation & CI Hardening:** Added `--strict` / `--allow-placeholders` / `--checksums` checks in `packaging/validate.sh` to reject all-zero placeholder SHA256s in releases, updated `README.md` to reference published release assets, added `cargo fmt --all -- --check` and `-D clippy::undocumented_unsafe_blocks` to `.github/workflows/ci.yml`, expanded `.gitignore`, and synced version/MCP tool documentation.
+- **Release Profile, Publish Metadata & CI Hardening:** Added optimized `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "unwind"`), workspace publish metadata, strict `--strict` / `--allow-placeholders` / `--checksums` checks in `packaging/validate.sh`, `cargo fmt --all -- --check` and `-D clippy::undocumented_unsafe_blocks` in `.github/workflows/ci.yml`, pruned unused dependencies, and narrowed internal `oz-cli` exports.
 
 ## [1.1.0] — 2026-11-24
 

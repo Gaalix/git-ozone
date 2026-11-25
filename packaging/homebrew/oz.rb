@@ -13,7 +13,7 @@
 class Oz < Formula
   desc "Pure-Rust CoW Git client and multi-agent workspace engine"
   homepage "https://github.com/Gaalix/git-ozone"
-  version "1.1.0"
+  version "1.2.0"
   license any_of: ["MIT", "Apache-2.0"]
 
   # Template checksums are populated from SHA256SUMS.txt by .github/workflows/release.yml.

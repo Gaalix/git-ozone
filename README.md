@@ -27,7 +27,7 @@ Release archives (`oz`, `git-ozone`, and `oz-vfsd`) are published as static pure
 curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash
 ```
 
-Supports `--version v1.1.0`, `--prefix ~/.local`, and `--dry-run`.
+Supports `--version v1.2.0`, `--prefix ~/.local`, and `--dry-run`.
 
 ### Windows (PowerShell Installer)
 
@@ -35,7 +35,7 @@ Supports `--version v1.1.0`, `--prefix ~/.local`, and `--dry-run`.
 irm https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.ps1 | iex
 ```
 
-Supports `-Version v1.1.0`, `-Prefix "$env:LOCALAPPDATA\Ozone"`, and `-DryRun`. To enable Windows `NTFS` virtualization (`Client-ProjFS`) without rebooting, run `oz setup --enable-projfs`.
+Supports `-Version v1.2.0`, `-Prefix "$env:LOCALAPPDATA\Ozone"`, and `-DryRun`. To enable Windows `NTFS` virtualization (`Client-ProjFS`) without rebooting, run `oz setup --enable-projfs`.
 
 ### Cargo (From GitHub, `cargo-binstall`, or Local Checkout)
 
@@ -55,8 +55,8 @@ cargo install --path crates/oz-vfsd --locked
 
 ```bash
 # Download the latest release .deb (amd64 or arm64) and install with Recommends: fuse3
-curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.1.0/ozone_1.1.0_amd64.deb
-sudo apt install ./ozone_1.1.0_amd64.deb
+curl -fsSLO https://github.com/Gaalix/git-ozone/releases/download/v1.2.0/ozone_1.2.0_amd64.deb
+sudo apt install ./ozone_1.2.0_amd64.deb
 ```
 
 For self-hosted APT repository instructions, see [`packaging/deb/apt-repo-setup.md`](packaging/deb/apt-repo-setup.md).

@@ -269,7 +269,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--version",
-        help="Release version (e.g. 1.1.0 or v1.1.0; defaults to Cargo.toml workspace version)",
+        help="Release version (e.g. 1.2.0 or v1.2.0; defaults to Cargo.toml workspace version)",
     )
     parser.add_argument(
         "--checksums",

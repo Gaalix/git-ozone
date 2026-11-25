@@ -23,7 +23,7 @@ Usage: build-deb.sh [OPTIONS]
 Build an Ubuntu/Debian .deb package containing oz, git-ozone, and oz-vfsd.
 
 Options:
-  --version <VER>     Package version (e.g. 1.1.0; defaults to Cargo.toml version)
+  --version <VER>     Package version (e.g. 1.2.0; defaults to Cargo.toml version)
   --arch <ARCH>       Debian architecture: amd64 or arm64 (defaults to host arch)
   --bin-dir <DIR>     Directory containing built oz, git-ozone, and oz-vfsd binaries
   --out-dir <DIR>     Output directory for the .deb archive (default: ./dist)
