@@ -954,7 +954,10 @@ proptest! {
                             let post_disk = snapshot_worktree_disk(&repo_dir);
 
                             // Cross-check tree OID against reference `git commit` of identical snapshot!
+                            // Drop `ref_dir`'s `.git/index` first so Windows NTFS coarse mtime + file
+                            // tunneling never causes `git add -A` to skip an equal-length rewrite.
                             mirror_disk_into_dir(&post_disk, &ref_dir);
+                            let _ = fs::remove_file(ref_dir.join(".git").join("index"));
                             run_git(&ref_dir, &["add", "-A"]);
                             let ref_res = Command::new(sys_git_bin())
                                 .args(["diff", "--cached", "--quiet"])
