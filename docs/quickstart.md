@@ -95,17 +95,38 @@ Useful commit flags:
 * `--allow-out-of-scope`: Override workspace `--scope` / `--deny` path guardrails.
 * `--allow-empty`: Create a commit with no file changes.
 
-### Checkpoints & Sub-10ms Undo / Redo
+### Checkpoints, OpLog Inspection & Sub-10ms Undo / Redo
 
 Every mutating `oz` command (and every `oz checkpoint`) appends an immutable MVCC entry to `.git/ozone/oplog/`:
 
 ```bash
 oz checkpoint -m "before refactor"   # < 10 ms working-tree snapshot
+oz oplog -n 10                       # Inspect recent op_... IDs, timestamps, and undo cursor
+oz undo --list                       # Non-destructive alias to list undoable OpLog entries
 oz undo                              # Rewind the last mutation or un-checkpointed edits
 oz undo --steps 2                    # Rewind the last 2 operations
 oz undo op_01J...                    # Rewind a specific OpLog entry ID
 oz redo                              # Re-apply the most recent undo
 ```
+
+### OpLog-Safe Git Fallback & Diagnostics
+
+For any Git command without a native `oz` equivalent, invoke `oz git <cmd>` (or `alias git="oz git"`) so mutating fallback commands stay recorded in the OpLog and reversible via `oz undo`:
+
+```bash
+oz git reflog                        # Safe read-only pass-through
+oz git rm obsolete.txt               # Wrapped in an OpLog transaction (reversible via `oz undo`)
+```
+
+Keep repositories and OpLog history healthy with built-in diagnostics and maintenance:
+
+```bash
+oz doctor                            # OS/FS, FUSE3/reflink, oz-vfsd, SSH signing, GitHub auth, mounts
+oz fsck --repair                     # Verify OpLog/snapshots and safely repair interrupted metadata
+oz gc --oplog-days 30 --dry-run      # Preview OpLog compaction and snapshot pruning
+```
+
+Pass `--agent` or set `OZ_AGENT=1` (or pass `--json` for the canonical `oz.v1` envelope) to force strict non-interactive execution with zero prompts, zero `$EDITOR`, and zero pagers.
 
 ### GitHub Stacked PRs, Sync & CI Self-Healing
 
@@ -163,13 +184,13 @@ oz agent setup --all --check
 
 | Harness (`--harness`) | Skill / Rule Files Written | Hook Config Merged (`oz checkpoint --quiet`) |
 | :--- | :--- | :--- |
-| `claude-code` | `.claude/skills/oz/SKILL.md` | `.claude/settings.json` |
-| `cursor` | `.cursor/rules/oz.mdc` | `.cursor/hooks.json` |
-| `codex-cli` | `.agents/skills/oz/SKILL.md`, `.codex/skills/oz/SKILL.md`, `AGENTS.md` | `.codex/hooks.json` |
-| `windsurf` | `.windsurf/rules/oz.md` | `.windsurf/hooks.json` |
-| `antigravity` | `.agent/skills/oz/SKILL.md` | `.agent/hooks.json` |
+| `claude-code` | `.claude/skills/oz/SKILL.md` (on-demand skill) | `.claude/settings.json` |
+| `cursor` | `.cursor/rules/oz.mdc` (compact always-on rule) | `.cursor/hooks.json` |
+| `codex-cli` | `.agents/skills/oz/SKILL.md`, `.codex/skills/oz/SKILL.md` (skills), `AGENTS.md` (compact always-on rule) | `.codex/hooks.json` |
+| `windsurf` | `.windsurf/rules/oz.md` (compact always-on rule) | `.windsurf/hooks.json` |
+| `antigravity` | `.agent/skills/oz/SKILL.md` (on-demand skill) | `.agent/hooks.json` |
 
-Pass `--no-hooks` to install only the skill/rule files.
+Always-on rule files stay compact (key Git-vs-Ozone behavioral rules, concise command map, and pointer to `SKILL.md` / `oz <cmd> --help`), while on-demand `SKILL.md` files include full multi-step workflows (amending/signing/guardrails, `oz git` fallback, `_integrate` conflict resolution, workspace lifecycle, stacked PR sync, `oz blame`, `oz oplog`/`oz undo --list`, `oz doctor`/`fsck`/`gc`, and the `--json` `oz.v1` envelope). Pass `--no-hooks` to install only the skill/rule files.
 
 ### Step 2: Spawn Scoped CoW Workspaces with Warm Caches
 

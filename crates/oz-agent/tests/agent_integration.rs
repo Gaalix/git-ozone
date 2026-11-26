@@ -235,6 +235,108 @@ fn non_destructive_hook_and_marker_updates_across_all_harnesses() {
 }
 
 #[test]
+fn progressive_disclosure_separates_compact_rules_from_comprehensive_skills() {
+    let dir = TempDir::new().expect("tempdir");
+    setup_agent_harnesses(dir.path(), &AgentSetupOptions::all_harnesses()).expect("setup all");
+
+    let agents_md = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+    let cursor_rule = fs::read_to_string(dir.path().join(".cursor/rules/oz.mdc")).unwrap();
+    let windsurf_rule = fs::read_to_string(dir.path().join(".windsurf/rules/oz.md")).unwrap();
+    let claude_skill = fs::read_to_string(dir.path().join(".claude/skills/oz/SKILL.md")).unwrap();
+    let agy_skill = fs::read_to_string(dir.path().join(".agent/skills/oz/SKILL.md")).unwrap();
+    let codex_skill = fs::read_to_string(dir.path().join(".codex/skills/oz/SKILL.md")).unwrap();
+
+    // All on-demand SKILL.md files share the same comprehensive workflow template.
+    assert_eq!(claude_skill, agy_skill);
+    assert_eq!(claude_skill, codex_skill);
+
+    // Always-on rules must stay significantly more compact than the on-demand SKILL.md.
+    assert!(
+        agents_md.len() * 2 < claude_skill.len(),
+        "expected always-on AGENTS.md ({} bytes) to be < half of SKILL.md ({} bytes)",
+        agents_md.len(),
+        claude_skill.len()
+    );
+    assert!(cursor_rule.len() * 2 < claude_skill.len());
+    assert!(windsurf_rule.len() * 2 < claude_skill.len());
+
+    // Always-on rules carry key behavioral differences, concise command map, and pointer to SKILL.md.
+    for (name, rule) in [
+        ("AGENTS.md", &agents_md),
+        (".cursor/rules/oz.mdc", &cursor_rule),
+        (".windsurf/rules/oz.md", &windsurf_rule),
+    ] {
+        for required in [
+            "oz -C <dir>",
+            "untracked files automatically",
+            "refs/notes/ai",
+            "Rust/ERE regex",
+            "oz oplog",
+            "oz undo --list",
+            "oz git <cmd>",
+            "--agent",
+            "OZ_AGENT=1",
+            "SKILL.md",
+            "oz <cmd> --help",
+        ] {
+            assert!(
+                rule.contains(required),
+                "expected {name} rule to contain {required:?}"
+            );
+        }
+    }
+
+    // On-demand SKILL.md covers all rich multi-step workflows and capabilities.
+    for required in [
+        "oz commit --amend",
+        "--no-edit",
+        "Change-Id:",
+        "--sign",
+        "--force",
+        "--allow-out-of-scope",
+        "oz git <cmd>",
+        "../<repo>.oz/_integrate",
+        "oz resolve c1 --take ours|theirs|base",
+        "oz resolve --all --take ours --continue",
+        "oz integrate --continue",
+        "oz integrate --abort",
+        "../<repo>.oz/<name>",
+        "oz ws spawn",
+        "oz ws list",
+        "oz ws rm",
+        "--delete-branch",
+        "oz ws gc",
+        "oz stack status",
+        "oz stack rebase",
+        "oz pr stack",
+        "oz sync",
+        "--push",
+        "--no-rebase",
+        "--no-gc",
+        "--no-warm",
+        "retargets downstream stacked PR",
+        "oz doctor",
+        "oz fsck [--repair]",
+        "oz gc",
+        "oz blame <path>",
+        "oz oplog",
+        "oz undo --list",
+        "oz undo <OP_ID>",
+        "oz redo",
+        "--agent",
+        "OZ_AGENT=1",
+        "\"schema\": \"oz.v1\"",
+        "\"recovery_commands\"",
+        "\"conflicts\"",
+    ] {
+        assert!(
+            claude_skill.contains(required),
+            "expected SKILL.md to contain {required:?}"
+        );
+    }
+}
+
+#[test]
 fn mcp_multi_workspace_radar_collision_and_partial_commit_blame_e2e() {
     let tmp = TempDir::new().expect("tempdir");
     let repo_dir = tmp.path().join("monorepo");
