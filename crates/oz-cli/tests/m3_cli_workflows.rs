@@ -259,7 +259,9 @@ async fn handle_mock_github_conn(
     let query_map = parse_query_map(query);
 
     let (status, content_type, resp_bytes) = {
-        let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expected_auth = format!("Bearer {}", guard.expected_token);
         if headers.get("authorization") == Some(&expected_auth) {
             route_mock_github(&method, path, &query_map, &body, &mut guard)
@@ -1026,10 +1028,7 @@ fn clone_partial_fetch_undo_and_push_atomic_force_with_lease_stale_rejection() {
     assert_eq!(stale_json["ok"], false);
     assert_eq!(stale_json["error"]["exit_code"], 1);
     assert_eq!(stale_json["conflicts"][0]["id"], "stale-lease");
-    assert_ne!(
-        stale_json["recovery_commands"].as_array().unwrap().len(),
-        0
-    );
+    assert_ne!(stale_json["recovery_commands"].as_array().unwrap().len(), 0);
 }
 
 struct RepoVfsCleanupGuard {

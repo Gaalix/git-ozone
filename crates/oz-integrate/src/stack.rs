@@ -395,10 +395,7 @@ fn execute_stack_rebase_loop(
             let orig_commit = gix_repo
                 .find_commit(orig_commit_oid)
                 .map_err(OzError::git_source)?;
-            let commit_tree = orig_commit
-                .tree_id()
-                .map_err(OzError::git_source)?
-                .detach();
+            let commit_tree = orig_commit.tree_id().map_err(OzError::git_source)?.detach();
             let parent_tree = match orig_commit.parent_ids().next() {
                 Some(pid) => commit_tree_id(gix_repo, pid.detach())?,
                 None => gix_repo.empty_tree().id().detach(),

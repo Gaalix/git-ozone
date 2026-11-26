@@ -20,8 +20,8 @@ globset.workspace = true
 ignore.workspace = true
 libc.workspace = true
 rayon.workspace = true
-regex-automata = { version = "0.4", default-features = false, features = ["meta", "syntax", "perf", "unicode-word-boundary"] }
-regex-syntax = "0.8"
+regex-automata.workspace = true
+regex-syntax.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

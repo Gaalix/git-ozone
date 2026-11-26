@@ -55,7 +55,6 @@ gix-packetline = { version = "0.24", default-features = false, features = ["bloc
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "charset", "http2", "json", "rustls"] }
 flate2 = "1.1"
 base64 = "0.23"
-bytes = "1.12"
 http = "1"
 url = "2.5"
 
@@ -76,7 +75,7 @@ ed25519-dalek = { version = "2.1", features = ["zeroize"] }
 sha2 = "0.10"
 zeroize = "1.8"
 rayon = "1.12"
-tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+tokio = { version = "1.54", features = ["rt"] }
 
 # Error Handling & System Utilities
 thiserror = "2.0"
@@ -87,6 +86,8 @@ filetime = "0.2"
 walkdir = "2.5"
 ignore = "0.4"
 globset = "0.4"
+regex-automata = { version = "0.4", default-features = false, features = ["meta", "syntax", "perf", "unicode-word-boundary"] }
+regex-syntax = "0.8"
 ulid = "3.0"
 chrono = { version = "0.4", features = ["serde"] }
 

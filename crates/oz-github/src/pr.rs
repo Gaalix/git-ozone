@@ -1832,8 +1832,10 @@ pub(crate) fn group_review_threads(
         let gql_meta = items
             .iter()
             .find_map(|c| meta_by_comment.get(&c.id).copied());
-        let is_outdated =
-            gql_meta.map_or_else(|| root.line.is_none() && root.position.is_none(), |m| m.is_outdated);
+        let is_outdated = gql_meta.map_or_else(
+            || root.line.is_none() && root.position.is_none(),
+            |m| m.is_outdated,
+        );
 
         let thread_comments = items
             .into_iter()

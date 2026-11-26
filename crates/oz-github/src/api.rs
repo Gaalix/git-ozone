@@ -1935,7 +1935,9 @@ mod tests {
                     vec!["Switch the remote URL from http:// to https:// or ssh://.".to_string()]
                 );
             }
-            other => panic!("expected GuardrailViolation(insecure_http_credentials), got {other:?}"),
+            other => {
+                panic!("expected GuardrailViolation(insecure_http_credentials), got {other:?}")
+            }
         };
 
         let client = GitHubClient::new("http://api.github.com", Some("ghp_secret_123".to_string()));
@@ -1979,9 +1981,7 @@ mod tests {
             "http://ghe.example.com/acme/demo.git",
             "http://github.com/acme/demo.git",
         ] {
-            let repo_dir = tmp
-                .path()
-                .join(remote_url.replace([':', '/', '.'], "_"));
+            let repo_dir = tmp.path().join(remote_url.replace([':', '/', '.'], "_"));
             std::fs::create_dir_all(&repo_dir).expect("mkdir");
             let st = std::process::Command::new("git")
                 .args(["init", "-b", "main"])

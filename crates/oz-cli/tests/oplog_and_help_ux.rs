@@ -192,7 +192,10 @@ fn oz_oplog_and_undo_list_human_and_json_end_to_end() {
     assert!(after_undo_json.status.success());
     let after_undo_env = parse_json_stdout(&after_undo_json);
     assert_eq!(after_undo_env["data"]["head_op_id"], undo_op_id);
-    assert_eq!(after_undo_env["data"]["undo_cursor_op_id"], checkpoint_op_id);
+    assert_eq!(
+        after_undo_env["data"]["undo_cursor_op_id"],
+        checkpoint_op_id
+    );
     assert_eq!(after_undo_env["data"]["redo_cursor_op_id"], undo_op_id);
     assert_eq!(after_undo_env["data"]["active_count"], 2);
     assert_eq!(after_undo_env["data"]["redo_depth"], 1);

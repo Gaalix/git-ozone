@@ -703,8 +703,7 @@ fn detects_custom_cargo_target_dir_and_subsecond_mtime_preservation() {
     let ws_root = dir.path().join("ws-subsec");
     std::fs::create_dir_all(ws_root.join("src")).expect("mkdir ws src");
     std::fs::write(ws_root.join("src/lib.rs"), "pub fn x() -> u32 { 1 }\n").expect("write ws");
-    apply_baseline_mtimes(&ws_root, &meta, &std::collections::HashSet::new())
-        .expect("apply mtime");
+    apply_baseline_mtimes(&ws_root, &meta, &std::collections::HashSet::new()).expect("apply mtime");
 
     let restored_meta = std::fs::metadata(ws_root.join("src/lib.rs")).expect("stat ws lib");
     let restored_mod = restored_meta.modified().expect("modified");

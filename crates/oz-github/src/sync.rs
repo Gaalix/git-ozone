@@ -1018,11 +1018,10 @@ fn transplant_children_of_squash_merged_branches(
 
         let mut aborted_branch = false;
         for &orig_cid in &commits_above_merged[start_idx..] {
-            let orig_commit = gix_repo.find_commit(orig_cid).map_err(OzError::git_source)?;
-            let commit_tree = orig_commit
-                .tree_id()
-                .map_err(OzError::git_source)?
-                .detach();
+            let orig_commit = gix_repo
+                .find_commit(orig_cid)
+                .map_err(OzError::git_source)?;
+            let commit_tree = orig_commit.tree_id().map_err(OzError::git_source)?.detach();
             let parent_tree = match orig_commit.parent_ids().next() {
                 Some(pid) => gix_repo
                     .find_commit(pid.detach())

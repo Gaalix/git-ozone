@@ -1216,9 +1216,10 @@ fn metadata_modified_filetime(meta: &Metadata) -> FileTime {
     meta.modified().map_or_else(
         |_| FileTime::zero(),
         |st| match st.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => {
-                FileTime::from_unix_time(i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos())
-            }
+            Ok(d) => FileTime::from_unix_time(
+                i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                d.subsec_nanos(),
+            ),
             Err(e) => {
                 let secs = i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX);
                 FileTime::from_unix_time(-secs, 0)
@@ -1254,7 +1255,10 @@ mod tests {
             Cow::Borrowed(_) => panic!("cold miss must return Cow::Owned"),
         };
         assert_eq!(computed_hex.len(), 64);
-        assert_eq!(std::fs::read(&dst1).expect("read dst1"), b"immutable-artifact-bytes");
+        assert_eq!(
+            std::fs::read(&dst1).expect("read dst1"),
+            b"immutable-artifact-bytes"
+        );
 
         let dst2 = dir.path().join("ws2_libdep.rlib");
         let warm = link_file_via_cas(&src, &dst2, &src_meta, &cas_dir, Some(&computed_hex))
@@ -1263,9 +1267,14 @@ mod tests {
             Cow::Borrowed(borrowed) => {
                 assert!(std::ptr::eq(borrowed, computed_hex.as_str()));
             }
-            Cow::Owned(_) => panic!("valid cached digest must return Cow::Borrowed without allocating"),
+            Cow::Owned(_) => {
+                panic!("valid cached digest must return Cow::Borrowed without allocating")
+            }
         }
-        assert_eq!(std::fs::read(&dst2).expect("read dst2"), b"immutable-artifact-bytes");
+        assert_eq!(
+            std::fs::read(&dst2).expect("read dst2"),
+            b"immutable-artifact-bytes"
+        );
 
         let dst3 = dir.path().join("ws3_libdep.rlib");
         let short = link_file_via_cas(&src, &dst3, &src_meta, &cas_dir, Some("ab"))

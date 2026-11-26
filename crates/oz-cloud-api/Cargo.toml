@@ -17,7 +17,7 @@ oz-core.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

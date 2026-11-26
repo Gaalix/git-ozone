@@ -1697,7 +1697,10 @@ fn undo_after_commit_preserves_dirty_visibility_for_same_and_diff_size_edits_and
             .entry_by_path("a.txt".as_bytes().as_bstr())
             .expect("a.txt in index after redo");
         assert_eq!(entry_redo.id.to_hex().to_string(), head_c2_blob);
-        assert_eq!(entry_redo.stat.size, u32::try_from(v2_content.len()).unwrap());
+        assert_eq!(
+            entry_redo.stat.size,
+            u32::try_from(v2_content.len()).unwrap()
+        );
 
         // Step e: second `oz undo` followed by re-committing via `oz commit` must work cleanly!
         undo(&repo, 1usize, agent_actor(None)).expect("second undo");

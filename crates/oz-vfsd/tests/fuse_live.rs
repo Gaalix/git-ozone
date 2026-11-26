@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #![allow(clippy::too_many_lines)]
-
 #![cfg(target_os = "linux")]
 
 //! Live `/dev/fuse` + `fusermount3` integration tests for `oz-vfsd`.

@@ -3141,10 +3141,7 @@ pub(crate) fn handle_push(
             if r.deleted {
                 println!("  - [deleted] {}", r.remote_ref);
             } else {
-                let new_short = r
-                    .new_oid
-                    .as_deref()
-                    .map_or("-", |s| &s[..s.len().min(10)]);
+                let new_short = r.new_oid.as_deref().map_or("-", |s| &s[..s.len().min(10)]);
                 println!(
                     "  {} -> {} ({new_short}{})",
                     r.local_ref.as_deref().unwrap_or("HEAD"),
@@ -3613,10 +3610,7 @@ fn handle_issue_view(
         } else {
             "Issue"
         };
-        let author = issue
-            .user
-            .as_ref()
-            .map_or("unknown", |u| u.login.as_str());
+        let author = issue.user.as_ref().map_or("unknown", |u| u.login.as_str());
         println!(
             "{kind_label} #{} [{}] {}",
             issue.number,

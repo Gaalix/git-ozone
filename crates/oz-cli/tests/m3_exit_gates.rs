@@ -1663,8 +1663,8 @@ fn vcbench_agent_eval_exit_gate_commands_and_tokens() {
     let total_oz_lex_toks: usize = results.iter().map(|r| r.oz_lexical_tokens).sum();
 
     let agg_cmd_red = 100.0 * (1.0 - (usize_to_f64(total_oz_cmds) / usize_to_f64(total_git_cmds)));
-    let agg_approx_red = 100.0
-        * (1.0 - (usize_to_f64(total_oz_approx_toks) / usize_to_f64(total_git_approx_toks)));
+    let agg_approx_red =
+        100.0 * (1.0 - (usize_to_f64(total_oz_approx_toks) / usize_to_f64(total_git_approx_toks)));
     let agg_lex_red =
         100.0 * (1.0 - (usize_to_f64(total_oz_lex_toks) / usize_to_f64(total_git_lex_toks)));
 
@@ -1872,7 +1872,9 @@ async fn handle_unified_http_conn(
     let body = read_http_body(&mut reader, &headers).await?;
 
     let (expected_token, bare_repo) = {
-        let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (guard.expected_token.clone(), guard.bare_repo.clone())
     };
     let expected_basic = format!(
@@ -1975,7 +1977,9 @@ async fn handle_unified_http_conn(
     // 2. GitHub REST & GraphQL API endpoints
     let query_map = parse_query_map(query);
     let (status, content_type, resp_bytes) = {
-        let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         route_github_api(&method, path, &query_map, &body, &mut guard)
     };
     write_http_response(&mut write_half, status, content_type, &resp_bytes).await

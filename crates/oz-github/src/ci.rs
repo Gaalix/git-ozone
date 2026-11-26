@@ -1108,9 +1108,7 @@ fn fetch_workflow_runs_resolved(
     let looks_direct = normalized.chars().all(|c| c.is_ascii_digit())
         || std::path::Path::new(&normalized)
             .extension()
-            .is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
-            });
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
 
     if looks_direct {
         match client.list_workflow_runs_for_workflow(
@@ -2279,8 +2277,7 @@ fn build_check_summary(
             .map(|st| st.name.clone())
     });
 
-    let cache_key =
-        job_id_opt.map_or_else(|| format!("name:{name}"), |jid| format!("job:{jid}"));
+    let cache_key = job_id_opt.map_or_else(|| format!("name:{name}"), |jid| format!("job:{jid}"));
     if let Some((cached_step, cached_excerpt)) = failure_cache.get(&cache_key) {
         return CiCheckSummary {
             name,

@@ -719,9 +719,7 @@ fn prepare_branch_target(
                 recovery: Vec::new(),
             });
         }
-        let commit = existing_ref
-            .peel_to_commit()
-            .map_err(OzError::git_source)?;
+        let commit = existing_ref.peel_to_commit().map_err(OzError::git_source)?;
         let commit_hex = commit.id.to_hex().to_string();
         let tree_hex = commit
             .tree_id()
@@ -745,12 +743,7 @@ fn prepare_branch_target(
             .map(|n| String::from_utf8_lossy(n.shorten().as_ref()).into_owned()),
     };
 
-    if from_ref.is_none()
-        && gix_repo
-            .head()
-            .map_err(OzError::git_source)?
-            .is_unborn()
-    {
+    if from_ref.is_none() && gix_repo.head().map_err(OzError::git_source)?.is_unborn() {
         return Ok(PreparedBranchTarget {
             base_commit: None,
             base_tree: None,

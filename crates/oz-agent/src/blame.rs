@@ -623,14 +623,18 @@ fn lookup_blob_in_tree(
 }
 
 fn commit_committer_seconds(gix_repo: &gix::Repository, commit_id: ObjectId) -> Result<i64> {
-    let commit = gix_repo.find_commit(commit_id).map_err(OzError::git_source)?;
+    let commit = gix_repo
+        .find_commit(commit_id)
+        .map_err(OzError::git_source)?;
     let committer = commit.committer().map_err(OzError::git_source)?;
     let time = committer.time().unwrap_or_default();
     Ok(time.seconds)
 }
 
 fn load_commit_meta(gix_repo: &gix::Repository, commit_id: ObjectId) -> Result<CommitMeta> {
-    let commit = gix_repo.find_commit(commit_id).map_err(OzError::git_source)?;
+    let commit = gix_repo
+        .find_commit(commit_id)
+        .map_err(OzError::git_source)?;
     let author = commit
         .author()
         .map_err(OzError::git_source)?

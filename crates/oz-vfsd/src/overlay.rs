@@ -3167,9 +3167,7 @@ mod linux_impl {
             };
 
             if let Ok(skip_count) = usize::try_from(offset) {
-                for (idx, (entry_ino, kind, name)) in
-                    snapshot.iter().enumerate().skip(skip_count)
-                {
+                for (idx, (entry_ino, kind, name)) in snapshot.iter().enumerate().skip(skip_count) {
                     let next_offset = (idx + 1) as u64;
                     if reply.add(*entry_ino, next_offset, *kind, name) {
                         break;

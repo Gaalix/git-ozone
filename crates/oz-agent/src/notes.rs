@@ -554,9 +554,9 @@ pub(crate) fn resolve_commit_oid(
         .rev_parse_single(trimmed)
         .map_err(|err| OzError::Git(format!("unable to resolve revision '{trimmed}': {err}")))?;
     let object = spec.object().map_err(OzError::git_source)?;
-    let commit = object
-        .peel_to_commit()
-        .map_err(|err| OzError::git_context(format!("revision '{trimmed}' is not a commit"), err))?;
+    let commit = object.peel_to_commit().map_err(|err| {
+        OzError::git_context(format!("revision '{trimmed}' is not a commit"), err)
+    })?;
     Ok(commit.id)
 }
 

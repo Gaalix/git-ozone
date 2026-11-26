@@ -402,8 +402,7 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
         let persisted_url = if connect_url == opts.url {
             resolved_persisted
         } else {
-            parse_git_remote(&opts.url, None)
-                .map_or_else(|_| opts.url.clone(), |p| p.sanitized_url)
+            parse_git_remote(&opts.url, None).map_or_else(|_| opts.url.clone(), |p| p.sanitized_url)
         };
 
         let mut warnings = Vec::new();
@@ -795,7 +794,8 @@ fn fetch_remote_blocking(
                 let full = FullName::try_from(dst_ref.as_str())
                     .map_err(|err| OzError::Git(format!("invalid ref '{dst_ref}': {err}")))?;
                 let forced = spec.allow_non_fast_forward
-                    && old_oid.is_some_and(|old_id| !is_ancestor_commit(&gix_repo, old_id, new_oid));
+                    && old_oid
+                        .is_some_and(|old_id| !is_ancestor_commit(&gix_repo, old_id, new_oid));
                 ref_edits.push(RefEdit::update(
                     full,
                     new_oid,

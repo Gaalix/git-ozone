@@ -84,13 +84,8 @@ pub(crate) fn resolve_workspace_head(
                 .try_find_reference(&ref_name)
                 .map_err(OzError::git_source)?
             {
-                let commit = reference
-                    .peel_to_commit()
-                    .map_err(OzError::git_source)?;
-                let tree_id = commit
-                    .tree_id()
-                    .map_err(OzError::git_source)?
-                    .detach();
+                let commit = reference.peel_to_commit().map_err(OzError::git_source)?;
+                let tree_id = commit.tree_id().map_err(OzError::git_source)?.detach();
                 return Ok((Some(branch.clone()), Some(commit.id), tree_id));
             }
             return Ok((Some(branch.clone()), None, empty_tree));

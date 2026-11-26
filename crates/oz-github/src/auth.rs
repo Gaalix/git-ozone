@@ -647,14 +647,12 @@ fn env_tokens_allowed_for_host(
         let trimmed = gh_host_raw.trim();
         if !trimmed.is_empty() {
             let configured_host = if trimmed.contains("://") {
-                url::Url::parse(trimmed)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| strip_host_port(h).to_ascii_lowercase()))
+                url::Url::parse(trimmed).ok().and_then(|u| {
+                    u.host_str()
+                        .map(|h| strip_host_port(h).to_ascii_lowercase())
+                })
             } else {
-                Some(
-                    strip_host_port(trimmed.trim_end_matches('/'))
-                        .to_ascii_lowercase(),
-                )
+                Some(strip_host_port(trimmed.trim_end_matches('/')).to_ascii_lowercase())
             };
             if configured_host.as_deref() == Some(bare_host) {
                 return true;

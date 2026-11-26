@@ -1404,10 +1404,10 @@ fn evaluate_doctor_checks(
         if ssh_signing.enabled_by_default {
             warnings.push(format!(
                 "SSH commit signing is enabled by default but not ready: {}",
-                ssh_signing
-                    .issues
-                    .first()
-                    .map_or("no valid unencrypted Ed25519 signing key found", String::as_str)
+                ssh_signing.issues.first().map_or(
+                    "no valid unencrypted Ed25519 signing key found",
+                    String::as_str
+                )
             ));
             for r in &rem {
                 push_unique(&mut recovery_commands, r.clone());

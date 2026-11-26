@@ -658,6 +658,9 @@ mod tests {
             after: 0..u32::MAX,
         }];
         assert_eq!(project_pos_onto_base(10, false, &huge_insert), u32::MAX);
-        assert_eq!(project_pos_onto_base(u32::MAX, true, &huge_insert), u32::MAX);
+        assert_eq!(
+            project_pos_onto_base(u32::MAX, true, &huge_insert),
+            u32::MAX
+        );
     }
 }

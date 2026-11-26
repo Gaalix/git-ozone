@@ -3,12 +3,15 @@
 
 //! `oz-vfsd` background VFS daemon entrypoint.
 
+#[cfg(target_os = "linux")]
+use fuser as _;
 use oz_core::OzoneRepo;
 use oz_vfsd::client::{global_daemon_socket_path, socket_path_for_git_dir};
 use oz_vfsd::server::{run_daemon, run_global_daemon};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use {chrono as _, fs4 as _, libc as _, serde as _, serde_json as _, walkdir as _};
 
 const HELP_TEXT: &str = "\
 Ozone CoW VFS background daemon
@@ -147,7 +150,9 @@ where
     }
 
     if args.global && args.git_dir.is_some() {
-        return Err("the argument '--global' cannot be used with '--git-dir <GIT_DIR>'".to_string());
+        return Err(
+            "the argument '--global' cannot be used with '--git-dir <GIT_DIR>'".to_string(),
+        );
     }
 
     Ok(ParseOutcome::Run(args))
@@ -266,11 +271,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_args_from([
-                "oz-vfsd",
-                "--git-dir=/repo/.git",
-                "--socket=/tmp/vfsd.sock",
-            ]),
+            parse_args_from(["oz-vfsd", "--git-dir=/repo/.git", "--socket=/tmp/vfsd.sock",]),
             Ok(ParseOutcome::Run(Args {
                 global: false,
                 git_dir: Some(PathBuf::from("/repo/.git")),

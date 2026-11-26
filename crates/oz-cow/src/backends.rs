@@ -100,7 +100,10 @@ impl WorkspaceBackend for ClonefileBackend {
     }
 
     fn health_check(&self, workspace_path: &Path) -> Result<BackendHealth> {
-        Ok(simple_dir_health(BackendKind::ApfsClonefile, workspace_path))
+        Ok(simple_dir_health(
+            BackendKind::ApfsClonefile,
+            workspace_path,
+        ))
     }
 }
 
@@ -177,7 +180,10 @@ impl WorkspaceBackend for RefsCloneBackend {
     }
 
     fn health_check(&self, workspace_path: &Path) -> Result<BackendHealth> {
-        Ok(simple_dir_health(BackendKind::WindowsRefsClone, workspace_path))
+        Ok(simple_dir_health(
+            BackendKind::WindowsRefsClone,
+            workspace_path,
+        ))
     }
 }
 

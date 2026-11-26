@@ -461,12 +461,11 @@ fn detect_linux_fuse(ozone_dir: Option<&Path>) -> LinuxFuseReadiness {
             .filter(|s| !s.is_empty())
     });
 
-    let user_allow_other_enabled =
-        std::fs::read_to_string("/etc/fuse.conf").is_ok_and(|content| {
-            content
-                .lines()
-                .any(|line| line.trim() == "user_allow_other")
-        });
+    let user_allow_other_enabled = std::fs::read_to_string("/etc/fuse.conf").is_ok_and(|content| {
+        content
+            .lines()
+            .any(|line| line.trim() == "user_allow_other")
+    });
 
     let no_new_privs = process_has_no_new_privs();
     let daemon_running = is_vfsd_daemon_running(ozone_dir);

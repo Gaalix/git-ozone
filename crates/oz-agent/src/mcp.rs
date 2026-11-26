@@ -626,7 +626,6 @@ impl McpServer {
 }
 
 impl McpSessionSnapshot {
-
     fn discover_target_repo(
         &self,
         directory: Option<&str>,
@@ -2203,7 +2202,12 @@ mod tests {
         // 9: oz_checkpoint
         let (is_err, checkpoint_json) = extract_tool_json(&responses[8]);
         assert!(!is_err);
-        assert!(checkpoint_json["op_id"].as_str().unwrap().starts_with("op_"));
+        assert!(
+            checkpoint_json["op_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("op_")
+        );
 
         // 10: oz_undo
         let (is_err, undo_json) = extract_tool_json(&responses[9]);
@@ -2883,9 +2887,9 @@ mod tests {
                 .expect("send concurrent results");
         });
 
-        let (list_raw, status_raw) = fast_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("concurrent tools/list and oz_status must complete while oz_ci_logs is blocked");
+        let (list_raw, status_raw) = fast_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "concurrent tools/list and oz_status must complete while oz_ci_logs is blocked",
+        );
         fast_handle.join().expect("join fast thread");
 
         let list_val: Value = serde_json::from_str(&list_raw).expect("parse tools/list");

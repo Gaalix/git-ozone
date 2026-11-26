@@ -1129,9 +1129,7 @@ fn reachable_from_head(entries: &BTreeMap<String, OpLogEntry>, head_id: &str) ->
     visited
 }
 
-fn build_reverse_children_map(
-    entries: &BTreeMap<String, OpLogEntry>,
-) -> HashMap<&str, Vec<&str>> {
+fn build_reverse_children_map(entries: &BTreeMap<String, OpLogEntry>) -> HashMap<&str, Vec<&str>> {
     let mut children: HashMap<&str, Vec<&str>> = HashMap::with_capacity(entries.len());
     for (child_id, entry) in entries {
         for parent_id in &entry.parents {

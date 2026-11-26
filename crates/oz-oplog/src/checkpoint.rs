@@ -72,8 +72,10 @@ pub fn checkpoint(
         )
     })?;
 
-    let reflog_msg =
-        message.map_or_else(|| format!("oz checkpoint {op_id}"), |m| format!("oz checkpoint: {m}"));
+    let reflog_msg = message.map_or_else(
+        || format!("oz checkpoint {op_id}"),
+        |m| format!("oz checkpoint: {m}"),
+    );
 
     let edits = [
         RefEdit::update(cp_full, dirty_tree, PreviousValue::Any, reflog_msg.as_str()),
