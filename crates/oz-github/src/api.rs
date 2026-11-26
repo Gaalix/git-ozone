@@ -1022,14 +1022,13 @@ impl GitHubClient {
                         .get("comments")
                         .and_then(|c| c.get("nodes"))
                         .and_then(|n| n.as_array())
-                        .map(|arr| {
+                        .map_or_default(|arr| {
                             arr.iter()
                                 .filter_map(|item| {
                                     item.get("databaseId").and_then(serde_json::Value::as_u64)
                                 })
                                 .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
+                        });
                     threads.push(GitHubReviewThreadMeta {
                         thread_id: thread_id.to_string(),
                         is_resolved,

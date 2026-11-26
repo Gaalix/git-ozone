@@ -810,10 +810,7 @@ pub fn materialize_cas_workspace(
     // Load cached BLAKE3 digests for this immutable baseline so spawns #2..N hardlink
     // directly from `.git/ozone/cas/` without re-reading or re-hashing gigabytes of artifacts.
     let cache_path = cas_digest_cache_path(cas_dir, baseline_dir);
-    let existing_digests = cache_path
-        .as_deref()
-        .map(load_cas_digest_cache)
-        .unwrap_or_default();
+    let existing_digests = cache_path.as_deref().map_or_default(load_cas_digest_cache);
 
     // Parallel CAS hardlinking (`0444` / `0555`) for immutable dependencies (lock-free).
     let computed_digests = dep_jobs

@@ -1352,10 +1352,7 @@ mod linux_impl {
                 let (rel, lock_target) = if name == "." {
                     (parent_rel.clone(), parent_rel.clone())
                 } else if name == ".." {
-                    let target = parent_rel
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
+                    let target = parent_rel.parent().map_or_default(Path::to_path_buf);
                     // Locking `parent_rel` as Shared covers `parent_rel` and all of its
                     // ancestors (including `target` when non-empty).
                     (target, parent_rel.clone())
@@ -3135,8 +3132,7 @@ mod linux_impl {
                     let parent_ino = if rel_dir.as_os_str().is_empty() {
                         INodeNo::ROOT
                     } else {
-                        let parent_rel =
-                            rel_dir.parent().map(Path::to_path_buf).unwrap_or_default();
+                        let parent_rel = rel_dir.parent().map_or_default(Path::to_path_buf);
                         if parent_rel.as_os_str().is_empty() {
                             INodeNo::ROOT
                         } else {

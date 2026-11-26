@@ -129,8 +129,7 @@ fn grouped_subcommands_help() -> &'static str {
             let name = sub.get_name().to_string();
             let about = sub
                 .get_about()
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             all_names.push(name.clone());
             descriptions.insert(name, about);
         }
@@ -444,7 +443,7 @@ pub(crate) struct DoctorReport {
 }
 
 /// Entrypoint shared by `oz` and `git-ozone` binaries.
-#[must_use]
+#[must_use = "returns the process exit code to return from main"]
 pub fn run_cli() -> std::process::ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     run_with_args(args).to_process_exit_code()
@@ -728,10 +727,7 @@ pub(crate) fn build_doctor_envelope(
     let git_ozone_alias_path = find_git_ozone_on_path();
     let git_ozone_sibling = find_sibling_git_ozone_bin();
 
-    let active_mounts = repo_opt
-        .as_ref()
-        .map(collect_active_mounts)
-        .unwrap_or_default();
+    let active_mounts = repo_opt.as_ref().map_or_default(collect_active_mounts);
     let active_mount_count = active_mounts.iter().filter(|m| m.mounted).count();
     let unhealthy_mount_count = active_mounts
         .iter()
@@ -1312,8 +1308,7 @@ fn evaluate_doctor_checks(
                     oz_vfsd
                         .path
                         .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
+                        .map_or_default(|p| p.display().to_string())
                 ),
                 remediation: Vec::new(),
             });
@@ -1352,10 +1347,7 @@ fn evaluate_doctor_checks(
         });
     } else {
         let rem = if let Some(ref sibling) = git_ozone_alias.sibling_path {
-            let parent = sibling
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
+            let parent = sibling.parent().map_or_default(|p| p.display().to_string());
             vec![format!(
                 "export PATH=\"{parent}:$PATH\"  # enables `git ozone <cmd>`"
             )]
@@ -1775,8 +1767,7 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
             d.repo
                 .repo_root
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+                .map_or_default(|p| p.display().to_string()),
             d.repo.branch.as_deref().unwrap_or("detached"),
             d.repo.ozone_initialized,
             d.repo.active_mount_count

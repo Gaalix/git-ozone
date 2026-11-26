@@ -1410,8 +1410,7 @@ pub(crate) fn pr_files_to_changes(files: &[GitHubPullRequestFile]) -> Vec<FileCh
             let hunks = f
                 .patch
                 .as_deref()
-                .map(|p| parse_github_patch_to_hunks(&fid, num, &f.filename, p))
-                .unwrap_or_default();
+                .map_or_default(|p| parse_github_patch_to_hunks(&fid, num, &f.filename, p));
             let is_binary = f.patch.is_none() && f.additions == 0 && f.deletions == 0;
             FileChange {
                 id: fid,

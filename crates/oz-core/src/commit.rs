@@ -560,10 +560,7 @@ fn commit_changes_inner(
     };
 
     let initial_message = if opts.amend && opts.message.trim().is_empty() {
-        amended_head
-            .as_ref()
-            .map(|h| h.message.clone())
-            .unwrap_or_default()
+        amended_head.as_ref().map_or_default(|h| h.message.clone())
     } else {
         opts.message.clone()
     };

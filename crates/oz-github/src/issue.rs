@@ -41,8 +41,7 @@ pub fn parse_issue_target(raw: &str) -> Result<ParsedIssueTarget> {
     if let Ok(parsed_url) = url::Url::parse(trimmed) {
         let segs: Vec<&str> = parsed_url
             .path_segments()
-            .map(|it| it.filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
+            .map_or_default(|it| it.filter(|s| !s.is_empty()).collect());
         if segs.len() >= 4
             && matches!(segs[2], "issues" | "pull")
             && let Ok(num) = segs[3].parse::<u64>()

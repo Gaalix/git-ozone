@@ -16,7 +16,7 @@ All notable changes to Ozone (`oz` / `git-ozone` / `oz-vfsd`) are documented in 
 
 ### Dependencies, Hygiene & Static Analysis
 - **Lean Workspace Dependencies & `clap`-Free `oz-vfsd` (`oz-vfsd`, workspace):** Replaced `clap` in `oz-vfsd` with a lightweight `std::env::args_os()` parser, removed unused `bytes` from workspace dependencies, hoisted `regex-automata` and `regex-syntax` to `[workspace.dependencies]`, and trimmed base workspace `tokio` to `["rt"]` with exact per-crate feature sets.
-- **Workspace-Wide Pedantic, Perf & Dependency Lints:** Narrowed crate-internal helpers to `pub(crate)`, removed dead internal methods, ignored `.hallmark/`, and made all 10 workspace crates warning-free under `-W clippy::pedantic -W clippy::perf` and `-W unused-crate-dependencies`.
+- **Workspace-Wide Pedantic, Perf & Dependency Lints:** Narrowed crate-internal helpers to `pub(crate)`, removed dead internal methods, ignored `.hallmark/`, and made all 10 workspace crates warning-free under Rust 1.100 `-W clippy::pedantic -W clippy::perf`, `-W unused-crate-dependencies`, and `cargo::unused_workspace_dependencies`.
 
 ## [1.3.0] — 2026-11-26
 

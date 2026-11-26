@@ -2881,8 +2881,7 @@ pub(crate) fn handle_clone(
         let filter_note = d
             .filter
             .as_deref()
-            .map(|f| format!(", filter={f}"))
-            .unwrap_or_default();
+            .map_or_default(|f| format!(", filter={f}"));
         println!(
             "Cloned '{}' into {} (branch: {}, files: {}{filter_note})",
             d.remote_url,
@@ -3327,8 +3326,7 @@ fn handle_issue_comment(
             .comment
             .html_url
             .as_deref()
-            .map(|u| format!(" -> {u}"))
-            .unwrap_or_default();
+            .map_or_default(|u| format!(" -> {u}"));
         println!(
             "Commented on #{} (comment #{}){url_suffix}",
             d.number, d.comment.id
@@ -3461,8 +3459,7 @@ fn handle_pr_reply(
         let handle = d
             .thread_handle
             .as_deref()
-            .map(|h| format!("[{h}] "))
-            .unwrap_or_default();
+            .map_or_default(|h| format!("[{h}] "));
         let resolved_suffix = match d.resolved {
             Some(true) => " [resolved]",
             _ => "",
@@ -3471,8 +3468,7 @@ fn handle_pr_reply(
             .reply
             .html_url
             .as_deref()
-            .map(|u| format!(" -> {u}"))
-            .unwrap_or_default();
+            .map_or_default(|u| format!(" -> {u}"));
         println!(
             "Replied to PR #{} {handle}#{} (reply #{}){resolved_suffix}{url_suffix}",
             d.pr_number, d.in_reply_to_comment_id, d.reply.id
@@ -3514,8 +3510,7 @@ fn handle_pr_resolve(
         let handle = d
             .thread_handle
             .as_deref()
-            .map(|h| format!("[{h}] "))
-            .unwrap_or_default();
+            .map_or_default(|h| format!("[{h}] "));
         println!("{verb} PR #{} {handle}thread {}", d.pr_number, d.thread_id);
     })
 }
@@ -4017,8 +4012,7 @@ fn handle_pr_review(
                 .review
                 .as_ref()
                 .and_then(|r| r.html_url.as_deref())
-                .map(|u| format!(" -> {u}"))
-                .unwrap_or_default();
+                .map_or_default(|u| format!(" -> {u}"));
             println!(
                 "Submitted {} review on PR #{} at commit {} ({} inline comment(s)){url_suffix}",
                 d.event,
@@ -4309,8 +4303,7 @@ pub(crate) fn handle_ci(
             let branch_suffix = d
                 .branch_filter
                 .as_deref()
-                .map(|b| format!(" (branch: {b})"))
-                .unwrap_or_default();
+                .map_or_default(|b| format!(" (branch: {b})"));
             println!(
                 "Workflow runs{branch_suffix}: {} total ({} passing, {} failing, {} pending)",
                 d.total_runs, d.passing_count, d.failing_count, d.pending_count
@@ -4811,8 +4804,7 @@ fn render_workflow_report_human(d: &CiWorkflowReport) {
     let branch_suffix = d
         .branch_filter
         .as_deref()
-        .map(|b| format!(" (branch: {b})"))
-        .unwrap_or_default();
+        .map_or_default(|b| format!(" (branch: {b})"));
     println!(
         "Workflow '{}'{} : {} ({} run(s))",
         d.workflow, branch_suffix, d.overall_status, d.total_runs

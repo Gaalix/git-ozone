@@ -98,7 +98,7 @@ pub fn compute_instance_guid(git_dir: &Path, workspace: &str) -> [u8; 16] {
 }
 
 /// Case-insensitive UTF-16 uppercase ordering matching Windows `PrjFileNameCompare`.
-#[must_use]
+#[must_use = "returns the case-insensitive UTF-16 sort order"]
 pub fn prj_file_name_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let up_a = utf16_upper_units(a);
     let up_b = utf16_upper_units(b);
@@ -592,7 +592,7 @@ impl ProjFsLayerEngine {
 
         remove_subtree_markers(&self.config.opaque_dir(), &norm_rel, OPAQUE_SUFFIX)?;
 
-        let parent_rel = norm_rel.parent().map(Path::to_path_buf).unwrap_or_default();
+        let parent_rel = norm_rel.parent().map_or_default(Path::to_path_buf);
         let (eff_cfg, _) = self.effective_config();
         if let Some((_, _, lower_meta)) = self.resolve_in_lower(&norm_rel)
             && !lower_layers_blocked_at_dir(&eff_cfg, &parent_rel)

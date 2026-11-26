@@ -30,7 +30,7 @@ impl ExitCode {
     }
 
     /// Converts into [`std::process::ExitCode`].
-    #[must_use]
+    #[must_use = "returns the process exit code to return from main"]
     pub fn to_process_exit_code(self) -> std::process::ExitCode {
         std::process::ExitCode::from(self as u8)
     }

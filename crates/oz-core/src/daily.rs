@@ -4133,8 +4133,7 @@ pub fn branch_list_with_options(
             let subject = commit
                 .decode()
                 .ok()
-                .map(|d| split_subject_and_body(&d.message.to_str_lossy()).0)
-                .unwrap_or_default();
+                .map_or_default(|d| split_subject_and_body(&d.message.to_str_lossy()).0);
             let is_current = head.branch.as_deref() == Some(name.as_str());
             branches.push(BranchInfo {
                 workspace: ws_by_branch.get(&name).cloned(),
@@ -4168,8 +4167,7 @@ pub fn branch_list_with_options(
             let subject = commit
                 .decode()
                 .ok()
-                .map(|d| split_subject_and_body(&d.message.to_str_lossy()).0)
-                .unwrap_or_default();
+                .map_or_default(|d| split_subject_and_body(&d.message.to_str_lossy()).0);
             branches.push(BranchInfo {
                 workspace: None,
                 name,

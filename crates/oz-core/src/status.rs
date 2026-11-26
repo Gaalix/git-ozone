@@ -1374,17 +1374,14 @@ fn scan_general_workdir(
     let mut index_cache = IndexStatCache::load(repo, hash_kind);
     let cap_hint = index_cache.as_ref().map_or(0, IndexStatCache::entry_count);
 
-    let staged_gitlinks: Vec<(String, gix::ObjectId)> = index_cache
-        .as_ref()
-        .map(|ic| {
-            ic.index
-                .entries()
-                .iter()
-                .filter(|e| e.mode == gix::index::entry::Mode::COMMIT)
-                .map(|e| (e.path(&ic.index).to_str_lossy().into_owned(), e.id))
-                .collect()
-        })
-        .unwrap_or_default();
+    let staged_gitlinks: Vec<(String, gix::ObjectId)> = index_cache.as_ref().map_or_default(|ic| {
+        ic.index
+            .entries()
+            .iter()
+            .filter(|e| e.mode == gix::index::entry::Mode::COMMIT)
+            .map(|e| (e.path(&ic.index).to_str_lossy().into_owned(), e.id))
+            .collect()
+    });
 
     let attr_resolver =
         AttributeResolver::for_workdir(&repo.workdir_path, &repo.git_common_dir, git_cfg)?;

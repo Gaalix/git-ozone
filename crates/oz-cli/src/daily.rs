@@ -329,8 +329,7 @@ fn format_log_human(
         } else {
             item.ai_provenance
                 .as_ref()
-                .map(|ai| format!(" {c_magenta}[AI:{}]{c_reset}", ai.client))
-                .unwrap_or_default()
+                .map_or_default(|ai| format!(" {c_magenta}[AI:{}]{c_reset}", ai.client))
         };
         let lr_prefix = if left_right {
             match c.side.as_deref() {
@@ -1521,8 +1520,7 @@ pub(crate) fn handle_branch(
                 let ws_suffix = b
                     .workspace
                     .as_ref()
-                    .map(|w| format!(" [ws:{w}]"))
-                    .unwrap_or_default();
+                    .map_or_default(|w| format!(" [ws:{w}]"));
                 let _ = writeln!(
                     out,
                     "{marker}{remote_prefix}{} ({}){} {}",
@@ -1869,11 +1867,7 @@ pub(crate) fn handle_grep(
     render_daily_result(mode, res, |env| {
         let d = &env.data;
         let mut out = String::new();
-        let prefix = d
-            .rev
-            .as_deref()
-            .map(|r| format!("{r}:"))
-            .unwrap_or_default();
+        let prefix = d.rev.as_deref().map_or_default(|r| format!("{r}:"));
         if args.files_with_matches {
             for f in &d.matched_files {
                 let _ = writeln!(out, "{prefix}{f}");

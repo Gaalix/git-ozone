@@ -595,8 +595,7 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
                     "oz clone {}{} {}",
                     opts.filter
                         .as_deref()
-                        .map(|f| format!("--filter={f} "))
-                        .unwrap_or_default(),
+                        .map_or_default(|f| format!("--filter={f} ")),
                     persisted_url,
                     dst.display()
                 ),
@@ -706,15 +705,12 @@ fn fetch_remote_blocking(
     } else if is_named_remote {
         let key = format!("remote.{remote_label}.fetch");
         let cfg = gix_repo.config_snapshot();
-        let vals: Vec<String> = cfg
-            .strings(&key)
-            .map(|list| {
-                list.into_iter()
-                    .map(|v| v.to_str_lossy().trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let vals: Vec<String> = cfg.strings(&key).map_or_default(|list| {
+            list.into_iter()
+                .map(|v| v.to_str_lossy().trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
         if vals.is_empty() {
             vec![format!("+refs/heads/*:refs/remotes/{remote_label}/*")]
         } else {
@@ -738,8 +734,7 @@ fn fetch_remote_blocking(
         if opts.prune { "--prune " } else { "" },
         effective_filter
             .as_deref()
-            .map(|f| format!("--filter={f} "))
-            .unwrap_or_default(),
+            .map_or_default(|f| format!("--filter={f} ")),
         remote_label
     );
     let tx = MutationTransaction::begin_watching_all_refs(repo, cmd_str, actor, None)?;

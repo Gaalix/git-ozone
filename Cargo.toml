@@ -43,7 +43,6 @@ oz-oplog = { path = "crates/oz-oplog" }
 oz-integrate = { path = "crates/oz-integrate" }
 oz-github = { path = "crates/oz-github" }
 oz-agent = { path = "crates/oz-agent" }
-oz-cloud-api = { path = "crates/oz-cloud-api" }
 
 # Pure-Rust Git & Diff
 gix = { version = "0.90", default-features = false, features = ["basic", "blob-diff", "dirwalk", "excludes", "index", "merge", "revision", "serde", "sha1", "status", "worktree-mutation"] }
