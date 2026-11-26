@@ -23,7 +23,7 @@ pub const WHITEOUT_SUFFIX: &str = ".oz_wh";
 /// Marker suffix for replaced/opaque directories inside `meta_dir/opaque/`.
 pub const OPAQUE_SUFFIX: &str = ".oz_opaque";
 
-/// Resolved configuration for a single CoW overlay mount.
+/// Resolved configuration for a single `CoW` overlay mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayMountConfig {
     pub workspace: String,
@@ -90,7 +90,7 @@ impl OverlayMountConfig {
 
 /// Auto-detects `<meta_dir>/../seed` when present as a directory on disk.
 #[must_use]
-pub fn resolve_seed_dir(spec: &MountSpec) -> Option<PathBuf> {
+pub(crate) fn resolve_seed_dir(spec: &MountSpec) -> Option<PathBuf> {
     spec.resolved_seed_dir()
 }
 
@@ -104,14 +104,14 @@ pub enum LayerKind {
 
 /// Host filesystem target resolved across `[upper, seed, baseline]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedEntry {
+pub(crate) struct ResolvedEntry {
     pub layer: LayerKind,
     pub host_path: PathBuf,
 }
 
 /// Single merged directory entry returned by [`list_merged_dir_entries`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergedDirEntry {
+pub(crate) struct MergedDirEntry {
     pub name: OsString,
     pub file_type: StdFileType,
     pub host_path: PathBuf,
@@ -158,7 +158,7 @@ fn is_valid_child_name(name: &OsStr) -> bool {
 /// Resolves `rel` across `[upper_dir, seed_dir, baseline_dir]` honoring whiteouts,
 /// opaque directory markers, and `seed_whiteouts`.
 #[must_use]
-pub fn resolve_rel_path(cfg: &OverlayMountConfig, rel: &Path) -> Option<ResolvedEntry> {
+pub(crate) fn resolve_rel_path(cfg: &OverlayMountConfig, rel: &Path) -> Option<ResolvedEntry> {
     if rel.as_os_str().is_empty() {
         return Some(ResolvedEntry {
             layer: LayerKind::Upper,
@@ -360,7 +360,7 @@ fn read_dir_whiteout_names(root: &Path, rel_dir: &Path) -> HashSet<OsString> {
 
 /// Collects and deduplicates directory entries across `[upper_dir, seed_dir, baseline_dir]`
 /// in deterministic lexicographical order.
-pub fn list_merged_dir_entries(
+pub(crate) fn list_merged_dir_entries(
     cfg: &OverlayMountConfig,
     rel_dir: &Path,
 ) -> std::io::Result<Vec<MergedDirEntry>> {
@@ -713,7 +713,7 @@ pub fn lazy_unmount_fuse(mount_point: &Path) -> Result<()> {
                     }
                     last_err = Some(stderr.trim().to_string());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(OzError::Io(e)),
             }
         }
@@ -791,7 +791,7 @@ impl MountedOverlay {
     }
 }
 
-/// Mounts the CoW overlay described by `spec` over `/dev/fuse`.
+/// Mounts the `CoW` overlay described by `spec` over `/dev/fuse`.
 #[cfg(target_os = "linux")]
 pub fn mount_overlay(spec: &MountSpec) -> Result<MountedOverlay> {
     let cfg = OverlayMountConfig::from_spec(spec);
@@ -832,7 +832,12 @@ pub fn mount_overlay(spec: &MountSpec) -> Result<MountedOverlay> {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use super::*;
+    use super::{
+        BTreeMap, Component, OPAQUE_SUFFIX, OsStr, OsString, OverlayMountConfig, Path, PathBuf,
+        WHITEOUT_SUFFIX, WalkDir, ancestors_inclusive, is_valid_child_name,
+        list_merged_dir_entries, lower_layers_blocked_at_dir, marker_path, resolve_in_lower_layers,
+        resolve_rel_path,
+    };
     use fuser::{
         AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
         Generation, INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
@@ -861,17 +866,17 @@ mod linux_impl {
 
     #[derive(Debug)]
     struct InodeTable {
-        next_ino: u64,
-        by_ino: HashMap<INodeNo, InodeEntry>,
-        path_to_ino: BTreeMap<PathBuf, INodeNo>,
+        next_id: u64,
+        entries: HashMap<INodeNo, InodeEntry>,
+        by_path: BTreeMap<PathBuf, INodeNo>,
     }
 
     impl InodeTable {
         fn new() -> Self {
-            let mut by_ino = HashMap::new();
+            let mut entries = HashMap::new();
             let mut root_paths = BTreeSet::new();
             root_paths.insert(PathBuf::new());
-            by_ino.insert(
+            entries.insert(
                 INodeNo::ROOT,
                 InodeEntry {
                     paths: root_paths,
@@ -880,17 +885,17 @@ mod linux_impl {
                     is_dir: true,
                 },
             );
-            let mut path_to_ino = BTreeMap::new();
-            path_to_ino.insert(PathBuf::new(), INodeNo::ROOT);
+            let mut by_path = BTreeMap::new();
+            by_path.insert(PathBuf::new(), INodeNo::ROOT);
             Self {
-                next_ino: 2,
-                by_ino,
-                path_to_ino,
+                next_id: 2,
+                entries,
+                by_path,
             }
         }
 
         fn resolve_ino_path(&self, ino: INodeNo) -> std::result::Result<PathBuf, Errno> {
-            let entry = self.by_ino.get(&ino).ok_or(Errno::ENOENT)?;
+            let entry = self.entries.get(&ino).ok_or(Errno::ENOENT)?;
             if entry.unlinked {
                 return Err(Errno::ENOENT);
             }
@@ -898,8 +903,8 @@ mod linux_impl {
         }
 
         fn lookup_or_insert(&mut self, rel: &Path, is_dir: bool, inc_lookup: bool) -> INodeNo {
-            if let Some(&ino) = self.path_to_ino.get(rel)
-                && let Some(entry) = self.by_ino.get_mut(&ino)
+            if let Some(&ino) = self.by_path.get(rel)
+                && let Some(entry) = self.entries.get_mut(&ino)
             {
                 if !entry.unlinked && entry.is_dir == is_dir {
                     if inc_lookup {
@@ -912,14 +917,14 @@ mod linux_impl {
                 if entry.paths.is_empty() {
                     entry.unlinked = true;
                 }
-                self.path_to_ino.remove(rel);
+                self.by_path.remove(rel);
             }
 
-            let ino = INodeNo(self.next_ino);
-            self.next_ino += 1;
+            let ino = INodeNo(self.next_id);
+            self.next_id += 1;
             let mut paths = BTreeSet::new();
             paths.insert(rel.to_path_buf());
-            self.by_ino.insert(
+            self.entries.insert(
                 ino,
                 InodeEntry {
                     paths,
@@ -928,7 +933,7 @@ mod linux_impl {
                     is_dir,
                 },
             );
-            self.path_to_ino.insert(rel.to_path_buf(), ino);
+            self.by_path.insert(rel.to_path_buf(), ino);
             ino
         }
 
@@ -939,7 +944,7 @@ mod linux_impl {
             inc_lookup: bool,
         ) -> std::result::Result<(), Errno> {
             self.detach_path(&new_rel);
-            let entry = self.by_ino.get_mut(&ino).ok_or(Errno::ENOENT)?;
+            let entry = self.entries.get_mut(&ino).ok_or(Errno::ENOENT)?;
             if entry.is_dir {
                 return Err(Errno::EPERM);
             }
@@ -948,19 +953,19 @@ mod linux_impl {
             if inc_lookup {
                 entry.lookup_count = entry.lookup_count.saturating_add(1);
             }
-            self.path_to_ino.insert(new_rel, ino);
+            self.by_path.insert(new_rel, ino);
             Ok(())
         }
 
         fn detach_path(&mut self, rel: &Path) {
-            if let Some(ino) = self.path_to_ino.remove(rel)
-                && let Some(entry) = self.by_ino.get_mut(&ino)
+            if let Some(ino) = self.by_path.remove(rel)
+                && let Some(entry) = self.entries.get_mut(&ino)
             {
                 entry.paths.remove(rel);
                 if entry.paths.is_empty() {
                     entry.unlinked = true;
                     if entry.lookup_count == 0 {
-                        self.by_ino.remove(&ino);
+                        self.entries.remove(&ino);
                     }
                 }
             }
@@ -970,24 +975,24 @@ mod linux_impl {
             if ino == INodeNo::ROOT {
                 return;
             }
-            let Some(entry) = self.by_ino.get_mut(&ino) else {
+            let Some(entry) = self.entries.get_mut(&ino) else {
                 return;
             };
             entry.lookup_count = entry.lookup_count.saturating_sub(nlookup);
             if entry.lookup_count == 0 {
                 let paths = std::mem::take(&mut entry.paths);
                 for p in paths {
-                    if self.path_to_ino.get(&p) == Some(&ino) {
-                        self.path_to_ino.remove(&p);
+                    if self.by_path.get(&p) == Some(&ino) {
+                        self.by_path.remove(&p);
                     }
                 }
-                self.by_ino.remove(&ino);
+                self.entries.remove(&ino);
             }
         }
 
         fn rename_subtree(&mut self, src_rel: &Path, dst_rel: &Path) {
             let dst_targets: Vec<PathBuf> = self
-                .path_to_ino
+                .by_path
                 .keys()
                 .filter(|p| *p == dst_rel || p.starts_with(dst_rel))
                 .cloned()
@@ -997,14 +1002,14 @@ mod linux_impl {
             }
 
             let src_entries: Vec<(PathBuf, INodeNo)> = self
-                .path_to_ino
+                .by_path
                 .iter()
                 .filter(|(p, _)| *p == src_rel || p.starts_with(src_rel))
                 .map(|(p, &ino)| (p.clone(), ino))
                 .collect();
 
             for (old_p, ino) in src_entries {
-                self.path_to_ino.remove(&old_p);
+                self.by_path.remove(&old_p);
                 let new_p = if old_p == src_rel {
                     dst_rel.to_path_buf()
                 } else if let Ok(tail) = old_p.strip_prefix(src_rel) {
@@ -1012,8 +1017,8 @@ mod linux_impl {
                 } else {
                     continue;
                 };
-                self.path_to_ino.insert(new_p.clone(), ino);
-                if let Some(entry) = self.by_ino.get_mut(&ino) {
+                self.by_path.insert(new_p.clone(), ino);
+                if let Some(entry) = self.entries.get_mut(&ino) {
                     entry.paths.remove(&old_p);
                     entry.paths.insert(new_p);
                 }
@@ -1377,15 +1382,14 @@ mod linux_impl {
             let locked = loop {
                 let candidate = {
                     let inner = self.lock_state();
-                    match inner.inodes.resolve_ino_path(ino) {
-                        Ok(rel) => Ok(rel),
-                        Err(_) => {
-                            let open_file = fh
-                                .and_then(|handle| inner.open_files.get(&handle))
-                                .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
-                                .map(|open| Arc::clone(&open.file));
-                            Err(open_file)
-                        }
+                    if let Ok(rel) = inner.inodes.resolve_ino_path(ino) {
+                        Ok(rel)
+                    } else {
+                        let open_file = fh
+                            .and_then(|handle| inner.open_files.get(&handle))
+                            .or_else(|| inner.open_files.values().find(|o| o.ino == ino))
+                            .map(|open| Arc::clone(&open.file));
+                        Err(open_file)
                     }
                 };
                 let rel = match candidate {
@@ -1757,15 +1761,13 @@ mod linux_impl {
     }
 
     fn errno_from_io(err: &std::io::Error) -> Errno {
-        err.raw_os_error()
-            .map(Errno::from_i32)
-            .unwrap_or(Errno::EIO)
+        err.raw_os_error().map_or(Errno::EIO, Errno::from_i32)
     }
 
     fn system_time_from_unix(secs: i64, nsec: i64) -> SystemTime {
         let clamped_ns = u32::try_from(nsec.clamp(0, 999_999_999)).unwrap_or(0);
-        if secs >= 0 {
-            UNIX_EPOCH + Duration::new(secs as u64, clamped_ns)
+        if let Ok(secs_u64) = u64::try_from(secs) {
+            UNIX_EPOCH + Duration::new(secs_u64, clamped_ns)
         } else {
             let abs_secs = secs.unsigned_abs();
             if clamped_ns == 0 {
@@ -1790,7 +1792,7 @@ mod linux_impl {
         let nlink = if kind == FileType::Directory {
             1
         } else {
-            meta.nlink() as u32
+            u32::try_from(meta.nlink()).unwrap_or(u32::MAX)
         };
         FileAttr {
             ino,
@@ -1805,7 +1807,7 @@ mod linux_impl {
             nlink,
             uid: meta.uid(),
             gid: meta.gid(),
-            rdev: meta.rdev() as u32,
+            rdev: u32::try_from(meta.rdev()).unwrap_or(0),
             blksize: 4096,
             flags: 0,
         }
@@ -1823,22 +1825,22 @@ mod linux_impl {
             },
             Some(TimeOrNow::SpecificTime(st)) => match st.duration_since(UNIX_EPOCH) {
                 Ok(d) => libc::timespec {
-                    tv_sec: d.as_secs() as libc::time_t,
-                    tv_nsec: d.subsec_nanos() as libc::c_long,
+                    tv_sec: libc::time_t::try_from(d.as_secs()).unwrap_or(libc::time_t::MAX),
+                    tv_nsec: libc::c_long::from(d.subsec_nanos()),
                 },
                 Err(e) => {
                     let d = e.duration();
-                    let secs = d.as_secs();
+                    let secs = libc::time_t::try_from(d.as_secs()).unwrap_or(libc::time_t::MAX);
                     let nsec = d.subsec_nanos();
                     if nsec == 0 {
                         libc::timespec {
-                            tv_sec: -(secs as libc::time_t),
+                            tv_sec: -secs,
                             tv_nsec: 0,
                         }
                     } else {
                         libc::timespec {
-                            tv_sec: -(secs as libc::time_t) - 1,
-                            tv_nsec: (1_000_000_000 - nsec) as libc::c_long,
+                            tv_sec: -secs - 1,
+                            tv_nsec: libc::c_long::from(1_000_000_000 - nsec),
                         }
                     }
                 }
@@ -2708,7 +2710,7 @@ mod linux_impl {
             }
             match std::fs::symlink_metadata(&upper_new) {
                 Ok(meta) => {
-                    reply.entry(&ZERO_TTL, &metadata_to_file_attr(ino, &meta), Generation(0))
+                    reply.entry(&ZERO_TTL, &metadata_to_file_attr(ino, &meta), Generation(0));
                 }
                 Err(e) => reply.error(errno_from_io(&e)),
             }
@@ -2803,14 +2805,11 @@ mod linux_impl {
                 let inner = self.lock_state();
                 if let Some(open) = inner.open_files.get(&fh) {
                     Ok(Arc::clone(&open.file))
+                } else if let Ok(rel) = inner.inodes.resolve_ino_path(ino) {
+                    Err(rel)
                 } else {
-                    match inner.inodes.resolve_ino_path(ino) {
-                        Ok(rel) => Err(rel),
-                        Err(_) => {
-                            reply.error(Errno::EBADF);
-                            return;
-                        }
-                    }
+                    reply.error(Errno::EBADF);
+                    return;
                 }
             };
             let file = match file_or_rel {
@@ -2836,7 +2835,7 @@ mod linux_impl {
                 match file.read_at(&mut buf[filled..], offset + filled as u64) {
                     Ok(0) => break,
                     Ok(n) => filled += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(e) => {
                         reply.error(errno_from_io(&e));
                         return;
@@ -2858,6 +2857,10 @@ mod linux_impl {
             _lock_owner: Option<LockOwner>,
             reply: ReplyWrite,
         ) {
+            let Ok(written) = u32::try_from(data.len()) else {
+                reply.error(Errno::EINVAL);
+                return;
+            };
             let file = {
                 let inner = self.lock_state();
                 let Some(open) = inner.open_files.get(&fh) else {
@@ -2876,7 +2879,7 @@ mod linux_impl {
                 reply.error(errno_from_io(&e));
                 return;
             }
-            reply.written(data.len() as u32);
+            reply.written(written);
         }
 
         fn flush(
@@ -3163,11 +3166,14 @@ mod linux_impl {
                 }
             };
 
-            for (idx, (entry_ino, kind, name)) in snapshot.iter().enumerate().skip(offset as usize)
-            {
-                let next_offset = (idx + 1) as u64;
-                if reply.add(*entry_ino, next_offset, *kind, name) {
-                    break;
+            if let Ok(skip_count) = usize::try_from(offset) {
+                for (idx, (entry_ino, kind, name)) in
+                    snapshot.iter().enumerate().skip(skip_count)
+                {
+                    let next_offset = (idx + 1) as u64;
+                    if reply.add(*entry_ino, next_offset, *kind, name) {
+                        break;
+                    }
                 }
             }
             reply.ok();
@@ -3228,9 +3234,9 @@ mod linux_impl {
             // SAFETY: `libc::statvfs` is a plain C struct of integer fields where all-zero bits
             // is a valid initial representation before being populated by `libc::statvfs`.
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-            // SAFETY: `c_path` is a valid NUL-terminated C string and `&mut stat` is a valid,
+            // SAFETY: `c_path` is a valid NUL-terminated C string and `&raw mut stat` is a valid,
             // aligned, writable `libc::statvfs` output struct.
-            let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+            let rc = unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) };
             if rc != 0 {
                 reply.error(errno_from_io(&std::io::Error::last_os_error()));
                 return;
@@ -3241,9 +3247,9 @@ mod linux_impl {
                 stat.f_bavail,
                 stat.f_files,
                 stat.f_ffree,
-                stat.f_bsize as u32,
-                stat.f_namemax as u32,
-                stat.f_frsize as u32,
+                u32::try_from(stat.f_bsize).unwrap_or(u32::MAX),
+                u32::try_from(stat.f_namemax).unwrap_or(255),
+                u32::try_from(stat.f_frsize).unwrap_or(u32::MAX),
             );
         }
 
@@ -3384,10 +3390,9 @@ mod tests {
         std::fs::write(&opq, b"").expect("write opaque");
         assert!(resolve_rel_path(&cfg, Path::new("pkg/shared.txt")).is_none());
         assert!(resolve_rel_path(&cfg, Path::new("pkg/base_only.txt")).is_none());
-        assert!(
-            list_merged_dir_entries(&cfg, Path::new("pkg"))
-                .expect("readdir opaque")
-                .is_empty()
+        assert_eq!(
+            list_merged_dir_entries(&cfg, Path::new("pkg")).expect("readdir opaque"),
+            &[]
         );
     }
 
@@ -3757,8 +3762,7 @@ mod tests {
                             Path::new("nested/deep/file_00.txt"),
                         )
                     };
-                    let _g1 = fs_l.test_lock_two_paths(a, b);
-                    drop(_g1);
+                    drop(fs_l.test_lock_two_paths(a, b));
 
                     let (c, d) = if tid == 0 {
                         (Path::new("nested"), Path::new("other_dir"))

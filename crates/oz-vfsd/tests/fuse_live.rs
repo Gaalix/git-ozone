@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(clippy::too_many_lines)]
+
 #![cfg(target_os = "linux")]
 
 //! Live `/dev/fuse` + `fusermount3` integration tests for `oz-vfsd`.
@@ -180,10 +182,10 @@ impl Drop for DaemonGuard {
         }
         for pid in &self.reap_pids {
             let mut status: libc::c_int = 0;
-            // SAFETY: Non-blocking `waitpid` with a valid stack `&mut status` reaps child PIDs
+            // SAFETY: Non-blocking `waitpid` with a valid stack `&raw mut status` reaps child PIDs
             // tracked by this test guard; `ECHILD` is safely ignored.
             unsafe {
-                let _ = libc::waitpid(*pid as libc::pid_t, &mut status, libc::WNOHANG);
+                let _ = libc::waitpid(*pid as libc::pid_t, &raw mut status, libc::WNOHANG);
             }
         }
     }
@@ -506,8 +508,8 @@ fn live_fuse_unlink_rmdir_opaque_rename_link_readdir_and_open_unlinked() {
     let c_mnt = std::ffi::CString::new(mnt.to_string_lossy().as_bytes()).expect("cstr");
     // SAFETY: `libc::statvfs` is a plain C struct for which all-zeroes is valid initial storage.
     let mut svfs: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c_mnt` is a valid NUL-terminated path and `&mut svfs` is valid writable storage.
-    assert_eq!(unsafe { libc::statvfs(c_mnt.as_ptr(), &mut svfs) }, 0);
+    // SAFETY: `c_mnt` is a valid NUL-terminated path and `&raw mut svfs` is valid writable storage.
+    assert_eq!(unsafe { libc::statvfs(c_mnt.as_ptr(), &raw mut svfs) }, 0);
     assert!(svfs.f_namemax > 0 && svfs.f_bsize > 0);
 
     // SAFETY: `libc::geteuid()` and `libc::getegid()` are always safe to call.
@@ -754,8 +756,8 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
     let kill_rc = unsafe { libc::kill(first_pong.pid as libc::pid_t, libc::SIGKILL) };
     assert_eq!(kill_rc, 0, "SIGKILL failed");
     let mut status: libc::c_int = 0;
-    // SAFETY: `first_pong.pid` is a child process and `&mut status` is valid stack storage.
-    let waited = unsafe { libc::waitpid(first_pong.pid as libc::pid_t, &mut status, 0) };
+    // SAFETY: `first_pong.pid` is a child process and `&raw mut status` is valid stack storage.
+    let waited = unsafe { libc::waitpid(first_pong.pid as libc::pid_t, &raw mut status, 0) };
     assert_eq!(waited, first_pong.pid as libc::pid_t);
     assert!(libc::WIFSIGNALED(status));
 
@@ -812,8 +814,9 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
     let term_rc = unsafe { libc::kill(second_pong.pid as libc::pid_t, libc::SIGTERM) };
     assert_eq!(term_rc, 0, "SIGTERM failed");
     let mut term_status: libc::c_int = 0;
-    // SAFETY: `second_pong.pid` is a child process and `&mut term_status` is valid stack storage.
-    let waited_term = unsafe { libc::waitpid(second_pong.pid as libc::pid_t, &mut term_status, 0) };
+    // SAFETY: `second_pong.pid` is a child process and `&raw mut term_status` is valid stack storage.
+    let waited_term =
+        unsafe { libc::waitpid(second_pong.pid as libc::pid_t, &raw mut term_status, 0) };
     assert_eq!(waited_term, second_pong.pid as libc::pid_t);
     assert!(libc::WIFEXITED(term_status) && libc::WEXITSTATUS(term_status) == 0);
 
@@ -836,8 +839,8 @@ fn live_daemon_multi_mount_dirty_paths_and_sigkill_recovery() {
 
     shutdown_daemon(&git_dir).expect("shutdown daemon");
     let mut status2: libc::c_int = 0;
-    // SAFETY: `third_pong.pid` is a child process and `&mut status2` is valid stack storage.
-    let _ = unsafe { libc::waitpid(third_pong.pid as libc::pid_t, &mut status2, 0) };
+    // SAFETY: `third_pong.pid` is a child process and `&raw mut status2` is valid stack storage.
+    let _ = unsafe { libc::waitpid(third_pong.pid as libc::pid_t, &raw mut status2, 0) };
     // Verify ws1 mountpoint is cleanly unmounted (not ENOTCONN).
     assert!(std::fs::symlink_metadata(&spec1.mount_point).is_ok());
 }
@@ -940,8 +943,8 @@ fn live_fuse_advisory_locks_flock_and_fcntl_soak() {
         .expect("open fcntl lock");
     // SAFETY: `libc::flock` is a plain C struct for which all-zeroes is a valid initial state.
     let mut fl: libc::flock = unsafe { std::mem::zeroed() };
-    fl.l_type = libc::F_WRLCK as libc::c_short;
-    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    fl.l_type = libc::c_short::try_from(libc::F_WRLCK).expect("c_short");
+    fl.l_whence = libc::c_short::try_from(libc::SEEK_SET).expect("c_short");
     fl.l_start = 0;
     fl.l_len = 64;
     // SAFETY: `f.as_raw_fd()` is an open writable file descriptor and `&fl` is a valid `libc::flock`.
@@ -965,7 +968,7 @@ fn live_fuse_advisory_locks_flock_and_fcntl_soak() {
         );
     }
 
-    fl.l_type = libc::F_UNLCK as libc::c_short;
+    fl.l_type = libc::c_short::try_from(libc::F_UNLCK).expect("c_short");
     // SAFETY: `f.as_raw_fd()` is still open and `&fl` is a valid initialized `libc::flock`.
     assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
 }
@@ -1026,65 +1029,65 @@ fn live_fuse_mmap_atomic_rename_fsync_and_mode_preservation_soak() {
     );
 
     // 3. MAP_PRIVATE on baseline file + MAP_SHARED PROT_READ|PROT_WRITE + msync + fsync + fsyncdir.
-    let ro_f = std::fs::File::open(mnt.join("ro_map.bin")).expect("open ro_map");
-    // SAFETY: `ro_f` is an open 21-byte file descriptor; mapping 21 bytes read-only with a null
-    // address lets the kernel choose a valid page-aligned mapping.
-    let ro_ptr = unsafe {
+    let readonly_file = std::fs::File::open(mnt.join("ro_map.bin")).expect("open ro_map");
+    // SAFETY: `readonly_file` is an open 21-byte file descriptor; mapping 21 bytes read-only with
+    // a null address lets the kernel choose a valid page-aligned mapping.
+    let readonly_ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             21,
             libc::PROT_READ,
             libc::MAP_PRIVATE,
-            ro_f.as_raw_fd(),
+            readonly_file.as_raw_fd(),
             0,
         )
     };
-    assert_ne!(ro_ptr, libc::MAP_FAILED);
-    // SAFETY: `ro_ptr` is a valid non-`MAP_FAILED` 21-byte read-only mapping alive until `munmap`.
-    let ro_slice = unsafe { std::slice::from_raw_parts(ro_ptr.cast::<u8>(), 21) };
-    assert_eq!(ro_slice, b"BASELINE_MMAP_PAYLOAD");
-    // SAFETY: `ro_ptr` was returned by `mmap` with length 21 and `ro_slice` is no longer used.
-    unsafe { assert_eq!(libc::munmap(ro_ptr, 21), 0) };
-    drop(ro_f);
+    assert_ne!(readonly_ptr, libc::MAP_FAILED);
+    // SAFETY: `readonly_ptr` is a valid non-`MAP_FAILED` 21-byte read-only mapping alive until `munmap`.
+    let readonly_slice = unsafe { std::slice::from_raw_parts(readonly_ptr.cast::<u8>(), 21) };
+    assert_eq!(readonly_slice, b"BASELINE_MMAP_PAYLOAD");
+    // SAFETY: `readonly_ptr` was returned by `mmap` with length 21 and `readonly_slice` is no longer used.
+    unsafe { assert_eq!(libc::munmap(readonly_ptr, 21), 0) };
+    drop(readonly_file);
 
-    let rw_path = mnt.join("rw_map.bin");
-    let rw_f = OpenOptions::new()
+    let shared_path = mnt.join("rw_map.bin");
+    let shared_file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(true)
-        .open(&rw_path)
+        .open(&shared_path)
         .expect("open rw_map");
-    rw_f.set_len(4096).expect("set_len");
-    // SAFETY: `rw_f` is an open 4096-byte read/write file descriptor; kernel selects mapping address.
-    let rw_ptr = unsafe {
+    shared_file.set_len(4096).expect("set_len");
+    // SAFETY: `shared_file` is an open 4096-byte read/write file descriptor; kernel selects mapping address.
+    let shared_ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             4096,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
-            rw_f.as_raw_fd(),
+            shared_file.as_raw_fd(),
             0,
         )
     };
-    assert_ne!(rw_ptr, libc::MAP_FAILED);
-    // SAFETY: `rw_ptr` is a valid non-`MAP_FAILED` 4096-byte writable mapping exclusively accessed
+    assert_ne!(shared_ptr, libc::MAP_FAILED);
+    // SAFETY: `shared_ptr` is a valid non-`MAP_FAILED` 4096-byte writable mapping exclusively accessed
     // by this thread until `munmap` releases it below.
     unsafe {
-        let s = std::slice::from_raw_parts_mut(rw_ptr.cast::<u8>(), 4096);
+        let s = std::slice::from_raw_parts_mut(shared_ptr.cast::<u8>(), 4096);
         s[..10].copy_from_slice(b"FUSE_MMAP!");
-        assert_eq!(libc::msync(rw_ptr, 4096, libc::MS_SYNC), 0);
-        assert_eq!(libc::munmap(rw_ptr, 4096), 0);
+        assert_eq!(libc::msync(shared_ptr, 4096, libc::MS_SYNC), 0);
+        assert_eq!(libc::munmap(shared_ptr, 4096), 0);
     }
-    rw_f.sync_all().expect("fsync rw_map");
-    drop(rw_f);
+    shared_file.sync_all().expect("fsync rw_map");
+    drop(shared_file);
 
     let dir_f = std::fs::File::open(mnt).expect("open mount dir");
     // SAFETY: `dir_f.as_raw_fd()` is an open directory file descriptor.
     assert_eq!(unsafe { libc::fsync(dir_f.as_raw_fd()) }, 0);
     drop(dir_f);
     assert_eq!(
-        &std::fs::read(&rw_path).expect("read rw_map")[..10],
+        &std::fs::read(&shared_path).expect("read rw_map")[..10],
         b"FUSE_MMAP!"
     );
 
@@ -1231,8 +1234,8 @@ fn live_fuse_stale_endpoint_recovery_without_hanging_ls_or_df() {
     let kill_rc = unsafe { libc::kill(pong1.pid as libc::pid_t, libc::SIGKILL) };
     assert_eq!(kill_rc, 0);
     let mut st: libc::c_int = 0;
-    // SAFETY: `pong1.pid` is a child process and `&mut st` is valid stack storage.
-    let _ = unsafe { libc::waitpid(pong1.pid as libc::pid_t, &mut st, 0) };
+    // SAFETY: `pong1.pid` is a child process and `&raw mut st` is valid stack storage.
+    let _ = unsafe { libc::waitpid(pong1.pid as libc::pid_t, &raw mut st, 0) };
 
     let mut ls_dead = Command::new("ls");
     ls_dead.arg(&spec.mount_point);

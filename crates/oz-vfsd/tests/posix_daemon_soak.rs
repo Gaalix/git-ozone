@@ -8,6 +8,7 @@
 //! cleanup, daemon lock mutual exclusion, and IPC concurrency without requiring `/dev/fuse`.
 
 #![cfg(unix)]
+#![allow(clippy::too_many_lines)]
 
 use fs4::{FileExt as Fs4FileExt, TryLockError};
 use oz_core::{BackendKind, ChangeKind, MountRecord, OzoneLayout};
@@ -132,8 +133,8 @@ fn posix_flock_and_fcntl_advisory_lock_soak_including_cross_process() {
 
         // SAFETY: `libc::flock` is a plain C struct for which all-zeroes is a valid initial state.
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
-        fl.l_type = libc::F_WRLCK as libc::c_short;
-        fl.l_whence = libc::SEEK_SET as libc::c_short;
+        fl.l_type = libc::c_short::try_from(libc::F_WRLCK).expect("c_short");
+        fl.l_whence = libc::c_short::try_from(libc::SEEK_SET).expect("c_short");
         fl.l_start = 0;
         fl.l_len = 64;
         // SAFETY: `f.as_raw_fd()` is an open writable file descriptor and `&fl` is a valid `libc::flock`.
@@ -155,7 +156,7 @@ fn posix_flock_and_fcntl_advisory_lock_soak_including_cross_process() {
             "child fcntl lock should fail while parent holds F_WRLCK"
         );
 
-        fl.l_type = libc::F_UNLCK as libc::c_short;
+        fl.l_type = libc::c_short::try_from(libc::F_UNLCK).expect("c_short");
         // SAFETY: `f.as_raw_fd()` is still open and `&fl` is a valid initialized `libc::flock`.
         assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &fl) }, 0);
 
@@ -445,7 +446,7 @@ fn daemon_tcp_ipc_and_non_hanging_stale_path_probes() {
         VfsResponse::MountList { mounts } => mounts,
         other => panic!("unexpected list response: {other:?}"),
     };
-    assert!(mounts.is_empty());
+    assert_eq!(mounts, &[]);
 
     assert!(matches!(
         send_tcp_request(&sock, &VfsRequest::Shutdown).expect("shutdown"),

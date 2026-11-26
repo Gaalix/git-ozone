@@ -1,13 +1,15 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Background VFS daemon (`oz-vfsd`), Linux FUSE3 CoW overlay engine, Windows ProjFS engine,
+//! Background VFS daemon (`oz-vfsd`), Linux `FUSE3` `CoW` overlay engine, Windows `ProjFS` engine,
 //! IPC client/server, executable lookup, and OS setup helpers.
 //!
-//! On Linux (`ext4`), `oz-vfsd` drives an unprivileged pure-Rust `fuser` FUSE3 overlay
+//! On Linux (`ext4`), `oz-vfsd` drives an unprivileged pure-Rust `fuser` `FUSE3` overlay
 //! backed by `.git/ozone/ws/<ws>/upper/` with tombstones and opacity markers in
-//! `.git/ozone/ws/<ws>/meta/`. On Windows (`NTFS`), `oz-vfsd` drives Windows ProjFS via
+//! `.git/ozone/ws/<ws>/meta/`. On Windows (`NTFS`), `oz-vfsd` drives Windows `ProjFS` via
 //! dynamic `ProjectedFSLib.dll` FFI backed by the exact same `upper/` + `meta/` layout.
+
+#![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
 pub mod client;
 pub mod lookup;
@@ -28,9 +30,8 @@ pub use lookup::{OZ_VFSD_BIN_ENV, find_oz_vfsd_bin, resolve_oz_vfsd_bin_with, vf
 #[cfg(unix)]
 pub use overlay::is_fuse_mount_in_proc_mountinfo;
 pub use overlay::{
-    LayerKind, MergedDirEntry, MountedOverlay, OPAQUE_SUFFIX, OverlayMountConfig, ResolvedEntry,
-    WHITEOUT_SUFFIX, lazy_unmount_fuse, list_merged_dir_entries, mount_overlay, resolve_rel_path,
-    resolve_seed_dir, scan_dirty_paths,
+    LayerKind, MountedOverlay, OPAQUE_SUFFIX, OverlayMountConfig, WHITEOUT_SUFFIX,
+    lazy_unmount_fuse, mount_overlay, scan_dirty_paths,
 };
 pub use projfs::{
     MountedProjFs, ProjFsDirEntry, ProjFsLayerEngine, ProjFsPlaceholderInfo, compute_instance_guid,
@@ -53,11 +54,11 @@ pub use windows_setup::{
     projected_fs_dll_path, projected_fs_dll_path_in,
 };
 
-/// Builds a pure-Rust `fuser::Config` for Linux FUSE3 mounts without requiring `user_allow_other`
+/// Builds a pure-Rust `fuser::Config` for Linux `FUSE3` mounts without requiring `user_allow_other`
 /// in `/etc/fuse.conf` when `spec.allow_other` is `false`.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn default_linux_fuser_config(spec: &MountSpec) -> fuser::Config {
+pub(crate) fn default_linux_fuser_config(spec: &MountSpec) -> fuser::Config {
     let mut cfg = fuser::Config::default();
     cfg.mount_options = vec![
         fuser::MountOption::FSName(format!("ozone:{}", spec.workspace)),

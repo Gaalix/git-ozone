@@ -19,11 +19,11 @@ use oz_warm::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 use walkdir::WalkDir;
 
 /// File-level difference between a baseline Git tree and a target branch tree.
@@ -45,6 +45,7 @@ pub fn resolve_git_common_dir(git_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Attempts to infer the baseline commit's tree OID from `baseline_dir` (`.../baselines/<oid>/root`).
+#[must_use]
 pub fn resolve_baseline_tree_id(
     repo: &gix::Repository,
     baseline_dir: &Path,
@@ -53,7 +54,7 @@ pub fn resolve_baseline_tree_id(
     let oid_str = parent.file_name()?.to_str()?;
     let commit_id = gix::ObjectId::from_hex(oid_str.as_bytes()).ok()?;
     let commit = repo.find_commit(commit_id).ok()?;
-    commit.tree_id().ok().map(|id| id.detach())
+    commit.tree_id().ok().map(gix::Id::detach)
 }
 
 /// Computes added/modified/deleted blob and symlink paths from `base_tree_id` to `target_tree_id`.
@@ -66,17 +67,13 @@ pub fn compute_tree_delta(
         return Ok(TreeDelta::default());
     }
 
-    let base_tree = repo
-        .find_tree(base_tree_id)
-        .map_err(|e| OzError::Git(e.to_string()))?;
+    let base_tree = repo.find_tree(base_tree_id).map_err(OzError::git_source)?;
     let target_tree = repo
         .find_tree(target_tree_id)
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut delta = TreeDelta::default();
-    let mut changes = base_tree
-        .changes()
-        .map_err(|e| OzError::Git(e.to_string()))?;
+    let mut changes = base_tree.changes().map_err(OzError::git_source)?;
     changes.options(|opts| {
         opts.track_rewrites(None);
     });
@@ -140,7 +137,7 @@ pub fn compute_tree_delta(
             }
             Ok::<_, gix::Error>(ControlFlow::Continue(()))
         })
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(delta)
 }
@@ -157,14 +154,12 @@ pub fn materialize_tree_from_odb(
     let attr_resolver =
         AttributeResolver::for_tree(repo, Some(tree_id), &git_common_dir, &git_cfg)?;
 
-    let tree = repo
-        .find_tree(tree_id)
-        .map_err(|e| OzError::Git(e.to_string()))?;
+    let tree = repo.find_tree(tree_id).map_err(OzError::git_source)?;
     let entries = tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut files = Vec::new();
     let mut dirs = HashSet::new();
@@ -198,7 +193,7 @@ pub fn materialize_tree_from_odb(
     files
         .par_iter()
         .map_init(
-            || gix::open(&git_dir).map_err(|e| OzError::Git(e.to_string())),
+            || gix::open(&git_dir).map_err(OzError::git_source),
             |thread_repo_res, (rel, dst, oid, mode)| {
                 let thread_repo = thread_repo_res
                     .as_ref()
@@ -265,7 +260,7 @@ pub fn apply_tree_delta_to_dir(
     file_upserts
         .par_iter()
         .map_init(
-            || gix::open(&git_dir).map_err(|e| OzError::Git(e.to_string())),
+            || gix::open(&git_dir).map_err(OzError::git_source),
             |thread_repo_res, (rel, dst, oid, mode)| {
                 let thread_repo = thread_repo_res
                     .as_ref()
@@ -307,14 +302,12 @@ pub(crate) fn reconcile_attributes_and_gitlinks_in_dir(
     let git_cfg = load_git_config_for_cow(repo, git_common_dir)?;
     let attr_resolver = AttributeResolver::for_tree(repo, Some(tree_id), git_common_dir, &git_cfg)?;
 
-    let tree = repo
-        .find_tree(tree_id)
-        .map_err(|e| OzError::Git(e.to_string()))?;
+    let tree = repo.find_tree(tree_id).map_err(OzError::git_source)?;
     let entries = tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let needs_file_checks = attr_resolver.may_have_rules() || git_cfg.autocrlf() == AutoCrlf::True;
     let mut jobs = Vec::new();
@@ -346,15 +339,13 @@ pub(crate) fn reconcile_attributes_and_gitlinks_in_dir(
     }
 
     for (rel, dst, oid, mode, resolved) in jobs {
-        let blob = repo
-            .find_blob(oid)
-            .map_err(|e| OzError::Git(e.to_string()))?;
+        let blob = repo.find_blob(oid).map_err(OzError::git_source)?;
         let needs_rewrite = resolved.filter_driver().is_some()
             || is_lfs_pointer(&blob.data)
-            || match oz_core::smudge_eol_bytes(&blob.data, &resolved, &git_cfg) {
-                std::borrow::Cow::Owned(_) => true,
-                std::borrow::Cow::Borrowed(_) => false,
-            };
+            || matches!(
+                oz_core::smudge_eol_bytes(&blob.data, &resolved, &git_cfg),
+                Cow::Owned(_)
+            );
         if !needs_rewrite {
             continue;
         }
@@ -459,9 +450,7 @@ fn build_delta_attribute_resolver(
                 .strip_suffix("/.gitattributes")
                 .unwrap_or("")
                 .to_string();
-            let blob = repo
-                .find_blob(*oid)
-                .map_err(|e| OzError::Git(e.to_string()))?;
+            let blob = repo.find_blob(*oid).map_err(OzError::git_source)?;
             per_dir.insert(dir, String::from_utf8_lossy(&blob.data).into_owned());
         }
     }
@@ -485,9 +474,7 @@ fn write_git_entry(
         std::fs::create_dir_all(dst)?;
         return Ok(());
     }
-    let blob = repo
-        .find_blob(oid)
-        .map_err(|e| OzError::Git(e.to_string()))?;
+    let blob = repo.find_blob(oid).map_err(OzError::git_source)?;
     if mode.is_link() {
         write_symlink_bytes(dst, &blob.data)?;
         return Ok(());
@@ -827,32 +814,31 @@ pub fn materialize_cas_workspace(
         .as_deref()
         .map(load_cas_digest_cache)
         .unwrap_or_default();
-    let new_digests: Mutex<Vec<(String, CachedCasDigest)>> = Mutex::new(Vec::new());
 
-    // Parallel CAS hardlinking (`0444` / `0555`) for immutable dependencies.
-    dep_jobs
+    // Parallel CAS hardlinking (`0444` / `0555`) for immutable dependencies (lock-free).
+    let computed_digests = dep_jobs
         .par_iter()
-        .try_for_each(|(rel_key, src, dst, is_symlink, meta)| -> Result<()> {
-            if *is_symlink {
-                copy_symlink(src, dst)?;
-                return Ok(());
-            }
-            if meta.is_file() {
-                let ft = metadata_modified_filetime(meta);
-                let cached_hex = existing_digests
-                    .get(rel_key)
-                    .filter(|c| {
-                        c.size == meta.len()
-                            && c.mtime_secs == ft.unix_seconds()
-                            && c.mtime_nsecs == ft.nanoseconds()
-                    })
-                    .map(|c| c.digest.as_str());
-                let digest = link_file_via_cas(src, dst, meta, cas_dir, cached_hex)?;
-                if cached_hex.is_none() && cache_path.is_some() {
-                    new_digests
-                        .lock()
-                        .expect("digest cache lock poisoned")
-                        .push((
+        .map(
+            |(rel_key, src, dst, is_symlink, meta)| -> Result<Option<(String, CachedCasDigest)>> {
+                if *is_symlink {
+                    copy_symlink(src, dst)?;
+                    return Ok(None);
+                }
+                if meta.is_file() {
+                    let ft = metadata_modified_filetime(meta);
+                    let cached_hex = existing_digests
+                        .get(rel_key)
+                        .filter(|c| {
+                            c.size == meta.len()
+                                && c.mtime_secs == ft.unix_seconds()
+                                && c.mtime_nsecs == ft.nanoseconds()
+                        })
+                        .map(|c| c.digest.as_str());
+                    let digest = link_file_via_cas(src, dst, meta, cas_dir, cached_hex)?;
+                    if let Cow::Owned(digest) = digest
+                        && cache_path.is_some()
+                    {
+                        return Ok(Some((
                             rel_key.clone(),
                             CachedCasDigest {
                                 size: meta.len(),
@@ -860,21 +846,22 @@ pub fn materialize_cas_workspace(
                                 mtime_nsecs: ft.nanoseconds(),
                                 digest,
                             },
-                        ));
+                        )));
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(None)
+            },
+        )
+        .collect::<Result<Vec<Option<_>>>>()?;
 
     if let Some(ref cpath) = cache_path {
-        let computed = new_digests
-            .into_inner()
-            .expect("digest cache lock poisoned");
-        if !computed.is_empty() {
-            let mut merged = existing_digests;
-            for (k, v) in computed {
-                merged.insert(k, v);
-            }
+        let mut merged = existing_digests;
+        let mut any_new = false;
+        for (k, v) in computed_digests.into_iter().flatten() {
+            merged.insert(k, v);
+            any_new = true;
+        }
+        if any_new {
             save_cas_digest_cache(cpath, &merged);
         }
     }
@@ -882,16 +869,17 @@ pub fn materialize_cas_workspace(
     Ok(())
 }
 
-fn link_file_via_cas(
+fn link_file_via_cas<'a>(
     src: &Path,
     dst: &Path,
     src_meta: &Metadata,
     cas_dir: &Path,
-    cached_digest: Option<&str>,
-) -> Result<String> {
+    cached_digest: Option<&'a str>,
+) -> Result<Cow<'a, str>> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let digest = match cached_digest {
-        Some(hex) if hex.len() > 2 => hex.to_string(),
-        _ => blake3_file_hex(src)?,
+        Some(hex) if hex.len() > 2 => Cow::Borrowed(hex),
+        _ => Cow::Owned(blake3_file_hex(src)?),
     };
     let (shard, rest) = digest.split_at(2);
     let shard_dir = cas_dir.join(shard);
@@ -900,7 +888,6 @@ fn link_file_via_cas(
     if !cas_obj.exists() {
         std::fs::create_dir_all(&shard_dir)?;
         let pid = std::process::id();
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = shard_dir.join(format!(".tmp_{rest}_{pid}_{seq}"));
 
@@ -1034,9 +1021,14 @@ fn classify_cargo_warm_path(
 /// `target/**/.fingerprint/**`, `target/**/incremental/**`, `target/**/*.d`, etc.) that MUST
 /// be copied writable (unique inode per workspace) rather than read-only (`0444`) CAS hardlinked.
 #[must_use]
-pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
+pub(crate) fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
     let rel_posix = rel.to_string_lossy().replace('\\', "/");
     let file_name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let has_ext = |ext: &str| {
+        Path::new(file_name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+    };
 
     if matches!(
         file_name,
@@ -1052,10 +1044,10 @@ pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
     ) {
         return true;
     }
-    if file_name.starts_with(".pnpm-workspace-state") && file_name.ends_with(".json") {
+    if file_name.starts_with(".pnpm-workspace-state") && has_ext("json") {
         return true;
     }
-    if file_name.ends_with(".tsbuildinfo") || file_name.ends_with(".pth") {
+    if file_name.ends_with(".tsbuildinfo") || has_ext("pth") {
         return true;
     }
     if rel_posix.ends_with(".pnpm/lock.yaml")
@@ -1072,7 +1064,7 @@ pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
     {
         return true;
     }
-    if file_name.ends_with(".d")
+    if has_ext("d")
         && (rel_posix.starts_with("target/")
             || rel_posix.contains("/deps/")
             || rel_posix.contains("/build/")
@@ -1221,15 +1213,63 @@ fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn metadata_modified_filetime(meta: &Metadata) -> FileTime {
-    meta.modified()
-        .map(|st| match st.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => FileTime::from_unix_time(d.as_secs() as i64, d.subsec_nanos()),
-            Err(e) => FileTime::from_unix_time(-(e.duration().as_secs() as i64), 0),
-        })
-        .unwrap_or_else(|_| FileTime::zero())
+    meta.modified().map_or_else(
+        |_| FileTime::zero(),
+        |st| match st.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => {
+                FileTime::from_unix_time(i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos())
+            }
+            Err(e) => {
+                let secs = i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX);
+                FileTime::from_unix_time(-secs, 0)
+            }
+        },
+    )
 }
 
 #[allow(deprecated)]
 fn set_file_mtime_compat(path: &Path, ft: FileTime) -> std::io::Result<()> {
     filetime::set_file_mtime(path, ft)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn link_file_via_cas_borrows_valid_cached_digest_and_owns_computed_digest() {
+        let dir = TempDir::new().expect("tempdir");
+        let cas_dir = dir.path().join("cas");
+        std::fs::create_dir_all(&cas_dir).expect("mkdir cas");
+
+        let src = dir.path().join("libdep.rlib");
+        std::fs::write(&src, b"immutable-artifact-bytes").expect("write src");
+        let src_meta = std::fs::symlink_metadata(&src).expect("meta");
+
+        let dst1 = dir.path().join("ws1_libdep.rlib");
+        let cold = link_file_via_cas(&src, &dst1, &src_meta, &cas_dir, None).expect("cold link");
+        let computed_hex = match cold {
+            Cow::Owned(hex) => hex,
+            Cow::Borrowed(_) => panic!("cold miss must return Cow::Owned"),
+        };
+        assert_eq!(computed_hex.len(), 64);
+        assert_eq!(std::fs::read(&dst1).expect("read dst1"), b"immutable-artifact-bytes");
+
+        let dst2 = dir.path().join("ws2_libdep.rlib");
+        let warm = link_file_via_cas(&src, &dst2, &src_meta, &cas_dir, Some(&computed_hex))
+            .expect("warm link");
+        match warm {
+            Cow::Borrowed(borrowed) => {
+                assert!(std::ptr::eq(borrowed, computed_hex.as_str()));
+            }
+            Cow::Owned(_) => panic!("valid cached digest must return Cow::Borrowed without allocating"),
+        }
+        assert_eq!(std::fs::read(&dst2).expect("read dst2"), b"immutable-artifact-bytes");
+
+        let dst3 = dir.path().join("ws3_libdep.rlib");
+        let short = link_file_via_cas(&src, &dst3, &src_meta, &cas_dir, Some("ab"))
+            .expect("short digest fallback");
+        assert!(matches!(short, Cow::Owned(ref hex) if hex == &computed_hex));
+    }
 }

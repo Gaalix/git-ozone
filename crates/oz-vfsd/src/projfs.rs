@@ -1,19 +1,19 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Windows ProjFS (`ProjectedFSLib.dll`) virtualization engine and un-gated CoW layer adapter.
+//! Windows `ProjFS` (`ProjectedFSLib.dll`) virtualization engine and un-gated `CoW` layer adapter.
 //!
-//! Mirrors Linux FUSE3's `[upper_dir, seed_dir, baseline_dir]` overlay layout and keeps
+//! Mirrors Linux `FUSE3`'s `[upper_dir, seed_dir, baseline_dir]` overlay layout and keeps
 //! `.git/ozone/ws/<ws>/upper/` + `.git/ozone/ws/<ws>/meta/{whiteouts,opaque}` synchronized
 //! on real NTFS disk so `oz-vfsd::scan_dirty_paths`, `oz-core::status`, and `oz-oplog`
-//! work identically across Linux FUSE3 and Windows ProjFS.
+//! work identically across Linux `FUSE3` and Windows `ProjFS`.
 
 use crate::overlay::{
     LayerKind, MergedDirEntry, OPAQUE_SUFFIX, OverlayMountConfig, ResolvedEntry, WHITEOUT_SUFFIX,
     ancestors_inclusive, list_merged_dir_entries, lower_layers_blocked_at_dir, marker_path,
-    resolve_in_lower_layers, resolve_rel_path, scan_dirty_paths,
+    resolve_in_lower_layers, resolve_rel_path,
 };
-use crate::protocol::{DirtyPathEntry, MountSpec};
+use crate::protocol::MountSpec;
 use oz_core::{OzError, Result, normalize_lexical};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -28,11 +28,13 @@ const TICKS_PER_SECOND: i128 = 10_000_000;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 
-pub const PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN: u32 = 0x0000_0001;
-pub const PRJ_CB_DATA_FLAG_ENUM_RETURN_SINGLE_ENTRY: u32 = 0x0000_0002;
+#[cfg(target_os = "windows")]
+const PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN: u32 = 0x0000_0001;
+#[cfg(target_os = "windows")]
+const PRJ_CB_DATA_FLAG_ENUM_RETURN_SINGLE_ENTRY: u32 = 0x0000_0002;
 
 pub const PRJ_NOTIFY_NEW_FILE_CREATED: u32 = 0x0000_0004;
-pub const PRJ_NOTIFY_FILE_OVERWRITTEN: u32 = 0x0000_0008;
+pub(crate) const PRJ_NOTIFY_FILE_OVERWRITTEN: u32 = 0x0000_0008;
 pub const PRJ_NOTIFY_PRE_DELETE: u32 = 0x0000_0010;
 pub const PRJ_NOTIFY_FILE_RENAMED: u32 = 0x0000_0080;
 pub const PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED: u32 = 0x0000_0400;
@@ -55,7 +57,7 @@ pub fn system_time_to_filetime(st: SystemTime) -> i64 {
         }
     };
     let ticks = (unix_secs + UNIX_TO_WINDOWS_EPOCH_SECS) * TICKS_PER_SECOND + (subsec_nanos / 100);
-    ticks.clamp(0, i128::from(i64::MAX)) as i64
+    i64::try_from(ticks.clamp(0, i128::from(i64::MAX))).unwrap_or(i64::MAX)
 }
 
 /// Converts a Unix timestamp (`unix_secs`, `subsec_nanos`) to a Windows `FILETIME` value.
@@ -63,19 +65,19 @@ pub fn system_time_to_filetime(st: SystemTime) -> i64 {
 pub fn unix_to_filetime(unix_secs: i64, subsec_nanos: u32) -> i64 {
     let ticks = (i128::from(unix_secs) + UNIX_TO_WINDOWS_EPOCH_SECS) * TICKS_PER_SECOND
         + i128::from(subsec_nanos / 100);
-    ticks.clamp(0, i128::from(i64::MAX)) as i64
+    i64::try_from(ticks.clamp(0, i128::from(i64::MAX))).unwrap_or(i64::MAX)
 }
 
-/// Computes a deterministic 16-byte ProjFS virtualization instance GUID from `(git_dir, workspace)`.
+/// Computes a deterministic 16-byte `ProjFS` virtualization instance GUID from `(git_dir, workspace)`.
 #[must_use]
 pub fn compute_instance_guid(git_dir: &Path, workspace: &str) -> [u8; 16] {
-    let normalized_git = normalize_lexical(git_dir);
-    let git_str = normalized_git.to_string_lossy().replace('\\', "/");
-    let git_trimmed = git_str.trim_end_matches('/');
-
     // 128-bit FNV-1a (RFC-stable across platforms and Rust toolchain versions).
     const FNV_OFFSET_128: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     const FNV_PRIME_128: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+    let normalized_git = normalize_lexical(git_dir);
+    let git_str = normalized_git.to_string_lossy().replace('\\', "/");
+    let git_trimmed = git_str.trim_end_matches('/');
 
     let mut hash = FNV_OFFSET_128;
     for byte in b"ozone-projfs-instance-v1\0"
@@ -311,7 +313,7 @@ impl ProjFsPlaceholderInfo {
     }
 }
 
-/// Un-gated CoW virtualization engine backing Windows ProjFS over `[upper, seed, baseline, repo_root]`.
+/// Un-gated `CoW` virtualization engine backing Windows `ProjFS` over `[upper, seed, baseline, repo_root]`.
 #[derive(Debug, Clone)]
 pub struct ProjFsLayerEngine {
     pub config: OverlayMountConfig,
@@ -336,13 +338,6 @@ impl ProjFsLayerEngine {
             config: OverlayMountConfig::from_spec(spec),
             repo_root: Some(spec.repo_root.clone()).filter(|p| p.is_dir()),
         }
-    }
-
-    /// Attaches an optional `repo_root` fallback path.
-    #[must_use]
-    pub fn with_repo_root(mut self, repo_root: impl Into<PathBuf>) -> Self {
-        self.repo_root = Some(repo_root.into());
-        self
     }
 
     fn effective_config(&self) -> (OverlayMountConfig, bool) {
@@ -523,7 +518,7 @@ impl ProjFsLayerEngine {
             match file.read(&mut buf[total..]) {
                 Ok(0) => break,
                 Ok(n) => total += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
@@ -712,11 +707,6 @@ impl ProjFsLayerEngine {
         }
 
         self.record_deleted_path(&old_norm)
-    }
-
-    /// Scans `upper_dir` and `meta_dir` using [`scan_dirty_paths`].
-    pub fn scan_dirty(&self) -> io::Result<Vec<DirtyPathEntry>> {
-        scan_dirty_paths(&self.config)
     }
 
     fn handle_case_only_rename(&self, old_norm: &Path, new_norm: &Path) -> io::Result<()> {
@@ -957,8 +947,7 @@ fn is_non_placeholder_attrs(_meta: &std::fs::Metadata) -> bool {
 
 fn is_real_non_placeholder_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
-        .map(|meta| meta.is_file() && is_non_placeholder_attrs(&meta))
-        .unwrap_or(false)
+        .is_ok_and(|meta| meta.is_file() && is_non_placeholder_attrs(&meta))
 }
 
 fn extract_file_times_and_attrs(meta: &std::fs::Metadata) -> (bool, u64, i64, i64, i64, u32) {
@@ -966,11 +955,8 @@ fn extract_file_times_and_attrs(meta: &std::fs::Metadata) -> (bool, u64, i64, i6
     let file_size = if is_dir { 0 } else { meta.len() };
     let mtime_st = meta.modified().unwrap_or(UNIX_EPOCH);
     let mtime = system_time_to_filetime(mtime_st);
-    let ctime = meta.created().map(system_time_to_filetime).unwrap_or(mtime);
-    let atime = meta
-        .accessed()
-        .map(system_time_to_filetime)
-        .unwrap_or(mtime);
+    let ctime = meta.created().map_or(mtime, system_time_to_filetime);
+    let atime = meta.accessed().map_or(mtime, system_time_to_filetime);
     let attrs = if is_dir {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
@@ -1192,12 +1178,14 @@ pub(crate) struct PrjCallbacks {
     pub(crate) cancel_command: Option<unsafe extern "system" fn(*const PrjCallbackData)>,
 }
 
-/// Per-enumeration cache state shared by ProjFS directory enumeration callbacks.
+/// Per-enumeration cache state shared by `ProjFS` directory enumeration callbacks.
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default)]
-pub struct ProjFsEnumCache {
+pub(crate) struct ProjFsEnumCache {
     sessions: std::collections::HashMap<[u8; 16], EnumSessionState>,
 }
 
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default)]
 struct EnumSessionState {
     populated: bool,
@@ -1205,16 +1193,17 @@ struct EnumSessionState {
     index: usize,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl ProjFsEnumCache {
-    pub fn start(&mut self, enum_id: [u8; 16]) {
+    pub(crate) fn start(&mut self, enum_id: [u8; 16]) {
         self.sessions.insert(enum_id, EnumSessionState::default());
     }
 
-    pub fn end(&mut self, enum_id: &[u8; 16]) {
+    pub(crate) fn end(&mut self, enum_id: &[u8; 16]) {
         self.sessions.remove(enum_id);
     }
 
-    pub fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         enum_id: [u8; 16],
         restart: bool,
@@ -1229,7 +1218,7 @@ impl ProjFsEnumCache {
         Ok(&mut session.entries)
     }
 
-    pub fn cursor_slice(&mut self, enum_id: &[u8; 16]) -> (&[ProjFsDirEntry], &mut usize) {
+    pub(crate) fn cursor_slice(&mut self, enum_id: &[u8; 16]) -> (&[ProjFsDirEntry], &mut usize) {
         let session = self.sessions.entry(*enum_id).or_default();
         (&session.entries, &mut session.index)
     }
@@ -1238,7 +1227,8 @@ impl ProjFsEnumCache {
 /// Steps through `entries[*idx..]` invoking `fill`, returning `ERROR_INSUFFICIENT_BUFFER_HR`
 /// when `fill` runs out of buffer space on the very first entry (`added == 0`) or `PRJ_S_OK`
 /// once at least one entry has been emitted (or enumeration reaches EOF).
-pub fn step_dir_enum_buffer(
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn step_dir_enum_buffer(
     entries: &[ProjFsDirEntry],
     idx: &mut usize,
     single: bool,
@@ -1268,16 +1258,20 @@ pub fn step_dir_enum_buffer(
 
 #[cfg(target_os = "windows")]
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+#[cfg(any(target_os = "windows", test))]
 const PRJ_S_OK: i32 = 0;
-const PRJ_E_FAIL: i32 = 0x8000_4005_u32 as i32;
+#[cfg(any(target_os = "windows", test))]
+const PRJ_E_FAIL: i32 = 0x8000_4005_u32.cast_signed();
 #[cfg(target_os = "windows")]
-const PRJ_E_OUTOFMEMORY: i32 = 0x8007_000E_u32 as i32;
-const ERROR_FILE_NOT_FOUND_HR: i32 = 0x8007_0002_u32 as i32;
-const ERROR_INSUFFICIENT_BUFFER_HR: i32 = 0x8007_007A_u32 as i32;
+const PRJ_E_OUTOFMEMORY: i32 = 0x8007_000E_u32.cast_signed();
+#[cfg(any(target_os = "windows", test))]
+const ERROR_FILE_NOT_FOUND_HR: i32 = 0x8007_0002_u32.cast_signed();
+#[cfg(any(target_os = "windows", test))]
+const ERROR_INSUFFICIENT_BUFFER_HR: i32 = 0x8007_007A_u32.cast_signed();
 #[cfg(target_os = "windows")]
-const ERROR_REPARSE_ENCOUNTERED_HR: i32 = 0x8007_112B_u32 as i32;
+const ERROR_REPARSE_ENCOUNTERED_HR: i32 = 0x8007_112B_u32.cast_signed();
 #[cfg(target_os = "windows")]
-const ERROR_ALREADY_EXISTS_HR: i32 = 0x8007_00B7_u32 as i32;
+const ERROR_ALREADY_EXISTS_HR: i32 = 0x8007_00B7_u32.cast_signed();
 #[cfg(target_os = "windows")]
 const PRJ_NOTIFY_MASK: u32 = PRJ_NOTIFY_NEW_FILE_CREATED
     | PRJ_NOTIFY_FILE_OVERWRITTEN
@@ -1286,7 +1280,7 @@ const PRJ_NOTIFY_MASK: u32 = PRJ_NOTIFY_NEW_FILE_CREATED
     | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED
     | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED;
 
-/// Dispatches a ProjFS notification mask to the un-gated CoW persistence engine.
+/// Dispatches a `ProjFS` notification mask to the un-gated `CoW` persistence engine.
 pub fn dispatch_projfs_notification(
     engine: &ProjFsLayerEngine,
     notification: u32,
@@ -1301,18 +1295,19 @@ pub fn dispatch_projfs_notification(
         PRJ_NOTIFY_FILE_RENAMED => {
             engine.record_renamed_path(rel_path, dest_path.unwrap_or_default())
         }
-        PRJ_NOTIFY_PRE_DELETE => Ok(()),
+        // `PRJ_NOTIFY_PRE_DELETE` and other informational notifications require no disk mutation.
         _ => Ok(()),
     }
 }
 
 /// Maps a [`std::io::Error`] into a standard Win32 `HRESULT`.
+#[cfg(any(target_os = "windows", test))]
 #[must_use]
-pub fn hresult_from_io_error(err: &io::Error) -> i32 {
+pub(crate) fn hresult_from_io_error(err: &io::Error) -> i32 {
     match err.kind() {
         io::ErrorKind::NotFound => ERROR_FILE_NOT_FOUND_HR,
-        io::ErrorKind::PermissionDenied => 0x8007_0005_u32 as i32,
-        io::ErrorKind::InvalidInput => 0x8007_0057_u32 as i32,
+        io::ErrorKind::PermissionDenied => 0x8007_0005_u32.cast_signed(),
+        io::ErrorKind::InvalidInput => 0x8007_0057_u32.cast_signed(),
         _ => PRJ_E_FAIL,
     }
 }
@@ -2089,7 +2084,7 @@ mod tests {
         assert_eq!(ph.variable_data, [0]);
 
         let cb_data = PrjCallbackData {
-            size: size_of::<PrjCallbackData>() as u32,
+            size: u32::try_from(size_of::<PrjCallbackData>()).expect("u32"),
             flags: 0,
             namespace_virtualization_context: std::ptr::null_mut(),
             command_id: 0,
@@ -2123,7 +2118,7 @@ mod tests {
             flags: 0,
             pool_thread_count: 0,
             concurrent_thread_count: 0,
-            notification_mappings: &mut mapping,
+            notification_mappings: &raw mut mapping,
             notification_mappings_count: 1,
         };
         assert_eq!(opts.flags, 0);
@@ -2261,5 +2256,38 @@ mod tests {
         assert_eq!(idx, 3);
         let hr_eof = step_dir_enum_buffer(&entries, &mut idx, false, |_| panic!("unexpected fill"));
         assert_eq!(hr_eof, PRJ_S_OK);
+
+        // Exercise ProjFsEnumCache and hresult_from_io_error.
+        let mut cache = ProjFsEnumCache::default();
+        let eid = [7u8; 16];
+        cache.start(eid);
+        cache
+            .prepare(eid, false, || Ok(entries.clone()))
+            .expect("prepare");
+        {
+            let (slice, cur) = cache.cursor_slice(&eid);
+            assert_eq!(slice.len(), 3);
+            *cur = 2;
+        }
+        cache
+            .prepare(eid, true, || Ok(vec![make_entry("only.txt")]))
+            .expect("restart");
+        {
+            let (slice, cur) = cache.cursor_slice(&eid);
+            assert_eq!(slice.len(), 1);
+            assert_eq!(*cur, 0);
+        }
+        cache.end(&eid);
+
+        assert_eq!(
+            hresult_from_io_error(&io::Error::from(io::ErrorKind::NotFound)),
+            ERROR_FILE_NOT_FOUND_HR
+        );
+        assert!(hresult_from_io_error(&io::Error::from(io::ErrorKind::PermissionDenied)) < 0);
+        assert!(hresult_from_io_error(&io::Error::from(io::ErrorKind::InvalidInput)) < 0);
+        assert_eq!(
+            hresult_from_io_error(&io::Error::other("other")),
+            PRJ_E_FAIL
+        );
     }
 }

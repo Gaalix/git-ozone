@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Local IPC server (`oz-vfsd`) managing CoW FUSE3 (Linux) and ProjFS (Windows) mounts.
+//! Local IPC server (`oz-vfsd`) managing `CoW` `FUSE3` (Linux) and `ProjFS` (Windows) mounts.
 
 #[cfg(not(target_os = "windows"))]
 use crate::overlay::{MountedOverlay, mount_overlay};
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 /// Maximum number of concurrent IPC client connections served simultaneously by `oz-vfsd`.
-pub const MAX_CONCURRENT_IPC_CONNECTIONS: usize = 64;
+const MAX_CONCURRENT_IPC_CONNECTIONS: usize = 64;
 
 static ENDPOINT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -774,7 +774,10 @@ pub fn validate_global_mount_spec(spec: &MountSpec, already_mounted_here: bool) 
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let parent_name = mp_parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let inside_oz_container = mp_name == spec.workspace && parent_name.ends_with(".oz");
+    let inside_oz_container = mp_name == spec.workspace
+        && Path::new(parent_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("oz"));
     let inside_git_ozone = resolved_mp.starts_with(canon_git.join("ozone"));
     if !inside_oz_container && !inside_git_ozone {
         return Err(guardrail_err(
@@ -800,9 +803,7 @@ pub fn validate_global_mount_spec(spec: &MountSpec, already_mounted_here: bool) 
             verify_owned_dir(mp_parent, "mount_point parent")?;
             verify_uid_owner(&meta, "mount_point", &spec.mount_point)?;
             if !already_mounted_here
-                && std::fs::read_dir(&spec.mount_point)
-                    .map(|mut it| it.next().is_some())
-                    .unwrap_or(true)
+                && std::fs::read_dir(&spec.mount_point).map_or(true, |mut it| it.next().is_some())
             {
                 return Err(guardrail_err(
                     "global_vfsd_validation",
@@ -1567,7 +1568,7 @@ async fn serve_ipc_stream<S>(
             .read_until(b'\n', &mut buf)
             .await;
         match read_res {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(_) => {
                 if buf.len() > MAX_IPC_LINE_BYTES {
                     let resp = VfsResponse::Error {
@@ -1664,7 +1665,6 @@ async fn serve_ipc_stream<S>(
                     break;
                 }
             }
-            Err(_) => break,
         }
     }
 }
@@ -2144,6 +2144,18 @@ mod tests {
         use crate::protocol::parse_tcp_endpoint;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+        // Helper sending one raw JSON line over TCP and returning the parsed VfsResponse.
+        async fn send_raw_line(addr: std::net::SocketAddr, line: &str) -> VfsResponse {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream.write_all(line.as_bytes()).await.expect("write");
+            stream.flush().await.expect("flush");
+            let mut reader = BufReader::new(stream);
+            let mut resp_line = String::new();
+            let n = reader.read_line(&mut resp_line).await.expect("read");
+            assert!(n > 0, "expected structured error response");
+            serde_json::from_str(resp_line.trim()).expect("parse VfsResponse")
+        }
+
         let dir = TempDir::new().unwrap();
         let git_dir = dir.path().join("tcp-auth/.git");
         std::fs::create_dir_all(&git_dir).unwrap();
@@ -2181,18 +2193,6 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(dir_mode, 0o700, "endpoint parent dir must be mode 0700");
-        }
-
-        // Helper sending one raw JSON line over TCP and returning the parsed VfsResponse.
-        async fn send_raw_line(addr: std::net::SocketAddr, line: &str) -> VfsResponse {
-            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-            stream.write_all(line.as_bytes()).await.expect("write");
-            stream.flush().await.expect("flush");
-            let mut reader = BufReader::new(stream);
-            let mut resp_line = String::new();
-            let n = reader.read_line(&mut resp_line).await.expect("read");
-            assert!(n > 0, "expected structured error response");
-            serde_json::from_str(resp_line.trim()).expect("parse VfsResponse")
         }
 
         // 1. Unauthenticated Ping, ListMounts, and Shutdown must be rejected as unauthorized.

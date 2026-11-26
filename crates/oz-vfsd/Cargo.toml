@@ -20,7 +20,6 @@ path = "src/main.rs"
 
 [dependencies]
 chrono.workspace = true
-clap.workspace = true
 fs4.workspace = true
 libc.workspace = true
 oz-core.workspace = true

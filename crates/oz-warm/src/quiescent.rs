@@ -216,7 +216,7 @@ pub fn find_nearest_prior_baseline(
     if let Ok(repo) = gix::open(repo_root) {
         let start_id = commit_oid
             .and_then(|hex| gix::ObjectId::from_hex(hex.as_bytes()).ok())
-            .or_else(|| repo.head_id().ok().map(|id| id.detach()));
+            .or_else(|| repo.head_id().ok().map(gix::Id::detach));
 
         if let Some(start) = start_id
             && let Ok(walk) = repo.rev_walk([start]).all()

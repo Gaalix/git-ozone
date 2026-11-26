@@ -324,7 +324,7 @@ pub fn ping_daemon(socket_path: &Path) -> Result<DaemonPong> {
 /// On Unix, cleans up dead `vfsd.sock` sockets and `ENOTCONN` (`errno == 107`) stale FUSE
 /// mountpoints via `fusermount3 -u -z`, spawns `oz-vfsd --git-dir <git_dir>` detached with
 /// `setsid()`. On Windows, spawns `oz-vfsd.exe` detached (`CREATE_NO_WINDOW | DETACHED_PROCESS`)
-/// listening on loopback TCP and virtualizing ProjFS mountpoints.
+/// listening on loopback TCP and virtualizing `ProjFS` mountpoints.
 #[cfg(any(unix, windows))]
 pub fn ensure_daemon_and_mounts(git_dir: &Path) -> Result<Vec<MountInfo>> {
     use fs4::FileExt as Fs4FileExt;

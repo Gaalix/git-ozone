@@ -3,6 +3,7 @@
 
 //! Quiescent baseline capture into `.git/ozone/baselines/<commit_oid>/` and LRU disk-cap GC.
 
+use crate::cargo::is_transient_cargo_lock_path;
 use crate::mtime::{
     metadata_modified_filetime, metadata_modified_secs_nanos, set_file_mtime_compat,
     set_symlink_times_compat,
@@ -14,7 +15,7 @@ use crate::trampoline::{
 };
 use crate::{
     BaselineMetadata, CargoArtifactDisposition, CargoTargetClassifier, EcosystemKind,
-    WarmCacheTarget, detect_warm_targets, is_transient_cargo_lock_path,
+    WarmCacheTarget, detect_warm_targets,
 };
 use chrono::{DateTime, Utc};
 use filetime::FileTime;
@@ -207,14 +208,13 @@ fn capture_git_commit_tree(
 ) -> Result<u64> {
     let commit_secs = commit
         .time()
-        .map(|t| t.seconds)
-        .unwrap_or_else(|_| Utc::now().timestamp());
-    let tree = commit.tree().map_err(|e| OzError::Git(e.to_string()))?;
+        .map_or_else(|_| Utc::now().timestamp(), |t| t.seconds);
+    let tree = commit.tree().map_err(OzError::git_source)?;
     let entries = tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut jobs = Vec::with_capacity(entries.len());
     let mut dirs = HashSet::new();
@@ -241,7 +241,7 @@ fn capture_git_commit_tree(
     let mtime_pairs: Vec<(String, i64, u32)> = jobs
         .par_iter()
         .map_init(
-            || gix::open(&git_dir).map_err(|e| OzError::Git(e.to_string())),
+            || gix::open(&git_dir).map_err(OzError::git_source),
             |thread_repo_res, (rel_str, dst_path, oid, mode)| -> Result<(String, i64, u32)> {
                 let thread_repo = thread_repo_res
                     .as_ref()
@@ -252,9 +252,7 @@ fn capture_git_commit_tree(
                     .as_ref()
                     .map_or((commit_secs, 0), metadata_modified_secs_nanos);
 
-                let blob = thread_repo
-                    .find_blob(*oid)
-                    .map_err(|e| OzError::Git(e.to_string()))?;
+                let blob = thread_repo.find_blob(*oid).map_err(OzError::git_source)?;
                 let data = &blob.data;
 
                 if mode.is_link() {
@@ -653,25 +651,19 @@ pub fn touch_baseline_lru(ozone_dir: &Path, commit_oid: &str) -> Result<()> {
 /// Prunes least-recently-used baselines in `.git/ozone/baselines/` until total retained bytes
 /// fit within `max_baseline_gb`.
 pub fn gc_baselines(ozone_dir: &Path, max_baseline_gb: f64) -> Result<GcReport> {
-    let baselines_dir = ozone_dir.join("baselines");
-    if !baselines_dir.is_dir() {
-        return Ok(GcReport::default());
-    }
-
-    let budget_bytes = if !max_baseline_gb.is_finite() || max_baseline_gb <= 0.0 {
-        0u64
-    } else {
-        (max_baseline_gb * 1024.0 * 1024.0 * 1024.0)
-            .floor()
-            .max(0.0) as u64
-    };
-
     struct BaselineEntry {
         id: String,
         path: PathBuf,
         size_bytes: u64,
         lru_nanos: i128,
     }
+
+    let baselines_dir = ozone_dir.join("baselines");
+    if !baselines_dir.is_dir() {
+        return Ok(GcReport::default());
+    }
+
+    let budget_bytes = gib_to_budget_bytes(max_baseline_gb);
 
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&baselines_dir)? {
@@ -894,4 +886,44 @@ fn set_symlink_mtime_secs_nanos(path: &Path, secs: i64, nanos: u32) -> Result<()
     let ft = FileTime::from_unix_time(secs, nanos);
     set_symlink_times_compat(path, ft)?;
     Ok(())
+}
+
+fn gib_to_budget_bytes(max_baseline_gb: f64) -> u64 {
+    const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    // Largest exact IEEE-754 `f64` value `<= u64::MAX` (`0xFFFF_FFFF_FFFF_F800`).
+    const MAX_U64_F64: f64 = 18_446_744_073_709_549_568.0;
+
+    if max_baseline_gb.is_nan() || max_baseline_gb <= 0.0 {
+        return 0;
+    }
+    if max_baseline_gb.is_infinite() {
+        return u64::MAX;
+    }
+    let scaled = (max_baseline_gb * BYTES_PER_GIB).floor();
+    if scaled >= MAX_U64_F64 {
+        return u64::MAX;
+    }
+    let clamped = scaled.clamp(0.0, MAX_U64_F64);
+    std::time::Duration::try_from_secs_f64(clamped).map_or(u64::MAX, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gib_to_budget_bytes;
+
+    #[test]
+    fn gib_to_budget_bytes_clamps_safely_across_edge_cases() {
+        assert_eq!(gib_to_budget_bytes(f64::NAN), 0);
+        assert_eq!(gib_to_budget_bytes(-10.0), 0);
+        assert_eq!(gib_to_budget_bytes(-0.0), 0);
+        assert_eq!(gib_to_budget_bytes(0.0), 0);
+        assert_eq!(gib_to_budget_bytes(1.0), 1024 * 1024 * 1024);
+        assert_eq!(
+            gib_to_budget_bytes(9000.0 / (1024.0 * 1024.0 * 1024.0)),
+            9000
+        );
+        assert_eq!(gib_to_budget_bytes(1e30), u64::MAX);
+        assert_eq!(gib_to_budget_bytes(f64::INFINITY), u64::MAX);
+        assert_eq!(gib_to_budget_bytes(f64::NEG_INFINITY), 0);
+    }
 }

@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Concrete [`WorkspaceBackend`] implementations across APFS, Linux `FICLONE`, Windows ReFS,
-//! Linux FUSE3 / Windows ProjFS (`oz-vfsd`), and universal CAS hardlink fallback.
+//! Concrete [`WorkspaceBackend`] implementations across APFS, Linux `FICLONE`, Windows `ReFS`,
+//! Linux FUSE3 / Windows `ProjFS` (`oz-vfsd`), and universal CAS hardlink fallback.
 
 use crate::detect::detect_filesystem;
 use crate::materialize::{
@@ -100,7 +100,7 @@ impl WorkspaceBackend for ClonefileBackend {
     }
 
     fn health_check(&self, workspace_path: &Path) -> Result<BackendHealth> {
-        simple_dir_health(BackendKind::ApfsClonefile, workspace_path)
+        Ok(simple_dir_health(BackendKind::ApfsClonefile, workspace_path))
     }
 }
 
@@ -149,11 +149,11 @@ impl WorkspaceBackend for FicloneBackend {
     }
 
     fn health_check(&self, workspace_path: &Path) -> Result<BackendHealth> {
-        simple_dir_health(BackendKind::LinuxFiclone, workspace_path)
+        Ok(simple_dir_health(BackendKind::LinuxFiclone, workspace_path))
     }
 }
 
-/// Windows ReFS / Dev Drive native block-cloning backend via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
+/// Windows `ReFS` / Dev Drive native block-cloning backend via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RefsCloneBackend;
@@ -177,11 +177,11 @@ impl WorkspaceBackend for RefsCloneBackend {
     }
 
     fn health_check(&self, workspace_path: &Path) -> Result<BackendHealth> {
-        simple_dir_health(BackendKind::WindowsRefsClone, workspace_path)
+        Ok(simple_dir_health(BackendKind::WindowsRefsClone, workspace_path))
     }
 }
 
-/// Linux `ext4` unprivileged FUSE3 CoW overlay backend powered by `oz-vfsd`.
+/// Linux `ext4` unprivileged FUSE3 `CoW` overlay backend powered by `oz-vfsd`.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct Fuse3VfsBackend {
@@ -214,18 +214,19 @@ impl Fuse3VfsBackend {
     }
 
     /// Unmounts and cleans up a FUSE3 workspace when `git_common_dir` and `workspace` are known.
-    pub fn destroy_with_context(
+    pub(crate) fn destroy_with_context(
         &self,
         git_common_dir: &Path,
         workspace: &str,
         workspace_path: &Path,
-    ) -> Result<()> {
+    ) {
+        let _ = self;
         destroy_daemon_vfs_workspace(
             git_common_dir,
             workspace,
             workspace_path,
             BackendKind::LinuxFuse3,
-        )
+        );
     }
 }
 
@@ -256,7 +257,8 @@ impl WorkspaceBackend for Fuse3VfsBackend {
         if let Ok(repo) = OzoneRepo::discover(Some(workspace_path))
             && let Some(ws_name) = repo.workspace.as_deref()
         {
-            return self.destroy_with_context(&repo.git_common_dir, ws_name, workspace_path);
+            self.destroy_with_context(&repo.git_common_dir, ws_name, workspace_path);
+            return Ok(());
         }
 
         if probe_mount_health_os(workspace_path) == MountHealth::DisconnectedEnotconn
@@ -313,20 +315,21 @@ impl ProjFsVfsBackend {
         Self { auto_start }
     }
 
-    /// Stops ProjFS virtualization and cleans up a workspace when `git_common_dir` and
+    /// Stops `ProjFS` virtualization and cleans up a workspace when `git_common_dir` and
     /// `workspace` are known.
-    pub fn destroy_with_context(
+    pub(crate) fn destroy_with_context(
         &self,
         git_common_dir: &Path,
         workspace: &str,
         workspace_path: &Path,
-    ) -> Result<()> {
+    ) {
+        let _ = self;
         destroy_daemon_vfs_workspace(
             git_common_dir,
             workspace,
             workspace_path,
             BackendKind::WindowsProjFs,
-        )
+        );
     }
 }
 
@@ -356,7 +359,8 @@ impl WorkspaceBackend for ProjFsVfsBackend {
         if let Ok(repo) = OzoneRepo::discover(Some(workspace_path))
             && let Some(ws_name) = repo.workspace.as_deref()
         {
-            return self.destroy_with_context(&repo.git_common_dir, ws_name, workspace_path);
+            self.destroy_with_context(&repo.git_common_dir, ws_name, workspace_path);
+            return Ok(());
         }
         remove_dir_if_exists(workspace_path)
     }
@@ -523,7 +527,7 @@ fn destroy_daemon_vfs_workspace(
     workspace: &str,
     workspace_path: &Path,
     backend_kind: BackendKind,
-) -> Result<()> {
+) {
     let layout = OzoneLayout::from_git_common_dir(git_common_dir);
 
     let _ = unmount_via_daemon(git_common_dir, workspace, true);
@@ -554,8 +558,6 @@ fn destroy_daemon_vfs_workspace(
             let _ = std::fs::write(&mount_json, json);
         }
     }
-
-    Ok(())
 }
 
 /// Universal fallback backend using a read-only (`0444`/`0555`) CAS hardlink store under
@@ -584,7 +586,7 @@ impl WorkspaceBackend for CasHardlinkBackend {
     }
 
     fn health_check(&self, workspace_path: &Path) -> Result<BackendHealth> {
-        simple_dir_health(BackendKind::CasHardlink, workspace_path)
+        Ok(simple_dir_health(BackendKind::CasHardlink, workspace_path))
     }
 }
 
@@ -643,14 +645,14 @@ fn spawned_non_vfs(kind: BackendKind, req: &SpawnRequest) -> SpawnedWorkspace {
     }
 }
 
-fn simple_dir_health(kind: BackendKind, workspace_path: &Path) -> Result<BackendHealth> {
+fn simple_dir_health(kind: BackendKind, workspace_path: &Path) -> BackendHealth {
     let exists = workspace_path.is_dir();
-    Ok(BackendHealth {
+    BackendHealth {
         healthy: exists,
         backend: kind,
         mount_active: exists,
         message: (!exists).then(|| "workspace path does not exist".to_string()),
-    })
+    }
 }
 
 pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<()> {
@@ -680,7 +682,7 @@ fn clear_readonly_tree_on_windows(_path: &Path) {}
 
 /// Populates `.git/ozone/ws/<ws>/seed/` (worktree `.git` pointer + branch delta over
 /// `baseline_dir`, or full ODB tree when no baseline exists) and writes `seed_whiteouts/*.oz_wh`
-/// shared by both Linux FUSE3 and Windows ProjFS VFS backends.
+/// shared by both Linux FUSE3 and Windows `ProjFS` VFS backends.
 pub fn prepare_vfs_seed_layer(
     req: &SpawnRequest,
     git_common_dir: &Path,

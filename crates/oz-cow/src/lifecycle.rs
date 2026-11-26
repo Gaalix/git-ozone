@@ -124,7 +124,7 @@ pub struct GcWorkspacesReport {
     pub skipped_dirty: Vec<String>,
 }
 
-/// Spawns an isolated CoW or VFS workspace at `../<repo>.oz/<ws>`, creating a real local
+/// Spawns an isolated `CoW` or VFS workspace at `../<repo>.oz/<ws>`, creating a real local
 /// branch `refs/heads/<branch>`, colocated `.git/worktrees/<ws>/` metadata, warm baseline
 /// caches + `mtime` preservation, and persistent `.git/ozone/state/<ws>.json`.
 pub fn spawn_workspace(
@@ -524,12 +524,12 @@ pub fn remove_workspace(
                 true,
                 repo.config.daemon.auto_start,
             );
-            fuse.destroy_with_context(&repo.git_common_dir, name, &worktree_path)?;
+            fuse.destroy_with_context(&repo.git_common_dir, name, &worktree_path);
         }
         #[cfg(target_os = "windows")]
         if backend_kind == BackendKind::WindowsProjFs {
             let projfs = ProjFsVfsBackend::new(repo.config.daemon.auto_start);
-            projfs.destroy_with_context(&repo.git_common_dir, name, &worktree_path)?;
+            projfs.destroy_with_context(&repo.git_common_dir, name, &worktree_path);
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
@@ -589,7 +589,7 @@ pub fn gc_workspaces(repo: &OzoneRepo, opts: &GcWorkspacesOptions) -> Result<GcW
         r.try_find_reference(&full)
             .ok()
             .flatten()
-            .and_then(|mut rf| rf.peel_to_id().ok().map(|id| id.detach()))
+            .and_then(|mut rf| rf.peel_to_id().ok().map(gix::Id::detach))
     });
 
     for ws in summaries {
@@ -709,7 +709,7 @@ fn prepare_branch_target(
 
     if let Some(mut existing_ref) = gix_repo
         .try_find_reference(branch_ref_name)
-        .map_err(|e| OzError::Git(e.to_string()))?
+        .map_err(OzError::git_source)?
     {
         if from_ref.is_some() {
             return Err(OzError::InvalidUsage {
@@ -721,11 +721,11 @@ fn prepare_branch_target(
         }
         let commit = existing_ref
             .peel_to_commit()
-            .map_err(|e| OzError::Git(e.to_string()))?;
+            .map_err(OzError::git_source)?;
         let commit_hex = commit.id.to_hex().to_string();
         let tree_hex = commit
             .tree_id()
-            .map_err(|e| OzError::Git(e.to_string()))?
+            .map_err(OzError::git_source)?
             .to_hex()
             .to_string();
         return Ok(PreparedBranchTarget {
@@ -748,7 +748,7 @@ fn prepare_branch_target(
     if from_ref.is_none()
         && gix_repo
             .head()
-            .map_err(|e| OzError::Git(e.to_string()))?
+            .map_err(OzError::git_source)?
             .is_unborn()
     {
         return Ok(PreparedBranchTarget {
@@ -762,16 +762,16 @@ fn prepare_branch_target(
     let rev_spec = from_ref.unwrap_or("HEAD");
     let obj_id = gix_repo
         .rev_parse_single(rev_spec)
-        .map_err(|e| OzError::Git(format!("could not resolve '{rev_spec}': {e}")))?;
+        .map_err(|e| OzError::git_context(format!("could not resolve '{rev_spec}'"), e))?;
     let commit = obj_id
         .object()
-        .map_err(|e| OzError::Git(e.to_string()))?
+        .map_err(OzError::git_source)?
         .peel_to_commit()
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
     let commit_id = commit.id;
     let tree_hex = commit
         .tree_id()
-        .map_err(|e| OzError::Git(e.to_string()))?
+        .map_err(OzError::git_source)?
         .to_hex()
         .to_string();
 
@@ -782,7 +782,7 @@ fn prepare_branch_target(
             gix::refs::transaction::PreviousValue::MustNotExist,
             "oz ws spawn",
         )
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(PreparedBranchTarget {
         base_commit: Some(commit_id.to_hex().to_string()),
@@ -842,16 +842,15 @@ fn create_colocated_worktree_metadata(
             return Ok(());
         }
 
-        let tree_id = gix::ObjectId::from_hex(tree_hex.as_bytes())
-            .map_err(|e| OzError::Git(e.to_string()))?;
+        let tree_id = gix::ObjectId::from_hex(tree_hex.as_bytes()).map_err(OzError::git_source)?;
         let index_file = gix_repo
             .index_from_tree(&tree_id)
-            .map_err(|e| OzError::Git(e.to_string()))?;
+            .map_err(OzError::git_source)?;
 
         let mut out = BufWriter::new(std::fs::File::create(&index_path)?);
         index_file
             .write_to(&mut out, gix::index::write::Options::default())
-            .map_err(|e| OzError::Git(e.to_string()))?;
+            .map_err(OzError::git_source)?;
         drop(out);
 
         // Best-effort atomic populate of the single-entry tree index cache (pruning stale entries).
@@ -885,7 +884,7 @@ fn create_colocated_worktree_metadata(
     let mut out = BufWriter::new(std::fs::File::create(&index_path)?);
     index_file
         .write_to(&mut out, gix::index::write::Options::default())
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(())
 }

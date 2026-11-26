@@ -1,8 +1,10 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Cross-platform unit/integration tests for `oz-vfsd` ProjFS layer engine,
-//! CoW upper/whiteout/opaque persistence, `windows_setup`, and loopback TCP IPC.
+//! Cross-platform unit/integration tests for `oz-vfsd` `ProjFS` layer engine,
+//! `CoW` upper/whiteout/opaque persistence, `windows_setup`, and loopback TCP IPC.
+
+#![allow(clippy::too_many_lines)]
 
 use oz_core::{ChangeKind, OzError};
 use oz_vfsd::{
@@ -246,7 +248,9 @@ fn projfs_preserves_mtime_as_windows_filetime_and_hydrates_byte_ranges() {
     let spec = make_spec(dir.path(), false, true);
     let base = spec.baseline_dir.as_ref().expect("base");
 
-    let payload: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(150 * 1024_usize))
+        .map(|i| u8::try_from(i % 251).expect("u8"))
+        .collect();
     let p = base.join("big.bin");
     std::fs::write(&p, &payload).expect("write big.bin");
     let fixed_mtime = UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000);
@@ -286,7 +290,7 @@ fn projfs_preserves_mtime_as_windows_filetime_and_hydrates_byte_ranges() {
     let past_eof = engine
         .read_hydration_data("big.bin", payload.len() as u64 + 100, 1024)
         .expect("past eof");
-    assert!(past_eof.is_empty());
+    assert_eq!(past_eof, b"");
 
     assert!(engine.read_hydration_data("missing.bin", 0, 16).is_err());
 }
@@ -540,13 +544,13 @@ fn tcp_loopback_daemon_round_trips_ipc_and_cleans_up_endpoint_on_shutdown() {
             pid, active_mounts, ..
         } => {
             assert_eq!(pid, std::process::id());
-            assert!(active_mounts.is_empty());
+            assert_eq!(active_mounts, &[]);
         }
         other => panic!("unexpected Status response: {other:?}"),
     }
 
     match send_tcp_request(&sock_path, &VfsRequest::ListMounts).expect("list mounts") {
-        VfsResponse::MountList { mounts } => assert!(mounts.is_empty()),
+        VfsResponse::MountList { mounts } => assert_eq!(mounts, &[]),
         other => panic!("unexpected ListMounts response: {other:?}"),
     }
 

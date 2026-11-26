@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Windows ProjFS feature enablement (`Client-ProjFS`) and startup script helpers for `oz setup`.
+//! Windows `ProjFS` feature enablement (`Client-ProjFS`) and startup script helpers for `oz setup`.
 
 use oz_core::{OzError, Result};
 use std::ffi::OsStr;
@@ -54,7 +54,7 @@ fn sanitize_cmd_arg(raw: &OsStr) -> String {
 /// supplied PowerShell runner with [`PROJFS_ENABLE_POWERSHELL_CMD`].
 ///
 /// Returns:
-/// - `Ok(false)` when ProjFS is already enabled (`ProjectedFSLib.dll` exists)
+/// - `Ok(false)` when `ProjFS` is already enabled (`ProjectedFSLib.dll` exists)
 /// - `Ok(true)` when the command enabled `Client-ProjFS`
 /// - `Err(OzError::CheckFailed)` with an Administrator recovery command on failure
 pub fn enable_windows_projfs_with<F>(system_root: &Path, run_powershell: F) -> Result<bool>
