@@ -19,7 +19,7 @@ pub enum BackendKind {
     LinuxFiclone,
     /// Linux `ext4` unprivileged FUSE3 overlay daemon (`oz-vfsd`).
     LinuxFuse3,
-    /// Windows Dev Drive / ReFS block clone via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
+    /// Windows Dev Drive / `ReFS` block clone via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
     WindowsRefsClone,
     /// Windows NTFS virtualization via `oz-vfsd` (`windows-projfs`).
     WindowsProjFs,
@@ -124,7 +124,7 @@ impl FilesystemKind {
         }
     }
 
-    /// Returns `true` if the filesystem natively supports zero-copy CoW reflinks.
+    /// Returns `true` if the filesystem natively supports zero-copy Copy-on-Write reflinks.
     #[must_use]
     pub fn supports_reflinks(&self) -> bool {
         matches!(

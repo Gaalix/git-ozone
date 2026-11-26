@@ -88,27 +88,21 @@ impl TreeDeltaOp {
 /// refusing dirty working-tree overwrites unless `opts.force` is `true`.
 pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOutcome> {
     let gix_repo = open_gix_for_workspace(repo)?;
-    let head = gix_repo
-        .head()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let head = gix_repo.head().map_err(OzError::git_source)?;
     let previous_branch = head
         .referent_name()
         .map(|name| String::from_utf8_lossy(name.shorten().as_ref()).into_owned());
     let current_commit = if head.is_unborn() {
         None
     } else {
-        Some(
-            head.into_peeled_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach(),
-        )
+        Some(head.into_peeled_id().map_err(OzError::git_source)?.detach())
     };
     let current_tree = match current_commit {
         Some(oid) => gix_repo
             .find_commit(oid)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach(),
         None => gix_repo.empty_tree().id().detach(),
     };
@@ -123,7 +117,7 @@ pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOut
         if !opts.reset_existing_branch
             && gix_repo
                 .try_find_reference(full_name.as_bstr())
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .is_some()
         {
             return Err(OzError::InvalidUsage {
@@ -148,7 +142,7 @@ pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOut
         let full_name = branch_full_name(new_br)?;
         let existing = gix_repo
             .try_find_reference(full_name.as_bstr())
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         if existing.is_some() && !opts.reset_existing_branch {
             return Err(OzError::InvalidUsage {
                 message: format!("a branch named '{new_br}' already exists"),
@@ -193,7 +187,7 @@ pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOut
         if !opts.detach
             && let Some(mut reference) = gix_repo
                 .try_find_reference(&candidate_ref)
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
         {
             let full_name = branch_full_name(spec)?;
             if let Some(other_wt) = find_worktree_using_branch(repo, &full_name)? {
@@ -207,10 +201,7 @@ pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOut
                     ],
                 });
             }
-            let oid = reference
-                .peel_to_commit()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .id;
+            let oid = reference.peel_to_commit().map_err(OzError::git_source)?.id;
             (Some(spec.to_string()), oid, None, false)
         } else {
             let oid = resolve_commit_oid(&gix_repo, spec)?;
@@ -228,9 +219,9 @@ pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOut
 
     let target_tree = gix_repo
         .find_commit(target_commit)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
     let delta = compute_tree_delta(&gix_repo, current_tree, target_tree)?;
@@ -297,12 +288,12 @@ pub fn switch_branch(repo: &OzoneRepo, opts: &SwitchOptions) -> Result<SwitchOut
             expected: PreviousValue::Any,
             new: head_target,
         },
-        name: FullName::try_from("HEAD").expect("HEAD is valid"),
+        name: FullName::try_from("HEAD").map_err(OzError::git_source)?,
         deref: false,
     });
     gix_repo
         .edit_references(edits)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     // Materialize tree delta onto workdir_path (leaving unrelated dirty files untouched).
     let updated_files = materialize_tree_delta(repo, &gix_repo, &delta)?;
@@ -339,31 +330,25 @@ pub fn checkout_paths(
 
     let gix_repo = open_gix_for_workspace(repo)?;
     let rev_spec = opts.revision.as_deref().unwrap_or("HEAD");
-    let tree_id = if rev_spec == "HEAD"
-        && gix_repo
-            .head()
-            .map_err(|err| OzError::Git(err.to_string()))?
-            .is_unborn()
+    let tree_id = if rev_spec == "HEAD" && gix_repo.head().map_err(OzError::git_source)?.is_unborn()
     {
         gix_repo.empty_tree().id().detach()
     } else {
         let oid = resolve_commit_oid(&gix_repo, rev_spec)?;
         gix_repo
             .find_commit(oid)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach()
     };
 
-    let tree = gix_repo
-        .find_tree(tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(tree_id).map_err(OzError::git_source)?;
     let files = tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut tree_entries: Vec<(String, gix::ObjectId, EntryKind)> = Vec::new();
     for entry in files {
@@ -377,7 +362,7 @@ pub fn checkout_paths(
         ));
     }
 
-    let mut ops = Vec::new();
+    let mut delta_ops = Vec::new();
     let mut restored_paths = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -389,7 +374,7 @@ pub fn checkout_paths(
                 matched_any = true;
                 if seen.insert(rel.clone()) {
                     restored_paths.push(rel.clone());
-                    ops.push(TreeDeltaOp::Upsert {
+                    delta_ops.push(TreeDeltaOp::Upsert {
                         path: rel.clone(),
                         oid: *oid,
                         kind: *kind,
@@ -405,7 +390,7 @@ pub fn checkout_paths(
         }
     }
 
-    materialize_tree_delta(repo, &gix_repo, &ops)?;
+    materialize_tree_delta(repo, &gix_repo, &delta_ops)?;
     restored_paths.sort();
 
     if rev_spec == "HEAD" {
@@ -443,7 +428,7 @@ pub fn create_or_reset_local_branch(
             PreviousValue::Any,
             "oz git worktree add -B",
         )
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(oid.to_hex().to_string())
 }
 
@@ -453,11 +438,12 @@ pub fn is_local_branch(repo: &OzoneRepo, name: &str) -> Result<bool> {
     let full = format!("refs/heads/{name}");
     Ok(gix_repo
         .try_find_reference(&full)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .is_some())
 }
 
 /// Returns `true` if `spec` resolves to a Git revision in `repo`.
+#[must_use]
 pub fn resolves_as_revision(repo: &OzoneRepo, spec: &str) -> bool {
     let Ok(gix_repo) = repo.open_gix() else {
         return false;
@@ -471,13 +457,13 @@ pub fn list_tracked_paths_in_head(repo: &OzoneRepo) -> Result<BTreeSet<String>> 
     let head = resolve_workspace_head(repo, &gix_repo)?;
     let tree = gix_repo
         .find_tree(head.tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let mut out = BTreeSet::new();
     for entry in tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     {
         if !entry.mode.is_tree() && entry.mode.kind() != EntryKind::Commit {
             out.insert(entry.filepath.to_str_lossy().into_owned());
@@ -546,9 +532,9 @@ fn resolve_commit_oid(gix_repo: &gix::Repository, spec: &str) -> Result<gix::Obj
         })?;
     let commit = obj_id
         .object()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .peel_to_commit()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(commit.id)
 }
 
@@ -567,12 +553,12 @@ fn set_head_symbolic(
             expected: PreviousValue::Any,
             new: Target::Symbolic(target_ref.clone()),
         },
-        name: FullName::try_from("HEAD").expect("HEAD is valid"),
+        name: FullName::try_from("HEAD").map_err(OzError::git_source)?,
         deref: false,
     };
     gix_repo
         .edit_references([edit])
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(())
 }
 
@@ -622,10 +608,10 @@ fn compute_tree_delta(
     }
     let lhs_tree = gix_repo
         .find_tree(lhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let rhs_tree = gix_repo
         .find_tree(rhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut state = gix::diff::tree::State::default();
     let mut recorder = gix::diff::tree::Recorder::default()
@@ -640,7 +626,7 @@ fn compute_tree_delta(
         &gix_repo.objects,
         &mut recorder,
     )
-    .map_err(|err| OzError::Git(err.to_string()))?;
+    .map_err(OzError::git_source)?;
 
     let mut ops = Vec::new();
     for change in recorder.records {
@@ -747,9 +733,7 @@ fn materialize_tree_delta(
                 }
             }
 
-            let blob = gix_repo
-                .find_blob(*oid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let blob = gix_repo.find_blob(*oid).map_err(OzError::git_source)?;
 
             if *kind == EntryKind::Link {
                 #[cfg(unix)]
@@ -796,35 +780,32 @@ fn sync_index_for_delta(
     if !index_path.is_file() {
         let mut index = gix_repo
             .index_from_tree(&target_tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         index
             .write(gix::index::write::Options {
                 extensions: gix::index::write::Extensions::None,
                 skip_hash: true,
             })
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         return Ok(());
     }
 
-    let mut index = match gix::index::File::at(
+    let Ok(mut index) = gix::index::File::at(
         &index_path,
         gix_repo.object_hash(),
         true,
         gix::index::decode::Options::default(),
-    ) {
-        Ok(idx) => idx,
-        Err(_) => {
-            let mut rebuilt = gix_repo
-                .index_from_tree(&target_tree_id)
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            rebuilt
-                .write(gix::index::write::Options {
-                    extensions: gix::index::write::Extensions::None,
-                    skip_hash: true,
-                })
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            return Ok(());
-        }
+    ) else {
+        let mut rebuilt = gix_repo
+            .index_from_tree(&target_tree_id)
+            .map_err(OzError::git_source)?;
+        rebuilt
+            .write(gix::index::write::Options {
+                extensions: gix::index::write::Extensions::None,
+                skip_hash: true,
+            })
+            .map_err(OzError::git_source)?;
+        return Ok(());
     };
 
     let touched: BTreeSet<&str> = delta.iter().map(TreeDeltaOp::path).collect();
@@ -853,7 +834,7 @@ fn sync_index_for_delta(
             extensions: gix::index::write::Extensions::None,
             skip_hash: true,
         })
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(())
 }
 

@@ -227,10 +227,20 @@ where
     }
 
     let opt = Option::<NumOrNull>::deserialize(deserializer)?;
-    Ok(opt.map(|n| match n {
-        NumOrNull::Float(f) => f,
-        NumOrNull::Int(i) => i as f64,
-    }))
+    match opt {
+        None => Ok(None),
+        Some(NumOrNull::Float(f)) => Ok(Some(f)),
+        Some(NumOrNull::Int(i)) => {
+            if let Ok(small) = i32::try_from(i) {
+                Ok(Some(f64::from(small)))
+            } else {
+                i.to_string()
+                    .parse::<f64>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    }
 }
 
 impl OzoneConfig {

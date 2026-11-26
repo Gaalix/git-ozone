@@ -392,7 +392,7 @@ pub fn is_lfs_pointer(bytes: &[u8]) -> bool {
 
 /// Applies clean (checkin) EOL normalization according to `.gitattributes` and `GitConfig`.
 #[must_use]
-pub fn clean_eol_bytes<'a>(
+pub(crate) fn clean_eol_bytes<'a>(
     bytes: &'a [u8],
     attrs: &ResolvedAttrs,
     cfg: &GitConfig,
@@ -494,7 +494,7 @@ pub fn smudge_eol_bytes<'a>(
 ///
 /// When `strict_missing_lfs` is `true` (e.g. `oz commit`), a missing `filter.lfs.clean`
 /// driver fails safely with `OzError::CheckFailed` instead of committing raw binary content.
-pub fn clean_blob_bytes<'a>(
+pub(crate) fn clean_blob_bytes<'a>(
     rel_path: &str,
     disk_bytes: &'a [u8],
     attrs: &ResolvedAttrs,
@@ -1369,7 +1369,7 @@ mod tests {
 
         // 256 KiB payload (> 4x typical 64 KiB OS pipe buffer) to prove concurrent stdin/stdout I/O.
         let payload: Vec<u8> = (0..(256 * 1024usize))
-            .map(|i| b'a' + (i % 26) as u8)
+            .map(|i| b'a' + u8::try_from(i % 26).unwrap_or(0))
             .collect();
 
         // NUL byte in filename is rejected before spawn on all platforms.

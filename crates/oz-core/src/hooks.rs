@@ -33,10 +33,10 @@ pub enum HookRunOutcome {
 
 /// Author environment metadata exported to commit hooks (matching Git).
 #[derive(Debug, Clone, Default)]
-pub struct CommitHookEnv {
-    pub author_name: Option<String>,
-    pub author_email: Option<String>,
-    pub author_date: Option<String>,
+pub(crate) struct CommitHookEnv {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub date: Option<String>,
 }
 
 /// One ref update line fed to `pre-push` on stdin.
@@ -62,7 +62,7 @@ impl PrePushRefLine {
 /// Resolves the active Git hooks directory (`core.hooksPath` if configured, else
 /// `<git_common_dir>/hooks`).
 #[must_use]
-pub fn resolve_hooks_dir(repo: &OzoneRepo, cfg: &GitConfig) -> PathBuf {
+pub(crate) fn resolve_hooks_dir(repo: &OzoneRepo, cfg: &GitConfig) -> PathBuf {
     if let Some(raw_hooks_path) = cfg.hooks_path() {
         let expanded = expand_tilde_env(raw_hooks_path);
         if expanded.is_absolute() {
@@ -76,7 +76,7 @@ pub fn resolve_hooks_dir(repo: &OzoneRepo, cfg: &GitConfig) -> PathBuf {
 /// Resolves the executable hook script path for `hook_name`, returning `None` if the
 /// hook does not exist or does not have an executable permission bit set.
 #[must_use]
-pub fn find_executable_hook(hooks_dir: &Path, hook_name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable_hook(hooks_dir: &Path, hook_name: &str) -> Option<PathBuf> {
     let candidate = hooks_dir.join(hook_name);
     let meta = fs::metadata(&candidate).ok()?;
     if !meta.is_file() {
@@ -92,7 +92,7 @@ pub fn find_executable_hook(hooks_dir: &Path, hook_name: &str) -> Option<PathBuf
 }
 
 /// Runs `pre-commit` unless `no_verify` is `true`.
-pub fn run_pre_commit(
+pub(crate) fn run_pre_commit(
     repo: &OzoneRepo,
     cfg: &GitConfig,
     env_ctx: &CommitHookEnv,
@@ -106,7 +106,7 @@ pub fn run_pre_commit(
 
 /// Runs `prepare-commit-msg <msg_file> <source> [<sha>]` (NOT skipped by `--no-verify`,
 /// matching Git).
-pub fn run_prepare_commit_msg(
+pub(crate) fn run_prepare_commit_msg(
     repo: &OzoneRepo,
     cfg: &GitConfig,
     env_ctx: &CommitHookEnv,
@@ -131,7 +131,7 @@ pub fn run_prepare_commit_msg(
 }
 
 /// Runs `commit-msg <msg_file>` unless `no_verify` is `true`.
-pub fn run_commit_msg(
+pub(crate) fn run_commit_msg(
     repo: &OzoneRepo,
     cfg: &GitConfig,
     env_ctx: &CommitHookEnv,
@@ -148,7 +148,8 @@ pub fn run_commit_msg(
 /// Runs `post-commit` after a commit is recorded. Following Git semantics, a non-zero exit
 /// from `post-commit` does not fail the already-recorded commit, returning `Ok` with any
 /// captured output.
-pub fn run_post_commit(
+#[must_use]
+pub(crate) fn run_post_commit(
     repo: &OzoneRepo,
     cfg: &GitConfig,
     env_ctx: &CommitHookEnv,
@@ -258,13 +259,13 @@ fn execute_hook_script(
         cmd.env("GIT_INDEX_FILE", repo.git_dir.join("index"));
         cmd.env("GIT_PREFIX", "");
         if let Some(cenv) = commit_env {
-            if let Some(ref name) = cenv.author_name {
+            if let Some(ref name) = cenv.name {
                 cmd.env("GIT_AUTHOR_NAME", name);
             }
-            if let Some(ref email) = cenv.author_email {
+            if let Some(ref email) = cenv.email {
                 cmd.env("GIT_AUTHOR_EMAIL", email);
             }
-            if let Some(ref date) = cenv.author_date {
+            if let Some(ref date) = cenv.date {
                 cmd.env("GIT_AUTHOR_DATE", date);
             }
         }
@@ -412,9 +413,9 @@ mod tests {
         let msg_path = repo.git_dir.join("COMMIT_EDITMSG");
         fs::write(&msg_path, "feat: test\n").unwrap();
         let env_ctx = CommitHookEnv {
-            author_name: Some("Ada".to_string()),
-            author_email: Some("ada@example.com".to_string()),
-            author_date: Some("@1700000000 +0000".to_string()),
+            name: Some("Ada".to_string()),
+            email: Some("ada@example.com".to_string()),
+            date: Some("@1700000000 +0000".to_string()),
         };
 
         run_prepare_commit_msg(&repo, &cfg, &env_ctx, &msg_path, "message", None).unwrap();

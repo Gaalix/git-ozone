@@ -222,12 +222,12 @@ impl GitConfig {
             cfg.load_file_if_exists(&global_path, ctx, 0)?;
         }
 
-        let explicit_git_config = if !ctx.ignore_env_configs {
+        let explicit_git_config = if ctx.ignore_env_configs {
+            None
+        } else {
             std::env::var_os("GIT_CONFIG")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
-        } else {
-            None
         };
 
         if let Some(env_file) = explicit_git_config {
@@ -1168,9 +1168,7 @@ fn match_gitdir_condition(
             }
         }
     } else if !raw_pat.starts_with('/')
-        && !(raw_pat.len() >= 2
-            && raw_pat.as_bytes()[0].is_ascii_alphabetic()
-            && raw_pat.as_bytes()[1] == b':')
+        && !matches!(raw_pat.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
     {
         patterns.push(format!("**/{raw_pat}"));
     } else {

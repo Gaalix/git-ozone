@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(clippy::too_many_lines)]
+
 use oz_core::{
     CommitOptions, OzError, OzoneRepo, commit_changes, compute_diff, compute_status,
     render_unified_diff,

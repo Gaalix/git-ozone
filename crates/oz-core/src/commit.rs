@@ -260,10 +260,8 @@ fn commit_changes_inner(
         };
         let head_obj = gix_repo
             .find_commit(head_oid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let decoded = head_obj
-            .decode()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
+        let decoded = head_obj.decode().map_err(OzError::git_source)?;
         let parents: Vec<gix::ObjectId> = decoded.parents().collect();
         let raw_msg = decoded.message.to_str_lossy().into_owned();
         let existing_change_id = find_existing_change_id(raw_msg.trim_end_matches(['\r', '\n']));
@@ -308,9 +306,9 @@ fn commit_changes_inner(
     }
 
     let hook_env = CommitHookEnv {
-        author_name: Some(author_sig.name.to_str_lossy().into_owned()),
-        author_email: Some(author_sig.email.to_str_lossy().into_owned()),
-        author_date: Some(format_git_author_date(author_sig.time)),
+        name: Some(author_sig.name.to_str_lossy().into_owned()),
+        email: Some(author_sig.email.to_str_lossy().into_owned()),
+        date: Some(format_git_author_date(author_sig.time)),
     };
 
     run_pre_commit(repo, &git_cfg, &hook_env, opts.no_verify)?;
@@ -497,16 +495,14 @@ fn commit_changes_inner(
     // Apply removals before upserts to cleanly handle file <-> directory replacements.
     let mut editor = gix_repo
         .edit_tree(ctx.head.tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut index_deltas = Vec::with_capacity(prepared_edits.len());
     let mut committed_paths = Vec::with_capacity(prepared_edits.len());
 
     for edit in &prepared_edits {
         if let PreparedEdit::Remove { path, .. } = edit {
-            editor
-                .remove(path.as_str())
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            editor.remove(path.as_str()).map_err(OzError::git_source)?;
             committed_paths.push(path.clone());
             index_deltas.push(IndexDelta::Remove { path: path.clone() });
         }
@@ -523,11 +519,11 @@ fn commit_changes_inner(
             } => {
                 let blob_id = gix_repo
                     .write_blob(bytes)
-                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .map_err(OzError::git_source)?
                     .detach();
                 editor
                     .upsert(path.as_str(), *entry_kind, blob_id)
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
                 committed_paths.push(path.clone());
                 index_deltas.push(IndexDelta::Upsert {
                     path: path.clone(),
@@ -541,7 +537,7 @@ fn commit_changes_inner(
             } => {
                 editor
                     .upsert(path.as_str(), EntryKind::Commit, *commit_oid)
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
                 committed_paths.push(path.clone());
                 index_deltas.push(IndexDelta::Upsert {
                     path: path.clone(),
@@ -556,10 +552,7 @@ fn commit_changes_inner(
 
     committed_paths.sort();
 
-    let new_tree_id = editor
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let new_tree_id = editor.write().map_err(OzError::git_source)?.detach();
 
     let parents: Vec<gix::ObjectId> = match amended_head {
         Some(ref head_info) => head_info.parents.clone(),
@@ -637,10 +630,11 @@ fn commit_changes_inner(
     };
 
     let (signed, signature_fingerprint) = if let Some(ref priv_key) = active_signing_key {
-        let mut unsigned_payload = Vec::with_capacity(commit_obj.size() as usize);
+        let mut unsigned_payload =
+            Vec::with_capacity(usize::try_from(commit_obj.size()).unwrap_or(0));
         commit_obj
             .write_to(&mut unsigned_payload)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let armored_sig = priv_key.sign_sshsig(&unsigned_payload, GIT_SSHSIG_NAMESPACE)?;
         let fp = priv_key.public_key().fingerprint_sha256();
         let sig_field = gix::objs::commit::signature_field_name(gix_repo.object_hash());
@@ -654,11 +648,10 @@ fn commit_changes_inner(
 
     let commit_id = gix_repo
         .write_object(&commit_obj)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
-    let ref_full_name =
-        FullName::try_from(target_ref.as_str()).map_err(|err| OzError::Git(err.to_string()))?;
+    let ref_full_name = FullName::try_from(target_ref.as_str()).map_err(OzError::git_source)?;
     let expected = match ctx.head.commit_oid.map(Target::Object) {
         Some(previous) => {
             if ref_full_name.as_bstr() == "HEAD" {
@@ -698,7 +691,7 @@ fn commit_changes_inner(
             }),
             Some(committer_ref),
         )
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     // Update `.git/index` / `.git/worktrees/<ws>/index` if applicable.
     update_git_index(repo, &gix_repo, &ctx, &index_deltas)?;
@@ -738,7 +731,7 @@ fn open_gix_for_commit(repo: &OzoneRepo) -> Result<gix::Repository> {
     } else {
         &repo.repo_root
     };
-    gix::open(target).map_err(|err| OzError::Git(err.to_string()))
+    gix::open(target).map_err(OzError::git_source)
 }
 
 fn resolve_selection(
@@ -984,21 +977,21 @@ fn resolve_signatures(
 
     let mut committer = match gix_repo.committer() {
         Some(res) => res
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
         None => gix_repo
             .committer_or_set_fallback("Ozone", "oz@ozone.dev")
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
     };
 
     let mut author = match gix_repo.author() {
         Some(res) => res
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
         None => committer.clone(),
     };
 
@@ -1183,7 +1176,7 @@ impl CommitOidArg for str {
         }
         gix_repo
             .rev_parse_single(trimmed)
-            .map(|id| id.detach())
+            .map(gix::Id::detach)
             .map_err(|err| OzError::InvalidUsage {
                 message: format!("cannot resolve commit '{trimmed}': {err}"),
                 recovery: Vec::new(),
@@ -1234,13 +1227,11 @@ fn verify_commit_signature_inner<C: CommitOidArg + ?Sized>(
 ) -> Result<CommitSignatureVerification> {
     let gix_repo = open_gix_for_workspace(repo)?;
     let oid = commit_oid.resolve_commit_oid(&gix_repo)?;
-    let commit_obj = gix_repo
-        .find_commit(oid)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let commit_obj = gix_repo.find_commit(oid).map_err(OzError::git_source)?;
 
     let hash_kind = gix_repo.object_hash();
     let mut commit_ref = gix::objs::CommitRef::from_bytes(&commit_obj.data, hash_kind)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let sig_field = gix::objs::commit::signature_field_name(hash_kind);
     let Some(sig_bstr) = commit_ref.extra_headers().find(sig_field) else {
@@ -1263,7 +1254,7 @@ fn verify_commit_signature_inner<C: CommitOidArg + ?Sized>(
     let mut unsigned_payload = Vec::with_capacity(commit_obj.data.len());
     commit_ref
         .write_to(&mut unsigned_payload)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let parsed = verify_sshsig(&unsigned_payload, &armored_sig, GIT_SSHSIG_NAMESPACE)?;
 
@@ -1361,13 +1352,11 @@ fn update_git_index(
 
     let index_path = repo.git_dir.join("index");
     let mut index = if index_path.is_file() {
-        gix_repo
-            .open_index()
-            .map_err(|err| OzError::Git(err.to_string()))?
+        gix_repo.open_index().map_err(OzError::git_source)?
     } else if ctx.head.commit_oid.is_some() {
         gix_repo
             .index_from_tree(&ctx.head.tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
     } else {
         gix::index::File::from_state(gix::index::State::new(gix_repo.object_hash()), index_path)
     };
@@ -1415,7 +1404,7 @@ fn update_git_index(
     index.sort_entries();
     index
         .write(gix::index::write::Options::default())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(())
 }
@@ -1512,7 +1501,7 @@ pub fn read_pinned_paths(repo: &OzoneRepo) -> Result<BTreeSet<String>> {
 }
 
 /// Atomically writes the complete virtual `pinned` path set for `repo`.
-pub fn write_pinned_paths(repo: &OzoneRepo, paths: &BTreeSet<String>) -> Result<()> {
+pub(crate) fn write_pinned_paths(repo: &OzoneRepo, paths: &BTreeSet<String>) -> Result<()> {
     let normalized: BTreeSet<String> = paths
         .iter()
         .map(|p| normalize_pinned_path(p))

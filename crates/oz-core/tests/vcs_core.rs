@@ -5,6 +5,8 @@
 //! Histogram diff & deterministic IDs, partial hunk/file commits, Change-Id trailers,
 //! `.git/index` updates, and pre-commit guardrails.
 
+#![allow(clippy::too_many_lines)]
+
 use chrono::Utc;
 use oz_core::{
     BackendKind, ChangeKind, CommitOptions, ExitCode, GuardrailOptions, GuardrailTarget,
@@ -162,8 +164,7 @@ fn fuse_fast_path_o_dirty_ignores_clean_upper_and_handles_whiteouts_and_opaque()
     assert_eq!(status.branch.as_deref(), Some("feat/fuse-ws"));
     assert!(
         elapsed.as_millis() < 250,
-        "expected fast O(dirty) FUSE status, took {:?}",
-        elapsed
+        "expected fast O(dirty) FUSE status, took {elapsed:?}"
     );
 
     let summary: Vec<(&str, &str, ChangeKind)> = status
@@ -204,7 +205,11 @@ fn deterministic_hunk_ids_beyond_26_and_binary_detection() {
     init_repo_with_user(&repo_root);
 
     // Build a 300-line file and modify 28 separated regions so hunks span h1a..h1z, h1aa, h1ab.
-    let orig: String = (0..300).map(|i| format!("row_{i:03}\n")).collect();
+    let orig: String = (0..300).fold(String::new(), |mut acc, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(acc, "row_{i:03}");
+        acc
+    });
     fs::write(repo_root.join("big.txt"), &orig).expect("write big.txt");
     git(&repo_root, &["add", "big.txt"]);
     git(&repo_root, &["commit", "-m", "init big"]);
@@ -239,7 +244,7 @@ fn deterministic_hunk_ids_beyond_26_and_binary_detection() {
     assert_eq!(diff_all.files[1].id, "f2");
     assert_eq!(diff_all.files[1].path, "blob.bin");
     assert!(diff_all.files[1].is_binary);
-    assert!(diff_all.files[1].hunks.is_empty());
+    assert_eq!(diff_all.files[1].hunks.len(), 0);
 
     assert_eq!(diff_all.files[2].id, "f3");
     assert!(!diff_all.files[2].is_binary);
@@ -261,7 +266,11 @@ fn partial_commit_pick_f2_h1a_and_exclude_leaves_unselected_hunks_and_files_unto
     let repo_root = tmp.path().join("partial");
     init_repo_with_user(&repo_root);
 
-    let initial_a: String = (1..=30).map(|i| format!("token_line_{i}\n")).collect();
+    let initial_a: String = (1..=30).fold(String::new(), |mut acc, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(acc, "token_line_{i}");
+        acc
+    });
     fs::write(repo_root.join("a_token.rs"), &initial_a).expect("write a_token");
     fs::write(repo_root.join("c_debug.rs"), "pub fn debug() {}\n").expect("write c_debug");
     git(&repo_root, &["add", "."]);
@@ -385,11 +394,7 @@ fn unborn_head_commit_pinned_paths_and_change_id_trailer() {
     );
 
     // C git should see a clean working tree on main with the Change-Id trailer.
-    assert!(
-        git(&repo_root, &["status", "--porcelain"])
-            .trim()
-            .is_empty()
-    );
+    assert_eq!(git(&repo_root, &["status", "--porcelain"]).trim(), "");
     let log_msg = git(&repo_root, &["log", "-1", "--pretty=%B"]);
     assert!(log_msg.contains(&format!("Change-Id: {}", out.change_id)));
 
@@ -620,11 +625,7 @@ fn tracks_executable_mode_and_symlinks_accurately() {
     assert_eq!(status.changes[1].kind, ChangeKind::Modified);
 
     commit_changes(&repo, &CommitOptions::new("chmod and symlink")).expect("commit modes");
-    assert!(
-        git(&repo_root, &["status", "--porcelain"])
-            .trim()
-            .is_empty()
-    );
+    assert_eq!(git(&repo_root, &["status", "--porcelain"]).trim(), "");
 
     let ls_tree = git(&repo_root, &["ls-tree", "HEAD"]);
     assert!(ls_tree.contains("100755 blob"));
@@ -637,7 +638,11 @@ fn linked_worktree_fuse_partial_commit_and_dir_whiteout_and_all_guardrails() {
     let repo_root = tmp.path().join("linked-fuse");
     init_repo_with_user(&repo_root);
 
-    let lines: String = (1..=30).map(|i| format!("line_{i}\n")).collect();
+    let lines: String = (1..=30).fold(String::new(), |mut acc, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(acc, "line_{i}");
+        acc
+    });
     fs::write(repo_root.join("app.rs"), &lines).expect("write app");
     fs::create_dir_all(repo_root.join("gone_dir")).expect("mkdir gone_dir");
     fs::write(repo_root.join("gone_dir/x.txt"), "x\n").expect("write x");

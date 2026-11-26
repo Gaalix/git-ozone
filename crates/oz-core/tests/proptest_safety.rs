@@ -104,7 +104,7 @@ fn snapshot_worktree(root: &Path) -> BTreeMap<String, WorktreeEntry> {
             .expect("read_dir")
             .map(|r| r.expect("dir entry"))
             .collect();
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let name = entry.file_name();
             if name == ".git" {
@@ -263,7 +263,10 @@ fn arb_entry_for_path(path: &'static str) -> BoxedStrategy<WorktreeEntry> {
             }),
         ]
         .boxed()
-    } else if path.ends_with(".bin") || path.ends_with(".dat") {
+    } else if Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin") || ext.eq_ignore_ascii_case("dat"))
+    {
         proptest::collection::vec(any::<u8>(), 1..=96)
             .prop_map(|mut bytes| {
                 // Ensure binary detection sees NUL bytes reliably.
@@ -284,7 +287,10 @@ fn arb_entry_for_path(path: &'static str) -> BoxedStrategy<WorktreeEntry> {
             .prop_map(move |(exec, lines)| {
                 let mut content = lines.join("\n");
                 content.push('\n');
-                let executable = if path.ends_with(".sh") {
+                let executable = if Path::new(path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+                {
                     exec
                 } else {
                     exec && path.contains("core")
