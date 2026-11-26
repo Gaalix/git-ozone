@@ -992,6 +992,7 @@ fn build_cargo_target_classifiers(
         || repo_root.join("Cargo.toml").is_file()
         || baseline_dir.join("target/.rustc_info.json").is_file()
         || baseline_dir.join("target/debug/.fingerprint").is_dir()
+        || baseline_dir.join("target/debug/build").is_dir()
     {
         candidates.insert("target".to_string());
     }
@@ -1082,8 +1083,10 @@ pub fn is_mutable_warm_metadata_file(rel: &Path) -> bool {
     if rel_posix.contains("/build/")
         && (matches!(
             file_name,
-            "invoked.timestamp" | "output" | "root-output" | "stderr"
-        ) || rel_posix.contains("/out/"))
+            "invoked.timestamp" | "output" | "root-output" | "stderr" | "stdout"
+        ) || rel_posix.contains("/fingerprint/")
+            || rel_posix.contains("/run/")
+            || rel_posix.contains("/out/"))
     {
         return true;
     }

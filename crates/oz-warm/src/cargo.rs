@@ -48,8 +48,17 @@ pub struct CargoTargetClassifier {
     /// normalized with `-` -> `_` for matching unhashed/hashed `deps/` filenames.
     workspace_targets: HashSet<String>,
     /// 16-hex Cargo unit hashes belonging to workspace packages or in-repo path crates,
-    /// discovered from `.fingerprint/<pkg>-<hash>/` and `deps/*.d` / `examples/*.d`.
+    /// discovered from `.fingerprint/<pkg>-<hash>/`, `deps/*.d` / `examples/*.d`, and
+    /// Cargo 1.100+ `build/<pkg>/<hash>/out/*.d`.
     local_unit_hashes: HashSet<String>,
+    /// Package directory names discovered as repo-local via Cargo 1.100+ `build/<pkg>/<hash>/out/*.d`
+    /// (covering all units — lib, build-script compile, and build-script run — of in-repo path
+    /// crates not listed in `[workspace].members`).
+    local_packages: HashSet<String>,
+    /// 16-hex unit hashes in Cargo 1.100+ `build/<pkg>/<hash>/` layout that represent build-script
+    /// execution units (identified by a sibling `run/` directory or `fingerprint/run-build-script-*`).
+    /// Their `out/` directory is `OUT_DIR` (mutable) rather than compiled `.rlib`/`.rmeta` artifacts.
+    build_script_run_hashes: HashSet<String>,
 }
 
 impl CargoTargetClassifier {
@@ -110,20 +119,49 @@ impl CargoTargetClassifier {
             return CargoArtifactDisposition::MutableWritable;
         }
 
-        // `build/<pkg>-<hash>/...`: Cargo overwrites `invoked.timestamp`, `output`, `root-output`,
-        // `stderr` in place; build scripts write freely into `out/**`; local workspace build
-        // scripts are recompiled when `build.rs` changes. Only external compiled `build-script-*`
-        // binaries remain immutable CAS hardlinks.
+        // `build/...`: handles both Cargo 1.100+ `build-dir-new-layout`
+        // (`build/<pkg>/<hex16>/{fingerprint,run,out}/...`) and legacy Cargo
+        // (`build/<pkg>-<hex16>/{invoked.timestamp,output,root-output,stderr,out,build-script-*}`).
         if let Some(build_pos) = comps.iter().position(|c| *c == "build") {
-            let pkg_dir = comps.get(build_pos + 1).copied();
-            let sub = comps.get(build_pos + 2).copied();
+            let next1 = comps.get(build_pos + 1).copied();
+            let next2 = comps.get(build_pos + 2).copied();
+            let next3 = comps.get(build_pos + 3).copied();
+
+            // Cargo 1.100+ `build-dir-new-layout`: `build/<pkg>/<hex16>/...`.
+            if let (Some(pkg), Some(unit_hash)) = (next1, next2)
+                && is_hex_16(unit_hash)
+            {
+                if matches!(next3, Some("fingerprint" | "run")) {
+                    return CargoArtifactDisposition::MutableWritable;
+                }
+                if self.is_workspace_package(pkg)
+                    || self.local_packages.contains(pkg)
+                    || self.local_unit_hashes.contains(unit_hash)
+                {
+                    return CargoArtifactDisposition::MutableWritable;
+                }
+                if next3 == Some("out") {
+                    if self.build_script_run_hashes.contains(unit_hash) {
+                        return CargoArtifactDisposition::MutableWritable;
+                    }
+                    for comp in &comps[build_pos + 4..] {
+                        if self.is_local_deps_entry(comp) {
+                            return CargoArtifactDisposition::MutableWritable;
+                        }
+                    }
+                    return CargoArtifactDisposition::ImmutableCas;
+                }
+                return CargoArtifactDisposition::MutableWritable;
+            }
+
+            // Legacy layout: `build/<pkg>-<hex16>/...`.
             if matches!(
-                sub,
+                next2,
                 Some("invoked.timestamp" | "output" | "root-output" | "stderr" | "out")
             ) {
                 return CargoArtifactDisposition::MutableWritable;
             }
-            if pkg_dir.is_some_and(|dir| self.is_local_pkg_hash_dir(dir)) {
+            if next1.is_some_and(|dir| self.is_local_pkg_hash_dir(dir)) {
                 return CargoArtifactDisposition::MutableWritable;
             }
             return CargoArtifactDisposition::ImmutableCas;
@@ -155,13 +193,16 @@ impl CargoTargetClassifier {
         CargoArtifactDisposition::ImmutableCas
     }
 
+    fn is_workspace_package(&self, pkg: &str) -> bool {
+        self.workspace_packages.contains(pkg)
+            || self.workspace_packages.contains(&pkg.replace('-', "_"))
+    }
+
     fn is_local_pkg_hash_dir(&self, dir_name: &str) -> bool {
         if let Some((pkg, hash)) = split_name_and_hex16(dir_name) {
-            return self.local_unit_hashes.contains(hash)
-                || self.workspace_packages.contains(pkg)
-                || self.workspace_packages.contains(&pkg.replace('-', "_"));
+            return self.local_unit_hashes.contains(hash) || self.is_workspace_package(pkg);
         }
-        self.workspace_packages.contains(dir_name)
+        self.is_workspace_package(dir_name)
     }
 
     fn is_local_deps_entry(&self, entry_name: &str) -> bool {
@@ -298,6 +339,86 @@ impl CargoTargetClassifier {
                         &target_rel_norm,
                     ) {
                         self.local_unit_hashes.insert(hash.to_string());
+                    }
+                }
+            }
+
+            // 3. Scan Cargo 1.100+ `build-dir-new-layout` units at `build/<pkg>/<hex16>/`:
+            //    - Workspace packages get their unit hashes recorded as local.
+            //    - Build-script execution units (`run/` dir or `fingerprint/run-build-script-*`)
+            //      have their `out/` directory marked as mutable `OUT_DIR`.
+            //    - In-repo path crates not listed in `[workspace].members` are detected from
+            //      `out/*.d` referencing local repo sources outside `target/`.
+            let build_dir = profile_dir.join("build");
+            if let Ok(pkg_entries) = std::fs::read_dir(&build_dir) {
+                for pkg_entry in pkg_entries.flatten() {
+                    let pkg_path = pkg_entry.path();
+                    if !pkg_path.is_dir() {
+                        continue;
+                    }
+                    let pkg_name_os = pkg_entry.file_name();
+                    let Some(pkg_name) = pkg_name_os.to_str() else {
+                        continue;
+                    };
+                    // Legacy `build/<pkg>-<hex16>/` dirs are not new-layout package roots.
+                    if split_name_and_hex16(pkg_name).is_some() {
+                        continue;
+                    }
+                    let Ok(unit_entries) = std::fs::read_dir(&pkg_path) else {
+                        continue;
+                    };
+                    let is_ws_pkg = self.is_workspace_package(pkg_name);
+                    for unit_entry in unit_entries.flatten() {
+                        let unit_path = unit_entry.path();
+                        if !unit_path.is_dir() {
+                            continue;
+                        }
+                        let unit_hash_os = unit_entry.file_name();
+                        let Some(unit_hash) = unit_hash_os.to_str() else {
+                            continue;
+                        };
+                        if !is_hex_16(unit_hash) {
+                            continue;
+                        }
+                        if is_ws_pkg {
+                            self.local_unit_hashes.insert(unit_hash.to_string());
+                        }
+                        let is_bs_run = unit_path.join("run").is_dir()
+                            || std::fs::read_dir(unit_path.join("fingerprint"))
+                                .ok()
+                                .is_some_and(|rd| {
+                                    rd.flatten().any(|f| {
+                                        f.file_name()
+                                            .to_str()
+                                            .is_some_and(|n| n.starts_with("run-build-script-"))
+                                    })
+                                });
+                        if is_bs_run {
+                            self.build_script_run_hashes.insert(unit_hash.to_string());
+                        }
+                        if !is_ws_pkg
+                            && let Ok(out_entries) = std::fs::read_dir(unit_path.join("out"))
+                        {
+                            for out_entry in out_entries.flatten() {
+                                let out_name_os = out_entry.file_name();
+                                let Some(out_name) = out_name_os.to_str() else {
+                                    continue;
+                                };
+                                if !out_name.ends_with(".d") {
+                                    continue;
+                                }
+                                if dep_info_references_local_source(
+                                    &out_entry.path(),
+                                    &canonical_roots,
+                                    &target_prefixes,
+                                    &target_rel_norm,
+                                ) {
+                                    self.local_unit_hashes.insert(unit_hash.to_string());
+                                    self.local_packages.insert(pkg_name.to_string());
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1007,5 +1128,103 @@ name = "custom-cli"
             CargoArtifactDisposition::MutableWritable,
             "local repo source outside target/ must still classify as MutableWritable"
         );
+    }
+
+    #[test]
+    fn classifies_cargo_1_100_build_dir_new_layout_units() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("ws-new-layout");
+        std::fs::create_dir_all(repo.join("crates/my-app/src")).expect("mkdir app");
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .expect("write root Cargo.toml");
+        std::fs::write(
+            repo.join("crates/my-app/Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member Cargo.toml");
+
+        let target = repo.join("target");
+        let app_lib_hash = "0123456789abcdef";
+        let ext_lib_hash = "fedcba9876543210";
+        let ext_bs_hash = "1122334455667788";
+        let ext_run_hash = "8877665544332211";
+        let vendor_hash = "aaaabbbbccccdddd";
+
+        for dir in [
+            target.join(format!("debug/build/my-app/{app_lib_hash}/fingerprint")),
+            target.join(format!("debug/build/my-app/{app_lib_hash}/out")),
+            target.join(format!("debug/build/ext-dep/{ext_lib_hash}/fingerprint")),
+            target.join(format!("debug/build/ext-dep/{ext_lib_hash}/out")),
+            target.join(format!("debug/build/ext-dep/{ext_bs_hash}/fingerprint")),
+            target.join(format!("debug/build/ext-dep/{ext_bs_hash}/out")),
+            target.join(format!("debug/build/ext-dep/{ext_run_hash}/fingerprint")),
+            target.join(format!("debug/build/ext-dep/{ext_run_hash}/out")),
+            target.join(format!("debug/build/ext-dep/{ext_run_hash}/run")),
+            target.join(format!(
+                "debug/build/local-vendor/{vendor_hash}/fingerprint"
+            )),
+            target.join(format!("debug/build/local-vendor/{vendor_hash}/out")),
+        ] {
+            std::fs::create_dir_all(dir).expect("mkdir unit dir");
+        }
+
+        std::fs::write(
+            target.join(format!(
+                "debug/build/ext-dep/{ext_lib_hash}/out/ext_dep-{ext_lib_hash}.d"
+            )),
+            format!(
+                "{t}/debug/build/ext-dep/{ext_lib_hash}/out/libext_dep-{ext_lib_hash}.rlib: /registry/src/ext-dep-1.0/src/lib.rs {t}/debug/build/ext-dep/{ext_run_hash}/out/ext_gen.rs\n",
+                t = target.display()
+            ),
+        )
+        .expect("write ext .d");
+        std::fs::write(
+            target.join(format!(
+                "debug/build/local-vendor/{vendor_hash}/out/local_vendor-{vendor_hash}.d"
+            )),
+            format!(
+                "{t}/debug/build/local-vendor/{vendor_hash}/out/liblocal_vendor-{vendor_hash}.rlib: {r}/vendor/local/src/lib.rs\n",
+                t = target.display(),
+                r = repo.display()
+            ),
+        )
+        .expect("write local vendor .d");
+
+        let cls = CargoTargetClassifier::for_target_dir(&[&repo], &target, "target");
+
+        for mutable in [
+            format!("debug/build/my-app/{app_lib_hash}/fingerprint/lib-my_app"),
+            format!("debug/build/my-app/{app_lib_hash}/out/libmy_app-{app_lib_hash}.rlib"),
+            format!("debug/build/ext-dep/{ext_lib_hash}/fingerprint/lib-ext_dep"),
+            format!("debug/build/ext-dep/{ext_lib_hash}/out/ext_dep-{ext_lib_hash}.d"),
+            format!("debug/build/ext-dep/{ext_run_hash}/fingerprint/run-build-script-build"),
+            format!("debug/build/ext-dep/{ext_run_hash}/run/invoked.timestamp"),
+            format!("debug/build/ext-dep/{ext_run_hash}/run/stdout"),
+            format!("debug/build/ext-dep/{ext_run_hash}/out/ext_gen.rs"),
+            format!(
+                "debug/build/local-vendor/{vendor_hash}/out/liblocal_vendor-{vendor_hash}.rlib"
+            ),
+        ] {
+            assert_eq!(
+                cls.classify(Path::new(&mutable)),
+                CargoArtifactDisposition::MutableWritable,
+                "expected MutableWritable for {mutable}"
+            );
+        }
+
+        for immutable in [
+            format!("debug/build/ext-dep/{ext_lib_hash}/out/libext_dep-{ext_lib_hash}.rlib"),
+            format!("debug/build/ext-dep/{ext_lib_hash}/out/libext_dep-{ext_lib_hash}.rmeta"),
+            format!("debug/build/ext-dep/{ext_bs_hash}/out/build_script_build"),
+        ] {
+            assert_eq!(
+                cls.classify(Path::new(&immutable)),
+                CargoArtifactDisposition::ImmutableCas,
+                "expected ImmutableCas for {immutable}"
+            );
+        }
     }
 }

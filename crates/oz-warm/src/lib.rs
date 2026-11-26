@@ -334,7 +334,7 @@ pub fn check_cargo_fingerprint_portability(
 
     let mut report = CargoFingerprintReport::default();
     for entry in WalkDir::new(&target_dir)
-        .max_depth(5)
+        .max_depth(7)
         .follow_links(false)
         .into_iter()
         .filter_map(std::result::Result::ok)
@@ -346,10 +346,16 @@ pub fn check_cargo_fingerprint_portability(
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        if !path
+        let comps: Vec<&str> = path
             .components()
-            .any(|c| matches!(c, Component::Normal(s) if s == ".fingerprint"))
-        {
+            .filter_map(|c| match c {
+                Component::Normal(s) => s.to_str(),
+                _ => None,
+            })
+            .collect();
+        let in_fingerprint = comps.contains(&".fingerprint")
+            || (comps.contains(&"build") && comps.contains(&"fingerprint"));
+        if !in_fingerprint {
             continue;
         }
         report.fingerprints_scanned += 1;

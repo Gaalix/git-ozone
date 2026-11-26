@@ -739,6 +739,26 @@ fn cargo_fingerprint_portability_check_detects_absolute_paths_and_remap_flags() 
     assert!(!bad_report.portable);
     assert_eq!(bad_report.non_portable_remap_rustflags.len(), 1);
     assert_eq!(bad_report.non_portable_rerun_paths.len(), 1);
+
+    // Also verify Cargo 1.100+ `build-dir-new-layout` (`target/debug/build/<pkg>/<hash>/fingerprint/*.json`).
+    let new_repo = dir.path().join("fp-check-new-layout");
+    let new_fp_dir = new_repo.join("target/debug/build/mycrate/0123456789abcdef/fingerprint");
+    std::fs::create_dir_all(&new_fp_dir).expect("mkdir new fp");
+    std::fs::write(
+        new_fp_dir.join("run-build-script.json"),
+        serde_json::json!({
+            "rustflags": [format!("--remap-path-prefix={}=/ws", new_repo.display())],
+            "local": [{"RerunIfChanged": {"output": "out", "paths": [new_repo.join("build.rs")]}}]
+        })
+        .to_string(),
+    )
+    .expect("write new-layout fp");
+    let new_report =
+        check_cargo_fingerprint_portability(&new_repo, Path::new("target")).expect("scan new");
+    assert!(!new_report.portable);
+    assert_eq!(new_report.fingerprints_scanned, 1);
+    assert_eq!(new_report.non_portable_remap_rustflags.len(), 1);
+    assert_eq!(new_report.non_portable_rerun_paths.len(), 1);
 }
 
 #[cfg(unix)]

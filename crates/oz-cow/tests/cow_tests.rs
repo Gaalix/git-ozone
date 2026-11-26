@@ -17,6 +17,8 @@ use oz_cow::{
     gc_workspaces, list_workspaces, prepare_vfs_seed_layer, probe_ozone_reflink, remove_workspace,
     spawn_workspace,
 };
+#[cfg(target_os = "windows")]
+use oz_vfsd::protocol::{AuthenticatedRequest, format_tcp_endpoint};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use oz_vfsd::{MountInfo, VfsRequest, VfsResponse, encode_line};
 use oz_vfsd::{MountSpec, OverlayMountConfig, ProjFsLayerEngine};
@@ -817,7 +819,8 @@ fn projfs_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_tcp_listener
     let sock_path = repo.layout.vfsd_socket_path();
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock tcp");
     let port = listener.local_addr().expect("addr").port();
-    std::fs::write(&sock_path, format!("tcp://127.0.0.1:{port}\n")).expect("write endpoint");
+    let auth_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::fs::write(&sock_path, format_tcp_endpoint(port, auth_token)).expect("write endpoint");
 
     let seen_requests = Arc::new(Mutex::new(Vec::<VfsRequest>::new()));
     let seen_clone = Arc::clone(&seen_requests);
@@ -828,7 +831,10 @@ fn projfs_vfs_backend_ipc_roundtrips_mount_and_unmount_against_mock_tcp_listener
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut line = String::new();
             reader.read_line(&mut line).expect("read line");
-            let req: VfsRequest = serde_json::from_str(line.trim()).expect("parse req");
+            let env: AuthenticatedRequest =
+                serde_json::from_str(line.trim()).expect("parse authenticated req");
+            assert_eq!(env.auth_token.as_deref(), Some(auth_token));
+            let req = env.request;
 
             let mut done = false;
             let resp = match &req {
@@ -997,23 +1003,34 @@ mod tests {
     opts2.backend = Some(BackendKind::CasHardlink);
     let ws2 = spawn_workspace(&repo, &opts2).expect("spawn ws-cargo-2");
 
-    // External third-party `deps/libext_dep-*.rlib` MUST remain 0444 read-only CAS hardlinked
-    // and shared across workspaces on Unix!
+    // External third-party `libext_dep-*.rlib` (in `target/debug/deps/` on Cargo < 1.100 or
+    // `target/debug/build/ext-dep/<hash>/out/` on Cargo 1.100+ `build-dir-new-layout`) MUST
+    // remain 0444 read-only CAS hardlinked and shared across workspaces on Unix!
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
         let find_ext_rlib = |root: &Path| {
-            std::fs::read_dir(root.join("target/debug/deps"))
-                .expect("read deps")
-                .flatten()
-                .map(|e| e.path())
-                .find(|p| {
-                    p.file_name()
+            let debug_dir = root.join("target/debug");
+            let mut stack = vec![debug_dir.clone()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                    .flatten()
+                {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p
+                        .file_name()
                         .and_then(|s| s.to_str())
                         .is_some_and(|n| n.starts_with("libext_dep-") && n.ends_with(".rlib"))
-                })
-                .expect("libext_dep-*.rlib must exist")
+                    {
+                        return p;
+                    }
+                }
+            }
+            panic!("libext_dep-*.rlib must exist under {}", debug_dir.display());
         };
         let ext1 = std::fs::metadata(find_ext_rlib(&ws1.workspace.workspace_path)).expect("m1");
         let ext2 = std::fs::metadata(find_ext_rlib(&ws2.workspace.workspace_path)).expect("m2");

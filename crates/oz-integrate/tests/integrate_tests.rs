@@ -1536,10 +1536,22 @@ mod tests {
     let repo = OzoneRepo::discover(Some(&repo_root)).expect("discover repo");
     repo.layout.ensure_initialized().expect("init ozone");
 
-    // Snapshot main repo's `target/.rustc_info.json` and `.fingerprint/` before any integration.
+    // Snapshot main repo's `target/.rustc_info.json` and Cargo build/fingerprint metadata before
+    // any integration (handles both legacy `target/debug/.fingerprint` and Cargo 1.100+
+    // `target/debug/build/<pkg>/<hash>/{fingerprint,run,out}`).
     let main_rustc_info_before =
         fs::read(repo_root.join("target/.rustc_info.json")).expect("read main rustc info");
-    let main_fp_before = snapshot_dir_file_bytes(&repo_root.join("target/debug/.fingerprint"));
+    let main_fp_root = if repo_root.join("target/debug/.fingerprint").is_dir() {
+        repo_root.join("target/debug/.fingerprint")
+    } else {
+        repo_root.join("target/debug/build")
+    };
+    let main_fp_before = snapshot_dir_file_bytes(&main_fp_root);
+    assert!(
+        !main_fp_before.is_empty(),
+        "expected Cargo build/fingerprint metadata under {}",
+        main_fp_root.display()
+    );
 
     // 1. Spawn warm workspace under `cas_hardlink`, edit `app` + `build.rs` + `tests/integ.rs`,
     //    and integrate with `--verify "cargo test"` (NO `--target-dir`!).
@@ -1617,9 +1629,10 @@ mod tests {
         main_rustc_info_before
     );
     assert_eq!(
-        snapshot_dir_file_bytes(&repo_root.join("target/debug/.fingerprint")),
+        snapshot_dir_file_bytes(&main_fp_root),
         main_fp_before,
-        "main repo target/debug/.fingerprint must stay untouched"
+        "main repo {} must stay untouched",
+        main_fp_root.display()
     );
     let cas_snapshot_after = snapshot_dir_file_bytes(&cas_dir);
     for (rel, bytes) in &cas_snapshot_before {
