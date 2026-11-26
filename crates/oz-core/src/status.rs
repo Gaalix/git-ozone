@@ -582,7 +582,7 @@ fn scan_fuse_fast_path(
                     &upper_dir.join(dir_rel),
                     oid,
                     whiteout_paths.contains(dir_rel),
-                )? {
+                ) {
                     dirty_map.insert(dir_rel.clone(), item);
                 }
             } else if !mode.is_tree() {
@@ -1175,46 +1175,55 @@ impl IndexStatCache {
         }
 
         let file_len = meta.len();
-        if file_len > u64::from(u32::MAX) || (file_len as u32) != stat.size {
+        if u32::try_from(file_len).ok() != Some(stat.size) {
             return false;
         }
 
-        #[cfg(unix)]
+        // Git's `.git/index` stat cache stores `mtime`, `ctime`, and `ino` truncated to their
+        // low 32 bits (`sd_mtime`, `sd_ctime`, `sd_ino`).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
-            use std::os::unix::fs::MetadataExt;
-            let m_sec = meta.mtime();
-            if m_sec < 0 || (m_sec as u32) != stat.mtime.secs {
-                return false;
-            }
-            if stat.mtime.nsecs != 0 && (meta.mtime_nsec() as u32) != stat.mtime.nsecs {
-                return false;
-            }
-            if stat.ctime.secs != 0 {
-                let c_sec = meta.ctime();
-                if c_sec < 0 || (c_sec as u32) != stat.ctime.secs {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let m_sec = meta.mtime();
+                if m_sec < 0 || (m_sec.cast_unsigned() as u32) != stat.mtime.secs {
                     return false;
                 }
-                if stat.ctime.nsecs != 0 && (meta.ctime_nsec() as u32) != stat.ctime.nsecs {
+                if stat.mtime.nsecs != 0
+                    && (meta.mtime_nsec().cast_unsigned() as u32) != stat.mtime.nsecs
+                {
                     return false;
                 }
+                if stat.ctime.secs != 0 {
+                    let c_sec = meta.ctime();
+                    if c_sec < 0 || (c_sec.cast_unsigned() as u32) != stat.ctime.secs {
+                        return false;
+                    }
+                    if stat.ctime.nsecs != 0
+                        && (meta.ctime_nsec().cast_unsigned() as u32) != stat.ctime.nsecs
+                    {
+                        return false;
+                    }
+                }
+                stat.ino == 0 || (meta.ino() as u32) == stat.ino
             }
-            stat.ino == 0 || (meta.ino() as u32) == stat.ino
-        }
-        #[cfg(not(unix))]
-        {
-            let Ok(modified) = meta.modified() else {
-                return false;
-            };
-            let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else {
-                return false;
-            };
-            if (dur.as_secs() as u32) != stat.mtime.secs {
-                return false;
+            #[cfg(not(unix))]
+            {
+                let Ok(modified) = meta.modified() else {
+                    return false;
+                };
+                let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else {
+                    return false;
+                };
+                if (dur.as_secs() as u32) != stat.mtime.secs {
+                    return false;
+                }
+                if stat.mtime.nsecs != 0 && dur.subsec_nanos() != stat.mtime.nsecs {
+                    return false;
+                }
+                true
             }
-            if stat.mtime.nsecs != 0 && dur.subsec_nanos() != stat.mtime.nsecs {
-                return false;
-            }
-            true
         }
     }
 }
@@ -1333,6 +1342,28 @@ fn collect_head_entries_parallel(
     Ok(files)
 }
 
+struct WorkerFlush<'a> {
+    local_dirty: Vec<DirtyWithPayload>,
+    local_err: Option<OzError>,
+    shared: &'a Mutex<(Vec<DirtyWithPayload>, Option<OzError>)>,
+}
+
+impl Drop for WorkerFlush<'_> {
+    fn drop(&mut self) {
+        if self.local_dirty.is_empty() && self.local_err.is_none() {
+            return;
+        }
+        let mut guard = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.0.append(&mut self.local_dirty);
+        if guard.1.is_none() && self.local_err.is_some() {
+            guard.1 = self.local_err.take();
+        }
+    }
+}
+
 fn scan_general_workdir(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
@@ -1442,25 +1473,6 @@ fn scan_general_workdir(
         let attrs_ref = &attr_resolver;
         let cfg_ref = git_cfg;
         let git_dir_ref = &repo.git_dir;
-
-        struct WorkerFlush<'a> {
-            local_dirty: Vec<DirtyWithPayload>,
-            local_err: Option<OzError>,
-            shared: &'a Mutex<(Vec<DirtyWithPayload>, Option<OzError>)>,
-        }
-
-        impl Drop for WorkerFlush<'_> {
-            fn drop(&mut self) {
-                if self.local_dirty.is_empty() && self.local_err.is_none() {
-                    return;
-                }
-                let mut guard = self.shared.lock().expect("status walk lock poisoned");
-                guard.0.append(&mut self.local_dirty);
-                if guard.1.is_none() && self.local_err.is_some() {
-                    guard.1 = self.local_err.take();
-                }
-            }
-        }
 
         builder.build_parallel().run(|| {
             let mut collector = WorkerFlush {
@@ -1590,7 +1602,7 @@ fn scan_general_workdir(
 
     let (mut dirty, walk_err) = shared_results
         .into_inner()
-        .expect("status walk lock poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(err) = walk_err {
         return Err(err);
     }
@@ -1609,11 +1621,8 @@ fn scan_general_workdir(
             if head_entry.kind == EntryKind::Commit {
                 match fs::symlink_metadata(&abs_path) {
                     Ok(meta) if meta.file_type().is_dir() => {
-                        match inspect_gitlink_dir_state(rel_path, &abs_path, head_entry.oid, false)
-                        {
-                            Ok(opt) => opt.map(Ok),
-                            Err(err) => Some(Err(err)),
-                        }
+                        inspect_gitlink_dir_state(rel_path, &abs_path, head_entry.oid, false)
+                            .map(Ok)
                     }
                     Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
                         let disk_kind = disk_entry_kind(&meta);
@@ -1810,7 +1819,7 @@ pub(crate) fn read_submodule_head_oid(sub_dir: &Path) -> Option<gix::ObjectId> {
     if head.is_unborn() {
         return None;
     }
-    head.into_peeled_id().ok().map(|id| id.detach())
+    head.into_peeled_id().ok().map(gix::Id::detach)
 }
 
 fn format_subproject_commit(oid: gix::ObjectId) -> Vec<u8> {
@@ -1839,24 +1848,22 @@ fn inspect_gitlink_dir_state(
     abs_dir: &Path,
     head_oid: gix::ObjectId,
     had_whiteout: bool,
-) -> Result<Option<DirtyWithPayload>> {
+) -> Option<DirtyWithPayload> {
     if !abs_dir.exists() {
         if had_whiteout {
-            return Ok(Some(make_gitlink_deleted_dirty(rel_path, head_oid)));
+            return Some(make_gitlink_deleted_dirty(rel_path, head_oid));
         }
-        return Ok(None);
+        return None;
     }
     if !abs_dir.join(".git").exists() {
         // Empty / uninitialized submodule mount dir is clean in Git worktrees.
-        return Ok(None);
+        return None;
     }
-    let Some(sub_oid) = read_submodule_head_oid(abs_dir) else {
-        return Ok(None);
-    };
+    let sub_oid = read_submodule_head_oid(abs_dir)?;
     if sub_oid == head_oid {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(DirtyWithPayload {
+    Some(DirtyWithPayload {
         raw: RawDirtyFile {
             path: rel_path.to_string(),
             kind: ChangeKind::Modified,
@@ -1869,7 +1876,7 @@ fn inspect_gitlink_dir_state(
         old_bytes: format_subproject_commit(head_oid),
         new_bytes: format_subproject_commit(sub_oid),
         known_binary: false,
-    }))
+    })
 }
 
 fn read_added_payload(
@@ -1908,89 +1915,84 @@ fn compare_disk_with_head_hash(
     git_dir: &Path,
 ) -> Result<Option<DirtyWithPayload>> {
     let resolved = attrs.resolve(rel_path);
-    match head_entry {
-        Some(head) => {
-            if head.kind == EntryKind::Commit {
-                let head_oid = head.oid;
-                let raw = read_disk_bytes(abs_path, Some(disk_kind))?;
-                let known_binary = resolved.is_diff_disabled()
-                    || (disk_kind != EntryKind::Link && crate::diff::is_binary_bytes(&raw));
-                return Ok(Some(DirtyWithPayload {
-                    raw: RawDirtyFile {
-                        path: rel_path.to_string(),
-                        kind: ChangeKind::TypeChanged,
-                        disk_kind: Some(disk_kind),
-                        head_entry: Some(head.clone()),
-                    },
-                    old_bytes: format_subproject_commit(head_oid),
-                    new_bytes: if known_binary { Vec::new() } else { raw },
-                    known_binary,
-                }));
-            }
-            let eff_disk_kind = effective_disk_kind(disk_kind, Some(head.kind));
-            let raw_disk_bytes = read_disk_bytes(abs_path, Some(disk_kind))?;
-            let raw_oid =
-                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &raw_disk_bytes)
-                    .map_err(OzError::git_source)?;
-            if raw_oid == head.oid && eff_disk_kind == head.kind {
-                return Ok(None);
-            }
-
-            let cleaned_cow = clean_blob_bytes(
-                rel_path,
-                &raw_disk_bytes,
-                &resolved,
-                cfg,
-                workdir,
-                git_dir,
-                false,
-            )?;
-            let cleaned_oid =
-                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &cleaned_cow)
-                    .map_err(OzError::git_source)?;
-            if cleaned_oid == head.oid && eff_disk_kind == head.kind {
-                return Ok(None);
-            }
-
-            let kind = if (eff_disk_kind == EntryKind::Link) != (head.kind == EntryKind::Link) {
-                ChangeKind::TypeChanged
-            } else {
-                ChangeKind::Modified
-            };
+    if let Some(head) = head_entry {
+        if head.kind == EntryKind::Commit {
+            let head_oid = head.oid;
+            let raw = read_disk_bytes(abs_path, Some(disk_kind))?;
             let known_binary = resolved.is_diff_disabled()
-                || (eff_disk_kind != EntryKind::Link && crate::diff::is_binary_bytes(&cleaned_cow));
-            let new_bytes = if known_binary {
-                Vec::new()
-            } else {
-                cleaned_cow.into_owned()
-            };
-            Ok(Some(DirtyWithPayload {
+                || (disk_kind != EntryKind::Link && crate::diff::is_binary_bytes(&raw));
+            return Ok(Some(DirtyWithPayload {
                 raw: RawDirtyFile {
                     path: rel_path.to_string(),
-                    kind,
-                    disk_kind: Some(eff_disk_kind),
+                    kind: ChangeKind::TypeChanged,
+                    disk_kind: Some(disk_kind),
                     head_entry: Some(head.clone()),
                 },
-                old_bytes: Vec::new(),
-                new_bytes,
+                old_bytes: format_subproject_commit(head_oid),
+                new_bytes: if known_binary { Vec::new() } else { raw },
                 known_binary,
-            }))
+            }));
         }
-        None => {
-            let (new_bytes, known_binary) =
-                read_added_payload(rel_path, abs_path, disk_kind, attrs, cfg)?;
-            Ok(Some(DirtyWithPayload {
-                raw: RawDirtyFile {
-                    path: rel_path.to_string(),
-                    kind: ChangeKind::Added,
-                    disk_kind: Some(disk_kind),
-                    head_entry: None,
-                },
-                old_bytes: Vec::new(),
-                new_bytes,
-                known_binary,
-            }))
+        let eff_disk_kind = effective_disk_kind(disk_kind, Some(head.kind));
+        let raw_disk_bytes = read_disk_bytes(abs_path, Some(disk_kind))?;
+        let raw_oid = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &raw_disk_bytes)
+            .map_err(OzError::git_source)?;
+        if raw_oid == head.oid && eff_disk_kind == head.kind {
+            return Ok(None);
         }
+
+        let cleaned_cow = clean_blob_bytes(
+            rel_path,
+            &raw_disk_bytes,
+            &resolved,
+            cfg,
+            workdir,
+            git_dir,
+            false,
+        )?;
+        let cleaned_oid = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &cleaned_cow)
+            .map_err(OzError::git_source)?;
+        if cleaned_oid == head.oid && eff_disk_kind == head.kind {
+            return Ok(None);
+        }
+
+        let kind = if (eff_disk_kind == EntryKind::Link) == (head.kind == EntryKind::Link) {
+            ChangeKind::Modified
+        } else {
+            ChangeKind::TypeChanged
+        };
+        let known_binary = resolved.is_diff_disabled()
+            || (eff_disk_kind != EntryKind::Link && crate::diff::is_binary_bytes(&cleaned_cow));
+        let new_bytes = if known_binary {
+            Vec::new()
+        } else {
+            cleaned_cow.into_owned()
+        };
+        Ok(Some(DirtyWithPayload {
+            raw: RawDirtyFile {
+                path: rel_path.to_string(),
+                kind,
+                disk_kind: Some(eff_disk_kind),
+                head_entry: Some(head.clone()),
+            },
+            old_bytes: Vec::new(),
+            new_bytes,
+            known_binary,
+        }))
+    } else {
+        let (new_bytes, known_binary) =
+            read_added_payload(rel_path, abs_path, disk_kind, attrs, cfg)?;
+        Ok(Some(DirtyWithPayload {
+            raw: RawDirtyFile {
+                path: rel_path.to_string(),
+                kind: ChangeKind::Added,
+                disk_kind: Some(disk_kind),
+                head_entry: None,
+            },
+            old_bytes: Vec::new(),
+            new_bytes,
+            known_binary,
+        }))
     }
 }
 
@@ -2089,4 +2091,51 @@ fn path_to_slash(path: &Path) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_flush_drop_recovers_from_poisoned_mutex_without_double_panic() {
+        let shared: Mutex<(Vec<DirtyWithPayload>, Option<OzError>)> =
+            Mutex::new((Vec::new(), None));
+
+        // Poison the mutex first.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.lock().expect("acquire lock before poisoning");
+            panic!("intentional worker panic to poison mutex");
+        }));
+        assert!(shared.is_poisoned());
+
+        // Dropping WorkerFlush during another unwind while `shared` is already poisoned
+        // must flush cleanly instead of triggering a double-panic process abort.
+        let unwind_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _flush = WorkerFlush {
+                local_dirty: vec![DirtyWithPayload {
+                    raw: RawDirtyFile {
+                        path: "src/recovered.rs".to_string(),
+                        kind: ChangeKind::Added,
+                        disk_kind: Some(EntryKind::Blob),
+                        head_entry: None,
+                    },
+                    old_bytes: Vec::new(),
+                    new_bytes: b"fn ok() {}\n".to_vec(),
+                    known_binary: false,
+                }],
+                local_err: Some(OzError::Other("io failure".to_string())),
+                shared: &shared,
+            };
+            panic!("unwind while holding WorkerFlush");
+        }));
+        assert!(unwind_res.is_err());
+
+        let (dirty, err) = shared
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].raw.path, "src/recovered.rs");
+        assert!(err.is_some());
+    }
 }

@@ -37,10 +37,10 @@ pub struct DiffReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawHunkSpan {
-    pub raw_before_start: usize,
-    pub raw_before_end: usize,
-    pub raw_after_start: usize,
-    pub raw_after_end: usize,
+    pub before_start: usize,
+    pub before_end: usize,
+    pub after_start: usize,
+    pub after_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -62,11 +62,11 @@ pub fn is_binary_bytes(bytes: &[u8]) -> bool {
 /// Computes the deterministic alphabetic suffix for a 0-based hunk index:
 /// `0 -> "a"`, `25 -> "z"`, `26 -> "aa"`, `27 -> "ab"`, etc.
 #[must_use]
-pub fn hunk_suffix(mut index: usize) -> String {
+pub(crate) fn hunk_suffix(mut index: usize) -> String {
     let mut chars = Vec::new();
     loop {
-        let rem = index % 26;
-        chars.push((b'a' + rem as u8) as char);
+        let rem = u8::try_from(index % 26).unwrap_or(0);
+        chars.push(char::from(b'a' + rem));
         if index < 26 {
             break;
         }
@@ -191,10 +191,11 @@ pub(crate) fn compute_file_diff(
         let leading_ctx = first.before.start - ctx_before_start;
         let ctx_after_start = first.after.start.saturating_sub(leading_ctx);
 
-        let ctx_before_end =
-            (last.before.end + DEFAULT_CONTEXT_LINES).min(before_lines.len() as u32);
+        let before_len_u32 = u32::try_from(before_lines.len()).unwrap_or(u32::MAX);
+        let after_len_u32 = u32::try_from(after_lines.len()).unwrap_or(u32::MAX);
+        let ctx_before_end = (last.before.end + DEFAULT_CONTEXT_LINES).min(before_len_u32);
         let trailing_ctx = ctx_before_end - last.before.end;
-        let ctx_after_end = (last.after.end + trailing_ctx).min(after_lines.len() as u32);
+        let ctx_after_end = (last.after.end + trailing_ctx).min(after_len_u32);
 
         let old_lines = ctx_before_end - ctx_before_start;
         let new_lines = ctx_after_end - ctx_after_start;
@@ -269,10 +270,10 @@ pub(crate) fn compute_file_diff(
         });
 
         spans.push(RawHunkSpan {
-            raw_before_start: first.before.start as usize,
-            raw_before_end: last.before.end as usize,
-            raw_after_start: first.after.start as usize,
-            raw_after_end: last.after.end as usize,
+            before_start: first.before.start as usize,
+            before_end: last.before.end as usize,
+            after_start: first.after.start as usize,
+            after_end: last.after.end as usize,
         });
     }
 
@@ -320,13 +321,13 @@ pub(crate) fn apply_selected_hunks(
     let mut cursor = 0usize;
     for (idx, span) in computed.spans.iter().enumerate() {
         if selected_indices.contains(&idx) {
-            for line in &before_lines[cursor..span.raw_before_start] {
+            for line in &before_lines[cursor..span.before_start] {
                 out.extend_from_slice(line);
             }
-            for line in &after_lines[span.raw_after_start..span.raw_after_end] {
+            for line in &after_lines[span.after_start..span.after_end] {
                 out.extend_from_slice(line);
             }
-            cursor = span.raw_before_end;
+            cursor = span.before_end;
         }
     }
     for line in &before_lines[cursor..] {
@@ -782,7 +783,10 @@ mod tests {
 
     #[test]
     fn applies_selected_hunks_preserving_unselected_hunk() {
-        let before: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let before: String = (1..=30).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
         let mut after_lines: Vec<String> = (1..=30).map(|i| format!("line {i}\n")).collect();
         after_lines[1] = "line 2 edited A\n".to_string();
         after_lines[25] = "line 26 edited B\n".to_string();

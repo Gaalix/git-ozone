@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Git reference storing the atomic Ozone stash stack commit chain.
 pub const OZ_STASH_REF: &str = "refs/ozone/stash";
@@ -57,11 +57,8 @@ fn parse_oid(hex: &str) -> Result<ObjectId> {
 fn commit_tree_id(gix_repo: &gix::Repository, commit_id: ObjectId) -> Result<ObjectId> {
     let commit = gix_repo
         .find_commit(commit_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    Ok(commit
-        .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach())
+        .map_err(OzError::git_source)?;
+    Ok(commit.tree_id().map_err(OzError::git_source)?.detach())
 }
 
 fn rev_parse_error(spec: &str, err: impl std::fmt::Display) -> OzError {
@@ -96,7 +93,7 @@ fn resolve_commit_oid(gix_repo: &gix::Repository, spec: &str) -> Result<ObjectId
     let id = gix_repo
         .rev_parse_single(trimmed)
         .map_err(|err| rev_parse_error(trimmed, err))?;
-    let obj = id.object().map_err(|err| OzError::Git(err.to_string()))?;
+    let obj = id.object().map_err(OzError::git_source)?;
     let commit = obj.peel_to_commit().map_err(|err| OzError::InvalidUsage {
         message: format!("revision '{trimmed}' does not point to a commit: {err}"),
         recovery: Vec::new(),
@@ -110,23 +107,22 @@ fn gix_time_to_utc(time: gix::date::Time) -> DateTime<Utc> {
 
 fn split_subject_and_body(message: &str) -> (String, String) {
     let trimmed = message.trim_end_matches(['\r', '\n']);
-    match trimmed.split_once("\n\n") {
-        Some((first, rest)) => (
+    if let Some((first, rest)) = trimmed.split_once("\n\n") {
+        (
             first.lines().map(str::trim).collect::<Vec<_>>().join(" "),
             rest.to_string(),
-        ),
-        None => {
-            let mut lines = trimmed.lines();
-            let first = lines.next().unwrap_or("").trim().to_string();
-            let rest: Vec<&str> = lines.collect();
-            (first, rest.join("\n"))
-        }
+        )
+    } else {
+        let mut lines = trimmed.lines();
+        let first = lines.next().unwrap_or("").trim().to_string();
+        let rest: Vec<&str> = lines.collect();
+        (first, rest.join("\n"))
     }
 }
 
 /// Extracts `Change-Id:` trailer from the trailing paragraph of a commit message.
 #[must_use]
-pub fn extract_change_id(message: &str) -> Option<String> {
+pub(crate) fn extract_change_id(message: &str) -> Option<String> {
     let base = message.trim_end_matches(['\r', '\n']);
     let last_para = base.rsplit("\n\n").next().unwrap_or(base);
     for line in last_para.lines() {
@@ -148,20 +144,20 @@ fn resolve_actor_signatures(
 ) -> Result<(gix::actor::Signature, gix::actor::Signature)> {
     let committer = match gix_repo.committer() {
         Some(res) => res
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
         None => gix_repo
             .committer_or_set_fallback("Ozone", "oz@ozone.dev")
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
     };
     let author = match gix_repo.author() {
         Some(res) => res
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
         None => committer.clone(),
     };
     Ok((author, committer))
@@ -302,10 +298,10 @@ fn compute_tree_delta(
     }
     let lhs_tree = gix_repo
         .find_tree(lhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let rhs_tree = gix_repo
         .find_tree(rhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut state = gix::diff::tree::State::default();
     let mut recorder = gix::diff::tree::Recorder::default()
@@ -320,7 +316,7 @@ fn compute_tree_delta(
         &gix_repo.objects,
         &mut recorder,
     )
-    .map_err(|err| OzError::Git(err.to_string()))?;
+    .map_err(OzError::git_source)?;
 
     let mut ops = Vec::new();
     for change in recorder.records {
@@ -432,9 +428,7 @@ fn write_tree_blob_to_disk(
         }
     }
 
-    let blob = gix_repo
-        .find_blob(oid)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let blob = gix_repo.find_blob(oid).map_err(OzError::git_source)?;
 
     if kind == EntryKind::Link {
         #[cfg(unix)]
@@ -513,7 +507,7 @@ fn write_index_no_ext(index: &mut gix::index::File) -> Result<()> {
             extensions: gix::index::write::Extensions::None,
             skip_hash: true,
         })
-        .map_err(|err| OzError::Git(err.to_string()))
+        .map_err(OzError::git_source)
 }
 
 fn load_or_rebuild_index(
@@ -524,24 +518,23 @@ fn load_or_rebuild_index(
     if !index_path.is_file() {
         let mut rebuilt = gix_repo
             .index_from_tree(&target_tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         write_index_no_ext(&mut rebuilt)?;
         return Ok((rebuilt, true));
     }
-    match gix::index::File::at(
+    if let Ok(idx) = gix::index::File::at(
         index_path,
         gix_repo.object_hash(),
         true,
         gix::index::decode::Options::default(),
     ) {
-        Ok(idx) => Ok((idx, false)),
-        Err(_) => {
-            let mut rebuilt = gix_repo
-                .index_from_tree(&target_tree_id)
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            write_index_no_ext(&mut rebuilt)?;
-            Ok((rebuilt, true))
-        }
+        Ok((idx, false))
+    } else {
+        let mut rebuilt = gix_repo
+            .index_from_tree(&target_tree_id)
+            .map_err(OzError::git_source)?;
+        write_index_no_ext(&mut rebuilt)?;
+        Ok((rebuilt, true))
     }
 }
 
@@ -635,7 +628,7 @@ fn sync_index_paths_to_tree(
         Some(
             gix_repo
                 .find_tree(target_tree_id)
-                .map_err(|err| OzError::Git(err.to_string()))?,
+                .map_err(OzError::git_source)?,
         )
     };
     let mut patches = Vec::new();
@@ -643,7 +636,7 @@ fn sync_index_paths_to_tree(
         let lookup = match target_tree.as_ref() {
             Some(tree) => tree
                 .lookup_entry_by_path(rel.as_str())
-                .map_err(|err| OzError::Git(err.to_string()))?,
+                .map_err(OzError::git_source)?,
             None => None,
         };
         let target = match lookup {
@@ -684,436 +677,40 @@ fn sync_index_paths_to_tree(
     patch_and_write_index(&mut index, patches)
 }
 
-/// Pure-Rust Thompson-NFA regular expression matcher used for `oz log -G` and `--grep`.
+/// Regular expression matcher backed by `regex_automata::meta::Regex` for `oz grep`,
+/// `oz log --grep`, and `oz log -G`.
 #[derive(Debug, Clone)]
 struct SimpleRegex {
-    nodes: Vec<NfaNode>,
-    start: usize,
-    anchored_start: bool,
-    case_insensitive: bool,
-}
-
-#[derive(Debug, Clone)]
-enum CharMatcher {
-    AnyNonNewline,
-    Literal(char),
-    Whitespace,
-    NonWhitespace,
-    Digit,
-    NonDigit,
-    Word,
-    NonWord,
-    Class {
-        negated: bool,
-        items: Vec<ClassItem>,
-    },
-}
-
-#[derive(Debug, Clone)]
-enum ClassItem {
-    Single(char),
-    Range(char, char),
-}
-
-impl CharMatcher {
-    fn matches(&self, c: char, case_insensitive: bool) -> bool {
-        match self {
-            Self::AnyNonNewline => c != '\n',
-            Self::Literal(expected) => {
-                if case_insensitive {
-                    c.eq_ignore_ascii_case(expected)
-                } else {
-                    c == *expected
-                }
-            }
-            Self::Whitespace => c.is_whitespace(),
-            Self::NonWhitespace => !c.is_whitespace(),
-            Self::Digit => c.is_ascii_digit(),
-            Self::NonDigit => !c.is_ascii_digit(),
-            Self::Word => c.is_ascii_alphanumeric() || c == '_',
-            Self::NonWord => !(c.is_ascii_alphanumeric() || c == '_'),
-            Self::Class { negated, items } => {
-                let target = if case_insensitive {
-                    c.to_ascii_lowercase()
-                } else {
-                    c
-                };
-                let hit = items.iter().any(|item| match item {
-                    ClassItem::Single(x) => {
-                        let cx = if case_insensitive {
-                            x.to_ascii_lowercase()
-                        } else {
-                            *x
-                        };
-                        target == cx
-                    }
-                    ClassItem::Range(lo, hi) => {
-                        let a = if case_insensitive {
-                            lo.to_ascii_lowercase()
-                        } else {
-                            *lo
-                        };
-                        let b = if case_insensitive {
-                            hi.to_ascii_lowercase()
-                        } else {
-                            *hi
-                        };
-                        target >= a && target <= b
-                    }
-                });
-                if *negated { !hit } else { hit }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum NfaNode {
-    Match,
-    EndAnchor(usize),
-    Char(CharMatcher, usize),
-    Split(usize, usize),
-}
-
-#[derive(Debug, Clone)]
-struct Frag {
-    start: usize,
-    outs: Vec<usize>,
+    inner: regex_automata::meta::Regex,
 }
 
 impl SimpleRegex {
     fn compile(pattern: &str, case_insensitive: bool) -> Result<Self> {
-        let chars: Vec<char> = pattern.chars().collect();
-        let mut pos = 0usize;
-        let anchored_start = chars.first() == Some(&'^');
-        if anchored_start {
-            pos += 1;
-        }
-        let mut nodes = Vec::new();
-        let frag = Self::parse_alt(&chars, &mut pos, &mut nodes)?;
-        if pos != chars.len() {
-            return Err(OzError::InvalidUsage {
-                message: format!("invalid regex pattern '{pattern}' near position {pos}"),
+        let syntax_cfg = regex_automata::util::syntax::Config::new()
+            .case_insensitive(case_insensitive)
+            .multi_line(false);
+        let inner = regex_automata::meta::Regex::builder()
+            .syntax(syntax_cfg)
+            .build(pattern)
+            .map_err(|err| OzError::InvalidUsage {
+                message: format!("invalid regex pattern '{pattern}': {err}"),
                 recovery: Vec::new(),
-            });
-        }
-        let match_id = nodes.len();
-        nodes.push(NfaNode::Match);
-        Self::patch(&mut nodes, &frag.outs, match_id);
-        Ok(Self {
-            nodes,
-            start: frag.start,
-            anchored_start,
-            case_insensitive,
-        })
+            })?;
+        Ok(Self { inner })
     }
 
-    fn patch(nodes: &mut [NfaNode], outs: &[usize], target: usize) {
-        for &idx in outs {
-            match &mut nodes[idx] {
-                NfaNode::Char(_, next) | NfaNode::EndAnchor(next) => *next = target,
-                NfaNode::Split(a, b) => {
-                    if *a == usize::MAX {
-                        *a = target;
-                    }
-                    if *b == usize::MAX {
-                        *b = target;
-                    }
-                }
-                NfaNode::Match => {}
-            }
-        }
-    }
-
-    fn parse_alt(chars: &[char], pos: &mut usize, nodes: &mut Vec<NfaNode>) -> Result<Frag> {
-        let mut lhs = Self::parse_seq(chars, pos, nodes)?;
-        while *pos < chars.len() && chars[*pos] == '|' {
-            *pos += 1;
-            let rhs = Self::parse_seq(chars, pos, nodes)?;
-            let split_id = nodes.len();
-            nodes.push(NfaNode::Split(lhs.start, rhs.start));
-            let mut outs = lhs.outs;
-            outs.extend(rhs.outs);
-            lhs = Frag {
-                start: split_id,
-                outs,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_seq(chars: &[char], pos: &mut usize, nodes: &mut Vec<NfaNode>) -> Result<Frag> {
-        let mut acc: Option<Frag> = None;
-        while *pos < chars.len() && chars[*pos] != ')' && chars[*pos] != '|' {
-            let atom = Self::parse_quantified(chars, pos, nodes)?;
-            acc = Some(match acc {
-                None => atom,
-                Some(prev) => {
-                    Self::patch(nodes, &prev.outs, atom.start);
-                    Frag {
-                        start: prev.start,
-                        outs: atom.outs,
-                    }
-                }
-            });
-        }
-        Ok(acc.unwrap_or_else(|| {
-            let id = nodes.len();
-            nodes.push(NfaNode::Split(usize::MAX, usize::MAX));
-            Frag {
-                start: id,
-                outs: vec![id],
-            }
-        }))
-    }
-
-    fn parse_quantified(chars: &[char], pos: &mut usize, nodes: &mut Vec<NfaNode>) -> Result<Frag> {
-        let base = Self::parse_atom(chars, pos, nodes)?;
-        if *pos >= chars.len() {
-            return Ok(base);
-        }
-        match chars[*pos] {
-            '*' => {
-                *pos += 1;
-                let split_id = nodes.len();
-                nodes.push(NfaNode::Split(base.start, usize::MAX));
-                Self::patch(nodes, &base.outs, split_id);
-                Ok(Frag {
-                    start: split_id,
-                    outs: vec![split_id],
-                })
-            }
-            '+' => {
-                *pos += 1;
-                let split_id = nodes.len();
-                nodes.push(NfaNode::Split(base.start, usize::MAX));
-                Self::patch(nodes, &base.outs, split_id);
-                Ok(Frag {
-                    start: base.start,
-                    outs: vec![split_id],
-                })
-            }
-            '?' => {
-                *pos += 1;
-                let split_id = nodes.len();
-                nodes.push(NfaNode::Split(base.start, usize::MAX));
-                let mut outs = base.outs;
-                outs.push(split_id);
-                Ok(Frag {
-                    start: split_id,
-                    outs,
-                })
-            }
-            _ => Ok(base),
-        }
-    }
-
-    fn parse_atom(chars: &[char], pos: &mut usize, nodes: &mut Vec<NfaNode>) -> Result<Frag> {
-        let ch = chars[*pos];
-        match ch {
-            '(' => {
-                *pos += 1;
-                let inner = Self::parse_alt(chars, pos, nodes)?;
-                if *pos >= chars.len() || chars[*pos] != ')' {
-                    return Err(OzError::InvalidUsage {
-                        message: "unclosed '(' in regex pattern".to_string(),
-                        recovery: Vec::new(),
-                    });
-                }
-                *pos += 1;
-                Ok(inner)
-            }
-            '$' => {
-                *pos += 1;
-                let id = nodes.len();
-                nodes.push(NfaNode::EndAnchor(usize::MAX));
-                Ok(Frag {
-                    start: id,
-                    outs: vec![id],
-                })
-            }
-            '.' => {
-                *pos += 1;
-                let id = nodes.len();
-                nodes.push(NfaNode::Char(CharMatcher::AnyNonNewline, usize::MAX));
-                Ok(Frag {
-                    start: id,
-                    outs: vec![id],
-                })
-            }
-            '[' => {
-                let matcher = Self::parse_class(chars, pos)?;
-                let id = nodes.len();
-                nodes.push(NfaNode::Char(matcher, usize::MAX));
-                Ok(Frag {
-                    start: id,
-                    outs: vec![id],
-                })
-            }
-            '\\' => {
-                *pos += 1;
-                if *pos >= chars.len() {
-                    return Err(OzError::InvalidUsage {
-                        message: "trailing '\\' in regex pattern".to_string(),
-                        recovery: Vec::new(),
-                    });
-                }
-                let esc = chars[*pos];
-                *pos += 1;
-                let matcher = match esc {
-                    's' => CharMatcher::Whitespace,
-                    'S' => CharMatcher::NonWhitespace,
-                    'd' => CharMatcher::Digit,
-                    'D' => CharMatcher::NonDigit,
-                    'w' => CharMatcher::Word,
-                    'W' => CharMatcher::NonWord,
-                    'n' => CharMatcher::Literal('\n'),
-                    't' => CharMatcher::Literal('\t'),
-                    other => CharMatcher::Literal(other),
-                };
-                let id = nodes.len();
-                nodes.push(NfaNode::Char(matcher, usize::MAX));
-                Ok(Frag {
-                    start: id,
-                    outs: vec![id],
-                })
-            }
-            '*' | '+' | '?' => Err(OzError::InvalidUsage {
-                message: format!("unexpected quantifier '{ch}' in regex pattern"),
-                recovery: Vec::new(),
-            }),
-            other => {
-                *pos += 1;
-                let id = nodes.len();
-                nodes.push(NfaNode::Char(CharMatcher::Literal(other), usize::MAX));
-                Ok(Frag {
-                    start: id,
-                    outs: vec![id],
-                })
-            }
-        }
-    }
-
-    fn parse_class(chars: &[char], pos: &mut usize) -> Result<CharMatcher> {
-        *pos += 1; // skip '['
-        let mut negated = false;
-        if *pos < chars.len() && chars[*pos] == '^' {
-            negated = true;
-            *pos += 1;
-        }
-        let mut items = Vec::new();
-        while *pos < chars.len() && chars[*pos] != ']' {
-            let start_c = if chars[*pos] == '\\' && *pos + 1 < chars.len() {
-                *pos += 1;
-                let c = chars[*pos];
-                *pos += 1;
-                c
-            } else {
-                let c = chars[*pos];
-                *pos += 1;
-                c
-            };
-            if *pos + 1 < chars.len() && chars[*pos] == '-' && chars[*pos + 1] != ']' {
-                *pos += 1; // skip '-'
-                let end_c = if chars[*pos] == '\\' && *pos + 1 < chars.len() {
-                    *pos += 1;
-                    let c = chars[*pos];
-                    *pos += 1;
-                    c
-                } else {
-                    let c = chars[*pos];
-                    *pos += 1;
-                    c
-                };
-                items.push(ClassItem::Range(start_c, end_c));
-            } else {
-                items.push(ClassItem::Single(start_c));
-            }
-        }
-        if *pos >= chars.len() || chars[*pos] != ']' {
-            return Err(OzError::InvalidUsage {
-                message: "unclosed '[' character class in regex pattern".to_string(),
-                recovery: Vec::new(),
-            });
-        }
-        *pos += 1;
-        Ok(CharMatcher::Class { negated, items })
+    fn compile_literal(literal: &str, case_insensitive: bool) -> Result<Self> {
+        let escaped = regex_syntax::escape(literal);
+        Self::compile(&escaped, case_insensitive)
     }
 
     fn is_match(&self, text: &str) -> bool {
-        if self.anchored_start {
-            return self.matches_at(text);
-        }
-        if self.matches_at(text) {
-            return true;
-        }
-        for (idx, _) in text.char_indices() {
-            if idx > 0 && self.matches_at(&text[idx..]) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn matches_at(&self, text: &str) -> bool {
-        let mut current = Vec::new();
-        let mut visited = vec![false; self.nodes.len()];
-        self.add_state(self.start, text.is_empty(), &mut current, &mut visited);
-        if current
-            .iter()
-            .any(|&s| matches!(self.nodes[s], NfaNode::Match))
-        {
-            return true;
-        }
-
-        let mut iter = text.chars().peekable();
-        while let Some(c) = iter.next() {
-            let at_end_after = iter.peek().is_none();
-            let mut next_states = Vec::new();
-            visited.fill(false);
-            for &state in &current {
-                if let NfaNode::Char(ref matcher, next) = self.nodes[state]
-                    && matcher.matches(c, self.case_insensitive)
-                {
-                    self.add_state(next, at_end_after, &mut next_states, &mut visited);
-                }
-            }
-            if next_states.is_empty() {
-                return false;
-            }
-            if next_states
-                .iter()
-                .any(|&s| matches!(self.nodes[s], NfaNode::Match))
-            {
-                return true;
-            }
-            current = next_states;
-        }
-        false
-    }
-
-    fn add_state(&self, idx: usize, at_end: bool, out: &mut Vec<usize>, visited: &mut [bool]) {
-        if idx >= self.nodes.len() || visited[idx] {
-            return;
-        }
-        visited[idx] = true;
-        match self.nodes[idx] {
-            NfaNode::Split(a, b) => {
-                self.add_state(a, at_end, out, visited);
-                self.add_state(b, at_end, out, visited);
-            }
-            NfaNode::EndAnchor(next) => {
-                if at_end {
-                    self.add_state(next, at_end, out, visited);
-                }
-            }
-            NfaNode::Char(_, _) | NfaNode::Match => out.push(idx),
-        }
+        self.inner.is_match(text)
     }
 }
 
 /// Parses `--since` timestamps (RFC3339, `YYYY-MM-DD`, Unix epoch, or relative `"2 days ago"` / `"12h"`).
-pub fn parse_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+pub(crate) fn parse_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(OzError::InvalidUsage {
@@ -1160,7 +757,7 @@ pub fn parse_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<DateTime<U
         _ => {}
     }
 
-    let without_ago = lower.strip_suffix("ago").map(str::trim).unwrap_or(&lower);
+    let without_ago = lower.strip_suffix("ago").map_or(lower.as_str(), str::trim);
     let tokens: Vec<&str> = without_ago.split_whitespace().collect();
     if tokens.len() == 2
         && let Ok(n) = tokens[0].parse::<i64>()
@@ -1353,9 +950,7 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
     if !hidden.is_empty() {
         walk_platform = walk_platform.with_hidden(hidden);
     }
-    let walk = walk_platform
-        .all()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let walk = walk_platform.all().map_err(OzError::git_source)?;
 
     let mut commits = Vec::new();
     let mut lanes: Vec<ObjectId> = Vec::new();
@@ -1366,33 +961,22 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
         {
             break;
         }
-        let info = item.map_err(|err| OzError::Git(err.to_string()))?;
+        let info = item.map_err(OzError::git_source)?;
         let commit_id = info.id;
         let commit = gix_repo
             .find_commit(commit_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let decoded = commit
-            .decode()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
+        let decoded = commit.decode().map_err(OzError::git_source)?;
 
-        let author = decoded
-            .author()
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let committer = decoded
-            .committer()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let author = decoded.author().map_err(OzError::git_source)?;
+        let committer = decoded.committer().map_err(OzError::git_source)?;
 
         let author_name = author.name.to_str_lossy().into_owned();
         let author_email = author.email.to_str_lossy().into_owned();
-        let author_time =
-            gix_time_to_utc(author.time().map_err(|err| OzError::Git(err.to_string()))?);
+        let author_time = gix_time_to_utc(author.time().map_err(OzError::git_source)?);
         let committer_name = committer.name.to_str_lossy().into_owned();
         let committer_email = committer.email.to_str_lossy().into_owned();
-        let committer_time = gix_time_to_utc(
-            committer
-                .time()
-                .map_err(|err| OzError::Git(err.to_string()))?,
-        );
+        let committer_time = gix_time_to_utc(committer.time().map_err(OzError::git_source)?);
         let message = decoded.message.to_str_lossy().into_owned();
         let (subject, body) = split_subject_and_body(&message);
         let change_id = extract_change_id(&message);
@@ -1506,8 +1090,8 @@ fn collect_reachable_excluding(
         walk = walk.with_hidden(hidden.iter().copied());
     }
     let mut set = HashSet::new();
-    for item in walk.all().map_err(|err| OzError::Git(err.to_string()))? {
-        let info = item.map_err(|err| OzError::Git(err.to_string()))?;
+    for item in walk.all().map_err(OzError::git_source)? {
+        let info = item.map_err(OzError::git_source)?;
         set.insert(info.id);
     }
     Ok(set)
@@ -1526,23 +1110,15 @@ fn resolve_log_bounds(
 )> {
     if opts.all {
         let mut starts = Vec::new();
-        let platform = gix_repo
-            .references()
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        for item in platform
-            .local_branches()
-            .map_err(|err| OzError::Git(err.to_string()))?
-        {
-            let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+        let platform = gix_repo.references().map_err(OzError::git_source)?;
+        for item in platform.local_branches().map_err(OzError::git_source)? {
+            let mut r = item.map_err(OzError::git_source)?;
             if let Ok(c) = r.peel_to_commit() {
                 starts.push(c.id);
             }
         }
-        for item in platform
-            .tags()
-            .map_err(|err| OzError::Git(err.to_string()))?
-        {
-            let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+        for item in platform.tags().map_err(OzError::git_source)? {
+            let mut r = item.map_err(OzError::git_source)?;
             if let Ok(c) = r.peel_to_commit() {
                 starts.push(c.id);
             }
@@ -1668,15 +1244,10 @@ fn collect_ref_decorations(
         map.entry(head_oid).or_default().push(label);
     }
 
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
 
-    for item in platform
-        .local_branches()
-        .map_err(|err| OzError::Git(err.to_string()))?
-    {
-        let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+    for item in platform.local_branches().map_err(OzError::git_source)? {
+        let mut r = item.map_err(OzError::git_source)?;
         let name = r.name().shorten().to_str_lossy().into_owned();
         if head.branch.as_deref() == Some(name.as_str()) {
             continue;
@@ -1686,22 +1257,16 @@ fn collect_ref_decorations(
         }
     }
 
-    for item in platform
-        .tags()
-        .map_err(|err| OzError::Git(err.to_string()))?
-    {
-        let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+    for item in platform.tags().map_err(OzError::git_source)? {
+        let mut r = item.map_err(OzError::git_source)?;
         let name = r.name().shorten().to_str_lossy().into_owned();
         if let Ok(c) = r.peel_to_commit() {
             map.entry(c.id).or_default().push(format!("tag: {name}"));
         }
     }
 
-    for item in platform
-        .remote_branches()
-        .map_err(|err| OzError::Git(err.to_string()))?
-    {
-        let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+    for item in platform.remote_branches().map_err(OzError::git_source)? {
+        let mut r = item.map_err(OzError::git_source)?;
         let name = r.name().shorten().to_str_lossy().into_owned();
         if let Ok(c) = r.peel_to_commit() {
             map.entry(c.id).or_default().push(name);
@@ -1716,12 +1281,11 @@ fn advance_graph_lanes(
     commit_id: ObjectId,
     parents: &[ObjectId],
 ) -> (String, Vec<String>) {
-    let col = match lanes.iter().position(|id| *id == commit_id) {
-        Some(idx) => idx,
-        None => {
-            lanes.push(commit_id);
-            lanes.len() - 1
-        }
+    let col = if let Some(idx) = lanes.iter().position(|id| *id == commit_id) {
+        idx
+    } else {
+        lanes.push(commit_id);
+        lanes.len() - 1
     };
 
     let mut prefix = String::with_capacity(lanes.len() * 2 + 1);
@@ -1851,12 +1415,10 @@ fn tree_entry_sig(
     if rel_path.is_empty() || rel_path == "." {
         return Ok(Some((gix::objs::tree::EntryKind::Tree, tree_id)));
     }
-    let tree = gix_repo
-        .find_tree(tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(tree_id).map_err(OzError::git_source)?;
     let entry = tree
         .lookup_entry_by_path(rel_path)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(entry.map(|e| (e.mode().kind(), e.object_id())))
 }
 
@@ -1883,10 +1445,10 @@ fn trees_differ_on_paths(
 
     let lhs_tree = gix_repo
         .find_tree(lhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let rhs_tree = gix_repo
         .find_tree(rhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let mut state = gix::diff::tree::State::default();
     let mut recorder = gix::diff::tree::Recorder::default()
         .track_location(Some(gix::diff::tree::recorder::Location::Path));
@@ -1899,7 +1461,7 @@ fn trees_differ_on_paths(
         &gix_repo.objects,
         &mut recorder,
     )
-    .map_err(|err| OzError::Git(err.to_string()))?;
+    .map_err(OzError::git_source)?;
 
     for record in recorder.records {
         let loc = match record {
@@ -1949,10 +1511,10 @@ fn commit_diff_matches_filters(
     }
     let lhs_tree = gix_repo
         .find_tree(parent_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let rhs_tree = gix_repo
         .find_tree(commit_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut state = gix::diff::tree::State::default();
     let mut recorder = gix::diff::tree::Recorder::default()
@@ -1967,7 +1529,7 @@ fn commit_diff_matches_filters(
         &gix_repo.objects,
         &mut recorder,
     )
-    .map_err(|err| OzError::Git(err.to_string()))?;
+    .map_err(OzError::git_source)?;
 
     for record in recorder.records {
         let (loc, old_oid, new_oid) = match record {
@@ -2153,27 +1715,26 @@ pub fn show_commit(repo: &OzoneRepo, opts: &ShowOptions) -> Result<ShowReport> {
     let gix_repo = open_gix_for_workspace(repo)?;
     let rev_spec = opts.rev.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    let resolved_id = match rev_spec {
-        Some(spec) => gix_repo
+    let resolved_id = if let Some(spec) = rev_spec {
+        gix_repo
             .rev_parse_single(spec)
             .map_err(|err| rev_parse_error(spec, err))?
-            .detach(),
-        None => {
-            let head = resolve_workspace_head(repo, &gix_repo)?;
-            head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
-                message: "repository has no commits yet (HEAD is unborn)".to_string(),
-                recovery: vec!["Create an initial commit with `oz commit -m \"...\"`.".to_string()],
-            })?
-        }
+            .detach()
+    } else {
+        let head = resolve_workspace_head(repo, &gix_repo)?;
+        head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
+            message: "repository has no commits yet (HEAD is unborn)".to_string(),
+            recovery: vec!["Create an initial commit with `oz commit -m \"...\"`.".to_string()],
+        })?
     };
 
     let obj = gix_repo
         .find_object(resolved_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let (tag_name, tag_message) = if obj.kind == gix::object::Kind::Tag {
         let tag_ref = gix::objs::TagRef::from_bytes(&obj.data, gix_repo.object_hash())
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         (
             Some(tag_ref.name.to_str_lossy().into_owned()),
             Some(tag_ref.message.to_str_lossy().trim().to_string()),
@@ -2187,27 +1748,17 @@ pub fn show_commit(repo: &OzoneRepo, opts: &ShowOptions) -> Result<ShowReport> {
         recovery: Vec::new(),
     })?;
     let commit_id = commit.id;
-    let decoded = commit
-        .decode()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let decoded = commit.decode().map_err(OzError::git_source)?;
 
-    let author = decoded
-        .author()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let committer = decoded
-        .committer()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let author = decoded.author().map_err(OzError::git_source)?;
+    let committer = decoded.committer().map_err(OzError::git_source)?;
 
     let author_name = author.name.to_str_lossy().into_owned();
     let author_email = author.email.to_str_lossy().into_owned();
-    let author_time = gix_time_to_utc(author.time().map_err(|err| OzError::Git(err.to_string()))?);
+    let author_time = gix_time_to_utc(author.time().map_err(OzError::git_source)?);
     let committer_name = committer.name.to_str_lossy().into_owned();
     let committer_email = committer.email.to_str_lossy().into_owned();
-    let committer_time = gix_time_to_utc(
-        committer
-            .time()
-            .map_err(|err| OzError::Git(err.to_string()))?,
-    );
+    let committer_time = gix_time_to_utc(committer.time().map_err(OzError::git_source)?);
     let message = decoded.message.to_str_lossy().into_owned();
     let (subject, body) = split_subject_and_body(&message);
     let change_id = extract_change_id(&message);
@@ -2223,7 +1774,7 @@ pub fn show_commit(repo: &OzoneRepo, opts: &ShowOptions) -> Result<ShowReport> {
         (false, None, None)
     };
 
-    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    let parents: Vec<ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
     let parent_tree_id = match parents.first() {
         Some(&pid) => commit_tree_id(&gix_repo, pid)?,
         None => ObjectId::empty_tree(gix_repo.object_hash()),
@@ -2436,6 +1987,7 @@ pub fn parse_line_range(raw: &str) -> Result<(Option<usize>, Option<usize>)> {
 
 /// Slices raw text bytes into a 1-based inclusive line range, returning
 /// `(total_lines, start_line, end_line, truncated, sliced_content)`.
+#[must_use]
 pub fn slice_text_lines(
     bytes: &[u8],
     start_line: Option<usize>,
@@ -2499,7 +2051,7 @@ pub fn show_blob(repo: &OzoneRepo, opts: &ShowBlobOptions) -> Result<ShowBlobRep
             .detach();
         gix_repo
             .find_object(id)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .peel_to_commit()
             .map_err(|err| OzError::InvalidUsage {
                 message: format!("revision '{rev_label}' does not point to a commit: {err}"),
@@ -2509,9 +2061,7 @@ pub fn show_blob(repo: &OzoneRepo, opts: &ShowBlobOptions) -> Result<ShowBlobRep
     };
 
     let tree_id = commit_tree_id(&gix_repo, commit_oid)?;
-    let tree = gix_repo
-        .find_tree(tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(tree_id).map_err(OzError::git_source)?;
 
     let norm_path = opts
         .path
@@ -2522,7 +2072,7 @@ pub fn show_blob(repo: &OzoneRepo, opts: &ShowBlobOptions) -> Result<ShowBlobRep
 
     let entry = tree
         .lookup_entry_by_path(&norm_path)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .ok_or_else(|| OzError::InvalidUsage {
             message: format!("path '{norm_path}' does not exist in '{rev_label}'"),
             recovery: vec![format!(
@@ -2540,9 +2090,7 @@ pub fn show_blob(repo: &OzoneRepo, opts: &ShowBlobOptions) -> Result<ShowBlobRep
     }
 
     let blob_oid = entry.object_id();
-    let blob = gix_repo
-        .find_blob(blob_oid)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let blob = gix_repo.find_blob(blob_oid).map_err(OzError::git_source)?;
     let bytes = blob.data.as_slice();
     let size_bytes = bytes.len();
     let oid_hex = commit_oid.to_hex().to_string();
@@ -2714,6 +2262,13 @@ pub fn rev_parse(repo: &OzoneRepo, opts: &RevParseOptions) -> Result<RevParseRep
     Ok(RevParseReport { values, entries })
 }
 
+struct RawTreeChange {
+    path: String,
+    kind: ChangeKind,
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
+}
+
 fn diff_commit_trees(
     gix_repo: &gix::Repository,
     lhs_tree_id: ObjectId,
@@ -2724,10 +2279,10 @@ fn diff_commit_trees(
     }
     let lhs_tree = gix_repo
         .find_tree(lhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let rhs_tree = gix_repo
         .find_tree(rhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut state = gix::diff::tree::State::default();
     let mut recorder = gix::diff::tree::Recorder::default()
@@ -2741,14 +2296,7 @@ fn diff_commit_trees(
         &gix_repo.objects,
         &mut recorder,
     )
-    .map_err(|err| OzError::Git(err.to_string()))?;
-
-    struct RawTreeChange {
-        path: String,
-        kind: ChangeKind,
-        old_bytes: Vec<u8>,
-        new_bytes: Vec<u8>,
-    }
+    .map_err(OzError::git_source)?;
 
     let mut raw_changes = Vec::new();
     for record in recorder.records {
@@ -3083,23 +2631,21 @@ fn read_stash_manifest(
 ) -> Result<(Option<ObjectId>, Vec<StashEntryRecord>)> {
     let Some(mut reference) = gix_repo
         .try_find_reference(OZ_STASH_REF)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     else {
         return Ok((None, Vec::new()));
     };
-    let commit = reference
-        .peel_to_commit()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let tree = commit.tree().map_err(|err| OzError::Git(err.to_string()))?;
+    let commit = reference.peel_to_commit().map_err(OzError::git_source)?;
+    let tree = commit.tree().map_err(OzError::git_source)?;
     let Some(entry) = tree
         .lookup_entry_by_path("manifest.json")
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     else {
         return Ok((Some(commit.id), Vec::new()));
     };
     let blob = gix_repo
         .find_blob(entry.object_id())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let manifest: StashManifest = serde_json::from_slice(&blob.data)?;
     Ok((Some(commit.id), manifest.entries))
 }
@@ -3122,7 +2668,7 @@ fn write_stash_manifest(
                 stash_ref_full,
                 PreviousValue::MustExistAndMatch(Target::Object(prev)),
             )])
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         return Ok(());
     }
 
@@ -3134,15 +2680,15 @@ fn write_stash_manifest(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     let manifest_blob = gix_repo
         .write_blob(&manifest_bytes)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
     let mut editor = gix_repo
         .edit_tree(empty_tree)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     editor
         .upsert("manifest.json", EntryKind::Blob, manifest_blob)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     for rec in entries {
         let dirty_oid = parse_oid(&rec.dirty_tree_oid)?;
@@ -3150,21 +2696,18 @@ fn write_stash_manifest(
             let p = format!("snapshots/{}/dirty", rec.id);
             editor
                 .upsert(p.as_str(), EntryKind::Tree, dirty_oid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
         }
         let base_oid = parse_oid(&rec.base_tree_oid)?;
         if base_oid != empty_tree {
             let p = format!("snapshots/{}/base", rec.id);
             editor
                 .upsert(p.as_str(), EntryKind::Tree, base_oid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
         }
     }
 
-    let tree_id = editor
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let tree_id = editor.write().map_err(OzError::git_source)?.detach();
     let (author, committer) = resolve_actor_signatures(gix_repo)?;
     let mut author_buf = gix::date::parse::TimeBuf::default();
     let mut committer_buf = gix::date::parse::TimeBuf::default();
@@ -3177,7 +2720,7 @@ fn write_stash_manifest(
             tree_id,
             parents,
         )
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let expected = match prev_commit {
         Some(prev) => PreviousValue::MustExistAndMatch(Target::Object(prev)),
@@ -3190,7 +2733,7 @@ fn write_stash_manifest(
             expected,
             reflog_msg,
         )])
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(())
 }
 
@@ -3236,7 +2779,7 @@ fn build_dirty_tree_from_workdir(
     let ctx = compute_status_context(repo)?;
     let mut editor = gix_repo
         .edit_tree(ctx.head.tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let mut paths = Vec::with_capacity(ctx.dirty_files.len());
 
     for raw in &ctx.dirty_files {
@@ -3245,7 +2788,7 @@ fn build_dirty_tree_from_workdir(
             ChangeKind::Deleted => {
                 editor
                     .remove(raw.path.as_str())
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
             }
             ChangeKind::Conflicted => {
                 return Err(OzError::Conflict {
@@ -3289,19 +2832,16 @@ fn build_dirty_tree_from_workdir(
                 };
                 let blob_id = gix_repo
                     .write_blob(&bytes)
-                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .map_err(OzError::git_source)?
                     .detach();
                 editor
                     .upsert(raw.path.as_str(), entry_kind, blob_id)
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
             }
         }
     }
 
-    let dirty_tree_id = editor
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let dirty_tree_id = editor.write().map_err(OzError::git_source)?.detach();
     Ok((ctx.head, dirty_tree_id, paths))
 }
 
@@ -3387,7 +2927,7 @@ pub fn stash_list(repo: &OzoneRepo) -> Result<StashListReport> {
     })
 }
 
-/// Performs read-only 3-way merge validation for `oz stash pop` before opening an OpLog transaction.
+/// Performs read-only 3-way merge validation for `oz stash pop` before opening an `OpLog` transaction.
 pub fn prepare_stash_pop(repo: &OzoneRepo, selector: Option<&str>) -> Result<PreparedStashPop> {
     let index = parse_stash_selector(selector)?;
     let gix_repo = open_gix_for_workspace(repo)?;
@@ -3404,9 +2944,7 @@ pub fn prepare_stash_pop(repo: &OzoneRepo, selector: Option<&str>) -> Result<Pre
     let stash_base = parse_oid(&rec.base_tree_oid)?;
     let stash_dirty = parse_oid(&rec.dirty_tree_oid)?;
 
-    let merge_opts = gix_repo
-        .tree_merge_options()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let merge_opts = gix_repo.tree_merge_options().map_err(OzError::git_source)?;
     let stash_label = format!("stash@{{{index}}}");
     let labels = gix::merge::blob::builtin_driver::text::Labels {
         ancestor: Some("stash-base".into()),
@@ -3415,7 +2953,7 @@ pub fn prepare_stash_pop(repo: &OzoneRepo, selector: Option<&str>) -> Result<Pre
     };
     let mut outcome = gix_repo
         .merge_trees(stash_base, live_tree_id, stash_dirty, labels, merge_opts)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     if outcome.has_unresolved_conflicts(gix::merge::tree::TreatAsUnresolved::git()) {
         let conflicts = extract_tree_merge_conflicts(&outcome.conflicts);
@@ -3432,11 +2970,7 @@ pub fn prepare_stash_pop(repo: &OzoneRepo, selector: Option<&str>) -> Result<Pre
         });
     }
 
-    let merged_tree_id = outcome
-        .tree
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let merged_tree_id = outcome.tree.write().map_err(OzError::git_source)?.detach();
     let delta = compute_tree_delta(&gix_repo, live_tree_id, merged_tree_id)?;
 
     Ok(PreparedStashPop {
@@ -3582,7 +3116,7 @@ fn resolve_commit_parent_tree(
     commit: &gix::Commit<'_>,
     mainline: Option<usize>,
 ) -> Result<ObjectId> {
-    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    let parents: Vec<ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
     if parents.is_empty() {
         return Ok(ObjectId::empty_tree(gix_repo.object_hash()));
     }
@@ -3704,10 +3238,11 @@ fn write_and_advance_commit(
     };
 
     let (signed, fingerprint) = if let Some(ref priv_key) = active_key {
-        let mut unsigned_payload = Vec::with_capacity(commit_obj.size() as usize);
+        let mut unsigned_payload =
+            Vec::with_capacity(usize::try_from(commit_obj.size()).unwrap_or(0));
         commit_obj
             .write_to(&mut unsigned_payload)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let armored = priv_key.sign_sshsig(&unsigned_payload, GIT_SSHSIG_NAMESPACE)?;
         let fp = priv_key.public_key().fingerprint_sha256();
         let sig_field = gix::objs::commit::signature_field_name(gix_repo.object_hash());
@@ -3721,11 +3256,11 @@ fn write_and_advance_commit(
 
     let commit_id = gix_repo
         .write_object(&commit_obj)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
-    let ref_full_name = FullName::try_from(spec.target_ref.as_str())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let ref_full_name =
+        FullName::try_from(spec.target_ref.as_str()).map_err(OzError::git_source)?;
     let expected = match spec.expected_head.map(Target::Object) {
         Some(prev) => {
             if ref_full_name.as_bstr() == "HEAD" {
@@ -3760,7 +3295,7 @@ fn write_and_advance_commit(
             }),
             Some(committer_ref),
         )
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok((commit_id, signed, fingerprint))
 }
@@ -3772,30 +3307,26 @@ pub fn cherry_pick_commit(repo: &OzoneRepo, opts: &CherryPickOptions) -> Result<
     let (source_tree, parent_tree, orig_author, orig_message) = {
         let source_commit = gix_repo
             .find_commit(source_oid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let source_tree = source_commit
             .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach();
         let parent_tree = resolve_commit_parent_tree(&gix_repo, &source_commit, opts.mainline)?;
 
-        let decoded = source_commit
-            .decode()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let decoded = source_commit.decode().map_err(OzError::git_source)?;
         let orig_author = decoded
             .author()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let orig_message = decoded.message.to_str_lossy().into_owned();
         (source_tree, parent_tree, orig_author, orig_message)
     };
 
     let head = resolve_workspace_head(repo, &gix_repo)?;
     let head_tree = head.tree_id;
-    let merge_opts = gix_repo
-        .tree_merge_options()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let merge_opts = gix_repo.tree_merge_options().map_err(OzError::git_source)?;
     let short_src = source_oid.to_hex().to_string();
     let short_src_7 = &short_src[..short_src.len().min(7)];
     let labels = gix::merge::blob::builtin_driver::text::Labels {
@@ -3806,7 +3337,7 @@ pub fn cherry_pick_commit(repo: &OzoneRepo, opts: &CherryPickOptions) -> Result<
 
     let mut outcome = gix_repo
         .merge_trees(parent_tree, head_tree, source_tree, labels, merge_opts)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     if outcome.has_unresolved_conflicts(gix::merge::tree::TreatAsUnresolved::git()) {
         let conflicts = extract_tree_merge_conflicts(&outcome.conflicts);
@@ -3823,11 +3354,7 @@ pub fn cherry_pick_commit(repo: &OzoneRepo, opts: &CherryPickOptions) -> Result<
         });
     }
 
-    let new_tree_id = outcome
-        .tree
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let new_tree_id = outcome.tree.write().map_err(OzError::git_source)?.detach();
     let delta = compute_tree_delta(&gix_repo, head_tree, new_tree_id)?;
     check_dirty_collision(repo, &delta, "cherry-pick")?;
 
@@ -3900,25 +3427,21 @@ pub fn revert_commit(repo: &OzoneRepo, opts: &RevertOptions) -> Result<RevertOut
     let (target_tree, parent_tree, orig_subject) = {
         let target_commit = gix_repo
             .find_commit(target_oid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let target_tree = target_commit
             .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach();
         let parent_tree = resolve_commit_parent_tree(&gix_repo, &target_commit, opts.mainline)?;
 
-        let decoded = target_commit
-            .decode()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let decoded = target_commit.decode().map_err(OzError::git_source)?;
         let (orig_subject, _) = split_subject_and_body(&decoded.message.to_str_lossy());
         (target_tree, parent_tree, orig_subject)
     };
 
     let head = resolve_workspace_head(repo, &gix_repo)?;
     let head_tree = head.tree_id;
-    let merge_opts = gix_repo
-        .tree_merge_options()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let merge_opts = gix_repo.tree_merge_options().map_err(OzError::git_source)?;
     let target_hex = target_oid.to_hex().to_string();
     let short_tgt = &target_hex[..target_hex.len().min(7)];
     let labels = gix::merge::blob::builtin_driver::text::Labels {
@@ -3930,7 +3453,7 @@ pub fn revert_commit(repo: &OzoneRepo, opts: &RevertOptions) -> Result<RevertOut
     // Reverse 3-way merge: base = target_tree, ours = head_tree, theirs = parent_tree.
     let mut outcome = gix_repo
         .merge_trees(target_tree, head_tree, parent_tree, labels, merge_opts)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     if outcome.has_unresolved_conflicts(gix::merge::tree::TreatAsUnresolved::git()) {
         let conflicts = extract_tree_merge_conflicts(&outcome.conflicts);
@@ -3947,11 +3470,7 @@ pub fn revert_commit(repo: &OzoneRepo, opts: &RevertOptions) -> Result<RevertOut
         });
     }
 
-    let new_tree_id = outcome
-        .tree
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let new_tree_id = outcome.tree.write().map_err(OzError::git_source)?.detach();
     let delta = compute_tree_delta(&gix_repo, head_tree, new_tree_id)?;
     check_dirty_collision(repo, &delta, "revert")?;
 
@@ -4120,15 +3639,10 @@ pub fn tag_list(repo: &OzoneRepo, pattern: Option<&str>) -> Result<TagListReport
         })
         .transpose()?;
 
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
     let mut tags = Vec::new();
-    for item in platform
-        .tags()
-        .map_err(|err| OzError::Git(err.to_string()))?
-    {
-        let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+    for item in platform.tags().map_err(OzError::git_source)? {
+        let mut r = item.map_err(OzError::git_source)?;
         let name = r.name().shorten().to_str_lossy().into_owned();
         if let Some(ref matcher) = glob_matcher
             && !matcher.is_match(&name)
@@ -4137,17 +3651,16 @@ pub fn tag_list(repo: &OzoneRepo, pattern: Option<&str>) -> Result<TagListReport
         }
         let direct_id = match r.target() {
             gix::refs::TargetRef::Object(id) => id.to_owned(),
-            gix::refs::TargetRef::Symbolic(_) => r
-                .peel_to_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach(),
+            gix::refs::TargetRef::Symbolic(_) => {
+                r.peel_to_id().map_err(OzError::git_source)?.detach()
+            }
         };
         let obj = gix_repo
             .find_object(direct_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         if obj.kind == gix::object::Kind::Tag {
             let tag_ref = gix::objs::TagRef::from_bytes(&obj.data, gix_repo.object_hash())
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
             let target_oid = tag_ref.target().to_hex().to_string();
             let tagger = tag_ref
                 .tagger()
@@ -4206,7 +3719,7 @@ pub fn tag_create(repo: &OzoneRepo, opts: &TagCreateOptions) -> Result<TagInfo> 
     let ref_str = full_name.as_bstr().to_str_lossy().into_owned();
     let existing = gix_repo
         .try_find_reference(&ref_str)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     if existing.is_some() && !opts.force {
         return Err(OzError::InvalidUsage {
             message: format!("tag '{}' already exists", opts.name),
@@ -4217,15 +3730,14 @@ pub fn tag_create(repo: &OzoneRepo, opts: &TagCreateOptions) -> Result<TagInfo> 
         });
     }
 
-    let target_oid = match opts.target_rev.as_deref() {
-        Some(spec) => resolve_commit_oid(&gix_repo, spec)?,
-        None => {
-            let head = resolve_workspace_head(repo, &gix_repo)?;
-            head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
-                message: "cannot create tag on unborn HEAD".to_string(),
-                recovery: vec!["Create an initial commit first.".to_string()],
-            })?
-        }
+    let target_oid = if let Some(spec) = opts.target_rev.as_deref() {
+        resolve_commit_oid(&gix_repo, spec)?
+    } else {
+        let head = resolve_workspace_head(repo, &gix_repo)?;
+        head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
+            message: "cannot create tag on unborn HEAD".to_string(),
+            recovery: vec!["Create an initial commit first.".to_string()],
+        })?
     };
 
     let wants_sign = opts.sign || opts.signing_key.is_some();
@@ -4244,7 +3756,7 @@ pub fn tag_create(repo: &OzoneRepo, opts: &TagCreateOptions) -> Result<TagInfo> 
                 expected,
                 format!("oz tag {}", opts.name),
             )])
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         return Ok(TagInfo {
             name: opts.name.clone(),
             kind: "lightweight".to_string(),
@@ -4290,7 +3802,7 @@ pub fn tag_create(repo: &OzoneRepo, opts: &TagCreateOptions) -> Result<TagInfo> 
         let mut unsigned_payload = Vec::new();
         base_tag
             .write_to(&mut unsigned_payload)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         if !unsigned_payload.ends_with(b"\n") {
             unsigned_payload.push(b'\n');
         }
@@ -4316,7 +3828,7 @@ pub fn tag_create(repo: &OzoneRepo, opts: &TagCreateOptions) -> Result<TagInfo> 
     let _ = &mut tag_obj;
     let tag_oid = gix_repo
         .write_object(&tag_obj)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
     let expected = if opts.force {
@@ -4331,7 +3843,7 @@ pub fn tag_create(repo: &OzoneRepo, opts: &TagCreateOptions) -> Result<TagInfo> 
             expected,
             format!("oz tag {}", opts.name),
         )])
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(TagInfo {
         name: opts.name.clone(),
@@ -4356,7 +3868,7 @@ pub fn tag_delete(repo: &OzoneRepo, name: &str) -> Result<TagDeleteOutcome> {
     let ref_str = full_name.as_bstr().to_str_lossy().into_owned();
     let existing = gix_repo
         .try_find_reference(&ref_str)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .ok_or_else(|| OzError::InvalidUsage {
             message: format!("tag '{name}' not found"),
             recovery: vec!["Run `oz tag` to list existing tags.".to_string()],
@@ -4365,7 +3877,7 @@ pub fn tag_delete(repo: &OzoneRepo, name: &str) -> Result<TagDeleteOutcome> {
         gix::refs::TargetRef::Object(id) => id.to_owned(),
         gix::refs::TargetRef::Symbolic(_) => existing
             .into_fully_peeled_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach(),
     };
 
@@ -4374,7 +3886,7 @@ pub fn tag_delete(repo: &OzoneRepo, name: &str) -> Result<TagDeleteOutcome> {
             full_name,
             PreviousValue::MustExistAndMatch(Target::Object(deleted_oid)),
         )])
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(TagDeleteOutcome {
         name: name.to_string(),
@@ -4389,7 +3901,7 @@ pub fn tag_verify(repo: &OzoneRepo, name: &str) -> Result<TagVerifyOutcome> {
     let ref_str = full_name.as_bstr().to_str_lossy().into_owned();
     let mut reference = gix_repo
         .try_find_reference(&ref_str)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .ok_or_else(|| OzError::InvalidUsage {
             message: format!("tag '{name}' not found"),
             recovery: vec!["Run `oz tag` to list tags.".to_string()],
@@ -4398,12 +3910,12 @@ pub fn tag_verify(repo: &OzoneRepo, name: &str) -> Result<TagVerifyOutcome> {
         gix::refs::TargetRef::Object(id) => id.to_owned(),
         gix::refs::TargetRef::Symbolic(_) => reference
             .peel_to_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach(),
     };
     let obj = gix_repo
         .find_object(direct_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     if obj.kind != gix::object::Kind::Tag {
         return Err(OzError::CheckFailed {
             message: format!("tag '{name}' is a lightweight tag and cannot carry a signature"),
@@ -4419,7 +3931,7 @@ pub fn tag_verify(repo: &OzoneRepo, name: &str) -> Result<TagVerifyOutcome> {
         });
     };
     let tag_ref = gix::objs::TagRef::from_bytes(&obj.data, gix_repo.object_hash())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let target_oid = tag_ref.target().to_hex().to_string();
     let tagger_email = tag_ref
         .tagger()
@@ -4603,26 +4115,19 @@ pub fn branch_list_with_options(
         })
         .transpose()?;
 
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
     let mut branches = Vec::new();
 
     if !opts.remotes_only {
-        for item in platform
-            .local_branches()
-            .map_err(|err| OzError::Git(err.to_string()))?
-        {
-            let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+        for item in platform.local_branches().map_err(OzError::git_source)? {
+            let mut r = item.map_err(OzError::git_source)?;
             let name = r.name().shorten().to_str_lossy().into_owned();
             if let Some(ref matcher) = glob_matcher
                 && !matcher.is_match(&name)
             {
                 continue;
             }
-            let commit = r
-                .peel_to_commit()
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let commit = r.peel_to_commit().map_err(OzError::git_source)?;
             let oid_hex = commit.id.to_hex().to_string();
             let short_oid = oid_hex[..oid_hex.len().min(7)].to_string();
             let subject = commit
@@ -4644,11 +4149,8 @@ pub fn branch_list_with_options(
     }
 
     if opts.include_remotes || opts.remotes_only {
-        for item in platform
-            .remote_branches()
-            .map_err(|err| OzError::Git(err.to_string()))?
-        {
-            let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+        for item in platform.remote_branches().map_err(OzError::git_source)? {
+            let mut r = item.map_err(OzError::git_source)?;
             if matches!(r.target(), gix::refs::TargetRef::Symbolic(_)) {
                 continue;
             }
@@ -4718,8 +4220,8 @@ pub struct GrepOptions {
     pub max_line_len: Option<usize>,
 }
 
-fn is_zero_usize(v: &usize) -> bool {
-    *v == 0
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Single matching line returned by [`grep_repo`].
@@ -4743,14 +4245,18 @@ pub struct GrepReport {
     pub matches: Vec<GrepMatch>,
     #[serde(default)]
     pub truncated: bool,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub lines_truncated: usize,
 }
 
 fn normalize_grep_pat(raw: &str) -> String {
-    raw.trim()
-        .replace('\\', "/")
-        .trim_start_matches("./")
+    let trimmed = raw.trim();
+    let cow: std::borrow::Cow<'_, str> = if trimmed.contains('\\') {
+        std::borrow::Cow::Owned(trimmed.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+    cow.trim_start_matches("./")
         .trim_start_matches('/')
         .trim_end_matches('/')
         .to_string()
@@ -4778,6 +4284,70 @@ fn truncate_grep_line(line: &str, max_len: usize) -> (String, bool) {
     (format!("{prefix}... (+{remaining} chars truncated)"), true)
 }
 
+/// Reads `path` only after sniffing its first [`crate::diff::BINARY_SNIFF_BYTES`] (8192 bytes)
+/// for a NUL byte (`0x00`), avoiding reading huge binary files into memory.
+fn read_non_binary_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut file = fs::File::open(path)?;
+    let mut sniff = [0u8; crate::diff::BINARY_SNIFF_BYTES];
+    let mut filled = 0usize;
+    while filled < sniff.len() {
+        match file.read(&mut sniff[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if filled == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if sniff[..filled].contains(&0) {
+        return Ok(None);
+    }
+    if filled < sniff.len() {
+        return Ok(Some(sniff[..filled].to_vec()));
+    }
+    let cap = file
+        .metadata()
+        .map_or(filled, |m| usize::try_from(m.len()).unwrap_or(filled));
+    let mut buf = Vec::with_capacity(cap.max(filled));
+    buf.extend_from_slice(&sniff[..filled]);
+    file.read_to_end(&mut buf)?;
+    Ok(Some(buf))
+}
+
+struct GrepLineHit {
+    line_number: usize,
+    line: String,
+    was_cut: bool,
+}
+
+struct FileGrepResult {
+    path: String,
+    matches: Vec<GrepLineHit>,
+    truncated: bool,
+}
+
+struct GrepWorkerFlush<'a> {
+    local: Vec<FileGrepResult>,
+    shared: &'a std::sync::Mutex<Vec<FileGrepResult>>,
+}
+
+impl Drop for GrepWorkerFlush<'_> {
+    fn drop(&mut self) {
+        if self.local.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.append(&mut self.local);
+    }
+}
+
 /// Searches tracked working-tree files or a committed Git revision's tree (`origin/main`, `HEAD`, etc.)
 /// without mutating the working tree.
 pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
@@ -4789,20 +4359,9 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
     }
 
     let regex = if opts.fixed_strings {
-        None
+        SimpleRegex::compile_literal(&opts.pattern, opts.ignore_case)?
     } else {
-        Some(SimpleRegex::compile(&opts.pattern, opts.ignore_case)?)
-    };
-    let needle_lower = opts.ignore_case.then(|| opts.pattern.to_lowercase());
-
-    let line_matches = |line: &str| -> bool {
-        if let Some(ref re) = regex {
-            re.is_match(line)
-        } else if let Some(ref lower) = needle_lower {
-            line.to_lowercase().contains(lower)
-        } else {
-            line.contains(&opts.pattern)
-        }
+        SimpleRegex::compile(&opts.pattern, opts.ignore_case)?
     };
 
     let mut normalized_paths: Vec<String> = Vec::new();
@@ -4902,41 +4461,85 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
     let max_matches = opts.max_matches.unwrap_or(usize::MAX);
     let max_line_len = opts.max_line_len.unwrap_or(0);
 
-    let mut scan_bytes = |rel_path: &str, bytes: &[u8]| -> bool {
-        if truncated || is_binary_bytes(bytes) {
-            return truncated;
-        }
+    let scan_non_binary_bytes = |rel_path: String, bytes: &[u8]| -> Option<FileGrepResult> {
         let text = String::from_utf8_lossy(bytes);
-        let mut file_hit = false;
+        if opts.files_with_matches {
+            for raw_line in text.lines() {
+                let line = raw_line.trim_end_matches('\r');
+                if regex.is_match(line) {
+                    return Some(FileGrepResult {
+                        path: rel_path,
+                        matches: Vec::new(),
+                        truncated: false,
+                    });
+                }
+            }
+            return None;
+        }
+
+        let mut file_hits: Vec<GrepLineHit> = Vec::new();
+        let mut file_truncated = false;
         for (idx, raw_line) in text.lines().enumerate() {
             let line = raw_line.trim_end_matches('\r');
-            if line_matches(line) {
-                if !file_hit {
-                    file_hit = true;
-                    matched_files.push(rel_path.to_string());
-                    if opts.files_with_matches {
-                        return false;
-                    }
-                }
-                if matches.len() >= max_matches {
-                    truncated = true;
-                    return true;
+            if regex.is_match(line) {
+                if file_hits.len() >= max_matches {
+                    file_truncated = true;
+                    break;
                 }
                 let (rendered_line, was_cut) = truncate_grep_line(line, max_line_len);
-                if was_cut {
-                    lines_truncated += 1;
-                }
-                matches.push(GrepMatch {
-                    path: rel_path.to_string(),
+                file_hits.push(GrepLineHit {
                     line_number: idx + 1,
                     line: rendered_line,
+                    was_cut,
                 });
             }
         }
-        false
+        if file_hits.is_empty() && !file_truncated {
+            None
+        } else {
+            Some(FileGrepResult {
+                path: rel_path,
+                matches: file_hits,
+                truncated: file_truncated,
+            })
+        }
     };
 
     let commit_oid = if let Some(ref rev_spec) = opts.rev {
+        let mut scan_tree_bytes = |rel_path: &str, bytes: &[u8]| -> bool {
+            if truncated || is_binary_bytes(bytes) {
+                return truncated;
+            }
+            let text = String::from_utf8_lossy(bytes);
+            let mut file_hit = false;
+            for (idx, raw_line) in text.lines().enumerate() {
+                let line = raw_line.trim_end_matches('\r');
+                if regex.is_match(line) {
+                    if !file_hit {
+                        file_hit = true;
+                        matched_files.push(rel_path.to_string());
+                        if opts.files_with_matches {
+                            return false;
+                        }
+                    }
+                    if matches.len() >= max_matches {
+                        truncated = true;
+                        return true;
+                    }
+                    let (rendered_line, was_cut) = truncate_grep_line(line, max_line_len);
+                    if was_cut {
+                        lines_truncated += 1;
+                    }
+                    matches.push(GrepMatch {
+                        path: rel_path.to_string(),
+                        line_number: idx + 1,
+                        line: rendered_line,
+                    });
+                }
+            }
+            false
+        };
+
         let gix_repo = open_gix_for_workspace(repo)?;
         let cid = resolve_commit_oid(&gix_repo, rev_spec)?;
         let tree_id = commit_tree_id(&gix_repo, cid)?;
@@ -4946,9 +4549,7 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
             if stop {
                 break;
             }
-            let tree = gix_repo
-                .find_tree(tid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let tree = gix_repo.find_tree(tid).map_err(OzError::git_source)?;
             let mut subtrees = Vec::new();
             let mut blobs = Vec::new();
             for entry in tree.iter() {
@@ -4972,7 +4573,7 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
             blobs.sort_by(|a, b| a.0.cmp(&b.0));
             for (rel, oid) in blobs {
                 if let Ok(bytes) = read_blob_bytes(&gix_repo, oid)
-                    && scan_bytes(&rel, &bytes)
+                    && scan_tree_bytes(&rel, &bytes)
                 {
                     stop = true;
                     break;
@@ -4983,33 +4584,90 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
         }
         Some(cid.to_hex().to_string())
     } else {
-        let mut files: Vec<(String, PathBuf)> = Vec::new();
-        let walker = ignore::WalkBuilder::new(&repo.workdir_path)
+        let shared_results: std::sync::Mutex<Vec<FileGrepResult>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut builder = ignore::WalkBuilder::new(&repo.workdir_path);
+        builder
             .hidden(false)
             .git_ignore(true)
             .git_exclude(true)
             .git_global(true)
-            .filter_entry(|e| e.file_name() != ".git")
-            .build();
-        for entry in walker.flatten() {
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                continue;
-            }
-            let Ok(rel_os) = entry.path().strip_prefix(&repo.workdir_path) else {
-                continue;
+            .threads(rayon::current_num_threads().clamp(1, 16))
+            .filter_entry(|e| e.file_name() != ".git");
+
+        let workdir_root = &repo.workdir_path;
+        let shared_ref = &shared_results;
+        let path_included_ref = &path_included;
+        let scan_ref = &scan_non_binary_bytes;
+
+        builder.build_parallel().run(|| {
+            let mut collector = GrepWorkerFlush {
+                local: Vec::new(),
+                shared: shared_ref,
             };
-            let rel = rel_os.to_string_lossy().replace('\\', "/");
-            if path_included(&rel) {
-                files.push((rel, entry.into_path()));
+            Box::new(move |result| {
+                let Ok(entry) = result else {
+                    return ignore::WalkState::Continue;
+                };
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    return ignore::WalkState::Continue;
+                }
+                let Ok(rel_os) = entry.path().strip_prefix(workdir_root) else {
+                    return ignore::WalkState::Continue;
+                };
+                let rel_lossy = rel_os.to_string_lossy();
+                let rel: std::borrow::Cow<'_, str> = if rel_lossy.contains('\\') {
+                    std::borrow::Cow::Owned(rel_lossy.replace('\\', "/"))
+                } else {
+                    rel_lossy
+                };
+                if !path_included_ref(&rel) {
+                    return ignore::WalkState::Continue;
+                }
+                if let Ok(Some(bytes)) = read_non_binary_file(entry.path())
+                    && let Some(hit) = scan_ref(rel.into_owned(), &bytes)
+                {
+                    collector.local.push(hit);
+                }
+                ignore::WalkState::Continue
+            })
+        });
+
+        let mut file_results = shared_results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file_results.sort_by(|a, b| a.path.cmp(&b.path));
+        if opts.files_with_matches {
+            matched_files = file_results.into_iter().map(|r| r.path).collect();
+        } else {
+            'merge: for file_res in file_results {
+                let mut pushed_file = false;
+                for lm in file_res.matches {
+                    if matches.len() >= max_matches {
+                        truncated = true;
+                        break 'merge;
+                    }
+                    if !pushed_file {
+                        pushed_file = true;
+                        matched_files.push(file_res.path.clone());
+                    }
+                    if lm.was_cut {
+                        lines_truncated += 1;
+                    }
+                    matches.push(GrepMatch {
+                        path: file_res.path.clone(),
+                        line_number: lm.line_number,
+                        line: lm.line,
+                    });
+                }
+                if file_res.truncated {
+                    truncated = true;
+                    break 'merge;
+                }
             }
-        }
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        for (rel, abs) in files {
-            if let Ok(bytes) = fs::read(&abs)
-                && scan_bytes(&rel, &bytes)
-            {
-                break;
-            }
+            matches.sort_by(|a, b| {
+                (a.path.as_str(), a.line_number).cmp(&(b.path.as_str(), b.line_number))
+            });
         }
         None
     };
@@ -5044,7 +4702,7 @@ pub fn branch_create(
     let ref_str = full_name.as_bstr().to_str_lossy().into_owned();
     let existing = gix_repo
         .try_find_reference(&ref_str)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     if existing.is_some() && !force {
         return Err(OzError::InvalidUsage {
             message: format!("a branch named '{name}' already exists"),
@@ -5061,15 +4719,14 @@ pub fn branch_create(
         });
     }
 
-    let oid = match start_point {
-        Some(spec) => resolve_commit_oid(&gix_repo, spec)?,
-        None => {
-            let head = resolve_workspace_head(repo, &gix_repo)?;
-            head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
-                message: "cannot create branch on unborn HEAD".to_string(),
-                recovery: vec!["Create an initial commit first.".to_string()],
-            })?
-        }
+    let oid = if let Some(spec) = start_point {
+        resolve_commit_oid(&gix_repo, spec)?
+    } else {
+        let head = resolve_workspace_head(repo, &gix_repo)?;
+        head.commit_oid.ok_or_else(|| OzError::InvalidUsage {
+            message: "cannot create branch on unborn HEAD".to_string(),
+            recovery: vec!["Create an initial commit first.".to_string()],
+        })?
     };
 
     let expected = if force {
@@ -5084,7 +4741,7 @@ pub fn branch_create(
             expected,
             format!("oz branch {name}"),
         )])
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(BranchCreateOutcome {
         name: name.to_string(),
@@ -5140,19 +4797,16 @@ pub fn branch_rename(
 
     let mut old_ref = gix_repo
         .try_find_reference(&old_ref_str)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .ok_or_else(|| OzError::InvalidUsage {
             message: format!("branch '{resolved_old}' not found"),
             recovery: vec!["Run `oz branch` to list existing branches.".to_string()],
         })?;
-    let oid = old_ref
-        .peel_to_commit()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .id;
+    let oid = old_ref.peel_to_commit().map_err(OzError::git_source)?.id;
 
     let new_exists = gix_repo
         .try_find_reference(&new_ref_str)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .is_some();
     if new_exists && !force {
         return Err(OzError::InvalidUsage {
@@ -5186,7 +4840,7 @@ pub fn branch_rename(
                 expected: PreviousValue::Any,
                 new: Target::Symbolic(new_full),
             },
-            name: FullName::try_from("HEAD").expect("HEAD is valid"),
+            name: FullName::try_from("HEAD").map_err(OzError::git_source)?,
             deref: false,
         });
     }
@@ -5198,7 +4852,7 @@ pub fn branch_rename(
 
     gix_repo
         .edit_references(edits)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     // If operating in a virtual Ozone workspace whose state file points to `resolved_old`,
     // update `state.branch` so `resolve_workspace_head` stays aligned.
@@ -5254,15 +4908,12 @@ pub fn branch_delete(repo: &OzoneRepo, name: &str, force: bool) -> Result<Branch
     let ref_str = full_name.as_bstr().to_str_lossy().into_owned();
     let mut branch_ref = gix_repo
         .try_find_reference(&ref_str)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .ok_or_else(|| OzError::InvalidUsage {
             message: format!("branch '{name}' not found"),
             recovery: vec!["Run `oz branch` to list local branches.".to_string()],
         })?;
-    let branch_oid = branch_ref
-        .peel_to_commit()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .id;
+    let branch_oid = branch_ref.peel_to_commit().map_err(OzError::git_source)?.id;
 
     if !force && let Some(head_oid) = head.commit_oid {
         let merged = if branch_oid == head_oid {
@@ -5270,7 +4921,7 @@ pub fn branch_delete(repo: &OzoneRepo, name: &str, force: bool) -> Result<Branch
         } else {
             gix_repo
                 .merge_base(branch_oid, head_oid)
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .is_some_and(|mb| mb.detach() == branch_oid)
         };
         if !merged {
@@ -5286,7 +4937,7 @@ pub fn branch_delete(repo: &OzoneRepo, name: &str, force: bool) -> Result<Branch
             full_name,
             PreviousValue::MustExistAndMatch(Target::Object(branch_oid)),
         )])
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(BranchDeleteOutcome {
         name: name.to_string(),
@@ -5325,7 +4976,7 @@ fn looks_like_hunk_id(s: &str) -> bool {
     let Some(rest) = s.strip_prefix('h') else {
         return false;
     };
-    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     if digits == 0 {
         return false;
     }
@@ -5398,11 +5049,9 @@ fn collect_tree_leaf_entries(
     prefix: &str,
     out: &mut Vec<(String, ObjectId, EntryKind)>,
 ) -> Result<()> {
-    let tree = gix_repo
-        .find_tree(tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(tree_id).map_err(OzError::git_source)?;
     for entry_res in tree.iter() {
-        let entry = entry_res.map_err(|err| OzError::Git(err.to_string()))?;
+        let entry = entry_res.map_err(OzError::git_source)?;
         let name = entry.filename().to_str_lossy();
         let rel = if prefix.is_empty() || prefix == "." {
             name.into_owned()
@@ -5463,7 +5112,7 @@ pub fn restore_paths(repo: &OzoneRepo, opts: &RestoreOptions) -> Result<RestoreO
         Some(
             gix_repo
                 .find_tree(source_tree_id)
-                .map_err(|err| OzError::Git(err.to_string()))?,
+                .map_err(OzError::git_source)?,
         )
     };
 
@@ -5524,45 +5173,37 @@ pub fn restore_paths(repo: &OzoneRepo, opts: &RestoreOptions) -> Result<RestoreO
         let lookup = match source_tree.as_ref() {
             Some(tree) => tree
                 .lookup_entry_by_path(rel.as_str())
-                .map_err(|err| OzError::Git(err.to_string()))?,
+                .map_err(OzError::git_source)?,
             None => None,
         };
 
-        match lookup {
-            Some(entry) => {
-                let kind = entry.mode().kind();
-                if kind == EntryKind::Tree {
-                    let mut entries = Vec::new();
-                    collect_tree_leaf_entries(
-                        &gix_repo,
-                        entry.oid().to_owned(),
-                        &rel,
-                        &mut entries,
-                    )?;
-                    for (path, oid, entry_kind) in entries {
-                        to_restore.insert(path, (oid, entry_kind));
-                    }
-                } else if kind != EntryKind::Commit {
-                    to_restore.insert(rel, (entry.oid().to_owned(), kind));
+        if let Some(entry) = lookup {
+            let kind = entry.mode().kind();
+            if kind == EntryKind::Tree {
+                let mut entries = Vec::new();
+                collect_tree_leaf_entries(&gix_repo, entry.oid().to_owned(), &rel, &mut entries)?;
+                for (path, oid, entry_kind) in entries {
+                    to_restore.insert(path, (oid, entry_kind));
                 }
+            } else if kind != EntryKind::Commit {
+                to_restore.insert(rel, (entry.oid().to_owned(), kind));
             }
-            None => {
-                let disk_path = repo.workdir_path.join(&rel);
-                let exists_on_disk = fs::symlink_metadata(&disk_path).is_ok();
-                if opts.remove_untracked && exists_on_disk {
-                    to_remove.insert(rel);
-                } else {
-                    let src_label = opts.source.as_deref().unwrap_or("HEAD");
-                    return Err(OzError::InvalidUsage {
-                        message: format!(
-                            "pathspec '{raw_target}' did not match any file(s) in {src_label}"
-                        ),
-                        recovery: vec![
-                            "Pass `--remove-untracked` if you intentionally want to delete an untracked path."
-                                .to_string(),
-                        ],
-                    });
-                }
+        } else {
+            let disk_path = repo.workdir_path.join(&rel);
+            let exists_on_disk = fs::symlink_metadata(&disk_path).is_ok();
+            if opts.remove_untracked && exists_on_disk {
+                to_remove.insert(rel);
+            } else {
+                let src_label = opts.source.as_deref().unwrap_or("HEAD");
+                return Err(OzError::InvalidUsage {
+                    message: format!(
+                        "pathspec '{raw_target}' did not match any file(s) in {src_label}"
+                    ),
+                    recovery: vec![
+                        "Pass `--remove-untracked` if you intentionally want to delete an untracked path."
+                            .to_string(),
+                    ],
+                });
             }
         }
     }
@@ -5609,8 +5250,7 @@ pub fn restore_paths(repo: &OzoneRepo, opts: &RestoreOptions) -> Result<RestoreO
 
     Ok(RestoreOutcome {
         source_oid: source_commit_oid
-            .map(|id| id.to_hex().to_string())
-            .unwrap_or_else(|| "unborn".to_string()),
+            .map_or_else(|| "unborn".to_string(), |id| id.to_hex().to_string()),
         restored_paths,
         removed_paths,
     })
@@ -5630,6 +5270,145 @@ mod tests {
 
         let ci = SimpleRegex::compile("fix.*bug", true).expect("compile ci");
         assert!(ci.is_match("chore: FIX critical BUG in parser"));
+    }
+
+    #[test]
+    fn simple_regex_supports_word_boundaries_and_bounded_quantifiers() {
+        let wb = SimpleRegex::compile(r"\bunsafe\b", false).expect("compile word boundary");
+        assert!(wb.is_match("unsafe fn ptr_op()"));
+        assert!(wb.is_match("let x = unsafe { *p };"));
+        assert!(!wb.is_match("fn my_unsafe_helper()"));
+        assert!(!wb.is_match("unsafely_cast()"));
+
+        let non_wb = SimpleRegex::compile(r"\Bunsafe\B", false).expect("compile non-word boundary");
+        assert!(non_wb.is_match("my_unsafe_helper"));
+        assert!(!non_wb.is_match("unsafe fn f()"));
+
+        let quant =
+            SimpleRegex::compile(r"\b[0-9a-f]{4,6}\b", false).expect("compile {m,n} quantifier");
+        assert!(!quant.is_match("abc"));
+        assert!(quant.is_match("dead"));
+        assert!(quant.is_match("c0ffee"));
+        assert!(!quant.is_match("deadbeef"));
+
+        let invalid = SimpleRegex::compile(r"[unclosed", false).expect_err("invalid regex");
+        assert!(matches!(invalid, OzError::InvalidUsage { .. }));
+    }
+
+    #[test]
+    fn grep_repo_parallel_fixed_case_insensitive_binary_skip_and_deterministic_sort() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let _ = gix::init(root).expect("gix init");
+
+        fs::create_dir_all(root.join("z_dir")).expect("mkdir z_dir");
+        fs::create_dir_all(root.join("a_dir")).expect("mkdir a_dir");
+
+        // Regex metacharacters in fixed-string case-insensitive query `-F -i`:
+        // literal "foo.bar[0]+" must match "FOO.BAR[0]+" and NOT regex-match "fooXbar000".
+        fs::write(
+            root.join("z_dir/second.rs"),
+            "let nope = \"fooXbar000\";\nlet hit = \"FOO.BAR[0]+\";\nunsafe fn z() {}\n",
+        )
+        .expect("write z_dir/second.rs");
+        fs::write(
+            root.join("a_dir/first.rs"),
+            "let hit1 = \"foo.bar[0]+\";\nlet skip = \"my_unsafe_ident\";\nlet hit2 = \"Prefix Foo.Bar[0]+ suffix\";\nunsafe { }\n",
+        )
+        .expect("write a_dir/first.rs");
+
+        // Large binary file (> BINARY_SNIFF_BYTES) with NUL in first 8 KiB and matching text after 8 KiB:
+        // must be skipped via 8 KiB prefix sniff!
+        let mut bin_payload = vec![b'A'; crate::diff::BINARY_SNIFF_BYTES * 3];
+        bin_payload[128] = 0;
+        bin_payload.extend_from_slice(b"\nFOO.BAR[0]+\nunsafe fn hidden_in_bin() {}\n");
+        fs::write(root.join("a_dir/huge.bin"), &bin_payload).expect("write binary");
+
+        let repo = OzoneRepo::discover(Some(root)).expect("discover repo");
+
+        // 1. `-F -i` fixed case-insensitive without regex false positives, sorted by (path, line_number)
+        let fixed_ci = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: "foo.bar[0]+".to_string(),
+                ignore_case: true,
+                fixed_strings: true,
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep -F -i");
+        assert!(!fixed_ci.truncated);
+        assert_eq!(
+            fixed_ci.matched_files,
+            vec!["a_dir/first.rs", "z_dir/second.rs"]
+        );
+        let coords: Vec<(&str, usize)> = fixed_ci
+            .matches
+            .iter()
+            .map(|m| (m.path.as_str(), m.line_number))
+            .collect();
+        assert_eq!(
+            coords,
+            vec![
+                ("a_dir/first.rs", 1),
+                ("a_dir/first.rs", 3),
+                ("z_dir/second.rs", 2),
+            ]
+        );
+
+        // 2. `\bunsafe\b` word boundary skips `my_unsafe_ident` and binary file
+        let wb_report = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: r"\bunsafe\b".to_string(),
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep word boundary");
+        let wb_coords: Vec<(&str, usize)> = wb_report
+            .matches
+            .iter()
+            .map(|m| (m.path.as_str(), m.line_number))
+            .collect();
+        assert_eq!(
+            wb_coords,
+            vec![("a_dir/first.rs", 4), ("z_dir/second.rs", 3)]
+        );
+
+        // 3. Deterministic `max_matches` truncation & `files_with_matches`
+        let capped = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: "foo.bar[0]+".to_string(),
+                ignore_case: true,
+                fixed_strings: true,
+                max_matches: Some(2),
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep max_matches");
+        assert!(capped.truncated);
+        assert_eq!(capped.matches.len(), 2);
+        assert_eq!(capped.matches[0].path, "a_dir/first.rs");
+        assert_eq!(capped.matches[0].line_number, 1);
+        assert_eq!(capped.matches[1].path, "a_dir/first.rs");
+        assert_eq!(capped.matches[1].line_number, 3);
+
+        let files_only = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: r"\bunsafe\b".to_string(),
+                files_with_matches: true,
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep -l");
+        assert_eq!(files_only.total_matches, 2);
+        assert_eq!(
+            files_only.matched_files,
+            vec!["a_dir/first.rs", "z_dir/second.rs"]
+        );
+        assert_eq!(files_only.matches, Vec::<GrepMatch>::new());
     }
 
     #[test]

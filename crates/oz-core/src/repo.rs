@@ -341,7 +341,7 @@ impl OzoneRepo {
 
 /// Parsed lexical `../<repo>.oz/<ws>` path match.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SiblingOzPath {
+pub(crate) struct SiblingOzPath {
     pub repo_name: String,
     pub workspace_name: String,
     pub sibling_repo_root: PathBuf,
@@ -350,7 +350,7 @@ pub struct SiblingOzPath {
 
 /// Lexically detects `<parent>/<repo>.oz/<ws>[/...]` without performing any filesystem I/O.
 #[must_use]
-pub fn parse_oz_workspace_path(path: &Path) -> Option<SiblingOzPath> {
+pub(crate) fn parse_oz_workspace_path(path: &Path) -> Option<SiblingOzPath> {
     let normalized = normalize_lexical(path);
     let comps: Vec<Component<'_>> = normalized.components().collect();
 
@@ -598,8 +598,7 @@ where
     let repo_root = if git_common_dir.file_name() == Some(OsStr::new(".git")) {
         git_common_dir
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| workdir_hint.to_path_buf())
+            .map_or_else(|| workdir_hint.to_path_buf(), Path::to_path_buf)
     } else {
         workdir_hint.to_path_buf()
     };
@@ -1018,8 +1017,8 @@ mod tests {
             worktree_path: ws_path.clone(),
             git_worktree_dir: None,
             baseline_id: None,
-            dirty_paths: Default::default(),
-            pinned_paths: Default::default(),
+            dirty_paths: std::collections::BTreeMap::new(),
+            pinned_paths: std::collections::BTreeSet::new(),
             scope: Vec::new(),
             deny: Vec::new(),
             created_at: Utc::now(),

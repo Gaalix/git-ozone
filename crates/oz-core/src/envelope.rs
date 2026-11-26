@@ -30,6 +30,7 @@ impl ExitCode {
     }
 
     /// Converts into [`std::process::ExitCode`].
+    #[must_use]
     pub fn to_process_exit_code(self) -> std::process::ExitCode {
         std::process::ExitCode::from(self as u8)
     }
@@ -180,13 +181,6 @@ impl<T: Serialize> Envelope<T> {
         self
     }
 
-    /// Appends a conflict entry.
-    #[must_use]
-    pub fn with_conflict(mut self, conflict: ConflictEntry) -> Self {
-        self.conflicts.push(conflict);
-        self
-    }
-
     /// Appends a recovery command suggestion.
     #[must_use]
     pub fn with_recovery_command(mut self, command: impl Into<String>) -> Self {
@@ -209,11 +203,6 @@ impl<T: Serialize> Envelope<T> {
     /// Renders the envelope as pretty-printed JSON.
     pub fn to_json_pretty(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
-    }
-
-    /// Renders the envelope as single-line compact JSON.
-    pub fn to_json_compact(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
     }
 }
 
@@ -463,7 +452,7 @@ mod tests {
         });
         assert!(env_agent.non_interactive);
         assert!(env_agent.agent);
-        assert!(!env_agent.child_env_overrides().is_empty());
+        assert_ne!(env_agent.child_env_overrides(), &[]);
 
         let flag_json = InteractionMode::from_input(InteractionInput {
             json_flag: true,

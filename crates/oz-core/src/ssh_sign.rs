@@ -73,7 +73,7 @@ fn base64_encode_inner(data: &[u8], pad: bool) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let (triples, rem) = data.as_chunks::<3>();
     for c in triples {
-        let n = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32);
+        let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
         out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
         out.push(B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
@@ -81,7 +81,7 @@ fn base64_encode_inner(data: &[u8], pad: bool) -> String {
     }
     match rem.len() {
         1 => {
-            let n = (rem[0] as u32) << 16;
+            let n = u32::from(rem[0]) << 16;
             out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
             out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
             if pad {
@@ -90,7 +90,7 @@ fn base64_encode_inner(data: &[u8], pad: bool) -> String {
             }
         }
         2 => {
-            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
             out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
             out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
             out.push(B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
@@ -143,9 +143,9 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
 
         let decode_sextet = |b: u8| -> Result<u32> {
             match b {
-                b'A'..=b'Z' => Ok((b - b'A') as u32),
-                b'a'..=b'z' => Ok((b - b'a' + 26) as u32),
-                b'0'..=b'9' => Ok((b - b'0' + 52) as u32),
+                b'A'..=b'Z' => Ok(u32::from(b - b'A')),
+                b'a'..=b'z' => Ok(u32::from(b - b'a' + 26)),
+                b'0'..=b'9' => Ok(u32::from(b - b'0' + 52)),
                 b'+' => Ok(62),
                 b'/' => Ok(63),
                 _ => Err(OzError::InvalidUsage {
@@ -347,7 +347,7 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
 }
 
 fn put_ssh_string(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_u32(out, bytes.len() as u32);
+    put_u32(out, u32::try_from(bytes.len()).unwrap_or(u32::MAX));
     out.extend_from_slice(bytes);
 }
 
@@ -723,9 +723,9 @@ impl OpenSshPrivateKey {
         let comment_bytes = self.comment.as_deref().unwrap_or("").as_bytes();
         put_ssh_string(&mut priv_sec, comment_bytes);
 
-        let pad_len = (8 - (priv_sec.len() % 8)) % 8;
+        let pad_len = u8::try_from((8 - (priv_sec.len() % 8)) % 8).unwrap_or(0);
         for i in 1..=pad_len {
-            priv_sec.push(i as u8);
+            priv_sec.push(i);
         }
 
         let mut outer = Zeroizing::new(Vec::with_capacity(256));
@@ -1033,7 +1033,9 @@ fn wrap_armor(header: &str, footer: &str, b64: &str, cols: usize) -> String {
     out.push_str(header);
     out.push('\n');
     for chunk in b64.as_bytes().chunks(cols) {
-        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        for &byte in chunk {
+            out.push(char::from(byte));
+        }
         out.push('\n');
     }
     out.push_str(footer);
@@ -1217,7 +1219,7 @@ pub fn resolve_signing_private_key(
 
 /// Checks an OpenSSH `allowed_signers` file for an entry matching `public_key` (and optionally
 /// `signer_email` if provided), returning `(true, Some(principal))` on match.
-pub fn match_allowed_signers_file(
+pub(crate) fn match_allowed_signers_file(
     allowed_signers_path: &Path,
     public_key: &OpenSshPublicKey,
     signer_email: Option<&str>,
@@ -1556,7 +1558,9 @@ mod tests {
         );
 
         // Streaming chunked update consistency across block boundaries
-        let big: Vec<u8> = (0..500usize).map(|i| (i * 37 % 251) as u8).collect();
+        let big: Vec<u8> = (0..500usize)
+            .map(|i| u8::try_from(i * 37 % 251).unwrap_or(0))
+            .collect();
         let mut streaming = Sha512::new();
         for chunk in big.chunks(13) {
             streaming.update(chunk);
@@ -1599,11 +1603,9 @@ mod tests {
 
         // Group order L = 2^252 + 27742317777372353535851937790883648493 in 32 LE bytes.
         let l_low: u128 = 27_742_317_777_372_353_535_851_937_790_883_648_493_u128;
-        let l_words: [u64; 4] = [l_low as u64, (l_low >> 64) as u64, 0, 1u64 << 60];
         let mut l_le = [0u8; 32];
-        for (i, w) in l_words.iter().enumerate() {
-            l_le[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
-        }
+        l_le[..16].copy_from_slice(&l_low.to_le_bytes());
+        l_le[24..32].copy_from_slice(&(1u64 << 60).to_le_bytes());
 
         // RFC 8032 §7.1 TEST 1 (empty message), TEST 2 (0x72), TEST 3 (0xaf82)
         let vectors: &[(&str, &str, &[u8], &str)] = &[
@@ -1768,6 +1770,6 @@ mod tests {
         );
         let enc_err = OpenSshPrivateKey::parse_openssh(&enc_pem).expect_err("reject encrypted");
         assert!(enc_err.to_string().contains("encrypted"));
-        assert!(!enc_err.recovery_commands().is_empty());
+        assert_ne!(enc_err.recovery_commands(), Vec::<String>::new());
     }
 }

@@ -5,6 +5,8 @@
 //! and `--amend` enhancements, including byte-level interoperability against system
 //! `/usr/bin/ssh-keygen` (`-Y verify` & `-Y sign`) and `/usr/bin/git` (`verify-commit`).
 
+#![allow(clippy::too_many_lines)]
+
 use oz_core::{
     CommitOptions, CommitOutcome, ExitCode, GIT_SSHSIG_NAMESPACE, OpenSshPrivateKey,
     OpenSshPublicKey, OzoneRepo, SSHSIG_ARMOR_FOOTER, SSHSIG_ARMOR_HEADER, commit_changes,
@@ -538,9 +540,11 @@ fn amend_root_child_merge_partial_pick_exclude_change_id_and_signed_amend() {
     );
 
     // 2. Create second commit with multi-section file so we can test surgical hunk `--pick` & `--exclude` amend
-    let base_file = (1..=20)
-        .map(|i| format!("line {i:02}\n"))
-        .collect::<String>();
+    let base_file = (1..=20).fold(String::new(), |mut acc, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(acc, "line {i:02}");
+        acc
+    });
     fs::write(repo_root.join("multi.txt"), &base_file).unwrap();
     let repo = OzoneRepo::discover(Some(&repo_root)).unwrap();
     let c2 = commit_changes(&repo, &CommitOptions::new("feat: add multi.txt")).unwrap();

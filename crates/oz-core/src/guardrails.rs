@@ -161,7 +161,7 @@ pub fn inspect_guardrails(
 
         let text = String::from_utf8_lossy(target.content);
         for (idx, raw_line) in text.lines().enumerate() {
-            let line_no = (idx + 1) as u32;
+            let line_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
             let line = raw_line.trim_end_matches('\r');
 
             if repo.config.guardrails.check_secrets
@@ -249,9 +249,6 @@ pub fn check_guardrails(
 
 /// Runs [`check_guardrails`] across all current dirty files in `repo`.
 pub fn check_workspace_guardrails(repo: &OzoneRepo, opts: &GuardrailOptions) -> Result<()> {
-    let ctx = compute_status_context(repo)?;
-    let max_blob_bytes = repo.config.max_blob_mb.saturating_mul(1024 * 1024);
-
     struct OwnedTarget {
         path: String,
         kind: ChangeKind,
@@ -260,6 +257,9 @@ pub fn check_workspace_guardrails(repo: &OzoneRepo, opts: &GuardrailOptions) -> 
         out_of_scope: bool,
         scope_reason: Option<String>,
     }
+
+    let ctx = compute_status_context(repo)?;
+    let max_blob_bytes = repo.config.max_blob_mb.saturating_mul(1024 * 1024);
 
     let mut owned = Vec::with_capacity(ctx.dirty_files.len());
     for raw in &ctx.dirty_files {
@@ -316,7 +316,7 @@ pub fn check_workspace_guardrails(repo: &OzoneRepo, opts: &GuardrailOptions) -> 
 
 /// Returns `true` if `rel_path` has filename `.env` or `.env.*` other than allowed templates.
 #[must_use]
-pub fn is_unignored_env_filename(rel_path: &str) -> bool {
+pub(crate) fn is_unignored_env_filename(rel_path: &str) -> bool {
     let Some(name) = Path::new(rel_path).file_name().and_then(|s| s.to_str()) else {
         return false;
     };
@@ -332,7 +332,7 @@ pub fn is_unignored_env_filename(rel_path: &str) -> bool {
 
 /// Detects suspected secret patterns in a single text line without exposing the secret value.
 #[must_use]
-pub fn detect_secret_in_line(line: &str) -> Option<&'static str> {
+pub(crate) fn detect_secret_in_line(line: &str) -> Option<&'static str> {
     if let Some(pos) = line.find("-----BEGIN ")
         && line[pos..].contains("PRIVATE KEY-----")
     {
@@ -395,7 +395,7 @@ fn has_github_classic_pat(bytes: &[u8]) -> bool {
             continue;
         }
         let body = &bytes[i + PREFIX.len()..i + total_len];
-        let body_ok = body.iter().all(|b| b.is_ascii_alphanumeric());
+        let body_ok = body.iter().all(u8::is_ascii_alphanumeric);
         let after_ok =
             i + total_len == bytes.len() || !bytes[i + total_len].is_ascii_alphanumeric();
         if body_ok && after_ok {
