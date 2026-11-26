@@ -4,13 +4,15 @@
 //! Phase 5C Everyday Human Ergonomics integration tests covering:
 //! - `oz log` (graph, `--oneline`, `-n`, `--author`, `--grep`, `-S`, `-G`, `--since`, `--json`)
 //! - `oz show <rev>` (metadata, `Change-Id`, `refs/notes/ai` badge, `--stat`, diff, `--json`)
-//! - `oz stash` (`push` / `pop` / `list` / `drop`, OpLog backup, `oz undo` & `oz redo`, conflicts)
+//! - `oz stash` (`push` / `pop` / `list` / `drop`, `OpLog` backup, `oz undo` & `oz redo`, conflicts)
 //! - `oz cherry-pick <rev>` & `oz revert <rev>` (`--json`, `--no-commit`, `oz undo`)
 //! - `oz tag` (lightweight, annotated, SSH-signed verified by `git verify-tag`, delete, `oz undo`)
 //! - `oz branch` (list, create, rename including current branch, delete `-d`/`-D`, `oz undo`)
 //! - Automatic TTY pager (`$OZ_PAGER` / `$GIT_PAGER` / `delta` / `less -FRX` and strict JSON/agent/non-TTY suppression)
 //! - Shell completions (`oz completions bash|zsh|fish|powershell`)
 //! - Built-in (`st`, `ci`, `co`, `lg`, `br`) and custom `.ozone.toml` `[aliases]` with `--json`, `--agent`, `-C`
+
+#![allow(clippy::too_many_lines)]
 
 use oz_cli::{PagerChoice, PagerSelectionInput, resolve_pager_spec};
 use oz_core::OZ_SCHEMA_V1;
@@ -1023,11 +1025,11 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
     // name/termios/winsize pointers are null as permitted by `openpty(3)`.
     let rc = unsafe {
         libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
+            &raw mut master_fd,
+            &raw mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null_mut() as _,
-            std::ptr::null_mut() as _,
+            std::ptr::null(),
+            std::ptr::null(),
         )
     };
     assert_eq!(rc, 0, "openpty failed");
@@ -1301,11 +1303,11 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
     // name/termios/winsize pointers are null as permitted by `openpty(3)`.
     let rc = unsafe {
         libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
+            &raw mut master_fd,
+            &raw mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null_mut() as _,
-            std::ptr::null_mut() as _,
+            std::ptr::null(),
+            std::ptr::null(),
         )
     };
     assert_eq!(rc, 0, "openpty failed");

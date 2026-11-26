@@ -190,21 +190,21 @@ mod tests {
         let policy: Arc<dyn PolicyProvider> = provider;
 
         assert!(!store.has_snapshot("org/repo", "abc").await.expect("has"));
-        assert!(
+        assert_eq!(
             radar
                 .poll_collisions("org/repo", &["src/lib.rs".to_string()])
                 .await
-                .expect("poll")
-                .is_empty()
+                .expect("poll"),
+            Vec::new()
         );
         audit.flush().await.expect("flush");
-        assert!(
+        assert_eq!(
             policy
                 .fetch_policy("org/repo")
                 .await
                 .expect("policy")
-                .enforced_deny_globs
-                .is_empty()
+                .enforced_deny_globs,
+            Vec::<String>::new()
         );
     }
 }

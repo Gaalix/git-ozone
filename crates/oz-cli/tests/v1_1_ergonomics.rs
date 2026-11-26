@@ -10,12 +10,15 @@
 //! - `oz ws spawn --backend cas_hardlink --from ... --branch ...` + `clean @ <oid>` output
 //! - `oz pr view`, `oz pr diff`, `oz pr read`, and `oz pr review` (with pre-flight validation)
 
+#![allow(clippy::too_many_lines)]
+
 use clap::Parser;
 use oz_cli::Cli;
 use oz_github::{
     GitHubPrRef, GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestReview, GitHubUser,
 };
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -175,7 +178,10 @@ fn status_collapses_large_hunk_lists_and_diff_handles_excludes_and_line_numbers(
     let (_tmp, repo) = init_sample_repo();
 
     // Create a file with 8 separate hunks (>5) to verify collapsing in `oz status`.
-    let orig: String = (1..=80).map(|i| format!("row {i}\n")).collect();
+    let mut orig = String::new();
+    for i in 1..=80 {
+        let _ = writeln!(orig, "row {i}");
+    }
     fs::write(repo.join("pnpm-lock.yaml"), &orig).unwrap();
     git_ok(&repo, &["add", "pnpm-lock.yaml"]);
     git_ok(&repo, &["commit", "-m", "chore: seed lockfile"]);

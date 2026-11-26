@@ -14,10 +14,10 @@ use std::path::Path;
 
 #[derive(Debug, Args)]
 pub struct GcArgs {
-    /// Retain OpLog entries newer than `<N>` days (defaults to `30`).
+    /// Retain `OpLog` entries newer than `<N>` days (defaults to `30`).
     #[arg(long = "oplog-days", default_value_t = DEFAULT_OPLOG_RETENTION_DAYS, value_name = "N")]
     pub oplog_days: u64,
-    /// Optional hard cap on retained non-protected OpLog entries.
+    /// Optional hard cap on retained non-protected `OpLog` entries.
     #[arg(long = "max-entries", value_name = "N")]
     pub max_entries: Option<usize>,
     /// Preview deletions and compaction without modifying `.git/ozone/oplog/` or refs.
@@ -27,7 +27,7 @@ pub struct GcArgs {
 
 #[derive(Debug, Args)]
 pub struct FsckArgs {
-    /// Safely recover/clean interrupted transactions, broken OpLog pointers, and orphaned
+    /// Safely recover/clean interrupted transactions, broken `OpLog` pointers, and orphaned
     /// metadata records without deleting user working-tree files.
     #[arg(long)]
     pub repair: bool,

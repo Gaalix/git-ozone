@@ -56,7 +56,7 @@ fn is_truthy_env(val: Option<&str>) -> bool {
 ///
 /// Strictly disabled under `--json`, `--agent`, `OZ_AGENT=1`, `CI=1`, or non-TTY stdout.
 #[must_use]
-pub const fn pager_allowed_for_mode(mode: InteractionMode) -> bool {
+pub(crate) const fn pager_allowed_for_mode(mode: InteractionMode) -> bool {
     !mode.json && !mode.agent && !mode.ci && mode.stdout_is_tty
 }
 
@@ -102,7 +102,7 @@ pub fn resolve_pager_spec(input: PagerSelectionInput<'_>) -> PagerChoice {
 
 /// Resolves the pager choice for the current process environment and [`InteractionMode`].
 #[must_use]
-pub fn resolve_current_pager(mode: InteractionMode) -> PagerChoice {
+pub(crate) fn resolve_current_pager(mode: InteractionMode) -> PagerChoice {
     if !pager_allowed_for_mode(mode) {
         return PagerChoice::Disabled;
     }
@@ -218,7 +218,7 @@ fn find_binary_in_path(name: &str, path_var: &OsStr) -> Option<PathBuf> {
 }
 
 /// Emits `content` through the active TTY pager if permitted, or directly to stdout.
-pub fn emit_paged_output(mode: InteractionMode, content: &str) -> std::io::Result<()> {
+pub(crate) fn emit_paged_output(mode: InteractionMode, content: &str) -> std::io::Result<()> {
     if content.is_empty() {
         return Ok(());
     }
@@ -257,9 +257,8 @@ fn spawn_and_feed_pager(mut cmd: Command, content: &str) -> std::io::Result<()> 
         cmd.env("LESS", "FRX");
     }
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return write_stdout_ignoring_broken_pipe(content),
+    let Ok(mut child) = cmd.spawn() else {
+        return write_stdout_ignoring_broken_pipe(content);
     };
 
     if let Some(mut stdin) = child.stdin.take()

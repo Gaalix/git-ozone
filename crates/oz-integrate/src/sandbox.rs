@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Shared Git/ODB, ephemeral CoW `_integrate/` sandbox, conflict extraction,
+//! Shared Git/ODB, ephemeral `CoW` `_integrate/` sandbox, conflict extraction,
 //! session persistence, and worktree/index synchronization helpers.
 
 use chrono::{DateTime, Utc};
@@ -188,16 +188,16 @@ pub(crate) fn resolve_main_repo(repo: &OzoneRepo) -> Result<OzoneRepo> {
 /// Opens `gix::Repository` with a safe fallback committer identity so reflog-enabled
 /// operations never fail when `user.name`/`user.email` are unconfigured.
 pub(crate) fn open_gix_with_fallback(path: &Path) -> Result<gix::Repository> {
-    let mut gix_repo = gix::open(path).map_err(|err| OzError::Git(err.to_string()))?;
+    let mut gix_repo = gix::open(path).map_err(OzError::git_source)?;
     gix_repo
         .committer_or_set_fallback("Ozone", "oz@ozone.dev")
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(gix_repo)
 }
 
 pub(crate) fn parse_oid(hex: &str) -> Result<ObjectId> {
     ObjectId::from_hex(hex.as_bytes())
-        .map_err(|err| OzError::Git(format!("invalid object id '{hex}': {err}")))
+        .map_err(|err| OzError::git_context(format!("invalid object id '{hex}'"), err))
 }
 
 pub(crate) fn normalize_branch_short(branch_or_ref: &str) -> &str {
@@ -215,12 +215,10 @@ pub(crate) fn resolve_local_branch(
     let full = format!("refs/heads/{short}");
     match gix_repo
         .try_find_reference(&full)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     {
         Some(mut r) => {
-            let commit = r
-                .peel_to_commit()
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let commit = r.peel_to_commit().map_err(OzError::git_source)?;
             Ok(Some((full, commit.id)))
         }
         None => Ok(None),
@@ -245,22 +243,18 @@ pub(crate) fn resolve_branch_or_revision(
     if trimmed.starts_with("refs/")
         && let Some(mut r) = gix_repo
             .try_find_reference(trimmed)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
     {
-        let commit = r
-            .peel_to_commit()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let commit = r.peel_to_commit().map_err(OzError::git_source)?;
         return Ok(Some((trimmed.to_string(), commit.id)));
     }
 
     let remote_ref = format!("refs/remotes/{trimmed}");
     if let Some(mut r) = gix_repo
         .try_find_reference(&remote_ref)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     {
-        let commit = r
-            .peel_to_commit()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let commit = r.peel_to_commit().map_err(OzError::git_source)?;
         return Ok(Some((remote_ref, commit.id)));
     }
 
@@ -285,7 +279,7 @@ pub(crate) fn is_ancestor(
     }
     let mb = gix_repo
         .merge_base(ancestor, descendant)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(mb.is_some_and(|id| id.detach() == ancestor))
 }
 
@@ -295,10 +289,8 @@ pub(crate) fn find_merge_base_commit(
     a: ObjectId,
     b: ObjectId,
 ) -> Result<Option<ObjectId>> {
-    let mb = gix_repo
-        .merge_base(a, b)
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    Ok(mb.map(|id| id.detach()))
+    let mb = gix_repo.merge_base(a, b).map_err(OzError::git_source)?;
+    Ok(mb.map(gix::Id::detach))
 }
 
 /// Resolves the merge-base tree OID between `a` and `b`, falling back to empty tree if disjoint.
@@ -308,13 +300,8 @@ pub(crate) fn merge_base_tree_id(
     b: ObjectId,
 ) -> Result<ObjectId> {
     if let Some(mb_id) = find_merge_base_commit(gix_repo, a, b)? {
-        let commit = gix_repo
-            .find_commit(mb_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        Ok(commit
-            .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
-            .detach())
+        let commit = gix_repo.find_commit(mb_id).map_err(OzError::git_source)?;
+        Ok(commit.tree_id().map_err(OzError::git_source)?.detach())
     } else {
         Ok(gix_repo.empty_tree().id().detach())
     }
@@ -323,11 +310,8 @@ pub(crate) fn merge_base_tree_id(
 pub(crate) fn commit_tree_id(gix_repo: &gix::Repository, commit_id: ObjectId) -> Result<ObjectId> {
     let commit = gix_repo
         .find_commit(commit_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    Ok(commit
-        .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach())
+        .map_err(OzError::git_source)?;
+    Ok(commit.tree_id().map_err(OzError::git_source)?.detach())
 }
 
 /// Resolves committer and author signatures using repository config or Ozone actor fallback.
@@ -336,34 +320,31 @@ pub(crate) fn resolve_signatures(
     actor: &ActorInfo,
     author_override: Option<gix::actor::Signature>,
 ) -> Result<(gix::actor::Signature, gix::actor::Signature)> {
-    let committer = match gix_repo.committer() {
-        Some(res) => res
-            .map_err(|err| OzError::Git(err.to_string()))?
+    let committer = if let Some(res) = gix_repo.committer() {
+        res.map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
-        None => {
-            let name = actor
-                .client
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("Ozone");
-            gix::actor::Signature {
-                name: name.into(),
-                email: "oz@ozone.dev".into(),
-                time: gix::date::Time::now_local_or_utc(),
-            }
+            .map_err(OzError::git_source)?
+    } else {
+        let name = actor
+            .client
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Ozone");
+        gix::actor::Signature {
+            name: name.into(),
+            email: "oz@ozone.dev".into(),
+            time: gix::date::Time::now_local_or_utc(),
         }
     };
 
-    let author = match author_override {
-        Some(a) => a,
-        None => match gix_repo.author() {
-            Some(res) => res
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .to_owned()
-                .map_err(|err| OzError::Git(err.to_string()))?,
-            None => committer.clone(),
-        },
+    let author = if let Some(a) = author_override {
+        a
+    } else if let Some(res) = gix_repo.author() {
+        res.map_err(OzError::git_source)?
+            .to_owned()
+            .map_err(OzError::git_source)?
+    } else {
+        committer.clone()
     };
 
     Ok((author, committer))
@@ -416,7 +397,7 @@ pub(crate) fn write_commit_in_odb(
             tree_id,
             parents.iter().copied(),
         )
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(commit.id)
 }
 
@@ -711,20 +692,18 @@ pub(crate) fn sync_git_index_for_delta(
     }
 
     let idx_repo = open_gix_with_fallback(git_dir)?;
-    let index_path = idx_repo.index_path().to_path_buf();
+    let index_path = idx_repo.index_path().clone();
     if !index_path.is_file() {
         let mut index = idx_repo
             .index_from_tree(&new_tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         index
             .write(gix::index::write::Options::default())
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         return Ok(());
     }
 
-    let mut index = idx_repo
-        .open_index()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let mut index = idx_repo.open_index().map_err(OzError::git_source)?;
     let _ = old_tree_id;
     index.remove_tree();
 
@@ -759,7 +738,7 @@ pub(crate) fn sync_git_index_for_delta(
     index.sort_entries();
     index
         .write(gix::index::write::Options::default())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(())
 }
 
@@ -842,7 +821,7 @@ pub(crate) fn extract_unresolved_conflicts(
 
     let merged_tree = gix_repo
         .find_tree(merged_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut extracted = Vec::new();
     for conflict in conflicts {
@@ -1018,7 +997,7 @@ fn check_tree_path_has_markers(
 ) -> Result<bool> {
     let Some(entry) = tree
         .lookup_entry_by_path(rel_path)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     else {
         return Ok(false);
     };
@@ -1027,7 +1006,7 @@ fn check_tree_path_has_markers(
     }
     let blob = gix_repo
         .find_blob(entry.object_id())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(bytes_contain_conflict_markers(&blob.data))
 }
 
@@ -1051,9 +1030,7 @@ fn snippet_from_entry(
     if e.mode.is_commit() {
         return Ok(Some(format!("<submodule {}>", e.id.to_hex())));
     }
-    let blob = gix_repo
-        .find_blob(e.id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let blob = gix_repo.find_blob(e.id).map_err(OzError::git_source)?;
     if e.mode.is_link() {
         let target = String::from_utf8_lossy(&blob.data);
         return Ok(Some(format!("<symlink -> {target}>")));
@@ -1084,8 +1061,8 @@ pub(crate) fn bytes_contain_conflict_markers(bytes: &[u8]) -> bool {
 
 pub(crate) fn entry_kind_from_u16_mode(mode: u16) -> EntryKind {
     match mode {
-        0o120000 => EntryKind::Link,
-        0o100755 => EntryKind::BlobExecutable,
+        0o120_000 => EntryKind::Link,
+        0o100_755 => EntryKind::BlobExecutable,
         _ => EntryKind::Blob,
     }
 }
@@ -1112,9 +1089,7 @@ pub(crate) fn write_entry_to_sandbox(
         Some(side_ref) => {
             let oid = parse_oid(&side_ref.oid)?;
             let kind = entry_kind_from_u16_mode(side_ref.mode);
-            let blob = gix_repo
-                .find_blob(oid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let blob = gix_repo.find_blob(oid).map_err(OzError::git_source)?;
             remove_conflicting_non_dir_ancestors(sandbox_dir, &dst)?;
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent)?;
@@ -1253,13 +1228,13 @@ pub(crate) fn verify_and_build_resolved_tree(
     // 2. Build resolved tree from sandbox files over `base_merged_tree_id`.
     let base_tree = gix_repo
         .find_tree(base_merged_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let mut tracked_entries: BTreeMap<String, (ObjectId, EntryKind)> = BTreeMap::new();
     let files = base_tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     for f in files {
         if f.mode.is_tree() || f.mode.is_commit() {
             continue;
@@ -1270,7 +1245,7 @@ pub(crate) fn verify_and_build_resolved_tree(
 
     let mut editor = gix_repo
         .edit_tree(base_merged_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let mut marker_conflicts = Vec::new();
     let hash_kind = gix_repo.object_hash();
 
@@ -1280,9 +1255,7 @@ pub(crate) fn verify_and_build_resolved_tree(
         match fs::symlink_metadata(&disk_path) {
             Ok(meta) if !meta.is_dir() => {}
             _ => {
-                editor
-                    .remove(rel.as_str())
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                editor.remove(rel.as_str()).map_err(OzError::git_source)?;
             }
         }
     }
@@ -1302,15 +1275,15 @@ pub(crate) fn verify_and_build_resolved_tree(
             continue;
         }
         let disk_oid = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &bytes)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         if disk_oid != *orig_oid || disk_kind != *orig_kind {
             let written = gix_repo
                 .write_blob(&bytes)
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .detach();
             editor
                 .upsert(rel.as_str(), disk_kind, written)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
         }
     }
 
@@ -1325,7 +1298,7 @@ pub(crate) fn verify_and_build_resolved_tree(
         &repo.git_common_dir,
         None,
         &mut ignore_buf,
-        Default::default(),
+        gix::ignore::search::Ignore::default(),
     )
     .unwrap_or_default();
     let root_gi = sandbox_dir.join(".gitignore");
@@ -1336,7 +1309,7 @@ pub(crate) fn verify_and_build_resolved_tree(
             &bytes,
             &root_gi,
             Some(sandbox_dir),
-            Default::default(),
+            gix::ignore::search::Ignore::default(),
         );
     }
 
@@ -1359,11 +1332,11 @@ pub(crate) fn verify_and_build_resolved_tree(
         }
         let blob_id = gix_repo
             .write_blob(&bytes)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach();
         editor
             .upsert(rel.as_str(), disk_kind, blob_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
     }
 
     if !marker_conflicts.is_empty() {
@@ -1395,10 +1368,7 @@ pub(crate) fn verify_and_build_resolved_tree(
         });
     }
 
-    let resolved_tree_id = editor
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let resolved_tree_id = editor.write().map_err(OzError::git_source)?.detach();
     Ok(resolved_tree_id)
 }
 
@@ -1420,7 +1390,7 @@ fn collect_new_sandbox_files(
                 &bytes,
                 &sub_gi,
                 Some(sandbox_root),
-                Default::default(),
+                gix::ignore::search::Ignore::default(),
             );
         }
     }
@@ -1572,10 +1542,10 @@ pub(crate) fn run_verify_command(sandbox_dir: &Path, verify_cmd: &str) -> Result
             .map_or_else(|| "signal".to_string(), |c| c.to_string());
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let snippet = if !stderr.trim().is_empty() {
-            truncate_excerpt(stderr.trim(), 512)
-        } else {
+        let snippet = if stderr.trim().is_empty() {
             truncate_excerpt(stdout.trim(), 512)
+        } else {
+            truncate_excerpt(stderr.trim(), 512)
         };
         let detail = if snippet.is_empty() {
             String::new()
@@ -1616,14 +1586,12 @@ pub(crate) fn collect_tree_leaf_map(
     if tree_id == gix_repo.empty_tree().id().detach() {
         return Ok(out);
     }
-    let tree = gix_repo
-        .find_tree(tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(tree_id).map_err(OzError::git_source)?;
     let files = tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     for f in files {
         if f.mode.is_tree() || f.mode.is_commit() {
             continue;

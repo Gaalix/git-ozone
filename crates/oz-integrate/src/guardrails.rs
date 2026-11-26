@@ -176,7 +176,7 @@ pub fn check_workspace_scope_for_integration(
 
 /// Validates changed paths and blob contents for `source_commit` (and optional `workspace`)
 /// prior to integration into `target_commit`.
-pub fn check_branch_guardrails_for_integration(
+pub(crate) fn check_branch_guardrails_for_integration(
     repo: &OzoneRepo,
     source_label: &str,
     source_commit: ObjectId,
@@ -237,14 +237,12 @@ fn collect_tree_changes_for_guardrails(
 
     let base_tree = gix_repo
         .find_tree(base_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let source_tree = gix_repo
         .find_tree(source_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
-    let mut changes = base_tree
-        .changes()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let mut changes = base_tree.changes().map_err(OzError::git_source)?;
     changes.options(|o| {
         o.track_rewrites(None);
     });
@@ -330,7 +328,7 @@ fn collect_tree_changes_for_guardrails(
             }
             Ok::<_, gix::Error>(ControlFlow::Continue(()))
         })
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(map)
 }
@@ -344,6 +342,12 @@ fn check_collected_changes(
     mut changed: BTreeMap<String, ChangedPayload>,
     opts: &IntegrationGuardrailOptions,
 ) -> Result<()> {
+    struct OwnedTarget {
+        path: String,
+        kind: ChangeKind,
+        content: Vec<u8>,
+        reported_size_bytes: Option<u64>,
+    }
     // Also incorporate any live uncommitted working-tree edits if `workspace` is accessible.
     if let Some(ws) = workspace
         && (ws.worktree_path.is_dir() || ws.backend.requires_daemon())
@@ -419,13 +423,6 @@ fn check_collected_changes(
 
     let max_blob_bytes = main_repo.config.max_blob_mb.saturating_mul(1024 * 1024);
 
-    struct OwnedTarget {
-        path: String,
-        kind: ChangeKind,
-        content: Vec<u8>,
-        reported_size_bytes: Option<u64>,
-    }
-
     let mut owned = Vec::with_capacity(changed.len());
     for (path, payload) in changed {
         match payload {
@@ -463,14 +460,12 @@ fn check_collected_changes(
                 } else if let Some(blob_oid) = oid {
                     let header = gix_repo
                         .find_header(blob_oid)
-                        .map_err(|err| OzError::Git(err.to_string()))?;
+                        .map_err(OzError::git_source)?;
                     let len = header.size();
                     if len > max_blob_bytes {
                         (Vec::new(), len)
                     } else {
-                        let blob = gix_repo
-                            .find_blob(blob_oid)
-                            .map_err(|err| OzError::Git(err.to_string()))?;
+                        let blob = gix_repo.find_blob(blob_oid).map_err(OzError::git_source)?;
                         (blob.data.clone(), len)
                     }
                 } else {

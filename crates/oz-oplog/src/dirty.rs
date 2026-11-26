@@ -21,13 +21,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
-const MODE_BLOB: u32 = 0o100644;
-const MODE_EXEC: u32 = 0o100755;
-const MODE_LINK: u32 = 0o120000;
+const MODE_BLOB: u32 = 0o100_644;
+const MODE_EXEC: u32 = 0o100_755;
+const MODE_LINK: u32 = 0o120_000;
 
 /// Returns the workspace identifier key used in `ws_snapshots` and checkpoint refs.
 #[must_use]
-pub fn workspace_key(repo: &OzoneRepo) -> &str {
+pub(crate) fn workspace_key(repo: &OzoneRepo) -> &str {
     repo.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE_KEY)
 }
 
@@ -52,11 +52,11 @@ pub(crate) fn open_gix_for_workspace(repo: &OzoneRepo) -> Result<gix::Repository
     } else {
         gix::open(&repo.repo_root)
     }
-    .map_err(|err| OzError::Git(err.to_string()))?;
+    .map_err(OzError::git_source)?;
 
     gix_repo
         .committer_or_set_fallback("Ozone", "bot@ozone.dev")
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(gix_repo)
 }
 
@@ -82,14 +82,14 @@ pub(crate) fn resolve_workspace_head(
             let ref_name = format!("refs/heads/{branch}");
             if let Some(mut reference) = gix_repo
                 .try_find_reference(&ref_name)
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
             {
                 let commit = reference
                     .peel_to_commit()
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
                 let tree_id = commit
                     .tree_id()
-                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .map_err(OzError::git_source)?
                     .detach();
                 return Ok((Some(branch.clone()), Some(commit.id), tree_id));
             }
@@ -97,22 +97,15 @@ pub(crate) fn resolve_workspace_head(
         }
     }
 
-    let mut head = gix_repo
-        .head()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let mut head = gix_repo.head().map_err(OzError::git_source)?;
     let branch = head
         .referent_name()
         .map(|name| String::from_utf8_lossy(name.shorten().as_ref()).into_owned());
     if head.is_unborn() {
         return Ok((branch, None, empty_tree));
     }
-    let commit = head
-        .peel_to_commit()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let tree_id = commit
-        .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let commit = head.peel_to_commit().map_err(OzError::git_source)?;
+    let tree_id = commit.tree_id().map_err(OzError::git_source)?.detach();
     Ok((branch, Some(commit.id), tree_id))
 }
 
@@ -162,7 +155,7 @@ fn path_to_rel_string(rel: &Path) -> Option<String> {
 
 pub(crate) fn parse_oid(hex: &str) -> Result<ObjectId> {
     ObjectId::from_hex(hex.as_bytes())
-        .map_err(|err| OzError::Git(format!("invalid object id '{hex}': {err}")))
+        .map_err(|err| OzError::git_context(format!("invalid object id '{hex}'"), err))
 }
 
 fn read_disk_blob_and_mode(path: &Path, meta: &fs::Metadata) -> Result<(Vec<u8>, u32)> {
@@ -195,14 +188,11 @@ fn read_disk_blob_and_mode(path: &Path, meta: &fs::Metadata) -> Result<(Vec<u8>,
 }
 
 fn compute_blob_oid(hash_kind: gix::hash::Kind, bytes: &[u8]) -> Result<ObjectId> {
-    gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, bytes)
-        .map_err(|err| OzError::Git(err.to_string()))
+    gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, bytes).map_err(OzError::git_source)
 }
 
 fn write_blob_if_needed(gix_repo: &gix::Repository, bytes: &[u8]) -> Result<String> {
-    let oid = gix_repo
-        .write_blob(bytes)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let oid = gix_repo.write_blob(bytes).map_err(OzError::git_source)?;
     Ok(oid.detach().to_hex().to_string())
 }
 
@@ -305,7 +295,7 @@ fn collect_subtree_leaf_paths(
 ) -> Result<()> {
     let Some(entry) = base_tree
         .lookup_entry_by_path(rel_dir)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     else {
         return Ok(());
     };
@@ -315,12 +305,12 @@ fn collect_subtree_leaf_paths(
     }
     let subtree = gix_repo
         .find_tree(entry.object_id())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let files = subtree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     for child in files {
         if !child.mode.is_tree() {
             let child_rel = child.filepath.to_str_lossy();
@@ -341,7 +331,7 @@ pub(crate) fn scan_dirty_files(
 ) -> Result<Vec<DirtyFileSnapshot>> {
     let base_tree = gix_repo
         .find_tree(base_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     if let Some(changes) = dirty_override {
         return snapshot_from_override(repo, gix_repo, &base_tree, changes);
@@ -370,7 +360,7 @@ fn snapshot_from_override(
             ChangeKind::Deleted => {
                 if base_tree
                     .lookup_entry_by_path(&rel)
-                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .map_err(OzError::git_source)?
                     .is_some()
                 {
                     map.insert(rel, DirtyFileState::Deleted);
@@ -381,7 +371,7 @@ fn snapshot_from_override(
                     let old_rel = normalize_rel_path(old_path);
                     if base_tree
                         .lookup_entry_by_path(&old_rel)
-                        .map_err(|err| OzError::Git(err.to_string()))?
+                        .map_err(OzError::git_source)?
                         .is_some()
                     {
                         map.insert(old_rel, DirtyFileState::Deleted);
@@ -419,7 +409,7 @@ fn snapshot_single_disk_path(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if base_tree
                 .lookup_entry_by_path(rel)
-                .map_err(|e| OzError::Git(e.to_string()))?
+                .map_err(OzError::git_source)?
                 .is_some()
             {
                 map.insert(rel.to_string(), DirtyFileState::Deleted);
@@ -484,7 +474,7 @@ fn snapshot_from_fuse_layers(
 
             let tree_entry = base_tree
                 .lookup_entry_by_path(&rel)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
 
             // Skip untracked gitignored files BEFORE reading or SHA-1 hashing their bytes.
             if tree_entry.is_none() && is_ignored_rel(gi.as_ref(), &rel, false) {
@@ -588,7 +578,7 @@ fn snapshot_from_standard_workdir(
             .traverse()
             .breadthfirst
             .files()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         tracked_entries.reserve(records.len());
         tracked_set.reserve(records.len());
         for rec in records {
@@ -740,7 +730,7 @@ fn snapshot_from_standard_workdir(
 
     let untracked_list = untracked_paths
         .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let untracked_items: Result<Vec<PendingDirtyDiskFile>> = untracked_list
         .into_par_iter()
         .map(|(rel, disk_path)| {
@@ -803,7 +793,7 @@ pub(crate) fn build_dirty_tree(
 
     let mut editor = gix_repo
         .edit_tree(base_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     for snap in dirty_files {
         match &snap.state {
@@ -811,19 +801,17 @@ pub(crate) fn build_dirty_tree(
                 let oid = parse_oid(blob_oid)?;
                 editor
                     .upsert(snap.path.as_str(), entry_kind_from_mode(*mode), oid)
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
             }
             DirtyFileState::Deleted => {
                 editor
                     .remove(snap.path.as_str())
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
             }
         }
     }
 
-    let new_tree_id = editor
-        .write()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let new_tree_id = editor.write().map_err(OzError::git_source)?;
     Ok(new_tree_id.detach())
 }
 
@@ -840,10 +828,10 @@ fn tree_diff_paths(
 
     let lhs_tree = gix_repo
         .find_tree(lhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let rhs_tree = gix_repo
         .find_tree(rhs_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut state = gix::diff::tree::State::default();
     let mut recorder = gix::diff::tree::Recorder::default()
@@ -859,7 +847,7 @@ fn tree_diff_paths(
         &gix_repo.objects,
         &mut recorder,
     )
-    .map_err(|err| OzError::Git(err.to_string()))?;
+    .map_err(OzError::git_source)?;
 
     for change in recorder.records {
         match change {
@@ -912,7 +900,7 @@ fn resolve_target_leaf(
 
     match target_tree
         .lookup_entry_by_path(rel_path)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     {
         Some(entry) if !entry.mode().is_tree() => Ok(ResolvedLeaf::File {
             oid: entry.object_id(),
@@ -1006,9 +994,7 @@ fn write_resolved_leaf(
                 fs::create_dir_all(parent)?;
             }
 
-            let blob = gix_repo
-                .find_blob(*oid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let blob = gix_repo.find_blob(*oid).map_err(OzError::git_source)?;
 
             if let Ok(meta) = fs::symlink_metadata(&disk_path) {
                 if meta.is_dir() {
@@ -1075,7 +1061,7 @@ pub(crate) fn restore_working_tree(
 
     let dst_tree = gix_repo
         .find_tree(dst_base_tree)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut touched = 0usize;
     for rel_path in &candidate_paths {
@@ -1170,6 +1156,12 @@ pub(crate) fn sync_git_index_diff(
     dst_dirty_files: &[DirtyFileSnapshot],
     changed_paths: &BTreeSet<String>,
 ) -> Result<()> {
+    struct IndexPatch<'a> {
+        rel: &'a str,
+        target: Option<(ObjectId, gix::index::entry::Mode)>,
+        is_dirty: bool,
+    }
+
     if changed_paths.is_empty() || (repo.workspace.is_some() && !repo.is_linked_worktree) {
         return Ok(());
     }
@@ -1188,30 +1180,24 @@ pub(crate) fn sync_git_index_diff(
         Err(_) => (
             gix_repo
                 .index_from_tree(&target_tree_id)
-                .map_err(|err| OzError::Git(err.to_string()))?,
+                .map_err(OzError::git_source)?,
             false,
         ),
     };
 
     let dst_tree = gix_repo
         .find_tree(target_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let dst_dirty_paths: HashSet<&str> = dst_dirty_files.iter().map(|d| d.path.as_str()).collect();
     let stat_opts = gix::index::entry::stat::Options::default();
-
-    struct IndexPatch<'a> {
-        rel: &'a str,
-        target: Option<(ObjectId, gix::index::entry::Mode)>,
-        is_dirty: bool,
-    }
 
     let mut patch_paths: Vec<IndexPatch<'_>> = Vec::new();
     for rel in changed_paths {
         let is_dirty = dst_dirty_paths.contains(rel.as_str());
         let target = match dst_tree
             .lookup_entry_by_path(rel.as_str())
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
         {
             Some(entry) if !entry.mode().is_tree() => {
                 Some((entry.object_id(), entry.mode().kind().into()))
@@ -1307,7 +1293,7 @@ pub(crate) fn sync_git_index_diff(
             extensions: gix::index::write::Extensions::None,
             skip_hash: true,
         })
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(())
 }
 
@@ -1331,9 +1317,7 @@ pub(crate) fn sync_workspace_state_file(
 
     let raw = fs::read_to_string(&state_path)?;
     let mut state: WorkspaceState = serde_json::from_str(&raw)?;
-    let tree = gix_repo
-        .find_tree(base_tree)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(base_tree).map_err(OzError::git_source)?;
 
     let now = Utc::now();
     state.base_commit = base_commit.map(|id| id.to_hex().to_string());
@@ -1355,7 +1339,7 @@ pub(crate) fn sync_workspace_state_file(
             DirtyFileState::Present { blob_oid, .. } => {
                 let in_base = tree
                     .lookup_entry_by_path(&snap.path)
-                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .map_err(OzError::git_source)?
                     .is_some();
                 let size_bytes = fs::symlink_metadata(repo.workdir_path.join(&snap.path))
                     .ok()
@@ -1393,15 +1377,13 @@ pub(crate) fn read_ref_oid_hex(
 ) -> Result<Option<String>> {
     match gix_repo
         .try_find_reference(ref_name)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     {
         Some(r) => match r.target() {
             gix::refs::TargetRef::Object(oid) => Ok(Some(oid.to_hex().to_string())),
             gix::refs::TargetRef::Symbolic(_) => {
                 let mut owned = r;
-                let id = owned
-                    .peel_to_id()
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                let id = owned.peel_to_id().map_err(OzError::git_source)?;
                 Ok(Some(id.to_hex().to_string()))
             }
         },
@@ -1512,7 +1494,10 @@ mod tests {
             clean_entry.stat.mtime.secs, 0,
             "clean restored path should cache disk stat"
         );
-        assert_eq!(clean_entry.stat.size, "clean-v1\n".len() as u32);
+        assert_eq!(
+            clean_entry.stat.size,
+            u32::try_from("clean-v1\n".len()).unwrap()
+        );
     }
 
     #[test]

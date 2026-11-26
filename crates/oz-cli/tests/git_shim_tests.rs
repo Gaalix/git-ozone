@@ -3,6 +3,8 @@
 
 //! End-to-end integration tests for the `oz git <args...>` compatibility shim.
 
+#![allow(clippy::too_many_lines)]
+
 use oz_cli::resolve_real_git;
 use oz_core::{OZ_SCHEMA_V1, OzoneLayout, OzoneRepo, WorkspaceState};
 use serde_json::Value;
@@ -189,6 +191,40 @@ fn real_git_resolution_skips_oz_alias_and_global_flags_work() {
 
 #[test]
 fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
+    struct ShimVfsCleanupGuard(PathBuf);
+    impl Drop for ShimVfsCleanupGuard {
+        fn drop(&mut self) {
+            let git_dir = self.0.join(".git");
+            let mut mounts = Vec::new();
+            if let Ok(entries) = fs::read_dir(git_dir.join("ozone/ws")) {
+                for entry in entries.flatten() {
+                    let mj = entry.path().join("mount.json");
+                    if let Ok(raw) = fs::read_to_string(&mj)
+                        && let Ok(rec) = serde_json::from_str::<oz_core::MountRecord>(&raw)
+                    {
+                        let _ = oz_vfsd::unmount_via_daemon(&git_dir, &rec.workspace, true);
+                        mounts.push(rec.mount_point);
+                    }
+                }
+            }
+            if git_dir.is_dir() {
+                let _ = oz_vfsd::shutdown_daemon(&git_dir);
+            }
+            #[cfg(target_os = "linux")]
+            for mp in &mounts {
+                let _ = Command::new("fusermount3")
+                    .args(["-u", "-z", "--"])
+                    .arg(mp)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = mounts;
+        }
+    }
+
     let tmp = TempDir::new().expect("tempdir");
     let repo_dir = tmp.path().join("shim-main");
     init_repo(&repo_dir);
@@ -372,39 +408,6 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
 
     // Now test `oz git worktree add` + `oz git add` + `oz git commit` inside spawned workspace!
     // RAII guard ensures `ws-shim` is unmounted even if an assertion panics before `worktree remove`.
-    struct ShimVfsCleanupGuard(PathBuf);
-    impl Drop for ShimVfsCleanupGuard {
-        fn drop(&mut self) {
-            let git_dir = self.0.join(".git");
-            let mut mounts = Vec::new();
-            if let Ok(entries) = fs::read_dir(git_dir.join("ozone/ws")) {
-                for entry in entries.flatten() {
-                    let mj = entry.path().join("mount.json");
-                    if let Ok(raw) = fs::read_to_string(&mj)
-                        && let Ok(rec) = serde_json::from_str::<oz_core::MountRecord>(&raw)
-                    {
-                        let _ = oz_vfsd::unmount_via_daemon(&git_dir, &rec.workspace, true);
-                        mounts.push(rec.mount_point);
-                    }
-                }
-            }
-            if git_dir.is_dir() {
-                let _ = oz_vfsd::shutdown_daemon(&git_dir);
-            }
-            #[cfg(target_os = "linux")]
-            for mp in &mounts {
-                let _ = Command::new("fusermount3")
-                    .args(["-u", "-z", "--"])
-                    .arg(mp)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = mounts;
-        }
-    }
     let _vfs_guard = ShimVfsCleanupGuard(repo_dir.clone());
     let wt_add = run_oz(
         &repo_dir,
@@ -433,8 +436,12 @@ fn git_add_status_diff_reset_and_commit_in_main_repo_and_workspace() {
 
     fs::write(ws_path.join("ws_one.rs"), "pub fn one() {}\n").unwrap();
     fs::write(ws_path.join("ws_two.rs"), "pub fn two() {}\n").unwrap();
-    let ws_add = run_oz(&ws_path, &["git", "add", "ws_one.rs"], &[]);
-    assert_eq!(ws_add.code, 0, "stderr: {}", ws_add.stderr);
+    let worktree_pin_out = run_oz(&ws_path, &["git", "add", "ws_one.rs"], &[]);
+    assert_eq!(
+        worktree_pin_out.code, 0,
+        "stderr: {}",
+        worktree_pin_out.stderr
+    );
 
     // Verify WorkspaceState.pinned_paths in `.git/ozone/state/ws-shim.json`.
     let layout = OzoneLayout::from_git_common_dir(repo_dir.join(".git"));
@@ -1323,7 +1330,7 @@ fn m3_git_commit_ssh_signing_and_native_amend_change_id() {
 
     let pub_line = fs::read_to_string(&pub_key).unwrap();
     let allowed_signers = key_dir.join("allowed_signers");
-    fs::write(&allowed_signers, format!("shim@ozone.dev {}", pub_line)).unwrap();
+    fs::write(&allowed_signers, format!("shim@ozone.dev {pub_line}")).unwrap();
 
     sys_git(&repo_dir, &["config", "gpg.format", "ssh"]);
     sys_git(
@@ -1722,7 +1729,7 @@ fn ide_tooling_flags_vscode_jetbrains_lazygit_and_gh() {
 
     let diff_quiet = run_oz(&repo_dir, &["git", "diff", "--quiet"], &[]);
     assert_eq!(diff_quiet.code, 1);
-    assert!(diff_quiet.stdout.is_empty());
+    assert_eq!(diff_quiet.stdout, "");
 
     // 4. `rev-parse`, `ls-files -z`, `check-ignore` (exit codes + piped `--stdin -z`)
     let rp_top = run_oz(

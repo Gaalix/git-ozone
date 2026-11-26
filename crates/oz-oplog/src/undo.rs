@@ -181,7 +181,7 @@ fn classify_entry_status(entry: &OpLogEntry, timeline: &WorkspaceTimeline<'_>) -
     }
 }
 
-/// Inspects the MVCC OpLog without mutating repository state, returning recent entries ordered
+/// Inspects the MVCC `OpLog` without mutating repository state, returning recent entries ordered
 /// newest-first along with the active workspace's undo/redo cursors and per-entry status.
 pub fn inspect_oplog(repo: &OzoneRepo, options: OpLogListOptions) -> Result<OpLogListReport> {
     if options.limit == 0 {
@@ -274,10 +274,10 @@ pub fn inspect_oplog(repo: &OzoneRepo, options: OpLogListOptions) -> Result<OpLo
 }
 
 fn undone_targets(entry: &OpLogEntry) -> Vec<String> {
-    if !entry.undone_ops.is_empty() {
-        entry.undone_ops.clone()
-    } else {
+    if entry.undone_ops.is_empty() {
         entry.inverse_of.iter().cloned().collect()
+    } else {
+        entry.undone_ops.clone()
     }
 }
 
@@ -299,25 +299,29 @@ fn apply_cas_ref_deltas_and_head(
     let head_edit = if update_git_head && head_changed && !transitions.contains_key("HEAD") {
         let new_target = if let Some(ref br) = dst.branch {
             let full = FullName::try_from(format!("refs/heads/{br}").as_str()).map_err(|err| {
-                OzError::Git(format!("invalid branch ref 'refs/heads/{br}': {err}"))
+                OzError::git_context(format!("invalid branch ref 'refs/heads/{br}'"), err)
             })?;
             Some(Target::Symbolic(full))
         } else {
             dst.head_commit.map(Target::Object)
         };
-        new_target.map(|target| RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: reflog_msg.into(),
+        if let Some(target) = new_target {
+            Some(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: reflog_msg.into(),
+                    },
+                    expected: PreviousValue::Any,
+                    new: target,
                 },
-                expected: PreviousValue::Any,
-                new: target,
-            },
-            name: FullName::try_from("HEAD").expect("HEAD is valid ref name"),
-            deref: false,
-        })
+                name: FullName::try_from("HEAD").map_err(OzError::git_source)?,
+                deref: false,
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -332,7 +336,7 @@ fn apply_cas_ref_deltas_and_head(
             continue;
         }
         let full_name = FullName::try_from(ref_name.as_str())
-            .map_err(|err| OzError::Git(format!("invalid ref name '{ref_name}': {err}")))?;
+            .map_err(|err| OzError::git_context(format!("invalid ref name '{ref_name}'"), err))?;
 
         let edit = match (&delta.old, &delta.new) {
             (Some(curr_hex), Some(target_hex)) => {
@@ -477,7 +481,7 @@ fn pre_slice(snap: &WsSnapshot, op_id: &str) -> Result<SnapshotSlice> {
 }
 
 /// Undoes one or more operations (or un-checkpointed dirty edits after a checkpoint) and appends
-/// an [`OpKind::Undo`] entry to the OpLog.
+/// an [`OpKind::Undo`] entry to the `OpLog`.
 pub fn undo(
     repo: &OzoneRepo,
     target: impl Into<UndoTarget>,
@@ -883,21 +887,19 @@ fn execute_undo_ops(
         [first, .., last] => (first, last),
     };
 
-    let src = match live_override {
-        Some(live) => live,
-        None => match newest_op.ws_snapshots.get(ws_key) {
-            Some(snap) => post_slice(snap)?,
-            None => {
-                let (branch, head_commit, base_tree) = resolve_workspace_head(repo, gix_repo)?;
-                SnapshotSlice {
-                    base_tree,
-                    dirty_tree: None,
-                    dirty_files: Vec::new(),
-                    head_commit,
-                    branch,
-                }
-            }
-        },
+    let src = if let Some(live) = live_override {
+        live
+    } else if let Some(snap) = newest_op.ws_snapshots.get(ws_key) {
+        post_slice(snap)?
+    } else {
+        let (branch, head_commit, base_tree) = resolve_workspace_head(repo, gix_repo)?;
+        SnapshotSlice {
+            base_tree,
+            dirty_tree: None,
+            dirty_files: Vec::new(),
+            head_commit,
+            branch,
+        }
     };
 
     let dst = match oldest_op.ws_snapshots.get(ws_key) {

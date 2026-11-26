@@ -5,7 +5,7 @@
 //!
 //! Natively intercepts high-impact Git commands (`worktree`, `status`, `diff`, `add`,
 //! `reset` unpinning, `commit`, `switch`, `checkout`, `clone`, `fetch`, `push`, and
-//! `merge`/`rebase` seams) on Ozone's CoW + `gix` + MVCC OpLog engine. Remaining
+//! `merge`/`rebase` seams) on Ozone's `CoW` + `gix` + MVCC `OpLog` engine. Remaining
 //! read-only commands delegate directly to system `git`, while mutating legacy commands
 //! (`reset --hard`, `clean`, `rm`, `mv`, `restore`, `revert`, `cherry-pick`, `stash`, etc.)
 //! are wrapped in [`oz_oplog::MutationTransaction`] so `oz undo` reverses them safely.
@@ -134,18 +134,18 @@ struct GitDelegatedOutcome {
 
 /// Parsed leading Git global options preceding the Git subcommand.
 #[derive(Debug, Clone)]
-pub struct ParsedGitGlobals {
-    pub effective_dir: Option<PathBuf>,
-    pub delegated_globals: Vec<OsString>,
-    pub config_overrides: Vec<(String, String)>,
-    pub no_pager: bool,
-    pub mode: InteractionMode,
-    pub subcommand: Option<String>,
-    pub subcommand_args: Vec<OsString>,
+pub(crate) struct ParsedGitGlobals {
+    pub(crate) effective_dir: Option<PathBuf>,
+    pub(crate) delegated_globals: Vec<OsString>,
+    pub(crate) config_overrides: Vec<(String, String)>,
+    pub(crate) no_pager: bool,
+    pub(crate) mode: InteractionMode,
+    pub(crate) subcommand: Option<String>,
+    pub(crate) subcommand_args: Vec<OsString>,
 }
 
 /// Dispatches `oz git <args...>`.
-pub fn handle_git(
+pub(crate) fn handle_git(
     args: &GitShimArgs,
     initial_directory: Option<&Path>,
     base_mode: InteractionMode,
@@ -379,9 +379,7 @@ fn invocation_dir(parsed: &ParsedGitGlobals) -> PathBuf {
 fn actor_from_mode(mode: InteractionMode, repo: &OzoneRepo) -> ActorInfo {
     let detected = detect_agent_session();
     let is_agent = mode.agent || detected.is_some();
-    let client = detected
-        .map(|s| s.client)
-        .unwrap_or_else(|| "oz-git".to_string());
+    let client = detected.map_or_else(|| "oz-git".to_string(), |s| s.client);
     ActorInfo {
         kind: if is_agent {
             ActorKind::Agent
@@ -396,9 +394,7 @@ fn actor_from_mode(mode: InteractionMode, repo: &OzoneRepo) -> ActorInfo {
 fn standalone_actor_from_mode(mode: InteractionMode) -> ActorInfo {
     let detected = detect_agent_session();
     let is_agent = mode.agent || detected.is_some();
-    let client = detected
-        .map(|s| s.client)
-        .unwrap_or_else(|| "oz-git".to_string());
+    let client = detected.map_or_else(|| "oz-git".to_string(), |s| s.client);
     ActorInfo {
         kind: if is_agent {
             ActorKind::Agent
@@ -652,9 +648,7 @@ fn is_executable_file(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
-            .unwrap_or(false)
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
     }
     #[cfg(not(unix))]
     {
@@ -892,8 +886,10 @@ fn delegate_mutating(
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("git {subcmd} exited with code {raw_code}"));
+                .map_or_else(
+                    || format!("git {subcmd} exited with code {raw_code}"),
+                    str::to_string,
+                );
             let mut env = Envelope::failure(
                 if raw_code == 1 {
                     "git_command_failed"
@@ -1031,8 +1027,7 @@ fn handle_git_worktree(parsed: &ParsedGitGlobals) -> ExitCode {
                     let head_short = item
                         .head_oid
                         .as_deref()
-                        .map(|h| &h[..h.len().min(7)])
-                        .unwrap_or("0000000");
+                        .map_or("0000000", |h| &h[..h.len().min(7)]);
                     if porcelain {
                         println!("worktree {}", item.path.display());
                         println!("HEAD {}", item.head_oid.as_deref().unwrap_or("0000000"));
@@ -1046,8 +1041,7 @@ fn handle_git_worktree(parsed: &ParsedGitGlobals) -> ExitCode {
                         let br_label = item
                             .branch
                             .as_deref()
-                            .map(|b| format!("[{b}]"))
-                            .unwrap_or_else(|| "(detached HEAD)".to_string());
+                            .map_or_else(|| "(detached HEAD)".to_string(), |b| format!("[{b}]"));
                         println!("{:<40} {head_short} {br_label}", item.path.display());
                     }
                 }
@@ -1359,16 +1353,11 @@ fn handle_git_worktree(parsed: &ParsedGitGlobals) -> ExitCode {
             emit_json_or_human(mode, res, |env| {
                 let removed = env.data["removed_workspaces"]
                     .as_array()
-                    .map(Vec::len)
-                    .unwrap_or(0);
+                    .map_or(0, Vec::len);
                 let extra = env.data["pruned_git_worktrees"]
                     .as_array()
-                    .map(Vec::len)
-                    .unwrap_or(0);
-                println!(
-                    "pruned {} workspace(s) and {} stale git worktree dir(s)",
-                    removed, extra
-                );
+                    .map_or(0, Vec::len);
+                println!("pruned {removed} workspace(s) and {extra} stale git worktree dir(s)");
             })
         }
         _ => delegate_readonly(parsed, &["worktree"], &parsed.subcommand_args),
@@ -1727,6 +1716,8 @@ fn render_porcelain_v2_status(
     delim: char,
     config_overrides: &[(String, String)],
 ) {
+    const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+
     if show_branch {
         let oid = report.head_oid.as_deref().unwrap_or("(initial)");
         let head = report.branch.as_deref().unwrap_or("(detached)");
@@ -1752,8 +1743,6 @@ fn render_porcelain_v2_status(
         std::collections::BTreeMap::new()
     };
 
-    const ZERO_OID: &str = "0000000000000000000000000000000000000000";
-
     for change in &report.changes {
         if !change.pinned
             && matches!(
@@ -1771,13 +1760,11 @@ fn render_porcelain_v2_status(
 
         let (head_mode, head_oid) = head_entries
             .get(&change.path)
-            .map(|(m, oid)| (*m, oid.as_str()))
-            .unwrap_or(("000000", ZERO_OID));
+            .map_or(("000000", ZERO_OID), |(m, oid)| (*m, oid.as_str()));
 
         let work_mode = repo_opt
             .and_then(|r| std::fs::symlink_metadata(r.workdir_path.join(&change.path)).ok())
-            .map(|m| disk_meta_octal(&m))
-            .unwrap_or_else(|| "000000".to_string());
+            .map_or_else(|| "000000".to_string(), |m| disk_meta_octal(&m));
 
         let idx_mode = if change.pinned {
             work_mode.as_str()
@@ -2168,7 +2155,7 @@ fn handle_git_add(parsed: &ParsedGitGlobals) -> ExitCode {
             list_tracked_paths_in_head(&repo)?
         };
 
-        let mut matched: BTreeSet<String> = BTreeSet::new();
+        let mut selected_paths: BTreeSet<String> = BTreeSet::new();
         if pathspecs.is_empty() {
             for c in &status.changes {
                 if update_only
@@ -2179,7 +2166,7 @@ fn handle_git_add(parsed: &ParsedGitGlobals) -> ExitCode {
                 {
                     continue;
                 }
-                matched.insert(c.path.clone());
+                selected_paths.insert(c.path.clone());
             }
         } else {
             for raw_spec in &pathspecs {
@@ -2197,7 +2184,7 @@ fn handle_git_add(parsed: &ParsedGitGlobals) -> ExitCode {
                         {
                             continue;
                         }
-                        matched.insert(c.path.clone());
+                        selected_paths.insert(c.path.clone());
                     }
                 }
                 if !hit {
@@ -2216,10 +2203,10 @@ fn handle_git_add(parsed: &ParsedGitGlobals) -> ExitCode {
             }
         }
 
-        let pinned_paths: Vec<String> = matched.iter().cloned().collect();
+        let pinned_paths: Vec<String> = selected_paths.iter().cloned().collect();
         let total_pinned = if dry_run {
             let mut cur = read_pinned_paths(&repo)?;
-            cur.extend(matched);
+            cur.extend(selected_paths);
             cur.len()
         } else {
             add_pinned_paths(&repo, &pinned_paths)?.len()
@@ -2292,8 +2279,7 @@ fn handle_git_reset(parsed: &ParsedGitGlobals) -> ExitCode {
     } else if !after_sep && positionals.len() == 1 {
         let first = &positionals[0];
         let is_pinned_or_disk = read_pinned_paths(&repo)
-            .ok()
-            .is_some_and(|p| p.contains(&resolve_pathspec_to_repo_rel(&repo, &inv_dir, first)))
+            .is_ok_and(|p| p.contains(&resolve_pathspec_to_repo_rel(&repo, &inv_dir, first)))
             || inv_dir.join(first).exists();
         if !is_pinned_or_disk && resolves_as_revision(&repo, first) {
             return delegate_mutating(parsed, "reset", &parsed.subcommand_args, false, false);
@@ -3037,9 +3023,9 @@ fn run_native_checkout_paths(
 // ============================================================================
 
 fn read_git_message_file(parsed: &ParsedGitGlobals, fpath: &str) -> Result<Option<String>> {
+    use std::io::Read as _;
     let content = if fpath == "-" {
         let mut buf = String::new();
-        use std::io::Read as _;
         std::io::stdin().read_to_string(&mut buf)?;
         buf
     } else {
@@ -3230,8 +3216,8 @@ fn can_resolve_all_merge_sources_natively(repo: &OzoneRepo, sources: &[String]) 
 }
 
 /// Handles `oz git merge ...` natively via `oz_integrate::integrate`, falling back to
-/// OpLog-wrapped system `git merge` only when unsupported flags or non-local refs are passed.
-pub fn handle_git_merge(parsed: &ParsedGitGlobals) -> ExitCode {
+/// `OpLog`-wrapped system `git merge` only when unsupported flags or non-local refs are passed.
+pub(crate) fn handle_git_merge(parsed: &ParsedGitGlobals) -> ExitCode {
     let (args, mode) = extract_json_agent_flags(&parsed.subcommand_args, parsed.mode);
     let action = match parse_git_merge_action(parsed, &args) {
         Ok(a) => a,
@@ -3446,8 +3432,8 @@ fn parse_git_rebase_action(args: &[String], mode: InteractionMode) -> Result<Git
 }
 
 /// Handles `oz git rebase ...` natively via `oz_integrate::stack_rebase`, falling back to
-/// OpLog-wrapped system `git rebase` only when unsupported flags or remote/range forms apply.
-pub fn handle_git_rebase(parsed: &ParsedGitGlobals) -> ExitCode {
+/// `OpLog`-wrapped system `git rebase` only when unsupported flags or remote/range forms apply.
+pub(crate) fn handle_git_rebase(parsed: &ParsedGitGlobals) -> ExitCode {
     let (args, mode) = extract_json_agent_flags(&parsed.subcommand_args, parsed.mode);
     let action = match parse_git_rebase_action(&args, mode) {
         Ok(a) => a,
@@ -4028,7 +4014,11 @@ fn derive_clone_dir_name(url: &str, is_bare: bool) -> PathBuf {
             .unwrap_or(last_seg)
             .to_string()
     };
-    PathBuf::from(if is_bare && !stripped.ends_with(".git") {
+    let has_git_ext = stripped.eq_ignore_ascii_case(".git")
+        || Path::new(&stripped)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("git"));
+    PathBuf::from(if is_bare && !has_git_ext {
         format!("{stripped}.git")
     } else {
         stripped
@@ -4115,7 +4105,6 @@ fn parse_git_fetch_action(args: &[String], has_exotic_globals: bool) -> Result<G
                             match ch {
                                 'p' => prune = true,
                                 'q' => quiet = true,
-                                'v' => {}
                                 _ => {}
                             }
                         }
@@ -4348,7 +4337,6 @@ fn parse_git_push_action(args: &[String], has_exotic_globals: bool) -> GitPushAc
                                 'f' => force = true,
                                 'u' => set_upstream = true,
                                 'q' => quiet = true,
-                                'v' => {}
                                 _ => {}
                             }
                         }

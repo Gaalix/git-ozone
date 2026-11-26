@@ -10,6 +10,8 @@
 //! - `oz branch -a` / `-r` (local + remote-tracking branch SHAs)
 //! - `oz grep <pattern> [<rev>] [-- <paths...>]` (rev-scoped tree grep)
 
+#![allow(clippy::too_many_lines)]
+
 use clap::Parser;
 use oz_cli::Cli;
 use oz_github::{

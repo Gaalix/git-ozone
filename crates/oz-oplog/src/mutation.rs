@@ -130,7 +130,7 @@ impl MutationTransaction {
     }
 
     /// Captures post-mutation refs and workspace snapshots and appends an [`OpKind::Mutate`]
-    /// entry to the OpLog.
+    /// entry to the `OpLog`.
     pub fn finish(
         self,
         repo: &OzoneRepo,
@@ -293,9 +293,9 @@ impl PreparedMutation {
     }
 }
 
-/// Wraps a mutating operation in a pre/post OpLog transaction (`OpKind::Mutate`).
+/// Wraps a mutating operation in a pre/post `OpLog` transaction (`OpKind::Mutate`).
 ///
-/// If `mutate` returns `Err`, no OpLog entry is appended.
+/// If `mutate` returns `Err`, no `OpLog` entry is appended.
 pub fn record_mutation<T, F>(
     repo: &OzoneRepo,
     command: impl Into<String>,
@@ -365,15 +365,11 @@ fn snapshot_refs(
     let mut map = BTreeMap::new();
 
     if watch_all_branches {
-        let platform = gix_repo
-            .references()
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let branches = platform
-            .local_branches()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let platform = gix_repo.references().map_err(OzError::git_source)?;
+        let branches = platform.local_branches().map_err(OzError::git_source)?;
 
         for item in branches {
-            let mut reference = item.map_err(|err| OzError::Git(err.to_string()))?;
+            let mut reference = item.map_err(OzError::git_source)?;
             if matches!(reference.target(), gix::refs::TargetRef::Symbolic(_)) {
                 continue;
             }
@@ -390,15 +386,11 @@ fn snapshot_refs(
     }
 
     if watch_remote_refs {
-        let platform = gix_repo
-            .references()
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let remotes = platform
-            .remote_branches()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let platform = gix_repo.references().map_err(OzError::git_source)?;
+        let remotes = platform.remote_branches().map_err(OzError::git_source)?;
 
         for item in remotes {
-            let mut reference = item.map_err(|err| OzError::Git(err.to_string()))?;
+            let mut reference = item.map_err(OzError::git_source)?;
             if matches!(reference.target(), gix::refs::TargetRef::Symbolic(_)) {
                 continue;
             }

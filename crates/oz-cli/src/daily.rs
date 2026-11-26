@@ -172,11 +172,11 @@ pub struct LogArgs {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AiBadgeSummary {
-    pub client: String,
+pub(crate) struct AiBadgeSummary {
+    pub(crate) client: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    pub session_id: String,
+    pub(crate) model: Option<String>,
+    pub(crate) session_id: String,
 }
 
 impl From<&AiProvenanceNote> for AiBadgeSummary {
@@ -190,20 +190,20 @@ impl From<&AiProvenanceNote> for AiBadgeSummary {
 }
 
 #[derive(Debug, Serialize)]
-pub struct LogCliCommit {
+pub(crate) struct LogCliCommit {
     #[serde(flatten)]
-    pub entry: LogCommitEntry,
+    pub(crate) entry: LogCommitEntry,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ai_provenance: Option<AiBadgeSummary>,
+    pub(crate) ai_provenance: Option<AiBadgeSummary>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct LogCliData {
+pub(crate) struct LogCliData {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_rev: Option<String>,
-    pub unborn: bool,
-    pub total_returned: usize,
-    pub commits: Vec<LogCliCommit>,
+    pub(crate) target_rev: Option<String>,
+    pub(crate) unborn: bool,
+    pub(crate) total_returned: usize,
+    pub(crate) commits: Vec<LogCliCommit>,
 }
 
 pub(crate) fn handle_log(
@@ -445,11 +445,11 @@ pub struct ShowArgs {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ShowCliData {
+pub(crate) struct ShowCliData {
     #[serde(flatten)]
-    pub report: ShowReport,
+    pub(crate) report: ShowReport,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ai_provenance: Option<AiProvenanceNote>,
+    pub(crate) ai_provenance: Option<AiProvenanceNote>,
 }
 
 pub(crate) fn handle_show(
@@ -772,21 +772,21 @@ pub struct StashTargetArgs {
 }
 
 #[derive(Debug, Serialize)]
-pub struct StashPushCliData {
+pub(crate) struct StashPushCliData {
     #[serde(flatten)]
-    pub outcome: StashPushOutcome,
+    pub(crate) outcome: StashPushOutcome,
 }
 
 #[derive(Debug, Serialize)]
-pub struct StashPopCliData {
+pub(crate) struct StashPopCliData {
     #[serde(flatten)]
-    pub outcome: StashPopOutcome,
+    pub(crate) outcome: StashPopOutcome,
 }
 
 #[derive(Debug, Serialize)]
-pub struct StashDropCliData {
+pub(crate) struct StashDropCliData {
     #[serde(flatten)]
-    pub outcome: StashDropOutcome,
+    pub(crate) outcome: StashDropOutcome,
 }
 
 pub(crate) fn handle_stash(
@@ -1608,10 +1608,10 @@ pub struct CompletionsArgs {
 }
 
 #[derive(Debug, Serialize)]
-pub struct CompletionsData {
-    pub shell: CompletionShell,
-    pub binary: &'static str,
-    pub script: String,
+pub(crate) struct CompletionsData {
+    pub(crate) shell: CompletionShell,
+    pub(crate) binary: &'static str,
+    pub(crate) script: String,
 }
 
 pub(crate) fn handle_completions(

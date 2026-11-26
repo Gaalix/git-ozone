@@ -23,13 +23,13 @@
 //!      clean `git fsck --full`.
 //!
 //! 3. **Gate 2 — End-to-End Signed Stacked PR + CI Self-Healing + Sync Loop**:
-//!    - Spawns CoW workspaces -> creates pure-Rust Ed25519 SSH-signed commits verified by
+//!    - Spawns `CoW` workspaces -> creates pure-Rust Ed25519 SSH-signed commits verified by
 //!      system `git verify-commit` -> runs `pr_stack` against a unified local `tokio`
 //!      Smart-HTTP v2 + Mock GitHub REST/GraphQL server -> simulates failing CI check ->
 //!      `query_ci_status` extracts failing step & log excerpt -> amends fix preserving
 //!      `Change-Id:` + valid SSH signature -> re-pushes `--force-with-lease` -> simulates
 //!      upstream PR #1 merge -> `sync_repo` fast-forwards `main`, retargets PR #2 base to
-//!      `main`, rebases downstream stack, and GCs merged CoW workspace & checkpoint.
+//!      `main`, rebases downstream stack, and GCs merged `CoW` workspace & checkpoint.
 //!
 //! 4. **Gate 3 — End-to-End Agent Ecosystem & Provenance Loop**:
 //!    - `oz_agent::setup_agent_harnesses` across all 5 harnesses (Claude Code, Cursor,
@@ -38,6 +38,8 @@
 //!      automatic `refs/notes/ai` provenance interoperating with `git notes --ref=ai` ->
 //!      `oz_agent::blame_file` proving exact agent vs. human line attribution -> `oz_undo`
 //!      via MCP stdio.
+
+#![allow(clippy::too_many_lines)]
 
 use base64::Engine;
 use oz_agent::{
@@ -766,16 +768,21 @@ impl VcBenchTaskSummary {
     }
 
     fn cmd_reduction_pct(&self) -> f64 {
-        100.0 * (1.0 - (self.oz_commands as f64 / self.git_commands as f64))
+        100.0 * (1.0 - (usize_to_f64(self.oz_commands) / usize_to_f64(self.git_commands)))
     }
 
     fn approx_token_reduction_pct(&self) -> f64 {
-        100.0 * (1.0 - (self.oz_approx_tokens as f64 / self.git_approx_tokens as f64))
+        100.0 * (1.0 - (usize_to_f64(self.oz_approx_tokens) / usize_to_f64(self.git_approx_tokens)))
     }
 
     fn lexical_token_reduction_pct(&self) -> f64 {
-        100.0 * (1.0 - (self.oz_lexical_tokens as f64 / self.git_lexical_tokens as f64))
+        100.0
+            * (1.0 - (usize_to_f64(self.oz_lexical_tokens) / usize_to_f64(self.git_lexical_tokens)))
     }
+}
+
+fn usize_to_f64(n: usize) -> f64 {
+    f64::from(u32::try_from(n).expect("metric count fits u32"))
 }
 
 /// Generates a realistic ~105-line Rust module with 3 distinct functional sections (`section_a`,
@@ -783,9 +790,9 @@ impl VcBenchTaskSummary {
 /// validation logic so diff context windows (`U3`) form genuine, non-overlapping hunks.
 fn render_three_section_rust_module(
     module_title: &str,
-    sec_a_body: &str,
-    sec_b_body: &str,
-    sec_c_body: &str,
+    first_body: &str,
+    second_body: &str,
+    third_body: &str,
 ) -> String {
     let mut lines = Vec::with_capacity(115);
     lines.push(format!("//! {module_title} — production service module."));
@@ -805,7 +812,7 @@ fn render_three_section_rust_module(
 
     // Section A (~L15-L24)
     lines.push("/// Primary section A entrypoint.".to_string());
-    for l in sec_a_body.lines() {
+    for l in first_body.lines() {
         lines.push(l.to_string());
     }
     lines.push(String::new());
@@ -825,7 +832,7 @@ fn render_three_section_rust_module(
 
     // Section B (~L68-L78)
     lines.push("/// Secondary section B handler.".to_string());
-    for l in sec_b_body.lines() {
+    for l in second_body.lines() {
         lines.push(l.to_string());
     }
     lines.push(String::new());
@@ -846,7 +853,7 @@ fn render_three_section_rust_module(
 
     // Section C (~L120+)
     lines.push("/// Tertiary section C finalize routine.".to_string());
-    for l in sec_c_body.lines() {
+    for l in third_body.lines() {
         lines.push(l.to_string());
     }
     lines.push(String::new());
@@ -1655,10 +1662,11 @@ fn vcbench_agent_eval_exit_gate_commands_and_tokens() {
     let total_git_lex_toks: usize = results.iter().map(|r| r.git_lexical_tokens).sum();
     let total_oz_lex_toks: usize = results.iter().map(|r| r.oz_lexical_tokens).sum();
 
-    let agg_cmd_red = 100.0 * (1.0 - (total_oz_cmds as f64 / total_git_cmds as f64));
-    let agg_approx_red =
-        100.0 * (1.0 - (total_oz_approx_toks as f64 / total_git_approx_toks as f64));
-    let agg_lex_red = 100.0 * (1.0 - (total_oz_lex_toks as f64 / total_git_lex_toks as f64));
+    let agg_cmd_red = 100.0 * (1.0 - (usize_to_f64(total_oz_cmds) / usize_to_f64(total_git_cmds)));
+    let agg_approx_red = 100.0
+        * (1.0 - (usize_to_f64(total_oz_approx_toks) / usize_to_f64(total_git_approx_toks)));
+    let agg_lex_red =
+        100.0 * (1.0 - (usize_to_f64(total_oz_lex_toks) / usize_to_f64(total_git_lex_toks)));
 
     println!(
         "\n=========================================================================================="
@@ -1750,18 +1758,15 @@ fn vcbench_agent_eval_exit_gate_commands_and_tokens() {
     // - Aggregate tokens:   >= 50% reduction (`oz_tokens * 100 <= git_tokens * 50`) on BOTH metrics!
     assert!(
         total_oz_cmds * 100 <= total_git_cmds * 40,
-        "VCBench Exit Gate FAILED: expected >= 60% command reduction, got {:.2}% (oz={total_oz_cmds}, git={total_git_cmds})",
-        agg_cmd_red
+        "VCBench Exit Gate FAILED: expected >= 60% command reduction, got {agg_cmd_red:.2}% (oz={total_oz_cmds}, git={total_git_cmds})"
     );
     assert!(
         total_oz_approx_toks * 100 <= total_git_approx_toks * 50,
-        "VCBench Exit Gate FAILED: expected >= 50% ceil(bytes/4) token reduction, got {:.2}% (oz={total_oz_approx_toks}, git={total_git_approx_toks})",
-        agg_approx_red
+        "VCBench Exit Gate FAILED: expected >= 50% ceil(bytes/4) token reduction, got {agg_approx_red:.2}% (oz={total_oz_approx_toks}, git={total_git_approx_toks})"
     );
     assert!(
         total_oz_lex_toks * 100 <= total_git_lex_toks * 50,
-        "VCBench Exit Gate FAILED: expected >= 50% lexical token reduction, got {:.2}% (oz={total_oz_lex_toks}, git={total_git_lex_toks})",
-        agg_lex_red
+        "VCBench Exit Gate FAILED: expected >= 50% lexical token reduction, got {agg_lex_red:.2}% (oz={total_oz_lex_toks}, git={total_git_lex_toks})"
     );
 }
 
@@ -1867,7 +1872,7 @@ async fn handle_unified_http_conn(
     let body = read_http_body(&mut reader, &headers).await?;
 
     let (expected_token, bare_repo) = {
-        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (guard.expected_token.clone(), guard.bare_repo.clone())
     };
     let expected_basic = format!(
@@ -1893,8 +1898,7 @@ async fn handle_unified_http_conn(
 
     let (path, query) = raw_target
         .split_once('?')
-        .map(|(p, q)| (p, Some(q)))
-        .unwrap_or((raw_target.as_str(), None));
+        .map_or((raw_target.as_str(), None), |(p, q)| (p, Some(q)));
     let git_protocol = headers.get("git-protocol").cloned();
 
     // 1. Smart-HTTP Git Wire v2 endpoints
@@ -1971,7 +1975,7 @@ async fn handle_unified_http_conn(
     // 2. GitHub REST & GraphQL API endpoints
     let query_map = parse_query_map(query);
     let (status, content_type, resp_bytes) = {
-        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         route_github_api(&method, path, &query_map, &body, &mut guard)
     };
     write_http_response(&mut write_half, status, content_type, &resp_bytes).await
@@ -2001,7 +2005,7 @@ fn route_github_api(
         let tail = &segs[3..];
 
         if method == "GET" && tail == ["pulls"] {
-            let state_filter = query.get("state").map(String::as_str).unwrap_or("open");
+            let state_filter = query.get("state").map_or("open", String::as_str);
             let head_filter = query.get("head").map(String::as_str);
             let base_filter = query.get("base").map(String::as_str);
 
@@ -2011,7 +2015,7 @@ fn route_github_api(
                 .filter(|pr| {
                     (state_filter == "all" || pr.state == state_filter)
                         && head_filter.is_none_or(|hf| {
-                            let short = hf.split_once(':').map(|(_, b)| b).unwrap_or(hf);
+                            let short = hf.split_once(':').map_or(hf, |(_, b)| b);
                             pr.head.ref_name == short
                         })
                         && base_filter.is_none_or(|bf| pr.base.ref_name == bf)
@@ -2257,7 +2261,7 @@ fn parse_query_map(query: Option<&str>) -> HashMap<String, String> {
     map
 }
 
-/// Spawns a CoW workspace using the platform's primary backend (`LinuxFuse3`, `MacosClonefile`,
+/// Spawns a `CoW` workspace using the platform's primary backend (`LinuxFuse3`, `MacosClonefile`,
 /// `WindowsProjFs`, etc.), falling back cleanly to `BackendKind::CasHardlink` only inside
 /// unprivileged container sandboxes where `fusermount3` is blocked (`Operation not permitted`).
 fn spawn_cow_workspace(repo: &OzoneRepo, mut opts: SpawnWorkspaceOptions) -> SpawnedWorkspaceInfo {

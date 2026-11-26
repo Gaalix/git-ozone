@@ -127,7 +127,7 @@ pub fn detect_harnesses(repo_root: &Path) -> Vec<AgentHarness> {
 
 /// Detects harnesses purely from repository-local marker files and directories.
 #[must_use]
-pub fn detect_repo_harnesses(repo_root: &Path) -> Vec<AgentHarness> {
+pub(crate) fn detect_repo_harnesses(repo_root: &Path) -> Vec<AgentHarness> {
     let mut set = BTreeSet::new();
 
     if repo_root.join(".claude").exists() || repo_root.join("CLAUDE.md").is_file() {
@@ -154,7 +154,7 @@ pub fn detect_repo_harnesses(repo_root: &Path) -> Vec<AgentHarness> {
 
 /// Detects harnesses across repository markers, optional `home_dir`, and explicit `env_vars`.
 #[must_use]
-pub fn detect_harnesses_with_context(
+pub(crate) fn detect_harnesses_with_context(
     repo_root: &Path,
     home_dir: Option<&Path>,
     env_vars: &BTreeMap<String, String>,
@@ -189,7 +189,7 @@ pub fn detect_harnesses_with_context(
 /// Detects harnesses from environment variables (`CLAUDECODE`, `CLAUDE_CODE_*`,
 /// `CURSOR_TRACE_ID`, `CODEX_*`, `WINDSURF_*`, `ANTIGRAVITY_*`).
 #[must_use]
-pub fn detect_env_harnesses(env_vars: &BTreeMap<String, String>) -> Vec<AgentHarness> {
+pub(crate) fn detect_env_harnesses(env_vars: &BTreeMap<String, String>) -> Vec<AgentHarness> {
     let mut set = BTreeSet::new();
 
     if has_nonempty_env(env_vars, "CLAUDECODE")
@@ -427,7 +427,7 @@ fn has_prefix_env(env: &BTreeMap<String, String>, prefix: &str) -> bool {
 /// Designed for progressive disclosure: keeps per-turn context lean with critical Git-vs-Ozone
 /// behavioral differences, a concise command map, and pointers to `SKILL.md` / `oz <cmd> --help`.
 #[must_use]
-pub fn render_ozone_rule_body() -> &'static str {
+pub(crate) fn render_ozone_rule_body() -> &'static str {
     "\
 # Ozone (`oz`) Guidelines
 
@@ -454,7 +454,7 @@ For multi-step workflows (conflict resolution in `../<repo>.oz/_integrate`, work
 
 /// Comprehensive on-demand Ozone workflow body written into `SKILL.md` templates.
 #[must_use]
-pub fn render_ozone_workflow_body() -> &'static str {
+pub(crate) fn render_ozone_workflow_body() -> &'static str {
     "\
 # Ozone (`oz`) Agent Workflow Guide
 
@@ -896,17 +896,17 @@ mod tests {
         let dry_report = setup_agent_harnesses(dir.path(), &dry_opts).expect("dry run");
         assert!(dry_report.check_only);
         assert_eq!(dry_report.harnesses, AgentHarness::ALL.to_vec());
-        assert!(!dry_report.created.is_empty());
-        assert!(dry_report.updated.is_empty());
-        assert!(dry_report.unchanged.is_empty());
+        assert_ne!(dry_report.created.len(), 0);
+        assert_eq!(dry_report.updated, Vec::<PathBuf>::new());
+        assert_eq!(dry_report.unchanged, Vec::<PathBuf>::new());
         assert!(!dir.path().join(".claude/skills/oz/SKILL.md").exists());
 
         // Real setup creates all skill, rule, AGENTS.md, and hook files.
         let first = setup_agent_harnesses(dir.path(), &opts).expect("first setup");
         assert!(!first.check_only);
         assert_eq!(first.created.len(), dry_report.created.len());
-        assert!(first.updated.is_empty());
-        assert!(first.unchanged.is_empty());
+        assert_eq!(first.updated, Vec::<PathBuf>::new());
+        assert_eq!(first.unchanged, Vec::<PathBuf>::new());
 
         for expected_rel in [
             ".claude/skills/oz/SKILL.md",
@@ -954,8 +954,8 @@ mod tests {
         // Second run must be 100% idempotent (zero created, zero updated, all unchanged).
         let second = setup_agent_harnesses(dir.path(), &opts).expect("second setup");
         assert!(second.is_up_to_date());
-        assert!(second.created.is_empty());
-        assert!(second.updated.is_empty());
+        assert_eq!(second.created, Vec::<PathBuf>::new());
+        assert_eq!(second.updated, Vec::<PathBuf>::new());
         assert_eq!(second.unchanged.len(), first.created.len());
     }
 

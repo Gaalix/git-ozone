@@ -5,6 +5,8 @@
 //! guardrails, collision radar, in-memory integration, conflict sandbox resolution,
 //! `--verify`, main working-tree + `.git/index` sync, stacked rebasing, and `< 10 ms` undo.
 
+#![allow(clippy::too_many_lines)]
+
 use oz_core::{BackendKind, CommitOptions, OzError, OzoneRepo, commit_changes, compute_status};
 use oz_cow::{RemoveWorkspaceOptions, SpawnWorkspaceOptions, remove_workspace, spawn_workspace};
 use oz_integrate::{
@@ -217,7 +219,10 @@ deny = ["Cargo.lock"]
 
 #[test]
 fn radar_detects_overlapping_out_of_scope_and_same_file_different_lines_with_projection() {
-    let lines: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+    let lines = (1..=100).fold(String::new(), |mut acc, i| {
+        let _ = writeln!(acc, "line {i}");
+        acc
+    });
     let (_tmp, repo_root, repo) = init_test_repo(&[
         ("crates/core/src/session.rs", &lines),
         ("crates/core/src/other.rs", &lines),
@@ -337,7 +342,10 @@ fn radar_detects_overlapping_out_of_scope_and_same_file_different_lines_with_pro
 
 #[test]
 fn integrate_clean_syncs_main_worktree_index_and_supports_sub_10ms_undo() {
-    let lines: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    let lines = (1..=30).fold(String::new(), |mut acc, i| {
+        let _ = writeln!(acc, "line {i}");
+        acc
+    });
     let (_tmp, repo_root, repo) =
         init_test_repo(&[("shared.txt", &lines), ("obsolete.txt", "remove me\n")]);
     let old_main_oid = run_git(&repo_root, &["rev-parse", "HEAD"]);
@@ -1105,7 +1113,10 @@ fn stack_rebase_conflict_leaves_refs_untouched_and_supports_resolve_continue_abo
 
 #[test]
 fn radar_handles_add_add_delete_modify_binary_and_multi_hunk_spans() {
-    let base_text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    let base_text = (1..=40).fold(String::new(), |mut acc, i| {
+        let _ = writeln!(acc, "line {i}");
+        acc
+    });
     let (_tmp, repo_root, repo) =
         init_test_repo(&[("multi.txt", &base_text), ("to_del.txt", "a\nb\nc\n")]);
     fs::write(repo_root.join("asset.bin"), [0u8, 1, 2]).expect("write bin");

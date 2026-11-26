@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// If the caller's process CWD was inside a dead FUSE3 mountpoint (causing `current_dir()` to fail
 /// with `ENOTCONN`), re-anchors CWD onto the freshly remounted workspace path and re-discovers
 /// [`OzoneRepo`] so `mount_health` reflects the healthy mount.
-pub fn discover_and_recover_repo(
+pub(crate) fn discover_and_recover_repo(
     directory: Option<&Path>,
     recover_all_ws: bool,
 ) -> Result<OzoneRepo> {

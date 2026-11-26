@@ -3,15 +3,18 @@
 
 //! End-to-end Milestone 2 exit-gate verification suite covering:
 //! 1. 10-process concurrent `oz commit` stress test on real Linux `ext4` FUSE3 (and OS native/fallback)
-//! 2. Windows NTFS ProjFS 10-workspace space/speed gate + cross-OS `oz doctor` & `oz setup --enable-projfs`
+//! 2. Windows NTFS `ProjFS` 10-workspace space/speed gate + cross-OS `oz doctor` & `oz setup --enable-projfs`
 //! 3. Guardrails (`--scope`/`--deny`, `out_of_scope` status warnings, exit-2 blocking) & live `oz radar --json`
 //! 4. Atomic in-memory `oz integrate`, `_integrate/` sandbox, `oz resolve`, `--verify`, & `oz stack rebase`
 //! 5. `oz git` compatibility shim (`merge`/`rebase` via `oz-integrate`, `add`/`status`/`diff`/`worktree`/`clone`) & `reset --hard` `< 10 ms` undo
+
+#![allow(clippy::too_many_lines)]
 
 use oz_core::{MountRecord, OZ_SCHEMA_V1, OzoneLayout};
 use oz_oplog::{OpLogEntry, list_entries, read_head_op_id};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -88,7 +91,7 @@ fn ensure_oz_vfsd_bin() -> &'static PathBuf {
 }
 
 /// Cross-platform RAII sandbox rooted on real `ext4`/`NTFS`/`APFS` (`CARGO_TARGET_TMPDIR`)
-/// with short tempdir prefixes (`oz-m2-`) so Unix `SUN_LEN` (< 108 bytes) and AppArmor pass.
+/// with short tempdir prefixes (`oz-m2-`) so Unix `SUN_LEN` (< 108 bytes) and `AppArmor` pass.
 struct GateSandbox {
     root: PathBuf,
     repo_root: PathBuf,
@@ -907,7 +910,10 @@ fn gate_m2_guardrails_and_live_radar() {
     let mut sandbox = GateSandbox::new("g3");
     let repo = sandbox.repo_root.clone();
 
-    let hundred_lines: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+    let mut hundred_lines = String::new();
+    for i in 1..=100 {
+        let _ = writeln!(hundred_lines, "line {i}");
+    }
     write_repo_file(&repo, "crates/auth/src/lib.rs", "pub fn auth() {}\n");
     write_repo_file(&repo, "crates/billing/src/lib.rs", "pub fn bill() {}\n");
     write_repo_file(&repo, "crates/core/src/session.rs", &hundred_lines);
@@ -1018,9 +1024,9 @@ fn gate_m2_guardrails_and_live_radar() {
         "expected exit 2 on integrate: {}",
         blocked_int.stdout
     );
-    let bi_json = blocked_int.json.expect("blocked integrate json");
-    assert_eq!(bi_json["ok"], false);
-    assert_eq!(bi_json["error"]["code"], "guardrail_violation");
+    let blocked_int_json = blocked_int.json.expect("blocked integrate json");
+    assert_eq!(blocked_int_json["ok"], false);
+    assert_eq!(blocked_int_json["error"]["code"], "guardrail_violation");
     assert_eq!(sys_git(&repo, &["rev-parse", "main"]), base_oid);
 
     let override_int = run_oz(
@@ -1364,10 +1370,10 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
 
     // Also verify `oz integrate --abort --json`.
     let abort_pre_main = sys_git(&repo, &["rev-parse", "main"]);
-    let ws_a1 = sandbox.ws_path("ws-a1");
-    let ws_a2 = sandbox.ws_path("ws-a2");
-    sandbox.register_mount(ws_a1.clone());
-    sandbox.register_mount(ws_a2.clone());
+    let abort_ws_1 = sandbox.ws_path("ws-a1");
+    let abort_ws_2 = sandbox.ws_path("ws-a2");
+    sandbox.register_mount(abort_ws_1.clone());
+    sandbox.register_mount(abort_ws_2.clone());
     assert_eq!(
         run_oz(&repo, &["ws", "spawn", "ws-a1", "--no-warm", "--json"]).code,
         0
@@ -1376,10 +1382,16 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
         run_oz(&repo, &["ws", "spawn", "ws-a2", "--no-warm", "--json"]).code,
         0
     );
-    write_repo_file(&ws_a1, "app.txt", "abort-a1\n");
-    assert_eq!(run_oz(&ws_a1, &["commit", "-m", "a1", "--json"]).code, 0);
-    write_repo_file(&ws_a2, "app.txt", "abort-a2\n");
-    assert_eq!(run_oz(&ws_a2, &["commit", "-m", "a2", "--json"]).code, 0);
+    write_repo_file(&abort_ws_1, "app.txt", "abort-a1\n");
+    assert_eq!(
+        run_oz(&abort_ws_1, &["commit", "-m", "a1", "--json"]).code,
+        0
+    );
+    write_repo_file(&abort_ws_2, "app.txt", "abort-a2\n");
+    assert_eq!(
+        run_oz(&abort_ws_2, &["commit", "-m", "a2", "--json"]).code,
+        0
+    );
     assert_eq!(
         run_oz(
             &repo,
@@ -1399,10 +1411,10 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
     assert_eq!(sys_git(&repo, &["rev-parse", "main"]), abort_pre_main);
 
     // 4. `oz stack rebase` preserving `Change-Id:` trailers + `oz stack status --json` + `< 10 ms` `oz undo`.
-    let ws_s1 = sandbox.ws_path("stack-1");
-    let ws_s2 = sandbox.ws_path("stack-2");
-    sandbox.register_mount(ws_s1.clone());
-    sandbox.register_mount(ws_s2.clone());
+    let stack_ws_1 = sandbox.ws_path("stack-1");
+    let stack_ws_2 = sandbox.ws_path("stack-2");
+    sandbox.register_mount(stack_ws_1.clone());
+    sandbox.register_mount(stack_ws_2.clone());
     assert_eq!(
         run_oz(
             &repo,
@@ -1421,8 +1433,8 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
         .code,
         0
     );
-    write_repo_file(&ws_s1, "stack1.txt", "s1\n");
-    let cs1 = run_oz(&ws_s1, &["commit", "-m", "feat: stack 1", "--json"]);
+    write_repo_file(&stack_ws_1, "stack1.txt", "s1\n");
+    let cs1 = run_oz(&stack_ws_1, &["commit", "-m", "feat: stack 1", "--json"]);
     assert_eq!(cs1.code, 0);
     let cid1 = cs1.json.expect("cs1 json")["data"]["change_id"]
         .as_str()
@@ -1447,8 +1459,8 @@ fn gate_m2_integrate_sandbox_resolve_verify_and_stack_rebase() {
         .code,
         0
     );
-    write_repo_file(&ws_s2, "stack2.txt", "s2\n");
-    let cs2 = run_oz(&ws_s2, &["commit", "-m", "feat: stack 2", "--json"]);
+    write_repo_file(&stack_ws_2, "stack2.txt", "s2\n");
+    let cs2 = run_oz(&stack_ws_2, &["commit", "-m", "feat: stack 2", "--json"]);
     assert_eq!(cs2.code, 0);
     let cid2 = cs2.json.expect("cs2 json")["data"]["change_id"]
         .as_str()

@@ -13,6 +13,8 @@
 //! - `oz log` (multi-rev, `A...B --left-right`, `-i`, `--no-notes`, `--format fuller`)
 //! - `oz show <missing-hex-sha>` hinting `oz fetch`
 
+#![allow(clippy::too_many_lines)]
+
 use clap::Parser;
 use oz_cli::Cli;
 use oz_github::{
@@ -631,11 +633,16 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
                     }])
                     .unwrap(),
                 ),
-                ("GET", "/repos/acme/demo/pulls/3341/reviews") => ("200 OK", b"[]".to_vec()),
+                (
+                    "GET",
+                    "/repos/acme/demo/pulls/3341/reviews"
+                    | "/repos/acme/demo/pulls/3341/comments"
+                    | "/repos/acme/demo/issues/3340/comments",
+                ) => ("200 OK", b"[]".to_vec()),
                 ("GET", "/repos/acme/demo/pulls/3340/comments") => (
                     "200 OK",
                     serde_json::to_vec(&vec![GitHubPullRequestComment {
-                        id: 4694921942,
+                        id: 4_694_921_942,
                         path: "src/app.ts".to_string(),
                         line: Some(12),
                         side: Some("RIGHT".to_string()),
@@ -647,16 +654,14 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
                     }])
                     .unwrap(),
                 ),
-                ("GET", "/repos/acme/demo/pulls/3341/comments") => ("200 OK", b"[]".to_vec()),
-                ("GET", "/repos/acme/demo/issues/3340/comments") => ("200 OK", b"[]".to_vec()),
                 ("POST", "/repos/acme/demo/pulls/3340/comments/4694921942/replies") => {
                     let req_json: Value = serde_json::from_str(&body_str).unwrap_or_default();
                     let reply_body = req_json["body"].as_str().unwrap_or("").to_string();
                     (
                         "201 Created",
                         serde_json::to_vec(&GitHubPullRequestComment {
-                            id: 4694929999,
-                            in_reply_to_id: Some(4694921942),
+                            id: 4_694_929_999,
+                            in_reply_to_id: Some(4_694_921_942),
                             path: "src/app.ts".to_string(),
                             line: Some(12),
                             side: Some("RIGHT".to_string()),
@@ -711,7 +716,7 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
                                                     "id": "PRRT_kwDO_t1",
                                                     "isResolved": false,
                                                     "isOutdated": false,
-                                                    "comments": { "nodes": [{ "databaseId": 4694921942u64 }] }
+                                                    "comments": { "nodes": [{ "databaseId": 4_694_921_942_u64 }] }
                                                 }]
                                             }
                                         }
@@ -745,7 +750,7 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
                             color: None,
                             description: None,
                         }],
-                        pull_request: is_pr.then_some(Default::default()),
+                        pull_request: is_pr.then(oz_github::GitHubIssuePullRequestRef::default),
                         ..Default::default()
                     };
                     (
@@ -938,7 +943,10 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
         String::from_utf8_lossy(&reply.stderr)
     );
     let reply_json: Value = serde_json::from_slice(&reply.stdout).unwrap();
-    assert_eq!(reply_json["data"]["in_reply_to_comment_id"], 4694921942u64);
+    assert_eq!(
+        reply_json["data"]["in_reply_to_comment_id"],
+        4_694_921_942_u64
+    );
     assert_eq!(reply_json["data"]["resolved"], true);
     assert_eq!(reply_json["data"]["reply"]["body"], "Fixed in commit");
 
@@ -985,7 +993,7 @@ fn github_pr_lifecycle_issue_and_compact_ci_work_against_mock_server() {
     assert!(brief.status.success());
     let brief_json: Value = serde_json::from_slice(&brief.stdout).unwrap();
     assert!(brief_json["data"]["pull_request"]["body"].is_null());
-    assert!(brief_json["data"]["files"].as_array().unwrap().is_empty());
+    assert_eq!(brief_json["data"]["files"].as_array().unwrap().len(), 0);
 
     // 6. `oz pr list --state merged --search cleos --json` & `oz issue list` & `oz issue comment`
     let pr_list = run_oz_env(

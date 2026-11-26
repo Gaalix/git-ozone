@@ -4,28 +4,26 @@
 //! Coding agent harness installers (`oz agent setup`), `oz mcp` server, `refs/notes/ai`
 //! provenance engine, and `oz blame` human vs. agent line attribution.
 
-pub mod blame;
-pub mod mcp;
-pub mod notes;
-pub mod setup;
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::struct_excessive_bools
+)]
+
+pub(crate) mod blame;
+pub(crate) mod mcp;
+pub(crate) mod notes;
+pub(crate) mod setup;
 
 pub use blame::{BlameLine, BlameOptions, BlameReport, blame_file, format_blame_report};
-pub use mcp::{
-    CiLogEntry, CiLogProvider, CiLogsReport, CiLogsRequest, JSONRPC_INTERNAL_ERROR,
-    JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR,
-    MCP_PROTOCOL_VERSION_2024, MCP_PROTOCOL_VERSION_2025, McpCallToolResult, McpServer,
-    McpToolContent, MessageFraming, mcp_tool_definitions,
-};
+pub use mcp::{CiLogEntry, CiLogProvider, CiLogsReport, CiLogsRequest, McpServer};
 pub use notes::{
-    AI_NOTES_REF, AI_PROVENANCE_SCHEMA_VERSION, DetectedAgentSession, ProvenanceOptions,
-    compute_commit_line_attributions, detect_agent_session, detect_agent_session_from_map,
-    list_provenance_notes, read_provenance_note, record_commit_provenance, write_provenance_note,
+    DetectedAgentSession, ProvenanceOptions, compute_commit_line_attributions,
+    detect_agent_session, list_provenance_notes, read_provenance_note, record_commit_provenance,
 };
 pub use setup::{
     AGENTS_MD_END_MARKER, AGENTS_MD_START_MARKER, AgentSetupOptions, AgentSetupReport,
-    OZ_CHECKPOINT_HOOK_CMD, detect_env_harnesses, detect_harnesses, detect_harnesses_with_context,
-    detect_repo_harnesses, render_ozone_rule_body, render_ozone_workflow_body,
-    setup_agent_harnesses,
+    OZ_CHECKPOINT_HOOK_CMD, detect_harnesses, setup_agent_harnesses,
 };
 
 use chrono::{DateTime, Utc};

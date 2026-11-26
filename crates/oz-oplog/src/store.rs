@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Append-only MVCC OpLog persistence under `.git/ozone/oplog/`.
+//! Append-only MVCC `OpLog` persistence under `.git/ozone/oplog/`.
 
 use crate::types::OpLogEntry;
 use fs4::FileExt;
@@ -12,35 +12,41 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-static IN_PROCESS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static IN_PROCESS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 
 pub(crate) fn process_oplog_mutex(oplog_dir: &Path) -> Arc<Mutex<()>> {
     let key = fs::canonicalize(oplog_dir).unwrap_or_else(|_| oplog_dir.to_path_buf());
     let map_mutex = IN_PROCESS_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = map_mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Arc::clone(map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    map.retain(|_, weak| weak.strong_count() > 0);
+    let arc = Arc::new(Mutex::new(()));
+    map.insert(key, Arc::downgrade(&arc));
+    arc
 }
 
 /// Returns `.git/ozone/oplog/ops/`.
 #[must_use]
-pub fn ops_dir(layout: &OzoneLayout) -> PathBuf {
+pub(crate) fn ops_dir(layout: &OzoneLayout) -> PathBuf {
     layout.oplog_dir().join("ops")
 }
 
 /// Returns `.git/ozone/oplog/HEAD`.
 #[must_use]
-pub fn head_path(layout: &OzoneLayout) -> PathBuf {
+pub(crate) fn head_path(layout: &OzoneLayout) -> PathBuf {
     layout.oplog_dir().join("HEAD")
 }
 
 /// Returns `.git/ozone/oplog/HEAD.lock`.
 #[must_use]
-pub fn head_lock_path(layout: &OzoneLayout) -> PathBuf {
+pub(crate) fn head_lock_path(layout: &OzoneLayout) -> PathBuf {
     layout.oplog_dir().join("HEAD.lock")
 }
 
@@ -137,7 +143,7 @@ pub(crate) fn lock_head<'a>(
     ensure_oplog_dirs(layout)?;
     let proc_guard = proc_mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -148,7 +154,7 @@ pub(crate) fn lock_head<'a>(
     loop {
         match FileExt::lock(&lock_file) {
             Ok(()) => break,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(err) => return Err(OzError::Io(err)),
         }
     }
@@ -262,7 +268,7 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-/// Lazily walks the OpLog backwards from `oplog/HEAD` in reverse causal/chronological order,
+/// Lazily walks the `OpLog` backwards from `oplog/HEAD` in reverse causal/chronological order,
 /// invoking `visitor` for each entry until `visitor` returns `Ok(false)` (stop) or all reachable
 /// entries are visited.
 pub(crate) fn walk_entries_rev<F>(layout: &OzoneLayout, mut visitor: F) -> Result<()>
@@ -295,7 +301,7 @@ where
     Ok(())
 }
 
-/// Lists all OpLog entries in chronological order (oldest to newest), reconstructing the causal
+/// Lists all `OpLog` entries in chronological order (oldest to newest), reconstructing the causal
 /// DAG from `oplog/HEAD` and including any unlinked `ops/*.json` entries if present.
 pub fn list_entries(layout: &OzoneLayout) -> Result<Vec<OpLogEntry>> {
     let ops = ops_dir(layout);
@@ -320,7 +326,10 @@ pub fn list_entries(layout: &OzoneLayout) -> Result<Vec<OpLogEntry>> {
         let Some(name_str) = file_name.to_str() else {
             continue;
         };
-        if name_str.starts_with('.') || !name_str.ends_with(".json") {
+        let has_json_ext = Path::new(name_str)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if name_str.starts_with('.') || !has_json_ext {
             continue;
         }
         let op_id = &name_str[..name_str.len() - ".json".len()];
@@ -344,4 +353,47 @@ pub fn list_entries(layout: &OzoneLayout) -> Result<Vec<OpLogEntry>> {
     }
 
     Ok(ordered_rev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn process_oplog_mutex_reuses_live_arc_and_prunes_dead_entries() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir_a = tmp.path().join("oplog-a");
+        let dir_b = tmp.path().join("oplog-b");
+        fs::create_dir_all(&dir_a).expect("mkdir a");
+        fs::create_dir_all(&dir_b).expect("mkdir b");
+        let canon_a = fs::canonicalize(&dir_a).expect("canon a");
+        let canon_b = fs::canonicalize(&dir_b).expect("canon b");
+
+        let live_1 = process_oplog_mutex(&dir_a);
+        let live_2 = process_oplog_mutex(&dir_a);
+        assert!(Arc::ptr_eq(&live_1, &live_2));
+
+        drop(live_1);
+        drop(live_2);
+
+        // Allocating a mutex for another path prunes dropped Weak entries (`canon_a`).
+        let live_b = process_oplog_mutex(&dir_b);
+        {
+            let map = IN_PROCESS_LOCKS
+                .get()
+                .expect("locks initialized")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !map.contains_key(&canon_a),
+                "dead Weak entry for oplog-a must be pruned once its Arc drops"
+            );
+            assert!(
+                map.get(&canon_b).and_then(Weak::upgrade).is_some(),
+                "live Weak entry for oplog-b must remain upgradable"
+            );
+        }
+        drop(live_b);
+    }
 }

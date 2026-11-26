@@ -36,7 +36,7 @@ pub(crate) fn find_latest_ws_snapshot(
 /// Captures an `O(dirty_files)` snapshot of uncommitted working-tree edits into `.git/objects/`,
 /// builds a real Git `dirty_tree` via `gix::objs::tree::Editor` over `base_tree`, updates
 /// `refs/ozone/checkpoints/<ws>` (and `refs/ozone/op-checkpoints/<ws>/<op_id>`), and appends
-/// an [`OpKind::Checkpoint`] entry to the MVCC OpLog.
+/// an [`OpKind::Checkpoint`] entry to the MVCC `OpLog`.
 pub fn checkpoint(
     repo: &OzoneRepo,
     command: &str,
@@ -62,17 +62,18 @@ pub fn checkpoint(
 
     let prev_checkpoint_oid = read_ref_oid_hex(&gix_repo, &checkpoint_ref)?;
 
-    let cp_full = FullName::try_from(checkpoint_ref.as_str())
-        .map_err(|err| OzError::Git(format!("invalid checkpoint ref '{checkpoint_ref}': {err}")))?;
+    let cp_full = FullName::try_from(checkpoint_ref.as_str()).map_err(|err| {
+        OzError::git_context(format!("invalid checkpoint ref '{checkpoint_ref}'"), err)
+    })?;
     let op_cp_full = FullName::try_from(op_checkpoint_ref.as_str()).map_err(|err| {
-        OzError::Git(format!(
-            "invalid op checkpoint ref '{op_checkpoint_ref}': {err}"
-        ))
+        OzError::git_context(
+            format!("invalid op checkpoint ref '{op_checkpoint_ref}'"),
+            err,
+        )
     })?;
 
-    let reflog_msg = message
-        .map(|m| format!("oz checkpoint: {m}"))
-        .unwrap_or_else(|| format!("oz checkpoint {op_id}"));
+    let reflog_msg =
+        message.map_or_else(|| format!("oz checkpoint {op_id}"), |m| format!("oz checkpoint: {m}"));
 
     let edits = [
         RefEdit::update(cp_full, dirty_tree, PreviousValue::Any, reflog_msg.as_str()),
@@ -85,7 +86,7 @@ pub fn checkpoint(
     ];
     gix_repo
         .edit_references(edits)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let prior_snap = find_latest_ws_snapshot(&repo.layout, &ws_key)?;
     let pre_slice = match prior_snap {

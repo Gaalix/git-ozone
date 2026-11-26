@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
-/// Compacts `.git/ozone/oplog/` and removes expired OpLog entries and checkpoint snapshot refs
+/// Compacts `.git/ozone/oplog/` and removes expired `OpLog` entries and checkpoint snapshot refs
 /// while preserving `oplog/HEAD`, active workspace heads, undo-chain consistency, and all
 /// Git objects referenced by surviving entries.
 pub fn compact_oplog(repo: &OzoneRepo, opts: &OpLogGcOptions) -> Result<OpLogGcOutcome> {
@@ -176,16 +176,14 @@ pub fn compact_oplog(repo: &OzoneRepo, opts: &OpLogGcOptions) -> Result<OpLogGcO
     let pruned_checkpoint_refs = collect_stale_op_checkpoint_refs(&gix_repo, &keep_ids)?;
     let preserved_object_count = count_referenced_objects(&entries, &keep_ids);
 
-    let head_bytes = fs::metadata(head_path(layout))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let head_bytes = fs::metadata(head_path(layout)).map_or(0, |m| m.len());
     let mut reclaimed_bytes = 0u64;
     for id in &removed_entries {
         reclaimed_bytes += file_sizes.get(id).copied().unwrap_or(0);
     }
     let mut removed_temp_files = Vec::new();
     for tmp in &temp_files {
-        reclaimed_bytes += fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
+        reclaimed_bytes += fs::metadata(tmp).map_or(0, |m| m.len());
         if let Ok(rel) = tmp.strip_prefix(&repo.git_common_dir) {
             removed_temp_files.push(rel.to_string_lossy().replace('\\', "/"));
         } else {
@@ -262,7 +260,7 @@ fn compute_cutoff(now: DateTime<Utc>, oplog_days: u64) -> DateTime<Utc> {
     if oplog_days == 0 {
         return now + Duration::microseconds(1);
     }
-    let clamped = oplog_days.min(365_000) as i64;
+    let clamped = i64::try_from(oplog_days.min(365_000)).unwrap_or(365_000);
     now - Duration::days(clamped)
 }
 
@@ -305,15 +303,18 @@ fn load_all_ops_strict(layout: &OzoneLayout) -> Result<LoadedOps> {
         if name_str.starts_with('.') {
             continue;
         }
-        if !name_str.ends_with(".json") {
+        let has_json_ext = std::path::Path::new(name_str)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if !has_json_ext {
             return Err(OzError::CheckFailed {
-                message: format!("unexpected non-json file in oplog/ops: '{}'", name_str),
+                message: format!("unexpected non-json file in oplog/ops: '{name_str}'"),
                 recovery: vec!["Run `oz fsck --repair` to clean oplog directory.".to_string()],
             });
         }
         let stem = &name_str[..name_str.len() - ".json".len()];
         validate_op_id(stem).map_err(|_| OzError::CheckFailed {
-            message: format!("invalid oplog entry filename '{}'", name_str),
+            message: format!("invalid oplog entry filename '{name_str}'"),
             recovery: vec!["Run `oz fsck --repair`.".to_string()],
         })?;
         let raw = fs::read_to_string(&path)?;
@@ -331,9 +332,7 @@ fn load_all_ops_strict(layout: &OzoneLayout) -> Result<LoadedOps> {
                 recovery: vec!["Run `oz fsck --repair`.".to_string()],
             });
         }
-        let len = fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(raw.len() as u64);
+        let len = fs::metadata(&path).map_or(raw.len() as u64, |m| m.len());
         sizes.insert(entry.op_id.clone(), len);
         entries.push(entry);
     }
@@ -384,8 +383,8 @@ fn discover_active_workspaces(repo: &OzoneRepo) -> HashSet<String> {
         }
     }
 
-    let wt_dir = repo.git_common_dir.join("worktrees");
-    if let Ok(rd) = fs::read_dir(&wt_dir) {
+    let worktrees_dir = repo.git_common_dir.join("worktrees");
+    if let Ok(rd) = fs::read_dir(&worktrees_dir) {
         for item in rd.flatten() {
             let p = item.path();
             if p.is_dir()
@@ -411,10 +410,10 @@ fn entry_affects_workspace(entry: &OpLogEntry, ws_key: &str) -> bool {
 }
 
 fn undone_targets(entry: &OpLogEntry) -> Vec<String> {
-    if !entry.undone_ops.is_empty() {
-        entry.undone_ops.clone()
-    } else {
+    if entry.undone_ops.is_empty() {
         entry.inverse_of.iter().cloned().collect()
+    } else {
+        entry.undone_ops.clone()
     }
 }
 
@@ -559,13 +558,11 @@ fn collect_stale_op_checkpoint_refs(
     gix_repo: &gix::Repository,
     keep_ids: &HashSet<String>,
 ) -> Result<Vec<String>> {
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
     let mut refs_to_prune = Vec::new();
     let prefixed = platform
         .prefixed("refs/ozone/op-checkpoints/")
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     for item in prefixed {
         let Ok(reference) = item else {
@@ -586,7 +583,7 @@ fn delete_refs(gix_repo: &gix::Repository, ref_names: &[String]) -> Result<()> {
     let mut edits = Vec::with_capacity(ref_names.len());
     for name in ref_names {
         let full = FullName::try_from(name.as_str())
-            .map_err(|err| OzError::Git(format!("invalid ref name '{name}': {err}")))?;
+            .map_err(|err| OzError::git_context(format!("invalid ref name '{name}'"), err))?;
         edits.push(RefEdit {
             change: Change::Delete {
                 expected: PreviousValue::Any,
@@ -599,7 +596,7 @@ fn delete_refs(gix_repo: &gix::Repository, ref_names: &[String]) -> Result<()> {
     if !edits.is_empty() {
         gix_repo
             .edit_references(edits)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
     }
     Ok(())
 }

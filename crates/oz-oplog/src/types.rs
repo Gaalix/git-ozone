@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 /// when operating directly in the main repository worktree (`repo.workspace == None`).
 pub const DEFAULT_WORKSPACE_KEY: &str = "default";
 
-/// Originator of an Ozone operation recorded in the OpLog.
+/// Originator of an Ozone operation recorded in the `OpLog`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
@@ -30,7 +30,7 @@ pub struct ActorInfo {
     pub workspace: Option<String>,
 }
 
-/// Classification of an operation recorded in the MVCC OpLog.
+/// Classification of an operation recorded in the MVCC `OpLog`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpKind {
@@ -113,6 +113,7 @@ pub struct WsSnapshot {
     pub post_detached: bool,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -216,7 +217,7 @@ pub struct RedoOutcome {
     pub entry: OpLogEntry,
 }
 
-/// Default number of OpLog entries returned by [`crate::inspect_oplog`] (`oz oplog` / `oz undo --list`).
+/// Default number of `OpLog` entries returned by [`crate::inspect_oplog`] (`oz oplog` / `oz undo --list`).
 pub const DEFAULT_OPLOG_LIST_LIMIT: usize = 20;
 
 /// Effective lifecycle status of an [`OpLogEntry`] within a workspace's undo/redo timeline.
@@ -251,7 +252,7 @@ impl OpLogEntryStatus {
     }
 }
 
-/// Options controlling read-only OpLog inspection ([`crate::inspect_oplog`]).
+/// Options controlling read-only `OpLog` inspection ([`crate::inspect_oplog`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpLogListOptions {
     /// Maximum number of entries to return, ordered newest first (default `20`).
@@ -312,15 +313,15 @@ pub struct OpLogListReport {
     pub entries: Vec<OpLogListItem>,
 }
 
-/// Default retention window (in days) for OpLog compaction (`oz gc --oplog-days`).
+/// Default retention window (in days) for `OpLog` compaction (`oz gc --oplog-days`).
 pub const DEFAULT_OPLOG_RETENTION_DAYS: u64 = 30;
 
-/// Options controlling OpLog compaction and garbage collection (`oz gc`).
+/// Options controlling `OpLog` compaction and garbage collection (`oz gc`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpLogGcOptions {
-    /// Retain OpLog entries newer than this many days (default `30`).
+    /// Retain `OpLog` entries newer than this many days (default `30`).
     pub oplog_days: u64,
-    /// Optional cap on retained non-protected OpLog entries (oldest evicted first).
+    /// Optional cap on retained non-protected `OpLog` entries (oldest evicted first).
     pub max_entries: Option<usize>,
     /// Preview compaction and GC without mutating `.git/ozone/oplog/` or refs.
     pub dry_run: bool,
@@ -362,7 +363,7 @@ pub struct OpLogGcOutcome {
 /// Options controlling [`crate::fsck_repo`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FsckOptions {
-    /// Safely recover/clean interrupted transactions, broken OpLog pointers, and orphaned
+    /// Safely recover/clean interrupted transactions, broken `OpLog` pointers, and orphaned
     /// metadata records without deleting user working-tree files.
     pub repair: bool,
 }

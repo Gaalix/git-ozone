@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Integration tests for `oz gc` (`--oplog-days`, `--dry-run`, `--json`) and
-//! `oz fsck` (`--repair`, `--json`, colocated `.git` + OpLog + mount/baseline checks).
+//! `oz fsck` (`--repair`, `--json`, colocated `.git` + `OpLog` + mount/baseline checks).
+
+#![allow(clippy::too_many_lines)]
 
 use chrono::{Duration, Utc};
 use oz_core::{BackendKind, MountRecord, OZ_SCHEMA_V1, OzoneLayout, OzoneRepo, WorkspaceState};
@@ -206,7 +208,7 @@ fn gc_dry_run_and_retention_preserves_head_active_undo_chain_and_objects() {
         git_worktree_dir: None,
         baseline_id: None,
         dirty_paths: BTreeMap::new(),
-        pinned_paths: Default::default(),
+        pinned_paths: std::collections::BTreeSet::default(),
         scope: Vec::new(),
         deny: Vec::new(),
         created_at: Utc::now() - Duration::days(45),
@@ -385,7 +387,7 @@ fn gc_dry_run_and_retention_preserves_head_active_undo_chain_and_objects() {
 
     // Active `refs/ozone/checkpoints/default` is preserved.
     let cp_ref_oid = run_git(&repo_dir, &["rev-parse", "refs/ozone/checkpoints/default"]);
-    assert!(!cp_ref_oid.is_empty());
+    assert_ne!(cp_ref_oid, "");
 
     // Both `oz fsck --json` and `git fsck --full` pass!
     let fsck = run_oz(&repo_dir, &["fsck", "--json"]);
@@ -532,7 +534,7 @@ fn fsck_detects_and_repairs_broken_oplog_interrupted_txns_and_orphans_without_de
         git_worktree_dir: Some(repo.git_common_dir.join("worktrees/dead-ws")),
         baseline_id: None,
         dirty_paths: BTreeMap::new(),
-        pinned_paths: Default::default(),
+        pinned_paths: std::collections::BTreeSet::default(),
         scope: Vec::new(),
         deny: Vec::new(),
         created_at: Utc::now(),
@@ -572,7 +574,7 @@ fn fsck_detects_and_repairs_broken_oplog_interrupted_txns_and_orphans_without_de
         git_worktree_dir: None,
         baseline_id: None,
         dirty_paths: BTreeMap::new(),
-        pinned_paths: Default::default(),
+        pinned_paths: std::collections::BTreeSet::default(),
         scope: Vec::new(),
         deny: Vec::new(),
         created_at: Utc::now(),

@@ -3,6 +3,8 @@
 
 //! End-to-end CLI UX tests for `oz oplog`, `oz undo --list`, and grouped `--help` output.
 
+#![allow(clippy::too_many_lines)]
+
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -109,9 +111,9 @@ fn oz_oplog_and_undo_list_human_and_json_end_to_end() {
         .to_string();
 
     fs::write(repo.join("notes.txt"), "step 1 wip\n").unwrap();
-    let cp_out = run_oz(&repo, &["checkpoint", "-m", "before step two", "--json"]);
-    assert!(cp_out.status.success());
-    let cp_op_id = parse_json_stdout(&cp_out)["op_id"]
+    let checkpoint_out = run_oz(&repo, &["checkpoint", "-m", "before step two", "--json"]);
+    assert!(checkpoint_out.status.success());
+    let checkpoint_op_id = parse_json_stdout(&checkpoint_out)["op_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -134,7 +136,7 @@ fn oz_oplog_and_undo_list_human_and_json_end_to_end() {
 
     let human_text = String::from_utf8_lossy(&human_oplog.stdout);
     assert!(human_text.contains(&c2_op_id));
-    assert!(human_text.contains(&cp_op_id));
+    assert!(human_text.contains(&checkpoint_op_id));
     assert!(human_text.contains(&c1_op_id));
     assert!(human_text.contains("feat: step two"));
     assert!(human_text.contains("before step two"));
@@ -160,7 +162,7 @@ fn oz_oplog_and_undo_list_human_and_json_end_to_end() {
     assert_eq!(entries[0]["is_next_undo"], true);
     assert_eq!(entries[0]["is_next_redo"], false);
 
-    assert_eq!(entries[1]["op_id"], cp_op_id);
+    assert_eq!(entries[1]["op_id"], checkpoint_op_id);
     assert_eq!(entries[1]["kind"], "checkpoint");
     assert_eq!(entries[1]["status"], "active");
     assert_eq!(entries[1]["summary"], "before step two");
@@ -190,7 +192,7 @@ fn oz_oplog_and_undo_list_human_and_json_end_to_end() {
     assert!(after_undo_json.status.success());
     let after_undo_env = parse_json_stdout(&after_undo_json);
     assert_eq!(after_undo_env["data"]["head_op_id"], undo_op_id);
-    assert_eq!(after_undo_env["data"]["undo_cursor_op_id"], cp_op_id);
+    assert_eq!(after_undo_env["data"]["undo_cursor_op_id"], checkpoint_op_id);
     assert_eq!(after_undo_env["data"]["redo_cursor_op_id"], undo_op_id);
     assert_eq!(after_undo_env["data"]["active_count"], 2);
     assert_eq!(after_undo_env["data"]["redo_depth"], 1);
@@ -200,7 +202,7 @@ fn oz_oplog_and_undo_list_human_and_json_end_to_end() {
     assert_eq!(after_entries[0]["is_next_redo"], true);
     assert_eq!(after_entries[1]["op_id"], c2_op_id);
     assert_eq!(after_entries[1]["status"], "undone");
-    assert_eq!(after_entries[2]["op_id"], cp_op_id);
+    assert_eq!(after_entries[2]["op_id"], checkpoint_op_id);
     assert_eq!(after_entries[2]["status"], "active");
     assert_eq!(after_entries[2]["is_next_undo"], true);
 
@@ -336,7 +338,7 @@ fn oz_help_groups_subcommands_and_updates_stale_descriptions() {
         ),
     ] {
         let sub = run_oz_raw(&sub_args);
-        assert!(sub.status.success(), "help {:?} failed", sub_args);
+        assert!(sub.status.success(), "help {sub_args:?} failed");
         let text = String::from_utf8_lossy(&sub.stdout);
         for snippet in expected_snippets {
             assert!(

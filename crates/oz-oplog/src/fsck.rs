@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Repository integrity verification (`oz fsck`) and safe non-destructive repair (`--repair`)
-//! covering colocated `.git/` (`git fsck --full`), OpLog DAG & undo-chain consistency,
+//! covering colocated `.git/` (`git fsck --full`), `OpLog` DAG & undo-chain consistency,
 //! snapshot object reachability, interrupted transactions, and orphaned mounts/baselines.
 
 use crate::store::{
@@ -39,7 +39,7 @@ struct MinimalIntegrateSession {
     sandbox_path: PathBuf,
 }
 
-/// Verifies colocated `.git/` integrity (including `git fsck --full`), OpLog chain consistency,
+/// Verifies colocated `.git/` integrity (including `git fsck --full`), `OpLog` chain consistency,
 /// snapshot reachability, and Ozone metadata health (`oz fsck [--repair]`).
 ///
 /// With `opts.repair == true`, safely recovers/cleans interrupted transactions and orphaned
@@ -51,7 +51,7 @@ pub fn fsck_repo(repo: &OzoneRepo, opts: &FsckOptions) -> Result<FsckReport> {
 
     // 1. Colocated `.git/` integrity + `git fsck --full` + orphaned `.git/worktrees/*`.
     let (git_fsck_passed, gix_repo_opt) =
-        check_and_repair_git(repo, opts.repair, &mut issues, &mut repaired_actions)?;
+        check_and_repair_git(repo, opts.repair, &mut issues, &mut repaired_actions);
     checks.push(summarize_category(
         "git_integrity",
         FsckCategory::Git,
@@ -64,7 +64,7 @@ pub fn fsck_repo(repo: &OzoneRepo, opts: &FsckOptions) -> Result<FsckReport> {
     ));
 
     // 2. Interrupted transactions under `.git/ozone/` and orphaned `_integrate/` state.
-    check_and_repair_interrupted_txns(repo, opts.repair, &mut issues, &mut repaired_actions)?;
+    check_and_repair_interrupted_txns(repo, opts.repair, &mut issues, &mut repaired_actions);
     checks.push(summarize_category(
         "interrupted_transactions",
         FsckCategory::Transaction,
@@ -201,7 +201,7 @@ fn check_and_repair_git(
     repair: bool,
     issues: &mut Vec<FsckIssue>,
     repaired_actions: &mut Vec<String>,
-) -> Result<(bool, Option<gix::Repository>)> {
+) -> (bool, Option<gix::Repository>) {
     let mut git_ok = true;
     let gix_repo_opt = match gix::open(&repo.repo_root) {
         Ok(gr) => {
@@ -384,7 +384,7 @@ fn check_and_repair_git(
         }
     }
 
-    Ok((git_ok, gix_repo_opt))
+    (git_ok, gix_repo_opt)
 }
 
 fn check_and_repair_interrupted_txns(
@@ -392,10 +392,10 @@ fn check_and_repair_interrupted_txns(
     repair: bool,
     issues: &mut Vec<FsckIssue>,
     repaired_actions: &mut Vec<String>,
-) -> Result<()> {
+) {
     let layout = &repo.layout;
     if !layout.ozone_dir.is_dir() {
-        return Ok(());
+        return;
     }
 
     // 1. Scan temp files inside `.git/ozone/` subdirs.
@@ -596,8 +596,12 @@ fn check_and_repair_interrupted_txns(
             action,
         });
     }
+}
 
-    Ok(())
+fn has_json_extension(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
 fn is_interrupted_temp_filename(name: &str) -> bool {
@@ -638,7 +642,7 @@ fn check_and_repair_oplog(
             if name_str.starts_with('.') {
                 continue;
             }
-            if !path.is_file() || !name_str.ends_with(".json") {
+            if !path.is_file() || !has_json_extension(name_str) {
                 corrupt_paths.push(path);
                 continue;
             }
@@ -668,7 +672,7 @@ fn check_and_repair_oplog(
         if repair {
             let quarantine_dir = oplog.join("quarantine");
             let fname = cp.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
-            let file_len = fs::metadata(cp).map(|m| m.len()).unwrap_or(0);
+            let file_len = fs::metadata(cp).map_or(0, |m| m.len());
             if file_len == 0 {
                 if fs::remove_file(cp).is_ok() {
                     repaired = true;
@@ -1005,14 +1009,20 @@ fn check_and_repair_oplog(
             let mut attached_parents: Vec<String> = Vec::new();
 
             if repair {
+                let children = build_reverse_children_map(&valid_entries);
+                let mut can_reach_head =
+                    entries_reaching_target(&valid_entries, &children, &current_head);
+
                 // If the newest unlinked tip already descends from current HEAD, `HEAD` lagged behind.
                 if let Some(newest_tip) = unlinked_tips.first()
-                    && reachable_from_head(&valid_entries, newest_tip).contains(&current_head)
+                    && can_reach_head.contains(newest_tip.as_str())
                 {
                     current_head.clone_from(newest_tip);
                     write_head_op_id(layout, Some(&current_head))?;
                     advanced_head_to = Some(current_head.clone());
                     reachable = reachable_from_head(&valid_entries, &current_head);
+                    can_reach_head =
+                        entries_reaching_target(&valid_entries, &children, &current_head);
                 }
 
                 // Link any remaining unlinked tips as parents on `current_head` (skipping any that
@@ -1022,7 +1032,7 @@ fn check_and_repair_oplog(
                     .filter(|t| {
                         !reachable.contains(t.as_str())
                             && t != &current_head
-                            && !reachable_from_head(&valid_entries, t).contains(&current_head)
+                            && !can_reach_head.contains(t.as_str())
                     })
                     .collect();
                 remaining_tips.sort();
@@ -1112,6 +1122,46 @@ fn reachable_from_head(entries: &BTreeMap<String, OpLogEntry>, head_id: &str) ->
             for p in &entry.parents {
                 if entries.contains_key(p) && visited.insert(p.clone()) {
                     queue.push_back(p.clone());
+                }
+            }
+        }
+    }
+    visited
+}
+
+fn build_reverse_children_map(
+    entries: &BTreeMap<String, OpLogEntry>,
+) -> HashMap<&str, Vec<&str>> {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::with_capacity(entries.len());
+    for (child_id, entry) in entries {
+        for parent_id in &entry.parents {
+            if let Some((parent_key, _)) = entries.get_key_value(parent_id.as_str()) {
+                children
+                    .entry(parent_key.as_str())
+                    .or_default()
+                    .push(child_id.as_str());
+            }
+        }
+    }
+    children
+}
+
+fn entries_reaching_target<'a>(
+    entries: &'a BTreeMap<String, OpLogEntry>,
+    children: &HashMap<&'a str, Vec<&'a str>>,
+    target_id: &str,
+) -> HashSet<&'a str> {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    if let Some((target_key, _)) = entries.get_key_value(target_id) {
+        visited.insert(target_key.as_str());
+        queue.push_back(target_key.as_str());
+    }
+    while let Some(node) = queue.pop_front() {
+        if let Some(child_list) = children.get(node) {
+            for &child in child_list {
+                if visited.insert(child) {
+                    queue.push_back(child);
                 }
             }
         }
@@ -1268,7 +1318,7 @@ fn check_and_repair_snapshots(
                 continue;
             };
             let full_name = reference.name().as_bstr().to_str_lossy().into_owned();
-            let obj_ok = reference.peel_to_id().ok().is_some_and(|id| {
+            let obj_ok = reference.peel_to_id().is_ok_and(|id| {
                 let oid = id.detach();
                 oid.is_empty_tree() || gix_repo.find_object(oid).is_ok()
             });
@@ -1343,7 +1393,7 @@ fn check_and_repair_snapshots(
             if !edits.is_empty() {
                 gix_repo
                     .edit_references(edits)
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                    .map_err(OzError::git_source)?;
             }
         }
     }
@@ -1359,8 +1409,7 @@ fn verify_tree_exists(
     issues: &mut Vec<FsckIssue>,
 ) {
     let ok = ObjectId::from_hex(hex.as_bytes())
-        .ok()
-        .is_some_and(|oid| oid.is_empty_tree() || gix_repo.find_tree(oid).is_ok());
+        .is_ok_and(|oid| oid.is_empty_tree() || gix_repo.find_tree(oid).is_ok());
     if !ok {
         issues.push(FsckIssue {
             code: "missing_snapshot_object".to_string(),
@@ -1385,9 +1434,7 @@ fn verify_commit_exists(
     field: &str,
     issues: &mut Vec<FsckIssue>,
 ) {
-    let ok = ObjectId::from_hex(hex.as_bytes())
-        .ok()
-        .is_some_and(|oid| gix_repo.find_commit(oid).is_ok());
+    let ok = ObjectId::from_hex(hex.as_bytes()).is_ok_and(|oid| gix_repo.find_commit(oid).is_ok());
     if !ok {
         issues.push(FsckIssue {
             code: "missing_snapshot_object".to_string(),
@@ -1412,9 +1459,7 @@ fn verify_blob_exists(
     file_path: &str,
     issues: &mut Vec<FsckIssue>,
 ) {
-    let ok = ObjectId::from_hex(hex.as_bytes())
-        .ok()
-        .is_some_and(|oid| gix_repo.find_blob(oid).is_ok());
+    let ok = ObjectId::from_hex(hex.as_bytes()).is_ok_and(|oid| gix_repo.find_blob(oid).is_ok());
     if !ok {
         issues.push(FsckIssue {
             code: "missing_snapshot_object".to_string(),
@@ -1453,7 +1498,7 @@ fn check_and_repair_mounts(
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            if name_str.starts_with('.') || !name_str.ends_with(".json") || !path.is_file() {
+            if name_str.starts_with('.') || !has_json_extension(name_str) || !path.is_file() {
                 continue;
             }
             mounts_checked += 1;
@@ -1921,8 +1966,7 @@ fn check_and_repair_baselines(
             active_baseline_ids.contains(id) || active_baseline_ids.contains(&meta.commit_oid);
         let commit_exists = gix_repo_opt.is_none_or(|gr| {
             ObjectId::from_hex(meta.commit_oid.as_bytes())
-                .ok()
-                .is_some_and(|oid| gr.find_commit(oid).is_ok())
+                .is_ok_and(|oid| gr.find_commit(oid).is_ok())
         });
 
         if !referenced_by_ws && !commit_exists {
@@ -2062,7 +2106,32 @@ fn resolve_real_git() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_pid_alive;
+    use super::{
+        BTreeMap, OpKind, OpLogEntry, Utc, build_reverse_children_map, entries_reaching_target,
+        is_pid_alive, reachable_from_head,
+    };
+    use crate::types::{ActorInfo, ActorKind};
+
+    fn dummy_entry(op_id: &str, parents: &[&str]) -> OpLogEntry {
+        OpLogEntry {
+            op_id: op_id.to_string(),
+            parents: parents.iter().map(|s| (*s).to_string()).collect(),
+            timestamp: Utc::now(),
+            actor: ActorInfo {
+                kind: ActorKind::Agent,
+                client: None,
+                workspace: None,
+            },
+            kind: OpKind::Mutate,
+            command: "test".to_string(),
+            message: None,
+            inverse_of: None,
+            undone_ops: Vec::new(),
+            rewound_uncheckpointed: false,
+            ref_deltas: BTreeMap::new(),
+            ws_snapshots: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn is_pid_alive_rejects_zero_and_overflow_and_detects_current_process() {
@@ -2070,5 +2139,34 @@ mod tests {
         assert!(!is_pid_alive(u32::MAX));
         #[cfg(unix)]
         assert!(is_pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn reverse_children_precomputation_matches_reachable_from_head() {
+        let mut entries = BTreeMap::new();
+        for (id, parents) in [
+            ("op_1", &[][..]),
+            ("op_2", &["op_1"][..]),
+            ("op_3", &["op_2"][..]),
+            ("op_4_desc", &["op_3"][..]),
+            ("op_5_desc2", &["op_4_desc"][..]),
+            ("op_6_branch", &["op_1"][..]),
+            ("op_7_island", &[][..]),
+        ] {
+            entries.insert(id.to_string(), dummy_entry(id, parents));
+        }
+
+        let children = build_reverse_children_map(&entries);
+        for target in entries.keys() {
+            let fast_set = entries_reaching_target(&entries, &children, target);
+            for candidate in entries.keys() {
+                let slow_reaches = reachable_from_head(&entries, candidate).contains(target);
+                assert_eq!(
+                    fast_set.contains(candidate.as_str()),
+                    slow_reaches,
+                    "mismatch for candidate={candidate} reaching target={target}"
+                );
+            }
+        }
     }
 }

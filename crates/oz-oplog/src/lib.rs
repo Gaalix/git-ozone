@@ -4,25 +4,25 @@
 //! Lock-free append-only MVCC operation log (`.git/ozone/oplog/`), `< 10 ms` dirty
 //! working-tree checkpointing, mutation transaction wrappers, and sub-10 ms `oz undo` / `oz redo`.
 
-pub mod checkpoint;
-pub mod dirty;
-pub mod fsck;
-pub mod gc;
-pub mod mutation;
-pub mod store;
-pub mod types;
-pub mod undo;
+#![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+
+pub(crate) mod checkpoint;
+pub(crate) mod dirty;
+pub(crate) mod fsck;
+pub(crate) mod gc;
+pub(crate) mod mutation;
+pub(crate) mod store;
+pub(crate) mod types;
+pub(crate) mod undo;
 
 pub use checkpoint::checkpoint;
-pub use dirty::workspace_key;
 pub use fsck::fsck_repo;
 pub use gc::compact_oplog;
 pub use mutation::{
     MutationTransaction, record_mutation, record_mutation_all_branches, record_mutation_with_refs,
 };
 pub use store::{
-    append_entry, ensure_oplog_dirs, entry_path, head_lock_path, head_path, list_entries,
-    load_entry, ops_dir, read_head_op_id,
+    append_entry, ensure_oplog_dirs, entry_path, list_entries, load_entry, read_head_op_id,
 };
 pub use types::{
     ActorInfo, ActorKind, CheckpointOutcome, DEFAULT_OPLOG_LIST_LIMIT,
@@ -46,7 +46,7 @@ pub fn new_op_id() -> String {
     let ulid = {
         let mut guard = mutex
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.generate().unwrap_or_else(|_| Ulid::generate())
     };
     format!("op_{ulid}")
@@ -110,7 +110,7 @@ mod tests {
         let snap = &parsed.ws_snapshots["agent-auth"];
         assert_eq!(snap.base_tree, "111aaa");
         assert_eq!(snap.dirty_tree.as_deref(), Some("222bbb"));
-        assert!(snap.dirty_files.is_empty());
+        assert_eq!(snap.dirty_files, Vec::new());
         assert_eq!(snap.pre_base_tree, None);
     }
 }

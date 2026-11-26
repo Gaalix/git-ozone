@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(clippy::too_many_lines)]
+
 use chrono::Utc;
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
@@ -12,7 +14,7 @@ use oz_oplog::{
     ActorInfo, ActorKind, DirtyFileState, OpKind, OpLogEntry, UndoTarget, append_entry, checkpoint,
     list_entries, load_entry, new_op_id, read_head_op_id, record_mutation, redo, undo,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -563,7 +565,7 @@ fn fuse_fast_path_and_workspace_state_sync_and_dirty_override() {
         git_worktree_dir: None,
         baseline_id: None,
         dirty_paths: BTreeMap::new(),
-        pinned_paths: Default::default(),
+        pinned_paths: BTreeSet::default(),
         scope: Vec::new(),
         deny: Vec::new(),
         created_at: Utc::now(),
@@ -679,14 +681,17 @@ fn workspace_isolation_undo_in_one_workspace_does_not_touch_another() {
     let layout = &main_repo.layout;
     layout.ensure_initialized().expect("init");
 
-    let ws_a_dir = tmp.path().join("repo.oz/ws-a");
-    let ws_b_dir = tmp.path().join("repo.oz/ws-b");
-    fs::create_dir_all(&ws_a_dir).unwrap();
-    fs::create_dir_all(&ws_b_dir).unwrap();
-    fs::write(ws_a_dir.join("shared.txt"), "base\n").unwrap();
-    fs::write(ws_b_dir.join("shared.txt"), "base\n").unwrap();
+    let first_ws_dir = tmp.path().join("repo.oz/ws-a");
+    let second_ws_dir = tmp.path().join("repo.oz/ws-b");
+    fs::create_dir_all(&first_ws_dir).unwrap();
+    fs::create_dir_all(&second_ws_dir).unwrap();
+    fs::write(first_ws_dir.join("shared.txt"), "base\n").unwrap();
+    fs::write(second_ws_dir.join("shared.txt"), "base\n").unwrap();
 
-    for (name, branch, dir) in [("ws-a", "feat/a", &ws_a_dir), ("ws-b", "feat/b", &ws_b_dir)] {
+    for (name, branch, dir) in [
+        ("ws-a", "feat/a", &first_ws_dir),
+        ("ws-b", "feat/b", &second_ws_dir),
+    ] {
         let st = WorkspaceState {
             schema_version: WorkspaceState::CURRENT_SCHEMA_VERSION,
             name: name.to_string(),
@@ -699,7 +704,7 @@ fn workspace_isolation_undo_in_one_workspace_does_not_touch_another() {
             git_worktree_dir: None,
             baseline_id: None,
             dirty_paths: BTreeMap::new(),
-            pinned_paths: Default::default(),
+            pinned_paths: BTreeSet::default(),
             scope: Vec::new(),
             deny: Vec::new(),
             created_at: Utc::now(),
@@ -713,25 +718,25 @@ fn workspace_isolation_undo_in_one_workspace_does_not_touch_another() {
         .unwrap();
     }
 
-    let repo_a = OzoneRepo::discover(Some(&ws_a_dir)).unwrap();
-    let repo_b = OzoneRepo::discover(Some(&ws_b_dir)).unwrap();
+    let repo_a = OzoneRepo::discover(Some(&first_ws_dir)).unwrap();
+    let repo_b = OzoneRepo::discover(Some(&second_ws_dir)).unwrap();
 
     // Workspace A checkpoints base, then modifies shared.txt.
     checkpoint(&repo_a, "cp a", None, agent_actor(Some("ws-a")), None).unwrap();
-    fs::write(ws_a_dir.join("shared.txt"), "edited-a\n").unwrap();
+    fs::write(first_ws_dir.join("shared.txt"), "edited-a\n").unwrap();
 
     // Workspace B checkpoints its own edit afterwards.
-    fs::write(ws_b_dir.join("shared.txt"), "edited-b\n").unwrap();
+    fs::write(second_ws_dir.join("shared.txt"), "edited-b\n").unwrap();
     checkpoint(&repo_b, "cp b", None, agent_actor(Some("ws-b")), None).unwrap();
 
     // Undo in workspace A ONLY undoes workspace A, leaving workspace B untouched.
     undo(&repo_a, 1usize, agent_actor(Some("ws-a"))).unwrap();
     assert_eq!(
-        fs::read_to_string(ws_a_dir.join("shared.txt")).unwrap(),
+        fs::read_to_string(first_ws_dir.join("shared.txt")).unwrap(),
         "base\n"
     );
     assert_eq!(
-        fs::read_to_string(ws_b_dir.join("shared.txt")).unwrap(),
+        fs::read_to_string(second_ws_dir.join("shared.txt")).unwrap(),
         "edited-b\n"
     );
 }
@@ -933,8 +938,7 @@ fn sub_10ms_checkpoint_undo_redo_on_1500_file_repo() {
     );
 
     eprintln!(
-        "1500-file FUSE fast-path: checkpoint={:?}, undo={:?}, redo={:?}",
-        fuse_cp_elapsed, fuse_undo_elapsed, fuse_redo_elapsed
+        "1500-file FUSE fast-path: checkpoint={fuse_cp_elapsed:?}, undo={fuse_undo_elapsed:?}, redo={fuse_redo_elapsed:?}"
     );
     assert!(
         fuse_cp_elapsed < budget,
@@ -1048,7 +1052,7 @@ fn eight_thread_concurrent_checkpoints_across_workspaces_zero_errors() {
             git_worktree_dir: None,
             baseline_id: None,
             dirty_paths: BTreeMap::new(),
-            pinned_paths: Default::default(),
+            pinned_paths: BTreeSet::default(),
             scope: Vec::new(),
             deny: Vec::new(),
             created_at: Utc::now(),
@@ -1168,14 +1172,17 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
     run_git(&repo_dir, &["branch", "feat/a"]);
     run_git(&repo_dir, &["branch", "feat/b"]);
 
-    let ws_a_dir = tmp.path().join("iso-refs.oz/ws-a");
-    let ws_b_dir = tmp.path().join("iso-refs.oz/ws-b");
-    fs::create_dir_all(&ws_a_dir).unwrap();
-    fs::create_dir_all(&ws_b_dir).unwrap();
-    fs::write(ws_a_dir.join("shared.txt"), "base\n").unwrap();
-    fs::write(ws_b_dir.join("shared.txt"), "base\n").unwrap();
+    let first_ws_dir = tmp.path().join("iso-refs.oz/ws-a");
+    let second_ws_dir = tmp.path().join("iso-refs.oz/ws-b");
+    fs::create_dir_all(&first_ws_dir).unwrap();
+    fs::create_dir_all(&second_ws_dir).unwrap();
+    fs::write(first_ws_dir.join("shared.txt"), "base\n").unwrap();
+    fs::write(second_ws_dir.join("shared.txt"), "base\n").unwrap();
 
-    for (name, branch, dir) in [("ws-a", "feat/a", &ws_a_dir), ("ws-b", "feat/b", &ws_b_dir)] {
+    for (name, branch, dir) in [
+        ("ws-a", "feat/a", &first_ws_dir),
+        ("ws-b", "feat/b", &second_ws_dir),
+    ] {
         let st = WorkspaceState {
             schema_version: WorkspaceState::CURRENT_SCHEMA_VERSION,
             name: name.to_string(),
@@ -1188,7 +1195,7 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
             git_worktree_dir: None,
             baseline_id: None,
             dirty_paths: BTreeMap::new(),
-            pinned_paths: Default::default(),
+            pinned_paths: BTreeSet::default(),
             scope: Vec::new(),
             deny: Vec::new(),
             created_at: Utc::now(),
@@ -1202,8 +1209,8 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
         .unwrap();
     }
 
-    let repo_a = OzoneRepo::discover(Some(&ws_a_dir)).unwrap();
-    let repo_b = OzoneRepo::discover(Some(&ws_b_dir)).unwrap();
+    let repo_a = OzoneRepo::discover(Some(&first_ws_dir)).unwrap();
+    let repo_b = OzoneRepo::discover(Some(&second_ws_dir)).unwrap();
 
     // Workspace A opens a mutation transaction.
     let tx_a = oz_oplog::MutationTransaction::begin(
@@ -1222,7 +1229,7 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
         None,
         || {
             let oid = commit_via_gix(&repo_dir, "feat/b", "feat-b", &[("b.txt", "b1\n")], &[]);
-            fs::write(ws_b_dir.join("b.txt"), "b1\n").unwrap();
+            fs::write(second_ws_dir.join("b.txt"), "b1\n").unwrap();
             Ok(oid)
         },
     )
@@ -1232,8 +1239,8 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
     assert!(!entry_b.ref_deltas.contains_key("refs/heads/feat/a"));
 
     // Now ws-a commits on feat/a and finishes its transaction.
-    let ca1_id = commit_via_gix(&repo_dir, "feat/a", "feat-a", &[("a.txt", "a1\n")], &[]);
-    fs::write(ws_a_dir.join("a.txt"), "a1\n").unwrap();
+    let feat_a_oid = commit_via_gix(&repo_dir, "feat/a", "feat-a", &[("a.txt", "a1\n")], &[]);
+    fs::write(first_ws_dir.join("a.txt"), "a1\n").unwrap();
     let entry_a = tx_a.finish(&repo_a, None).expect("finish tx_a");
 
     assert_eq!(
@@ -1247,7 +1254,7 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
     );
     assert_eq!(
         entry_a.ref_deltas["refs/heads/feat/a"].new.as_deref(),
-        Some(ca1_id.to_hex().to_string().as_str())
+        Some(feat_a_oid.to_hex().to_string().as_str())
     );
 
     // Undoing ws-a rolls back feat/a without touching or conflicting with feat/b!
@@ -1260,8 +1267,11 @@ fn concurrent_record_mutation_isolates_ref_deltas_per_workspace() {
         run_git(&repo_dir, &["rev-parse", "refs/heads/feat/b"]),
         cb1_hex
     );
-    assert!(!ws_a_dir.join("a.txt").exists());
-    assert_eq!(fs::read_to_string(ws_b_dir.join("b.txt")).unwrap(), "b1\n");
+    assert!(!first_ws_dir.join("a.txt").exists());
+    assert_eq!(
+        fs::read_to_string(second_ws_dir.join("b.txt")).unwrap(),
+        "b1\n"
+    );
 }
 
 #[test]
@@ -1339,10 +1349,7 @@ fn fuse_fast_path_prunes_ignored_dir_with_many_files_under_10ms() {
     .expect("checkpoint");
     let elapsed = t0.elapsed();
 
-    eprintln!(
-        "FUSE checkpoint with 2000 ignored target/ files: {:?}",
-        elapsed
-    );
+    eprintln!("FUSE checkpoint with 2000 ignored target/ files: {elapsed:?}");
     assert_eq!(cp.dirty_file_count, 1);
     assert_eq!(
         cp.entry.ws_snapshots[ws_name].dirty_files[0].path,
@@ -1416,7 +1423,7 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
     let t0 = Instant::now();
     undo(&repo, 1usize, agent_actor(None)).expect("undo reset+clean");
     let elapsed = t0.elapsed();
-    eprintln!("1200-file reset --hard + clean -fd undo took {:?}", elapsed);
+    eprintln!("1200-file reset --hard + clean -fd undo took {elapsed:?}");
 
     assert_eq!(run_git(&repo_dir, &["rev-parse", "HEAD"]), c2_oid);
     assert_eq!(
@@ -1462,7 +1469,7 @@ fn windows_projfs_uses_daemon_fast_path_and_reset_hard_clean_undo_sub_10ms() {
         git_worktree_dir: None,
         baseline_id: None,
         dirty_paths: BTreeMap::new(),
-        pinned_paths: Default::default(),
+        pinned_paths: BTreeSet::default(),
         scope: Vec::new(),
         deny: Vec::new(),
         created_at: Utc::now(),
@@ -1690,7 +1697,7 @@ fn undo_after_commit_preserves_dirty_visibility_for_same_and_diff_size_edits_and
             .entry_by_path("a.txt".as_bytes().as_bstr())
             .expect("a.txt in index after redo");
         assert_eq!(entry_redo.id.to_hex().to_string(), head_c2_blob);
-        assert_eq!(entry_redo.stat.size, v2_content.len() as u32);
+        assert_eq!(entry_redo.stat.size, u32::try_from(v2_content.len()).unwrap());
 
         // Step e: second `oz undo` followed by re-committing via `oz commit` must work cleanly!
         undo(&repo, 1usize, agent_actor(None)).expect("second undo");
@@ -1717,7 +1724,11 @@ fn undo_after_commit_preserves_dirty_visibility_for_same_and_diff_size_edits_and
 fn undo_and_redo_after_partial_hunk_commit_and_amend_keep_index_accurate() {
     let tmp = TempDir::new().expect("tempdir");
     let repo_dir = tmp.path().join("repo-partial-amend");
-    let orig_lines: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    let orig_lines = (1..=20).fold(String::new(), |mut acc, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(acc, "line {i}");
+        acc
+    });
     let (repo, c1_hex) = init_repo_with_commit(&repo_dir, &[("a.txt", &orig_lines)]);
 
     // Edit two separated hunks (h1a and h1b) and backdate mtime.
@@ -1904,7 +1915,7 @@ fn inspect_oplog_reports_cursors_statuses_limits_and_is_read_only() {
     // 1. Fresh repo without `.git/ozone/oplog`: read-only inspection returns empty without creating files.
     assert!(!repo.layout.oplog_dir().exists());
     let empty_report = inspect_oplog(&repo, OpLogListOptions::default()).expect("inspect empty");
-    assert!(empty_report.entries.is_empty());
+    assert_eq!(empty_report.entries.len(), 0);
     assert_eq!(empty_report.total_entries, 0);
     assert_eq!(empty_report.active_count, 0);
     assert_eq!(empty_report.redo_depth, 0);

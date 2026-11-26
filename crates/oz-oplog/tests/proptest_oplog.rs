@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Stateful property-based tests for `oz checkpoint`, `oz commit` (`record_mutation`),
-//! `oz undo` / `oz redo`, OpLog compaction (`compact_oplog`), and `fsck_repo` (`--repair`)
+//! `oz undo` / `oz redo`, `OpLog` compaction (`compact_oplog`), and `fsck_repo` (`--repair`)
 //! across unicode paths, symlinks, executable bits, renames, binary files, and nested directories.
 
 use chrono::{Duration, Utc};
@@ -445,9 +445,9 @@ fn snapshot_worktree_disk(root: &Path) -> BTreeMap<String, TreeEntry> {
 fn collect_worktree_recursive(root: &Path, dir: &Path, out: &mut BTreeMap<String, TreeEntry>) {
     let mut children: Vec<_> = fs::read_dir(dir)
         .expect("read_dir")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
-    children.sort_by_key(|e| e.file_name());
+    children.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in children {
         let name = entry.file_name();
@@ -1057,18 +1057,18 @@ proptest! {
                     }
                 }
                 MachineStep::UndoStep => {
-                    if !model.can_undo_now() {
-                        let res = undo(&repo, UndoTarget::Steps(1), actor.clone());
-                        prop_assert!(
-                            matches!(res, Err(OzError::InvalidUsage { .. })),
-                            "unavailable undo should yield InvalidUsage, got {res:?}"
-                        );
-                    } else {
+                    if model.can_undo_now() {
                         undo(&repo, UndoTarget::Steps(1), actor.clone()).expect("undo step");
                         let did = model.undo_step();
                         prop_assert!(did);
                         strict_undo_redo_paths =
                             model.redo_stack.last().map(|t| t.changed_paths.clone());
+                    } else {
+                        let res = undo(&repo, UndoTarget::Steps(1), actor.clone());
+                        prop_assert!(
+                            matches!(res, Err(OzError::InvalidUsage { .. })),
+                            "unavailable undo should yield InvalidUsage, got {res:?}"
+                        );
                     }
                 }
                 MachineStep::RedoStep => {
@@ -1235,7 +1235,7 @@ proptest! {
             git_worktree_dir: Some(main_repo.layout.git_common_dir.join("worktrees/ws-active")),
             baseline_id: None,
             dirty_paths: BTreeMap::new(),
-            pinned_paths: Default::default(),
+            pinned_paths: BTreeSet::default(),
             scope: Vec::new(),
             deny: Vec::new(),
             created_at: Utc::now() - Duration::days(45),
