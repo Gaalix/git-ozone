@@ -2,6 +2,20 @@
 
 All notable changes to Ozone (`oz` / `git-ozone` / `oz-vfsd`) are documented in this file.
 
+## [1.3.0] — 2026-11-26
+
+### Features & CLI UX
+- **OpLog Inspection (`oz oplog` & `oz undo --list`) (`oz-oplog`, `oz-cli`):** Added `oz oplog` (with `--limit`, `--all`, `--json`, and `ol` alias) and `oz undo --list` to inspect the MVCC operation journal, display operation IDs, kinds, timestamps, undo/redo pointers, and target snapshots before rolling back.
+- **Grouped 6-Domain `oz --help` & Updated Command Summaries (`oz-cli`):** Reorganized top-level `oz --help` into 6 clear task domains (Daily VCS, Inspect & History, Workspaces & Integration, Undo & Recovery, GitHub & Stacked PRs, Setup & Agent Tooling) with refreshed `pr`, `issue`, and `ci` subcommand summaries.
+- **Progressive-Disclosure Agent Harness Setup (`oz-agent`):** Split `oz agent setup` templates into compact always-on instruction rules plus full on-demand `SKILL.md` workflow guides across supported coding-agent harnesses, keeping default context footprint minimal while preserving deep workflow references.
+
+### Bug Fixes & Compatibility
+- **Cargo 1.100 Build Layout & Authenticated Windows Mock TCP IPC (`oz-warm`, `oz-cow`, `oz-integrate`):** Added support for Cargo 1.100's new build directory layout (`build-dir-new-layout`) in warm cache classification and updated Windows mock TCP IPC tests to use per-instance authenticated endpoints.
+- **GitHub Pages Deployment Workflow (`.github/workflows`):** Split GitHub Pages build and deploy jobs and bumped Pages actions to Node 24.
+
+### Dependencies & Release Automation
+- Bumped `bytes` from `1.12.1` to `1.12.2` and updated GitHub Actions (`actions/upload-artifact` v7, `actions/download-artifact` v8, `actions/attest-build-provenance` v4, `softprops/action-gh-release` v3).
+
 ## [1.2.0] — 2026-11-25
 
 ### Features & Workflow Ergonomics

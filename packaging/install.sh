@@ -6,11 +6,11 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.sh | bash
-#   ./packaging/install.sh --version 1.2.0 --prefix "$HOME/.local" --dry-run
+#   ./packaging/install.sh --version 1.3.0 --prefix "$HOME/.local" --dry-run
 
 set -euo pipefail
 
-DEFAULT_VERSION="1.2.0"
+DEFAULT_VERSION="1.3.0"
 REPO="${OZ_REPO:-Gaalix/git-ozone}"
 VERSION="${OZ_VERSION:-${DEFAULT_VERSION}}"
 PREFIX="${OZ_INSTALL_PREFIX:-${HOME}/.local}"
@@ -27,7 +27,7 @@ Usage:
   install.sh [OPTIONS]
 
 Options:
-  --version <VER>   Version to install (e.g. 1.2.0, v1.2.0, or latest; default: 1.2.0)
+  --version <VER>   Version to install (e.g. 1.3.0, v1.3.0, or latest; default: 1.3.0)
   --prefix <DIR>    Installation prefix; binaries go into <DIR>/bin (default: ~/.local)
   --repo <O/R>      GitHub repository slug (default: Gaalix/git-ozone)
   --dry-run         Print resolved target, URLs, and install paths without downloading or writing

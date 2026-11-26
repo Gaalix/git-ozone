@@ -283,7 +283,7 @@ Returns `DoctorReport` (safe to run outside a Git repository; never leaks raw cr
 ```json
 {
   "invoked_as": "oz",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "non_interactive": true,
   "os": "linux",
   "arch": "x86_64",
@@ -474,7 +474,7 @@ Returns `BlameReport` joining commit history with `refs/notes/ai`:
 
 * **`oz agent setup`:** `{ "repo_root", "harnesses", "check_only", "created", "updated", "unchanged" }`
 * **`oz setup`:** `{ "repo_root", "git_common_dir", "ozone_dir", "recommended_backend", "oz_vfsd_bin", "systemd_unit_path", "projfs_enabled"? }`
-* **`oz --version --json`:** `{ "name": "oz", "invoked_as": "oz", "version": "1.2.0", "os": "linux", "arch": "x86_64", "pure_rust": true, "non_interactive": true }`
+* **`oz --version --json`:** `{ "name": "oz", "invoked_as": "oz", "version": "1.3.0", "os": "linux", "arch": "x86_64", "pure_rust": true, "non_interactive": true }`
 
 ---
 
