@@ -24,7 +24,8 @@ pub use notes::{
 pub use setup::{
     AGENTS_MD_END_MARKER, AGENTS_MD_START_MARKER, AgentSetupOptions, AgentSetupReport,
     OZ_CHECKPOINT_HOOK_CMD, detect_env_harnesses, detect_harnesses, detect_harnesses_with_context,
-    detect_repo_harnesses, render_ozone_workflow_body, setup_agent_harnesses,
+    detect_repo_harnesses, render_ozone_rule_body, render_ozone_workflow_body,
+    setup_agent_harnesses,
 };
 
 use chrono::{DateTime, Utc};
