@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Maximum size in bytes of a single newline-delimited JSON IPC request frame (1 MiB).
-pub const MAX_IPC_LINE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_IPC_LINE_BYTES: usize = 1024 * 1024;
 
 /// Mount configuration sent to `oz-vfsd` to materialize a VFS workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

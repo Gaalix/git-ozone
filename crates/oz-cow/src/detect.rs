@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Linux `/dev/fuse` and `fusermount3` readiness diagnostics.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinuxFuseReadiness {
     pub dev_fuse_exists: bool,
@@ -71,18 +72,26 @@ pub(crate) fn select_backend_fast(
     } else {
         probe_reflink_ephemeral(&existing).unwrap_or(true)
     };
-    let fuse_ready = detect_linux_fuse_ready_fast(ozone_dir);
+    #[cfg(target_os = "linux")]
+    let fuse = {
+        let (ready, no_new_privs, daemon_running) = detect_linux_fuse_ready_fast(ozone_dir);
+        Some(LinuxFuseReadiness {
+            dev_fuse_exists: ready,
+            dev_fuse_rw: ready,
+            fusermount3_path: None,
+            fusermount3_version: None,
+            user_allow_other_enabled: false,
+            no_new_privs,
+            daemon_running,
+            ready,
+        })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let fuse: Option<LinuxFuseReadiness> = {
+        let _ = ozone_dir;
+        None
+    };
     let projfs_ready = detect_windows_projfs();
-    let fuse = fuse_ready.map(|(ready, no_new_privs, daemon_running)| LinuxFuseReadiness {
-        dev_fuse_exists: ready,
-        dev_fuse_rw: ready,
-        fusermount3_path: None,
-        fusermount3_version: None,
-        user_allow_other_enabled: false,
-        no_new_privs,
-        daemon_running,
-        ready,
-    });
     Ok(recommend_backend(
         &fs_kind,
         reflink_supported,
@@ -106,12 +115,12 @@ fn process_has_no_new_privs() -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_vfsd_daemon_running(ozone_dir: Option<&Path>) -> bool {
-    let git_common_dir = ozone_dir.and_then(|oz| oz.parent());
+    let git_common_dir = ozone_dir.and_then(Path::parent);
     oz_vfsd::is_any_daemon_running(git_common_dir)
 }
 
 #[cfg(target_os = "linux")]
-fn detect_linux_fuse_ready_fast(ozone_dir: Option<&Path>) -> Option<(bool, bool, bool)> {
+fn detect_linux_fuse_ready_fast(ozone_dir: Option<&Path>) -> (bool, bool, bool) {
     // SAFETY: `c"/dev/fuse"` is a static NUL-terminated C string literal and `libc::access`
     // only inspects permissions for the given path without retaining the pointer.
     let dev_fuse_rw = unsafe { libc::access(c"/dev/fuse".as_ptr(), libc::R_OK | libc::W_OK) == 0 };
@@ -123,12 +132,7 @@ fn detect_linux_fuse_ready_fast(ozone_dir: Option<&Path>) -> Option<(bool, bool,
         false
     };
     let ready = dev_fuse_rw && has_bin && (!no_new_privs || daemon_running);
-    Some((ready, no_new_privs, daemon_running))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn detect_linux_fuse_ready_fast(_ozone_dir: Option<&Path>) -> Option<(bool, bool, bool)> {
-    None
+    (ready, no_new_privs, daemon_running)
 }
 
 /// Probes OS, host filesystem type, reflink support, and VFS daemon readiness for `path`.
@@ -154,7 +158,10 @@ pub fn detect_filesystem_with_ozone(
         false
     };
 
-    let fuse = detect_linux_fuse(ozone_dir);
+    #[cfg(target_os = "linux")]
+    let fuse = Some(detect_linux_fuse(ozone_dir));
+    #[cfg(not(target_os = "linux"))]
+    let fuse: Option<LinuxFuseReadiness> = None;
     let projfs_ready = detect_windows_projfs();
     let recommended_backend =
         recommend_backend(&fs_kind, reflink_supported, fuse.as_ref(), projfs_ready);
@@ -180,7 +187,7 @@ pub fn probe_ozone_reflink(ozone_dir: &Path) -> bool {
 
 /// Empirically tests `reflink_copy::reflink` using temporary probe files inside `probe_dir`.
 #[must_use]
-pub fn probe_reflink_in_dir(probe_dir: &Path) -> bool {
+pub(crate) fn probe_reflink_in_dir(probe_dir: &Path) -> bool {
     if std::fs::create_dir_all(probe_dir).is_err() {
         return false;
     }
@@ -188,10 +195,10 @@ pub fn probe_reflink_in_dir(probe_dir: &Path) -> bool {
 }
 
 fn probe_reflink_ephemeral(dir: &Path) -> Option<bool> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if !dir.is_dir() {
         return None;
     }
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
     let src = dir.join(format!(".oz_probe_src_{pid}_{seq}"));
@@ -305,7 +312,7 @@ fn probe_fs_kind(path: &Path) -> Result<(FilesystemKind, Option<String>)> {
     }
     // SAFETY: `libc::statfs` returned `0`, guaranteeing `buf` was fully initialized by the kernel.
     let stat = unsafe { buf.assume_init() };
-    let magic = stat.f_type as u64;
+    let magic = stat.f_type.cast_unsigned();
     let kind = match magic {
         EXT4_SUPER_MAGIC => FilesystemKind::Ext4,
         BTRFS_SUPER_MAGIC => FilesystemKind::Btrfs,
@@ -432,7 +439,7 @@ fn probe_fs_kind(_path: &Path) -> Result<(FilesystemKind, Option<String>)> {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_linux_fuse(ozone_dir: Option<&Path>) -> Option<LinuxFuseReadiness> {
+fn detect_linux_fuse(ozone_dir: Option<&Path>) -> LinuxFuseReadiness {
     let dev_fuse = Path::new("/dev/fuse");
     let dev_fuse_exists = dev_fuse.exists();
     let dev_fuse_rw = if dev_fuse_exists {
@@ -454,19 +461,18 @@ fn detect_linux_fuse(ozone_dir: Option<&Path>) -> Option<LinuxFuseReadiness> {
             .filter(|s| !s.is_empty())
     });
 
-    let user_allow_other_enabled = std::fs::read_to_string("/etc/fuse.conf")
-        .map(|content| {
+    let user_allow_other_enabled =
+        std::fs::read_to_string("/etc/fuse.conf").is_ok_and(|content| {
             content
                 .lines()
                 .any(|line| line.trim() == "user_allow_other")
-        })
-        .unwrap_or(false);
+        });
 
     let no_new_privs = process_has_no_new_privs();
     let daemon_running = is_vfsd_daemon_running(ozone_dir);
     let ready = dev_fuse_rw && fusermount3_path.is_some() && (!no_new_privs || daemon_running);
 
-    Some(LinuxFuseReadiness {
+    LinuxFuseReadiness {
         dev_fuse_exists,
         dev_fuse_rw,
         fusermount3_path,
@@ -475,12 +481,7 @@ fn detect_linux_fuse(ozone_dir: Option<&Path>) -> Option<LinuxFuseReadiness> {
         no_new_privs,
         daemon_running,
         ready,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn detect_linux_fuse(_ozone_dir: Option<&Path>) -> Option<LinuxFuseReadiness> {
-    None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -517,7 +518,7 @@ mod tests {
     fn probes_current_filesystem_successfully() {
         let probe = detect_filesystem(Path::new(".")).expect("detect filesystem");
         assert_eq!(probe.os, std::env::consts::OS);
-        assert!(!probe.fs_kind.as_str().is_empty());
+        assert_ne!(probe.fs_kind.as_str(), "");
         #[cfg(target_os = "linux")]
         {
             assert!(probe.fuse.is_some());

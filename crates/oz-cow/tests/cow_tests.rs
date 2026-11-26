@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(clippy::too_many_lines)]
+
 //! Integration tests for `oz-cow` backends, empirical reflink probing, CAS hardlink isolation,
 //! workspace lifecycle management, and `Fuse3VfsBackend` Unix socket IPC.
 
@@ -557,9 +559,8 @@ fn fuse3_backend_fails_fast_when_auto_start_disabled_and_socket_missing() {
 fn windows_projfs_backend_availability_and_shared_seed_layer() {
     #[cfg(not(target_os = "windows"))]
     {
-        let err = match backend_for_kind(BackendKind::WindowsProjFs) {
-            Ok(_) => panic!("WindowsProjFs must not be constructed on non-Windows"),
-            Err(e) => e,
+        let Err(err) = backend_for_kind(BackendKind::WindowsProjFs) else {
+            panic!("WindowsProjFs must not be constructed on non-Windows");
         };
         match err {
             oz_core::OzError::InvalidUsage { message, .. } => {
@@ -1021,11 +1022,12 @@ mod tests {
                     let p = entry.path();
                     if p.is_dir() {
                         stack.push(p);
-                    } else if p
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|n| n.starts_with("libext_dep-") && n.ends_with(".rlib"))
-                    {
+                    } else if p.file_name().and_then(|s| s.to_str()).is_some_and(|n| {
+                        n.starts_with("libext_dep-")
+                            && Path::new(n)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("rlib"))
+                    }) {
                         return p;
                     }
                 }

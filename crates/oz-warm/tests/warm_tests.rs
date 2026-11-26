@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Ozone Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(clippy::too_many_lines)]
+
 //! Integration tests for `oz-warm`.
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -411,10 +413,13 @@ fn mtime_preservation_restores_untouched_and_keeps_modified_at_now() {
     std::fs::write(ws_root.join("src/modified.rs"), "pub fn b() -> u32 { 2 }\n").expect("w");
     std::fs::write(ws_root.join("src/added.rs"), "pub fn c() {}\n").expect("w");
 
-    let now_before = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_secs() as i64;
+    let now_before = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs(),
+    )
+    .expect("i64");
     let stats = apply_baseline_mtimes(&ws_root, &baseline_meta, &changed).expect("apply mtimes");
     assert_eq!(stats.kept_modified_files, 1);
     assert!(stats.restored_files >= 2);
@@ -442,11 +447,11 @@ fn lru_gc_evicts_least_recently_used_baselines_within_budget() {
 
         let meta = BaselineMetadata {
             commit_oid: (*id).to_string(),
-            created_at: now - ChronoDuration::hours((3 - idx) as i64),
+            created_at: now - ChronoDuration::hours(i64::try_from(3 - idx).expect("i64")),
             targets: Vec::new(),
             total_bytes: 4096,
-            file_mtimes_secs: Default::default(),
-            file_mtimes_nanos: Default::default(),
+            file_mtimes_secs: std::collections::BTreeMap::new(),
+            file_mtimes_nanos: std::collections::BTreeMap::new(),
         };
         std::fs::write(
             bdir.join("metadata.json"),
@@ -475,13 +480,16 @@ fn set_mtime_secs(path: &Path, secs: i64) {
 }
 
 fn get_mtime_secs(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .expect("meta")
-        .modified()
-        .expect("modified")
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs() as i64
+    i64::try_from(
+        std::fs::metadata(path)
+            .expect("meta")
+            .modified()
+            .expect("modified")
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs(),
+    )
+    .expect("i64")
 }
 
 #[cfg(unix)]
@@ -695,7 +703,8 @@ fn detects_custom_cargo_target_dir_and_subsecond_mtime_preservation() {
     let ws_root = dir.path().join("ws-subsec");
     std::fs::create_dir_all(ws_root.join("src")).expect("mkdir ws src");
     std::fs::write(ws_root.join("src/lib.rs"), "pub fn x() -> u32 { 1 }\n").expect("write ws");
-    apply_baseline_mtimes(&ws_root, &meta, &Default::default()).expect("apply mtime");
+    apply_baseline_mtimes(&ws_root, &meta, &std::collections::HashSet::new())
+        .expect("apply mtime");
 
     let restored_meta = std::fs::metadata(ws_root.join("src/lib.rs")).expect("stat ws lib");
     let restored_mod = restored_meta.modified().expect("modified");

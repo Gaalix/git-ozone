@@ -3,6 +3,8 @@
 
 //! Tiered Copy-on-Write workspace backend trait and host filesystem capability detection.
 
+#![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+
 pub mod backends;
 pub mod detect;
 pub mod lifecycle;
@@ -17,7 +19,7 @@ pub use backends::{FicloneBackend, Fuse3VfsBackend};
 pub use backends::{ProjFsVfsBackend, RefsCloneBackend};
 pub use detect::{
     FilesystemProbe, LinuxFuseReadiness, detect_filesystem, detect_filesystem_with_ozone,
-    probe_ozone_reflink, probe_reflink_in_dir, select_backend,
+    probe_ozone_reflink, select_backend,
 };
 pub use lifecycle::{
     GcWorkspacesOptions, GcWorkspacesReport, RemoveWorkspaceOptions, RemovedWorkspace,
@@ -62,7 +64,7 @@ pub struct SpawnedWorkspace {
     pub untouched_disk_bytes: u64,
 }
 
-/// Health snapshot for an existing CoW or VFS workspace.
+/// Health snapshot for an existing `CoW` or VFS workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendHealth {
     pub healthy: bool,
@@ -72,7 +74,7 @@ pub struct BackendHealth {
     pub message: Option<String>,
 }
 
-/// Stable cross-platform trait implemented by APFS, FICLONE, FUSE3, ReFS, ProjFS, and CAS backends.
+/// Stable cross-platform trait implemented by APFS, `FICLONE`, FUSE3, `ReFS`, `ProjFS`, and CAS backends.
 pub trait WorkspaceBackend: Send + Sync {
     /// Backend identifier.
     fn kind(&self) -> BackendKind;

@@ -9,6 +9,7 @@ use gix::object::tree::diff::Change;
 use oz_core::{OzError, Result};
 use rayon::prelude::*;
 use std::collections::HashSet;
+use std::hash::BuildHasher;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,10 +26,10 @@ pub struct MtimeApplyStats {
 
 /// Restores deterministic baseline `mtime` (`<= cached artifact mtime`) on all untouched files
 /// in `workspace_root`, while leaving `modified_or_added_paths` untouched at `NOW`.
-pub fn apply_baseline_mtimes(
+pub fn apply_baseline_mtimes<S: BuildHasher + Sync>(
     workspace_root: &Path,
     baseline: &BaselineMetadata,
-    modified_or_added_paths: &HashSet<String>,
+    modified_or_added_paths: &HashSet<String, S>,
 ) -> Result<MtimeApplyStats> {
     let entries: Vec<(&String, &i64)> = baseline.file_mtimes_secs.iter().collect();
     let restored = AtomicUsize::new(0);
@@ -82,18 +83,22 @@ pub(crate) fn metadata_modified_secs_nanos(meta: &std::fs::Metadata) -> (i64, u3
 
 pub(crate) fn system_time_to_filetime(st: std::time::SystemTime) -> FileTime {
     match st.duration_since(UNIX_EPOCH) {
-        Ok(d) => FileTime::from_unix_time(d.as_secs() as i64, d.subsec_nanos()),
+        Ok(d) => FileTime::from_unix_time(
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
         Err(err) => {
-            let d = err.duration();
-            FileTime::from_unix_time(-(d.as_secs() as i64), 0)
+            let secs = i64::try_from(err.duration().as_secs()).unwrap_or(i64::MAX);
+            FileTime::from_unix_time(-secs, 0)
         }
     }
 }
 
 pub(crate) fn metadata_modified_filetime(meta: &std::fs::Metadata) -> FileTime {
-    meta.modified()
-        .map(system_time_to_filetime)
-        .unwrap_or_else(|_| FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(0)))
+    meta.modified().map_or_else(
+        |_| FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(0)),
+        system_time_to_filetime,
+    )
 }
 
 #[allow(deprecated)]
@@ -117,31 +122,29 @@ pub fn compute_changed_paths_between_commits(
         return Ok(HashSet::new());
     }
 
-    let repo = gix::open(repo_root).map_err(|e| OzError::Git(e.to_string()))?;
-    let base_id = gix::ObjectId::from_hex(base_commit_oid.as_bytes())
-        .map_err(|e| OzError::Git(e.to_string()))?;
-    let target_id = gix::ObjectId::from_hex(target_commit_oid.as_bytes())
-        .map_err(|e| OzError::Git(e.to_string()))?;
+    let repo = gix::open(repo_root).map_err(OzError::git_source)?;
+    let base_id =
+        gix::ObjectId::from_hex(base_commit_oid.as_bytes()).map_err(OzError::git_source)?;
+    let target_id =
+        gix::ObjectId::from_hex(target_commit_oid.as_bytes()).map_err(OzError::git_source)?;
 
     let base_tree = repo
         .find_commit(base_id)
-        .map_err(|e| OzError::Git(e.to_string()))?
+        .map_err(OzError::git_source)?
         .tree()
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
     let target_tree = repo
         .find_commit(target_id)
-        .map_err(|e| OzError::Git(e.to_string()))?
+        .map_err(OzError::git_source)?
         .tree()
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut changed = HashSet::new();
-    let mut changes = base_tree
-        .changes()
-        .map_err(|e| OzError::Git(e.to_string()))?;
-    changes.options(|opts| {
+    let mut diff_platform = base_tree.changes().map_err(OzError::git_source)?;
+    diff_platform.options(|opts| {
         opts.track_rewrites(None);
     });
-    changes
+    diff_platform
         .for_each_to_obtain_tree(&target_tree, |change| {
             match change {
                 Change::Addition {
@@ -153,14 +156,8 @@ pub fn compute_changed_paths_between_commits(
                     location,
                     entry_mode,
                     ..
-                } => {
-                    if !entry_mode.is_tree()
-                        && let Ok(s) = std::str::from_utf8(location.as_ref())
-                    {
-                        changed.insert(s.to_string());
-                    }
                 }
-                Change::Rewrite {
+                | Change::Rewrite {
                     location,
                     entry_mode,
                     ..
@@ -175,7 +172,7 @@ pub fn compute_changed_paths_between_commits(
             }
             Ok::<_, gix::Error>(ControlFlow::Continue(()))
         })
-        .map_err(|e| OzError::Git(e.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     Ok(changed)
 }

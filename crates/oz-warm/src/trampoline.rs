@@ -11,7 +11,7 @@ use std::path::{Component, Path};
 ///
 /// Returns `None` for non-Python shebangs, relative paths, or `#!/usr/bin/env ...`.
 #[must_use]
-pub fn parse_python_shebang(first_line: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_python_shebang(first_line: &str) -> Option<(&str, &str)> {
     let trimmed = first_line.trim_end_matches(['\r', '\n']);
     let after_bang = trimmed.strip_prefix("#!")?.trim_start();
     parse_abs_python_invocation(after_bang)
@@ -96,20 +96,20 @@ fn format_trampoline_header(exe_name: &str, args: &str) -> String {
 }
 
 fn parse_long_shebang_trampoline(content_str: &str) -> Option<(&str, &str, &str)> {
-    let mut lines = content_str.split_inclusive('\n');
-    let line1 = lines.next()?;
-    let line2 = lines.next()?;
-    let line3 = lines.next()?;
+    let mut split = content_str.split_inclusive('\n');
+    let first = split.next()?;
+    let second = split.next()?;
+    let third = split.next()?;
 
-    let shebang = line1.trim_end_matches(['\r', '\n']).trim();
+    let shebang = first.trim_end_matches(['\r', '\n']).trim();
     if shebang != "#!/bin/sh" && shebang != "#!/usr/bin/env sh" {
         return None;
     }
-    if line3.trim_end_matches(['\r', '\n']).trim() != "' '''" {
+    if third.trim_end_matches(['\r', '\n']).trim() != "' '''" {
         return None;
     }
 
-    let exec_body = line2
+    let exec_body = second
         .trim_end_matches(['\r', '\n'])
         .trim_start()
         .strip_prefix("'''exec'")?
@@ -125,7 +125,7 @@ fn parse_long_shebang_trampoline(content_str: &str) -> Option<(&str, &str, &str)
         .or_else(|| trailing.strip_suffix("'$0' '$@'"))?
         .trim();
 
-    let header_len = line1.len() + line2.len() + line3.len();
+    let header_len = first.len() + second.len() + third.len();
     Some((exe_name, args, &content_str[header_len..]))
 }
 
@@ -141,7 +141,7 @@ fn parse_long_shebang_trampoline(content_str: &str) -> Option<(&str, &str, &str)
 ///
 /// Returns `None` when the file is binary or does not contain a hardcoded absolute Python invocation.
 #[must_use]
-pub fn rewrite_python_trampoline_bytes(content: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn rewrite_python_trampoline_bytes(content: &[u8]) -> Option<Vec<u8>> {
     if !content.starts_with(b"#!") {
         return None;
     }
@@ -180,7 +180,7 @@ pub fn rewrite_python_trampoline_bytes(content: &[u8]) -> Option<Vec<u8>> {
 /// dynamically relative to the workspace's `.venv/bin/` directory instead of hardcoding the
 /// original repository's `.venv` path.
 #[must_use]
-pub fn rewrite_venv_activate_bytes(
+pub(crate) fn rewrite_venv_activate_bytes(
     file_name: &str,
     content: &[u8],
     orig_target_root: &Path,
@@ -301,7 +301,7 @@ pub fn rewrite_venv_activate_bytes(
 /// or repository root path) never leaks the original repository's filesystem location across
 /// spawned workspaces.
 #[must_use]
-pub fn rewrite_pyvenv_cfg_bytes(
+pub(crate) fn rewrite_pyvenv_cfg_bytes(
     content: &[u8],
     repo_root: &Path,
     orig_target_root: &Path,
@@ -351,7 +351,7 @@ pub fn rewrite_pyvenv_cfg_bytes(
 /// Rewrites Python `site-packages/*.pth` editable-install path entries that point inside
 /// `repo_root` into workspace-relative `import os, sys; ...` lines anchored at `sys.prefix`.
 #[must_use]
-pub fn rewrite_python_pth_bytes(content: &[u8], repo_root: &Path) -> Option<Vec<u8>> {
+pub(crate) fn rewrite_python_pth_bytes(content: &[u8], repo_root: &Path) -> Option<Vec<u8>> {
     if content.contains(&0) {
         return None;
     }
@@ -406,7 +406,7 @@ pub fn rewrite_python_pth_bytes(content: &[u8], repo_root: &Path) -> Option<Vec<
 /// Returns `true` if `rel_path` points to a direct script inside `.venv/bin/` (or `<target>/bin/`
 /// for a Python target).
 #[must_use]
-pub fn is_venv_bin_script(rel_path: &Path) -> bool {
+pub(crate) fn is_venv_bin_script(rel_path: &Path) -> bool {
     let comps: Vec<&str> = rel_path
         .components()
         .filter_map(|c| match c {
@@ -419,7 +419,7 @@ pub fn is_venv_bin_script(rel_path: &Path) -> bool {
 
 /// Returns `true` if `rel_path` points to a `.pth` file inside `site-packages/`.
 #[must_use]
-pub fn is_venv_pth_file(rel_path: &Path) -> bool {
+pub(crate) fn is_venv_pth_file(rel_path: &Path) -> bool {
     rel_path.extension().and_then(|s| s.to_str()) == Some("pth")
         && rel_path
             .components()

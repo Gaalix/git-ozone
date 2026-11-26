@@ -42,7 +42,7 @@ pub enum CargoArtifactDisposition {
 /// transient locks, mutable workspace/metadata files, and immutable third-party CAS artifacts.
 #[derive(Debug, Clone, Default)]
 pub struct CargoTargetClassifier {
-    /// Workspace package names (both kebab-case and snake_case, e.g. `"oz-cli"` and `"oz_cli"`).
+    /// Workspace package names (both kebab-case and `snake_case`, e.g. `"oz-cli"` and `"oz_cli"`).
     workspace_packages: HashSet<String>,
     /// Workspace package + target names (`[lib]`, `[[bin]]`, `[[test]]`, `[[example]]`, `[[bench]]`)
     /// normalized with `-` -> `_` for matching unhashed/hashed `deps/` filenames.
@@ -109,7 +109,7 @@ impl CargoTargetClassifier {
         // Cargo fingerprints, incremental compilation sessions, rustdoc outputs, examples,
         // `target/tmp` integration-test scratch, and all `.d` dep-info files are opened in-place
         // (`O_WRONLY | O_TRUNC`) or checked for writability by Cargo/rustc/rustdoc.
-        if file_name.ends_with(".d")
+        if has_ext_ignore_ascii_case(file_name, "d")
             || comps.contains(&".fingerprint")
             || comps.contains(&"incremental")
             || comps.contains(&"doc")
@@ -384,15 +384,13 @@ impl CargoTargetClassifier {
                             self.local_unit_hashes.insert(unit_hash.to_string());
                         }
                         let is_bs_run = unit_path.join("run").is_dir()
-                            || std::fs::read_dir(unit_path.join("fingerprint"))
-                                .ok()
-                                .is_some_and(|rd| {
-                                    rd.flatten().any(|f| {
-                                        f.file_name()
-                                            .to_str()
-                                            .is_some_and(|n| n.starts_with("run-build-script-"))
-                                    })
-                                });
+                            || std::fs::read_dir(unit_path.join("fingerprint")).is_ok_and(|rd| {
+                                rd.flatten().any(|f| {
+                                    f.file_name()
+                                        .to_str()
+                                        .is_some_and(|n| n.starts_with("run-build-script-"))
+                                })
+                            });
                         if is_bs_run {
                             self.build_script_run_hashes.insert(unit_hash.to_string());
                         }
@@ -404,7 +402,7 @@ impl CargoTargetClassifier {
                                 let Some(out_name) = out_name_os.to_str() else {
                                     continue;
                                 };
-                                if !out_name.ends_with(".d") {
+                                if !has_ext_ignore_ascii_case(out_name, "d") {
                                     continue;
                                 }
                                 if dep_info_references_local_source(
@@ -428,7 +426,7 @@ impl CargoTargetClassifier {
 
 /// Returns `true` when `rel_in_target` is a transient Cargo advisory lock file.
 #[must_use]
-pub fn is_transient_cargo_lock_path(rel_in_target: &Path) -> bool {
+pub(crate) fn is_transient_cargo_lock_path(rel_in_target: &Path) -> bool {
     let comps: Vec<&str> = rel_in_target
         .components()
         .filter_map(|c| match c {
@@ -442,12 +440,25 @@ pub fn is_transient_cargo_lock_path(rel_in_target: &Path) -> bool {
     is_transient_cargo_lock(&comps, file_name)
 }
 
+fn has_ext_ignore_ascii_case(file_name: &str, ext: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
 fn is_transient_cargo_lock(comps: &[&str], file_name: &str) -> bool {
-    if is_cargo_lock_filename(file_name) || file_name == ".oz-lock" || file_name.ends_with(".flock")
+    if is_cargo_lock_filename(file_name)
+        || file_name == ".oz-lock"
+        || file_name.eq_ignore_ascii_case(".flock")
+        || has_ext_ignore_ascii_case(file_name, "flock")
     {
         return true;
     }
-    if comps.contains(&"incremental") && (file_name == "lock" || file_name.ends_with(".lock")) {
+    if comps.contains(&"incremental")
+        && (file_name == "lock"
+            || file_name.eq_ignore_ascii_case(".lock")
+            || has_ext_ignore_ascii_case(file_name, "lock"))
+    {
         return true;
     }
     comps.contains(&"doc") && file_name == ".lock"
@@ -912,21 +923,21 @@ fn match_segments(pat: &[&str], txt: &[&str]) -> bool {
 
 fn match_wildcard(pat: &[u8], txt: &[u8]) -> bool {
     let (mut pi, mut ti) = (0usize, 0usize);
-    let mut star_pi: Option<usize> = None;
-    let mut star_ti = 0usize;
+    let mut backtrack_pat: Option<usize> = None;
+    let mut backtrack_txt = 0usize;
 
     while ti < txt.len() {
         if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == txt[ti]) {
             pi += 1;
             ti += 1;
         } else if pi < pat.len() && pat[pi] == b'*' {
-            star_pi = Some(pi);
+            backtrack_pat = Some(pi);
             pi += 1;
-            star_ti = ti;
-        } else if let Some(sp) = star_pi {
+            backtrack_txt = ti;
+        } else if let Some(sp) = backtrack_pat {
             pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
+            backtrack_txt += 1;
+            ti = backtrack_txt;
         } else {
             return false;
         }

@@ -3,22 +3,20 @@
 
 //! Ecosystem warm build/dependency cache detection, baseline capture, and `mtime` preservation.
 
+#![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+
 pub mod baseline;
 pub mod cargo;
 pub mod mtime;
 pub mod quiescent;
-pub mod trampoline;
+pub(crate) mod trampoline;
 
 pub use baseline::{GcReport, capture_baseline, gc_baselines, touch_baseline_lru};
-pub use cargo::{CargoArtifactDisposition, CargoTargetClassifier, is_transient_cargo_lock_path};
+pub use cargo::{CargoArtifactDisposition, CargoTargetClassifier};
 pub use mtime::{MtimeApplyStats, apply_baseline_mtimes, compute_changed_paths_between_commits};
 pub use quiescent::{
     BaselineResolution, BaselineSource, LoadedBaseline, find_baseline, find_nearest_prior_baseline,
     is_repo_quiescent, resolve_or_capture_baseline,
-};
-pub use trampoline::{
-    is_venv_bin_script, is_venv_pth_file, parse_python_shebang, rewrite_python_pth_bytes,
-    rewrite_python_trampoline_bytes, rewrite_pyvenv_cfg_bytes, rewrite_venv_activate_bytes,
 };
 
 use chrono::{DateTime, Utc};
@@ -60,7 +58,7 @@ pub struct BaselineMetadata {
     pub file_mtimes_nanos: BTreeMap<String, u32>,
 }
 
-/// Portability report for a Rust Cargo `target/` directory across relocated CoW workspaces.
+/// Portability report for a Rust Cargo `target/` directory across relocated `CoW` workspaces.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CargoFingerprintReport {
     pub fingerprints_scanned: usize,
@@ -72,7 +70,7 @@ pub struct CargoFingerprintReport {
 /// Returns `true` when `file_name` is a transient Cargo advisory lock file (`target/.cargo-lock`,
 /// `.cargo-build-lock`, `.cargo-artifact-lock`).
 #[must_use]
-pub fn is_cargo_lock_filename(file_name: &str) -> bool {
+pub(crate) fn is_cargo_lock_filename(file_name: &str) -> bool {
     matches!(
         file_name,
         ".cargo-lock" | ".cargo-build-lock" | ".cargo-artifact-lock"
@@ -152,7 +150,7 @@ fn parse_cargo_config_target_dir(repo_root: &Path) -> Option<String> {
 /// Detects Cargo `target-dir` from `cargo_target_dir_env` or `.cargo/config.toml` when it
 /// resolves inside `repo_root`.
 #[must_use]
-pub fn resolve_cargo_target_dir_rel(
+pub(crate) fn resolve_cargo_target_dir_rel(
     repo_root: &Path,
     cargo_target_dir_env: Option<&OsStr>,
 ) -> Option<String> {
@@ -261,8 +259,7 @@ fn is_js_monorepo(repo_root: &Path) -> bool {
         return true;
     }
     std::fs::read_to_string(repo_root.join("package.json"))
-        .ok()
-        .is_some_and(|raw| raw.contains("\"workspaces\""))
+        .is_ok_and(|raw| raw.contains("\"workspaces\""))
 }
 
 fn detect_nested_workspace_node_modules(repo_root: &Path) -> Vec<String> {
