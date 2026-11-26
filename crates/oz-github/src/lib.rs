@@ -3,6 +3,12 @@
 
 //! Pure-Rust Git wire protocol client, token discovery, and GitHub stacked PR / sync / CI workflows.
 
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::struct_excessive_bools
+)]
+
 pub mod api;
 pub mod auth;
 pub mod ci;
@@ -13,30 +19,24 @@ pub mod sync;
 pub mod wire;
 
 pub use api::{
-    ConditionalGet, CreatePullRequestReviewPayload, GitHubActionsJob, GitHubCheckRun,
-    GitHubCheckRunOutput, GitHubClient, GitHubIssue, GitHubIssueComment, GitHubIssuePullRequestRef,
-    GitHubJobStep, GitHubLabel, GitHubMilestone, GitHubPrRef, GitHubPullRequest,
-    GitHubPullRequestComment, GitHubPullRequestFile, GitHubPullRequestReview,
-    GitHubReviewCommentPayload, GitHubReviewThreadMeta, GitHubSearchIssuesResponse, GitHubUser,
-    GitHubWorkflow, GitHubWorkflowRun, UpdatePullRequest,
+    GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput, GitHubClient, GitHubIssue,
+    GitHubIssueComment, GitHubIssuePullRequestRef, GitHubJobStep, GitHubLabel, GitHubMilestone,
+    GitHubPrRef, GitHubPullRequest, GitHubPullRequestComment, GitHubPullRequestFile,
+    GitHubPullRequestReview, GitHubUser, GitHubWorkflow, GitHubWorkflowRun,
 };
 pub use auth::{
     DEFAULT_GITHUB_API_URL, DiscoveredToken, GitHubAuthProbe, ParsedGitRemote, RemoteScheme,
     TokenDiscoveryOptions, TokenSource, discover_github_token, discover_github_token_with_options,
-    extract_token_from_gh_hosts_yml, load_git_config_from_gix_repo, parse_git_remote,
-    parse_git_remote_with_env, probe_github_auth, query_git_credential_fill,
-    read_remote_url_from_gix, read_remote_url_from_repo, require_github_token, resolve_repo_remote,
-    strip_host_port,
+    parse_git_remote, parse_git_remote_with_env, probe_github_auth, query_git_credential_fill,
+    require_github_token,
 };
 pub use ci::{
     CiJobLogOptions, CiJobLogReport, CiQueryOptions, CiReport, CiRunsOptions, CiRunsReport,
     CiWatchEvent, CiWatchMetadata, CiWatchOptions, CiWatchOutcome, CiWorkflowOptions,
     CiWorkflowReport, CiWorkflowRunSummary, DEFAULT_MAX_EXCERPT_LINES,
     DEFAULT_WATCH_STARTUP_TIMEOUT_SECS, DEFAULT_WATCH_TIMEOUT_SECS, DEFAULT_WORKFLOW_RUN_LIMIT,
-    MAX_MCP_WAIT_SECONDS, MultiPrCiReport, extract_log_text_from_bytes, query_ci_job_log,
-    query_ci_runs, query_ci_status, query_multi_pr_ci_status, query_workflow_ci_status,
-    strip_actions_timestamp, strip_ansi_escapes, summarize_failing_log, watch_ci_status,
-    watch_workflow_ci_status,
+    MAX_MCP_WAIT_SECONDS, MultiPrCiReport, query_ci_job_log, query_ci_runs, query_ci_status,
+    query_multi_pr_ci_status, query_workflow_ci_status, watch_ci_status, watch_workflow_ci_status,
 };
 pub use issue::{
     IssueCommentOptions, IssueCommentOutcome, IssueListItem, IssueListOptions, IssueListOutcome,
@@ -51,15 +51,12 @@ pub use pr::{
     PrResolveOutcome, PrReviewEvent, PrReviewOptions, PrReviewOutcome, PrReviewThread,
     PrReviewThreadComment, PrStackOptions, PrStackOutcome, PrStatusItem, PrStatusOptions,
     PrStatusOutcome, PrViewFileSummary, PrViewOptions, PrViewOutcome, PrViewReviewSummary,
-    StackPrItem, group_review_threads, infer_title_body_and_change_ids,
-    parse_github_patch_to_hunks, parse_inline_comment_spec, pr_comments, pr_create, pr_diff,
-    pr_edit, pr_files_to_changes, pr_list, pr_read, pr_reply, pr_resolve, pr_review, pr_stack,
-    pr_status, pr_view, render_stack_navigation_block, strip_stack_navigation_block,
-    upsert_stack_navigation_block, validate_pr_review_comments,
+    StackPrItem, parse_inline_comment_spec, pr_comments, pr_create, pr_diff, pr_edit, pr_list,
+    pr_read, pr_reply, pr_resolve, pr_review, pr_stack, pr_status, pr_view,
 };
 pub use ssh_config::{
-    ResolvedSshHost, SshConfigSearchContext, build_gix_ssh_options, format_openssh_command,
-    resolve_ssh_host, resolve_ssh_host_with_context,
+    ResolvedSshHost, SshConfigSearchContext, format_openssh_command, resolve_ssh_host,
+    resolve_ssh_host_with_context,
 };
 pub use sync::{
     PullOptions, PullOutcome, PullStrategy, RetargetedPrSummary, SyncOptions, SyncOutcome,

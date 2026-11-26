@@ -7,7 +7,7 @@
 use crate::PullRequestSpec;
 use crate::auth::{
     DEFAULT_GITHUB_API_URL, ParsedGitRemote, RemoteScheme, TokenDiscoveryOptions,
-    discover_github_token_with_options, resolve_repo_remote,
+    discover_github_token_with_options, is_loopback_host, resolve_repo_remote,
 };
 use crate::wire::run_blocking_safe;
 use http::StatusCode;
@@ -170,7 +170,7 @@ pub struct GitHubIssueComment {
 
 /// GraphQL review thread resolution/outdated metadata keyed by REST comment `databaseId`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitHubReviewThreadMeta {
+pub(crate) struct GitHubReviewThreadMeta {
     pub thread_id: String,
     pub is_resolved: bool,
     pub is_outdated: bool,
@@ -238,7 +238,7 @@ pub struct GitHubIssue {
 
 /// Response from GitHub REST Search Issues/PRs (`GET /search/issues`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitHubSearchIssuesResponse {
+pub(crate) struct GitHubSearchIssuesResponse {
     #[serde(default)]
     pub total_count: u64,
     #[serde(default)]
@@ -265,7 +265,7 @@ struct WorkflowsEnvelope {
 
 /// Single inline comment entry inside [`CreatePullRequestReviewPayload`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitHubReviewCommentPayload {
+pub(crate) struct GitHubReviewCommentPayload {
     pub path: String,
     pub line: u32,
     pub side: String,
@@ -278,7 +278,7 @@ pub struct GitHubReviewCommentPayload {
 
 /// Request body for `POST /repos/{owner}/{repo}/pulls/{number}/reviews`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreatePullRequestReviewPayload {
+pub(crate) struct CreatePullRequestReviewPayload {
     pub commit_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -297,7 +297,7 @@ impl GitHubPullRequest {
 
 /// Partial update payload for `PATCH /repos/{owner}/{repo}/pulls/{number}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdatePullRequest {
+pub(crate) struct UpdatePullRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,7 +406,7 @@ struct ActionsJobsEnvelope {
 
 /// Outcome of a conditional HTTP GET supporting `If-None-Match` / `ETag` and rate-limit backoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConditionalGet<T> {
+pub(crate) enum ConditionalGet<T> {
     /// Server returned `304 Not Modified` (zero GitHub REST rate-limit cost).
     NotModified {
         etag: Option<String>,
@@ -502,13 +502,22 @@ impl GitHubClient {
             .clone()
             .unwrap_or_else(|| "github.com".to_string());
         let discovered = discover_github_token_with_options(&TokenDiscoveryOptions {
-            host,
+            host: host.clone(),
             protocol: protocol.to_string(),
             explicit_token: explicit_token.map(str::to_string),
             credential_workdir: Some(repo.repo_root.clone()),
             ..Default::default()
         });
         let client = Self::new(parsed.api_base_url.clone(), discovered.map(|d| d.token));
+        if client.has_token() {
+            if parsed.scheme == RemoteScheme::Http
+                && !is_loopback_host(&host)
+                && api_url_override.is_none()
+            {
+                return Err(insecure_http_credentials_error(&host));
+            }
+            validate_endpoint_credentials_security(&client.api_base_url)?;
+        }
         Ok((client, parsed))
     }
 
@@ -526,7 +535,7 @@ impl GitHubClient {
 
     /// Returns the token if present, or an actionable [`OzError::InvalidUsage`] when missing.
     pub fn require_authenticated(&self) -> Result<&str> {
-        self.token.as_deref().ok_or_else(|| OzError::InvalidUsage {
+        let tok = self.token.as_deref().ok_or_else(|| OzError::InvalidUsage {
             message: format!(
                 "GitHub authentication token required for API calls to '{}'",
                 self.api_base_url
@@ -535,7 +544,9 @@ impl GitHubClient {
                 "export GITHUB_TOKEN=<personal-access-token>".to_string(),
                 "gh auth login".to_string(),
             ],
-        })
+        })?;
+        validate_endpoint_credentials_security(&self.api_base_url)?;
+        Ok(tok)
     }
 
     /// Lists pull requests (`GET /repos/{owner}/{repo}/pulls`).
@@ -586,7 +597,7 @@ impl GitHubClient {
     }
 
     /// Conditionally fetches a single pull request with `If-None-Match` (`ETag`) support.
-    pub fn get_pull_request_conditional(
+    pub(crate) fn get_pull_request_conditional(
         &self,
         owner: &str,
         repo: &str,
@@ -625,15 +636,15 @@ impl GitHubClient {
     }
 
     /// Updates an existing pull request (`PATCH /repos/{owner}/{repo}/pulls/{number}`).
-    pub fn update_pull_request(
+    pub(crate) fn update_pull_request(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
-        patch: &UpdatePullRequest,
+        update: &UpdatePullRequest,
     ) -> Result<GitHubPullRequest> {
-        let path = format!("/repos/{owner}/{repo}/pulls/{number}");
-        self.send_json(http::Method::PATCH, &path, patch)
+        let endpoint_path = format!("/repos/{owner}/{repo}/pulls/{number}");
+        self.send_json(http::Method::PATCH, &endpoint_path, update)
     }
 
     /// Retargets a pull request's `base` branch (`PATCH /repos/{owner}/{repo}/pulls/{number}`).
@@ -795,7 +806,7 @@ impl GitHubClient {
     }
 
     /// Searches issues and pull requests via REST (`GET /search/issues?q=...`).
-    pub fn search_issues_and_prs(
+    pub(crate) fn search_issues_and_prs(
         &self,
         query: &str,
         per_page: usize,
@@ -851,12 +862,12 @@ impl GitHubClient {
     ) -> Result<bool> {
         let (mutation, field) = if resolved {
             (
-                r#"mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }"#,
+                r"mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }",
                 "resolveReviewThread",
             )
         } else {
             (
-                r#"mutation($threadId: ID!) { unresolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }"#,
+                r"mutation($threadId: ID!) { unresolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }",
                 "unresolveReviewThread",
             )
         };
@@ -879,7 +890,7 @@ impl GitHubClient {
             .and_then(|d| d.get(field))
             .and_then(|r| r.get("thread"))
             .and_then(|t| t.get("isResolved"))
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(resolved);
         Ok(is_resolved)
     }
@@ -892,13 +903,13 @@ impl GitHubClient {
         number: u64,
         draft: bool,
     ) -> Result<bool> {
-        const ID_QUERY: &str = r#"
+        const ID_QUERY: &str = r"
             query($owner: String!, $repo: String!, $number: Int!) {
               repository(owner: $owner, name: $repo) {
                 pullRequest(number: $number) { id isDraft }
               }
             }
-        "#;
+        ";
         let id_resp = self.graphql(
             ID_QUERY,
             serde_json::json!({ "owner": owner, "repo": repo, "number": number }),
@@ -916,12 +927,12 @@ impl GitHubClient {
 
         let (mutation, field) = if draft {
             (
-                r#"mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } } }"#,
+                r"mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } } }",
                 "convertPullRequestToDraft",
             )
         } else {
             (
-                r#"mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }"#,
+                r"mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }",
                 "markPullRequestReadyForReview",
             )
         };
@@ -944,18 +955,18 @@ impl GitHubClient {
             .and_then(|d| d.get(field))
             .and_then(|r| r.get("pullRequest"))
             .and_then(|p| p.get("isDraft"))
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(draft))
     }
 
     /// Best-effort GraphQL lookup for PR `reviewThreads` (`isResolved`, `isOutdated`, thread IDs).
-    pub fn list_pull_request_review_threads_graphql(
+    pub(crate) fn list_pull_request_review_threads_graphql(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
     ) -> Result<Vec<GitHubReviewThreadMeta>> {
-        const QUERY: &str = r#"
+        const QUERY: &str = r"
             query($owner: String!, $repo: String!, $number: Int!, $after: String) {
               repository(owner: $owner, name: $repo) {
                 pullRequest(number: $number) {
@@ -973,7 +984,7 @@ impl GitHubClient {
                 }
               }
             }
-        "#;
+        ";
 
         let mut threads = Vec::new();
         let mut cursor: Option<String> = None;
@@ -1001,11 +1012,11 @@ impl GitHubClient {
                     };
                     let is_resolved = node
                         .get("isResolved")
-                        .and_then(|v| v.as_bool())
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
                     let is_outdated = node
                         .get("isOutdated")
-                        .and_then(|v| v.as_bool())
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
                     let comment_ids = node
                         .get("comments")
@@ -1013,7 +1024,9 @@ impl GitHubClient {
                         .and_then(|n| n.as_array())
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|item| item.get("databaseId").and_then(|v| v.as_u64()))
+                                .filter_map(|item| {
+                                    item.get("databaseId").and_then(serde_json::Value::as_u64)
+                                })
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
@@ -1028,7 +1041,7 @@ impl GitHubClient {
             let has_next = rt
                 .get("pageInfo")
                 .and_then(|p| p.get("hasNextPage"))
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             if !has_next {
                 break;
@@ -1047,7 +1060,7 @@ impl GitHubClient {
     }
 
     /// Submits a pull request review (`POST /repos/{owner}/{repo}/pulls/{number}/reviews`).
-    pub fn create_pull_request_review(
+    pub(crate) fn create_pull_request_review(
         &self,
         owner: &str,
         repo: &str,
@@ -1090,19 +1103,20 @@ impl GitHubClient {
         }
         full_url.query_pairs_mut().append_pair("ref", git_ref);
         let endpoint = full_url.to_string();
+        if self.has_token() {
+            validate_endpoint_credentials_security(&endpoint)?;
+        }
         let label = format!("GET /repos/{owner}/{repo}/contents/{trimmed}?ref={git_ref}");
         let this = self.clone();
 
         run_blocking_safe(move || {
             let http_client = this.blocking_client()?;
-            let mut req = http_client
+            let req = http_client
                 .get(&endpoint)
                 .header("Accept", "application/vnd.github.raw+json")
                 .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
                 .header("User-Agent", CLIENT_USER_AGENT);
-            if let Some(ref tok) = this.token {
-                req = req.bearer_auth(tok);
-            }
+            let req = this.attach_auth(req, &endpoint)?;
             let resp = req.send().map_err(|err| {
                 OzError::Other(format!("GitHub API request {label} failed: {err}"))
             })?;
@@ -1131,20 +1145,21 @@ impl GitHubClient {
         } else {
             format!("{}/graphql", self.api_base_url)
         };
+        if self.has_token() {
+            validate_endpoint_credentials_security(&endpoint)?;
+        }
 
         let body_val = serde_json::to_value(GraphQlBody { query, variables })?;
         let this = self.clone();
         run_blocking_safe(move || {
             let http_client = this.blocking_client()?;
-            let mut req = http_client
+            let req = http_client
                 .post(&endpoint)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
                 .header("User-Agent", CLIENT_USER_AGENT)
                 .json(&body_val);
-            if let Some(ref tok) = this.token {
-                req = req.bearer_auth(tok);
-            }
+            let req = this.attach_auth(req, &endpoint)?;
             let resp = req
                 .send()
                 .map_err(|err| OzError::Other(format!("GitHub GraphQL request failed: {err}")))?;
@@ -1167,7 +1182,7 @@ impl GitHubClient {
     }
 
     /// Conditionally lists commit check-runs with `If-None-Match` (`ETag`) support.
-    pub fn list_check_runs_for_ref_conditional(
+    pub(crate) fn list_check_runs_for_ref_conditional(
         &self,
         owner: &str,
         repo: &str,
@@ -1216,7 +1231,7 @@ impl GitHubClient {
     }
 
     /// Conditionally lists GitHub Actions workflow runs with `If-None-Match` (`ETag`) support.
-    pub fn list_workflow_runs_conditional(
+    pub(crate) fn list_workflow_runs_conditional(
         &self,
         owner: &str,
         repo: &str,
@@ -1266,7 +1281,7 @@ impl GitHubClient {
     }
 
     /// Conditionally lists runs for a specific GitHub Actions workflow with `ETag` support.
-    pub fn list_workflow_runs_for_workflow_conditional(
+    pub(crate) fn list_workflow_runs_for_workflow_conditional(
         &self,
         owner: &str,
         repo: &str,
@@ -1301,7 +1316,7 @@ impl GitHubClient {
     }
 
     /// Conditionally lists jobs for a workflow run with `If-None-Match` (`ETag`) support.
-    pub fn list_jobs_for_workflow_run_conditional(
+    pub(crate) fn list_jobs_for_workflow_run_conditional(
         &self,
         owner: &str,
         repo: &str,
@@ -1334,17 +1349,18 @@ impl GitHubClient {
             "{}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
             self.api_base_url
         );
+        if self.has_token() {
+            validate_endpoint_credentials_security(&url)?;
+        }
         let this = self.clone();
         run_blocking_safe(move || {
             let http_client = this.blocking_client()?;
-            let mut req = http_client
+            let req = http_client
                 .get(&url)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
                 .header("User-Agent", CLIENT_USER_AGENT);
-            if let Some(ref tok) = this.token {
-                req = req.bearer_auth(tok);
-            }
+            let req = this.attach_auth(req, &url)?;
             let resp = req.send().map_err(|err| {
                 OzError::Other(format!("failed downloading job {job_id} logs: {err}"))
             })?;
@@ -1362,6 +1378,18 @@ impl GitHubClient {
             })?;
             Ok(bytes.to_vec())
         })
+    }
+
+    fn attach_auth(
+        &self,
+        req: reqwest::blocking::RequestBuilder,
+        endpoint: &str,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
+        let Some(ref tok) = self.token else {
+            return Ok(req);
+        };
+        validate_endpoint_credentials_security(endpoint)?;
+        Ok(req.bearer_auth(tok))
     }
 
     /// Returns the shared pooled [`reqwest::blocking::Client`], lazily initialized once
@@ -1417,19 +1445,20 @@ impl GitHubClient {
             }
         }
         let endpoint = full_url.to_string();
+        if self.has_token() {
+            validate_endpoint_credentials_security(&endpoint)?;
+        }
         let label = format!("GET {path}");
         let this = self.clone();
 
         run_blocking_safe(move || {
             let http_client = this.blocking_client()?;
-            let mut req = http_client
+            let req = http_client
                 .get(&endpoint)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
                 .header("User-Agent", CLIENT_USER_AGENT);
-            if let Some(ref tok) = this.token {
-                req = req.bearer_auth(tok);
-            }
+            let req = this.attach_auth(req, &endpoint)?;
             let resp = req.send().map_err(|err| {
                 OzError::Other(format!("GitHub API request {label} failed: {err}"))
             })?;
@@ -1463,6 +1492,9 @@ impl GitHubClient {
             }
         }
         let endpoint = full_url.to_string();
+        if self.has_token() {
+            validate_endpoint_credentials_security(&endpoint)?;
+        }
         let label = format!("GET {path}");
         let inm = if_none_match
             .map(str::trim)
@@ -1472,14 +1504,12 @@ impl GitHubClient {
 
         run_blocking_safe(move || {
             let http_client = this.blocking_client()?;
-            let mut req = http_client
+            let req = http_client
                 .get(&endpoint)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
                 .header("User-Agent", CLIENT_USER_AGENT);
-            if let Some(ref tok) = this.token {
-                req = req.bearer_auth(tok);
-            }
+            let mut req = this.attach_auth(req, &endpoint)?;
             if let Some(ref etag) = inm {
                 req = req.header("If-None-Match", etag);
             }
@@ -1555,26 +1585,51 @@ impl GitHubClient {
     {
         let payload = serde_json::to_value(body)?;
         let endpoint = format!("{}{path}", self.api_base_url);
+        if self.has_token() {
+            validate_endpoint_credentials_security(&endpoint)?;
+        }
         let label = format!("{method} {path}");
         let this = self.clone();
 
         run_blocking_safe(move || {
             let http_client = this.blocking_client()?;
-            let mut req = http_client
+            let req = http_client
                 .request(method, &endpoint)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
                 .header("User-Agent", CLIENT_USER_AGENT)
                 .json(&payload);
-            if let Some(ref tok) = this.token {
-                req = req.bearer_auth(tok);
-            }
+            let req = this.attach_auth(req, &endpoint)?;
             let resp = req.send().map_err(|err| {
                 OzError::Other(format!("GitHub API request {label} failed: {err}"))
             })?;
             decode_json_response(resp, &label)
         })
     }
+}
+
+fn insecure_http_credentials_error(host: &str) -> OzError {
+    OzError::GuardrailViolation {
+        kind: "insecure_http_credentials".to_string(),
+        message: format!(
+            "refusing to transmit authentication credentials over unencrypted HTTP to non-loopback host '{host}'"
+        ),
+        recovery: vec!["Switch the remote URL from http:// to https:// or ssh://.".to_string()],
+    }
+}
+
+fn validate_endpoint_credentials_security(endpoint: &str) -> Result<()> {
+    let parsed = url::Url::parse(endpoint).map_err(|err| OzError::InvalidUsage {
+        message: format!("invalid GitHub API URL '{endpoint}': {err}"),
+        recovery: Vec::new(),
+    })?;
+    if parsed.scheme().eq_ignore_ascii_case("http") {
+        let host = parsed.host_str().unwrap_or_default();
+        if !is_loopback_host(host) {
+            return Err(insecure_http_credentials_error(host));
+        }
+    }
+    Ok(())
 }
 
 fn decode_json_response<T: DeserializeOwned>(
@@ -1704,8 +1759,7 @@ fn parse_rate_limit_backoff_secs(headers: &reqwest::header::HeaderMap) -> Option
     if remaining == Some(0) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         if let Some(reset) = headers
             .get("x-ratelimit-reset")
             .and_then(|v| v.to_str().ok())
@@ -1864,5 +1918,87 @@ mod tests {
 
         drop(client);
         server.join().expect("mock server join");
+    }
+
+    #[test]
+    fn github_client_rejects_cleartext_http_credentials_on_non_loopback_hosts() {
+        let assert_insecure_guardrail = |err: OzError| match err {
+            OzError::GuardrailViolation {
+                kind,
+                message,
+                recovery,
+            } => {
+                assert_eq!(kind, "insecure_http_credentials");
+                assert!(message.contains("unencrypted HTTP"), "got: {message}");
+                assert_eq!(
+                    recovery,
+                    vec!["Switch the remote URL from http:// to https:// or ssh://.".to_string()]
+                );
+            }
+            other => panic!("expected GuardrailViolation(insecure_http_credentials), got {other:?}"),
+        };
+
+        let client = GitHubClient::new("http://api.github.com", Some("ghp_secret_123".to_string()));
+        assert_insecure_guardrail(client.require_authenticated().unwrap_err());
+        assert_insecure_guardrail(client.get_pull_request("acme", "demo", 1).unwrap_err());
+        assert_insecure_guardrail(
+            client
+                .get_pull_request_conditional("acme", "demo", 1, None)
+                .unwrap_err(),
+        );
+        assert_insecure_guardrail(
+            client
+                .create_pull_request(
+                    "acme",
+                    "demo",
+                    &PullRequestSpec {
+                        title: "t".to_string(),
+                        body: String::new(),
+                        head_branch: "feat".to_string(),
+                        base_branch: "main".to_string(),
+                        draft: false,
+                    },
+                )
+                .unwrap_err(),
+        );
+        assert_insecure_guardrail(
+            client
+                .graphql("query { viewer { login } }", serde_json::json!({}))
+                .unwrap_err(),
+        );
+        assert_insecure_guardrail(
+            client
+                .get_file_contents_at_ref("acme", "demo", "README.md", "main")
+                .unwrap_err(),
+        );
+        assert_insecure_guardrail(client.download_job_logs("acme", "demo", 42).unwrap_err());
+
+        // `GitHubClient::for_repo` on non-loopback `http://` remotes with explicit token also fails closed.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        for remote_url in [
+            "http://ghe.example.com/acme/demo.git",
+            "http://github.com/acme/demo.git",
+        ] {
+            let repo_dir = tmp
+                .path()
+                .join(remote_url.replace([':', '/', '.'], "_"));
+            std::fs::create_dir_all(&repo_dir).expect("mkdir");
+            let st = std::process::Command::new("git")
+                .args(["init", "-b", "main"])
+                .current_dir(&repo_dir)
+                .status()
+                .expect("git init");
+            assert!(st.success());
+            let st2 = std::process::Command::new("git")
+                .args(["remote", "add", "origin", remote_url])
+                .current_dir(&repo_dir)
+                .status()
+                .expect("git remote add");
+            assert!(st2.success());
+            let oz = OzoneRepo::discover(Some(&repo_dir)).expect("discover");
+            let err = GitHubClient::for_repo(&oz, Some("origin"), Some("ghp_secret_123"), None)
+                .expect_err("for_repo must block cleartext HTTP credentials");
+            assert_insecure_guardrail(err);
+        }
     }
 }

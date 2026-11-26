@@ -12,7 +12,6 @@ exclude = ["tests/", "benchmarks/"]
 description = "Pure-Rust Git wire protocol, SSH signing, and GitHub stacked PR / CI workflows"
 
 [dependencies]
-bytes.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 gix.workspace = true

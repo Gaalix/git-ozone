@@ -3,7 +3,7 @@
 
 //! `oz sync` workflow: fetch remote, fast-forward `main`, detect merged branches (via GitHub PRs
 //! and offline ancestor/`Change-Id:` fallback), auto-retarget downstream stacked PR bases on GitHub,
-//! rebase local downstream stacked branches via `oz-integrate`, GC merged CoW workspaces &
+//! rebase local downstream stacked branches via `oz-integrate`, GC merged `CoW` workspaces &
 //! checkpoints, and refresh the quiescent `oz-warm` baseline.
 
 use crate::api::{GitHubClient, GitHubPullRequest, UpdatePullRequest};
@@ -96,7 +96,7 @@ pub struct SyncOutcome {
 /// 3. Detects merged branches via GitHub PR API (gracefully degrading to local ancestor / `Change-Id:` detection)
 /// 4. Auto-retargets open downstream stacked PR bases on GitHub
 /// 5. Rebases local downstream stacked branches onto updated `main` via `oz-integrate`
-/// 6. Removes & GCs merged CoW workspaces (`oz-cow`) and prunes merged checkpoints (`refs/ozone/*checkpoints/*`)
+/// 6. Removes & GCs merged `CoW` workspaces (`oz-cow`) and prunes merged checkpoints (`refs/ozone/*checkpoints/*`)
 /// 7. Refreshes the quiescent `oz-warm` baseline
 pub fn sync_repo(repo: &OzoneRepo, opts: &SyncOptions, actor: ActorInfo) -> Result<SyncOutcome> {
     let main_repo = if repo.is_linked_worktree || repo.workspace.is_some() {
@@ -125,7 +125,7 @@ pub fn sync_repo(repo: &OzoneRepo, opts: &SyncOptions, actor: ActorInfo) -> Resu
 
     let gix_initial = open_gix_unrestricted(&main_repo.repo_root)?;
     let previous_base_oid = read_ref_oid(&gix_initial, &format!("refs/heads/{base_branch}"))?;
-    let remote_url_opt = read_remote_url_from_gix(&gix_initial, &remote_name, false)?;
+    let remote_url_opt = read_remote_url_from_gix(&gix_initial, &remote_name, false);
 
     // Capture pre-sync branch OIDs & branches that have recorded commits/rebases in OpLog.
     let pre_branches = list_local_branch_oids(&gix_initial)?;
@@ -178,7 +178,7 @@ pub fn sync_repo(repo: &OzoneRepo, opts: &SyncOptions, actor: ActorInfo) -> Resu
     {
         let can_ff = match current_base_oid {
             None => true,
-            Some(old_oid) => is_ancestor_commit(&gix_after_fetch, old_oid, target_oid)?,
+            Some(old_oid) => is_ancestor_commit(&gix_after_fetch, old_oid, target_oid),
         };
 
         if can_ff {
@@ -262,7 +262,7 @@ pub fn sync_repo(repo: &OzoneRepo, opts: &SyncOptions, actor: ActorInfo) -> Resu
     }
 
     if let Some(base_id) = current_base_oid {
-        for cid in collect_recent_change_ids(&gix_repo, base_id, previous_base_oid, 256)? {
+        for cid in collect_recent_change_ids(&gix_repo, base_id, previous_base_oid, 256) {
             merged_change_ids.insert(cid);
         }
 
@@ -270,14 +270,13 @@ pub fn sync_repo(repo: &OzoneRepo, opts: &SyncOptions, actor: ActorInfo) -> Resu
             if branch == &base_branch || merged_set.contains(branch) {
                 continue;
             }
-            let was_ahead_before_ff = previous_base_oid.is_some_and(|prev_id| {
-                !is_ancestor_commit(&gix_repo, br_oid, prev_id).unwrap_or(false)
-            });
+            let was_ahead_before_ff = previous_base_oid
+                .is_some_and(|prev_id| !is_ancestor_commit(&gix_repo, br_oid, prev_id));
             let had_work = was_ahead_before_ff
                 || branches_with_commits.contains(branch)
                 || (!has_workspace_set.contains(branch) && br_oid != base_id);
 
-            if had_work && is_ancestor_commit(&gix_repo, br_oid, base_id)? {
+            if had_work && is_ancestor_commit(&gix_repo, br_oid, base_id) {
                 merged_set.insert(branch.clone());
                 continue;
             }
@@ -561,17 +560,17 @@ fn fast_forward_local_base(
     let old_tree = match old_oid {
         Some(id) => gix_repo
             .find_commit(id)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach(),
         None => gix_repo.empty_tree().id().detach(),
     };
     let new_tree = gix_repo
         .find_commit(new_oid)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
     let delta = compute_tree_delta(gix_repo, old_tree, new_tree)?;
@@ -625,7 +624,7 @@ fn fast_forward_local_base(
     let full_name = FullName::try_from(full_ref.as_str())
         .map_err(|err| OzError::Git(format!("invalid ref '{full_ref}': {err}")))?;
     let expected = match old_oid {
-        Some(old_id) => PreviousValue::MustExistAndMatch(gix::refs::Target::Object(old_id)),
+        Some(prev_oid) => PreviousValue::MustExistAndMatch(gix::refs::Target::Object(prev_oid)),
         None => PreviousValue::Any,
     };
     gix_repo
@@ -706,7 +705,7 @@ pub struct PullOutcome {
 }
 
 /// Fetches updates from remote and fast-forwards, merges, or rebases the current branch,
-/// with full OpLog snapshot capture for `< 10 ms` `oz undo`.
+/// with full `OpLog` snapshot capture for `< 10 ms` `oz undo`.
 pub fn pull_current_branch(
     repo: &OzoneRepo,
     opts: &PullOptions,
@@ -727,8 +726,7 @@ pub fn pull_current_branch(
         .ok_or_else(|| OzError::InvalidUsage {
             message: "HEAD is detached; cannot pull without a checked-out branch".to_string(),
             recovery: vec!["Run `oz switch <branch>` first.".to_string()],
-        })?
-        .to_string();
+        })?;
 
     let main_repo = if repo.is_linked_worktree || repo.workspace.is_some() {
         OzoneRepo::discover(Some(&repo.repo_root))?
@@ -800,8 +798,7 @@ pub fn pull_current_branch(
     let previous_oid = local_oid.map(|id| id.to_hex().to_string());
 
     if local_oid == Some(upstream_oid)
-        || local_oid
-            .is_some_and(|l| is_ancestor_commit(&gix_after, upstream_oid, l).unwrap_or(false))
+        || local_oid.is_some_and(|l| is_ancestor_commit(&gix_after, upstream_oid, l))
     {
         return Ok(PullOutcome {
             remote: remote_name,
@@ -819,7 +816,7 @@ pub fn pull_current_branch(
 
     let can_ff = match local_oid {
         None => true,
-        Some(l) => is_ancestor_commit(&gix_after, l, upstream_oid)?,
+        Some(l) => is_ancestor_commit(&gix_after, l, upstream_oid),
     };
 
     if can_ff {
@@ -884,8 +881,7 @@ pub fn pull_current_branch(
         let new_head = rebase_out
             .branches
             .first()
-            .map(|b| b.new_oid.clone())
-            .unwrap_or_else(|| upstream_oid.to_hex().to_string());
+            .map_or_else(|| upstream_oid.to_hex().to_string(), |b| b.new_oid.clone());
         return Ok(PullOutcome {
             remote: remote_name,
             branch: current_branch,
@@ -946,7 +942,7 @@ fn transplant_children_of_squash_merged_branches(
     let squash_merged_tips: Vec<(String, ObjectId)> = merged_set
         .iter()
         .filter_map(|br| pre_branches.get(br).map(|&oid| (br.clone(), oid)))
-        .filter(|(_, oid)| !is_ancestor_commit(&gix_repo, *oid, new_base_id).unwrap_or(false))
+        .filter(|(_, oid)| !is_ancestor_commit(&gix_repo, *oid, new_base_id))
         .collect();
 
     if squash_merged_tips.is_empty() {
@@ -964,7 +960,7 @@ fn transplant_children_of_squash_merged_branches(
         let mut best_merged: Option<(ObjectId, Vec<ObjectId>)> = None;
         for (_, m_oid) in &squash_merged_tips {
             if *m_oid != br_oid
-                && is_ancestor_commit(&gix_repo, *m_oid, br_oid)?
+                && is_ancestor_commit(&gix_repo, *m_oid, br_oid)
                 && let Ok(range) = collect_commits_between(&gix_repo, br_oid, *m_oid)
             {
                 let replace = match &best_merged {
@@ -1022,32 +1018,28 @@ fn transplant_children_of_squash_merged_branches(
 
         let mut aborted_branch = false;
         for &orig_cid in &commits_above_merged[start_idx..] {
-            let orig_commit = gix_repo
-                .find_commit(orig_cid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let orig_commit = gix_repo.find_commit(orig_cid).map_err(OzError::git_source)?;
             let commit_tree = orig_commit
                 .tree_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .detach();
             let parent_tree = match orig_commit.parent_ids().next() {
                 Some(pid) => gix_repo
                     .find_commit(pid.detach())
-                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .map_err(OzError::git_source)?
                     .tree_id()
-                    .map_err(|err| OzError::Git(err.to_string()))?
+                    .map_err(OzError::git_source)?
                     .detach(),
                 None => gix_repo.empty_tree().id().detach(),
             };
             let onto_tree = gix_repo
                 .find_commit(current_onto)
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .tree_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .detach();
 
-            let merge_opts = gix_repo
-                .tree_merge_options()
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let merge_opts = gix_repo.tree_merge_options().map_err(OzError::git_source)?;
             let labels = gix::merge::blob::builtin_driver::text::Labels {
                 ancestor: Some("parent".into()),
                 current: Some(base_branch.into()),
@@ -1055,7 +1047,7 @@ fn transplant_children_of_squash_merged_branches(
             };
             let mut merged = gix_repo
                 .merge_trees(parent_tree, onto_tree, commit_tree, labels, merge_opts)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
 
             if merged.has_unresolved_conflicts(TreatAsUnresolved::git()) {
                 warnings.push(format!(
@@ -1065,11 +1057,7 @@ fn transplant_children_of_squash_merged_branches(
                 break;
             }
 
-            let new_tree_id = merged
-                .tree
-                .write()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach();
+            let new_tree_id = merged.tree.write().map_err(OzError::git_source)?.detach();
             let new_cid = write_rebased_commit(&gix_repo, orig_cid, current_onto, new_tree_id)?;
             rewritten_tips.insert(orig_cid, new_cid);
             current_onto = new_cid;
@@ -1082,20 +1070,19 @@ fn transplant_children_of_squash_merged_branches(
         rewritten_tips.insert(orig_tip_oid, current_onto);
         let orig_tree = gix_repo
             .find_commit(orig_tip_oid)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach();
         let new_tree = gix_repo
             .find_commit(current_onto)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach();
 
         let full_ref = format!("refs/heads/{br_name}");
-        let full_name =
-            FullName::try_from(full_ref.as_str()).map_err(|err| OzError::Git(err.to_string()))?;
+        let full_name = FullName::try_from(full_ref.as_str()).map_err(OzError::git_source)?;
         ref_edits.push(RefEdit::update(
             full_name,
             current_onto,
@@ -1167,13 +1154,13 @@ fn write_rebased_commit(
 ) -> Result<ObjectId> {
     let orig = gix_repo
         .find_commit(orig_commit_oid)
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let decoded = orig.decode().map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
+    let decoded = orig.decode().map_err(OzError::git_source)?;
     let author = decoded
         .author()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .to_owned()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let committer = gix_repo
         .committer()
         .and_then(std::result::Result::ok)
@@ -1192,8 +1179,8 @@ fn write_rebased_commit(
     };
     gix_repo
         .write_object(&commit_obj)
-        .map(|id| id.detach())
-        .map_err(|err| OzError::Git(err.to_string()))
+        .map(gix::Id::detach)
+        .map_err(OzError::git_source)
 }
 
 fn refresh_open_stack_blocks(
@@ -1282,14 +1269,9 @@ fn collect_branches_with_recorded_commits(main_repo: &OzoneRepo) -> HashSet<Stri
 
 fn list_local_branch_oids(gix_repo: &gix::Repository) -> Result<BTreeMap<String, ObjectId>> {
     let mut out = BTreeMap::new();
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    for item in platform
-        .local_branches()
-        .map_err(|err| OzError::Git(err.to_string()))?
-    {
-        let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
+    for item in platform.local_branches().map_err(OzError::git_source)? {
+        let mut r = item.map_err(OzError::git_source)?;
         let short = r
             .name()
             .as_bstr()
@@ -1311,7 +1293,7 @@ fn collect_recent_change_ids(
     tip: ObjectId,
     stop_opt: Option<ObjectId>,
     limit: usize,
-) -> Result<HashSet<String>> {
+) -> HashSet<String> {
     let mut ids = HashSet::new();
     let mut cur = Some(tip);
     let mut count = 0usize;
@@ -1327,9 +1309,9 @@ fn collect_recent_change_ids(
         for c in extract_change_ids_from_text(&msg) {
             ids.insert(c);
         }
-        cur = commit.parent_ids().next().map(|id| id.detach());
+        cur = commit.parent_ids().next().map(gix::Id::detach);
     }
-    Ok(ids)
+    ids
 }
 
 fn branch_commits_all_merged_by_change_id(
@@ -1342,7 +1324,7 @@ fn branch_commits_all_merged_by_change_id(
         .merge_base(branch_tip, base_tip)
         .ok()
         .flatten()
-        .map(|id| id.detach())
+        .map(gix::Id::detach)
     else {
         return Ok(false);
     };
@@ -1351,9 +1333,7 @@ fn branch_commits_all_merged_by_change_id(
         return Ok(false);
     }
     for cid in commits {
-        let commit = gix_repo
-            .find_commit(cid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let commit = gix_repo.find_commit(cid).map_err(OzError::git_source)?;
         let msg = commit.message_raw_sloppy().to_str_lossy();
         let cids = extract_change_ids_from_text(&msg);
         if cids.is_empty() || !cids.iter().any(|c| merged_change_ids.contains(c)) {
@@ -1381,10 +1361,8 @@ fn collect_commits_between(
         }
         guard += 1;
         out.push(cid);
-        let commit = gix_repo
-            .find_commit(cid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        cur = commit.parent_ids().next().map(|id| id.detach());
+        let commit = gix_repo.find_commit(cid).map_err(OzError::git_source)?;
+        cur = commit.parent_ids().next().map(gix::Id::detach);
     }
     out.reverse();
     Ok(out)
@@ -1424,9 +1402,7 @@ fn prune_workspace_checkpoints(
     let mut edits = Vec::new();
     let mut pruned = Vec::new();
 
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
     for ws in removed_workspaces {
         let direct_cp = format!("refs/ozone/checkpoints/{ws}");
         if gix_repo
@@ -1478,11 +1454,11 @@ fn write_repo_index(gix_repo: &gix::Repository, tree_id: ObjectId) -> Result<()>
     let index_path = gix_repo.index_path();
     let index_file = gix_repo
         .index_from_tree(&tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let mut out = BufWriter::new(std::fs::File::create(&index_path)?);
     index_file
         .write_to(&mut out, gix::index::write::Options::default())
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     out.flush()?;
     Ok(())
 }

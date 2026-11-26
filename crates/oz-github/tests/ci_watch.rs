@@ -5,6 +5,8 @@
 //! GitHub REST API server (ETag/304 caching, startup grace period, fail-fast, wait-all log
 //! caching, superseded SHA detection, check filtering, and single-job drill-down).
 
+#![allow(clippy::too_many_lines)]
+
 use oz_core::{CommitOptions, OzoneRepo, commit_changes};
 use oz_github::{
     CiJobLogOptions, CiQueryOptions, CiWatchEvent, CiWatchOptions, CiWatchOutcome,
@@ -349,7 +351,7 @@ fn init_test_repo(dir: &Path, branch: &str) -> (OzoneRepo, String) {
             .args(args)
             .output()
             .expect("git");
-        assert!(out.status.success(), "git {:?} failed", args);
+        assert!(out.status.success(), "git {args:?} failed");
     };
     run_git(&["init", "-b", branch]);
     run_git(&["config", "user.name", "Test"]);
@@ -848,12 +850,12 @@ fn watch_ignores_stale_ancestor_pr_head_and_older_workflow_runs() {
                     "lint-tests-types",
                     "in_progress",
                     None,
-                    45398395423,
+                    45_398_395_423,
                     901,
                 )],
                 workflow_runs: vec![
                     GitHubWorkflowRun {
-                        id: 45398395423,
+                        id: 45_398_395_423,
                         name: Some("CI".to_string()),
                         head_branch: Some("feat/lag-race".to_string()),
                         head_sha: new_sha.clone(),
@@ -862,7 +864,7 @@ fn watch_ignores_stale_ancestor_pr_head_and_older_workflow_runs() {
                         ..Default::default()
                     },
                     GitHubWorkflowRun {
-                        id: 45398000000,
+                        id: 45_398_000_000,
                         name: Some("CI".to_string()),
                         head_branch: Some("feat/lag-race".to_string()),
                         head_sha: old_sha.clone(),
@@ -882,12 +884,12 @@ fn watch_ignores_stale_ancestor_pr_head_and_older_workflow_runs() {
                     "lint-tests-types",
                     "in_progress",
                     None,
-                    45398395423,
+                    45_398_395_423,
                     901,
                 )],
                 workflow_runs: vec![
                     GitHubWorkflowRun {
-                        id: 45398395423,
+                        id: 45_398_395_423,
                         name: Some("CI".to_string()),
                         head_branch: Some("feat/lag-race".to_string()),
                         head_sha: new_sha.clone(),
@@ -896,7 +898,7 @@ fn watch_ignores_stale_ancestor_pr_head_and_older_workflow_runs() {
                         ..Default::default()
                     },
                     GitHubWorkflowRun {
-                        id: 45398000000,
+                        id: 45_398_000_000,
                         name: Some("CI".to_string()),
                         head_branch: Some("feat/lag-race".to_string()),
                         head_sha: old_sha.clone(),
@@ -916,11 +918,11 @@ fn watch_ignores_stale_ancestor_pr_head_and_older_workflow_runs() {
                     "lint-tests-types",
                     "completed",
                     Some("success"),
-                    45398395423,
+                    45_398_395_423,
                     901,
                 )],
                 workflow_runs: vec![GitHubWorkflowRun {
-                    id: 45398395423,
+                    id: 45_398_395_423,
                     name: Some("CI".to_string()),
                     head_branch: Some("feat/lag-race".to_string()),
                     head_sha: new_sha.clone(),

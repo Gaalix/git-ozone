@@ -6,7 +6,7 @@
 //! SSH, and HTTP/HTTPS (`reqwest` + `rustls`).
 
 use crate::auth::{
-    RemoteScheme, TokenDiscoveryOptions, discover_github_token_with_options,
+    RemoteScheme, TokenDiscoveryOptions, discover_github_token_with_options, is_loopback_host,
     load_git_config_from_gix_repo, parse_git_remote, read_remote_url_from_gix,
 };
 use crate::ssh_config::build_gix_ssh_options;
@@ -325,7 +325,7 @@ where
 
 /// Clones a remote Git repository over `file://`/local path, SSH, or HTTP/HTTPS using pure-Rust
 /// `gix` Wire Protocol v2, supporting `--filter=blob:none` partial clones, `--branch`, checkout
-/// materialization, colocated `.git/ozone/` initialization, and initial OpLog recording.
+/// materialization, colocated `.git/ozone/` initialization, and initial `OpLog` recording.
 pub fn clone_repo(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOutcome> {
     let opts_owned = opts.clone();
     run_blocking_safe(move || clone_repo_blocking(&opts_owned, actor))
@@ -399,12 +399,11 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
             opts.auth_token.as_deref(),
             opts.auth_scheme,
         )?;
-        let persisted_url = if connect_url != opts.url {
-            parse_git_remote(&opts.url, None)
-                .map(|p| p.sanitized_url)
-                .unwrap_or_else(|_| opts.url.clone())
-        } else {
+        let persisted_url = if connect_url == opts.url {
             resolved_persisted
+        } else {
+            parse_git_remote(&opts.url, None)
+                .map_or_else(|_| opts.url.clone(), |p| p.sanitized_url)
         };
 
         let mut warnings = Vec::new();
@@ -539,10 +538,7 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
             let commit = gix_repo
                 .find_commit(oid)
                 .map_err(|err| OzError::Git(format!("missing cloned HEAD commit {oid}: {err}")))?;
-            let tree_id = commit
-                .tree_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach();
+            let tree_id = commit.tree_id().map_err(OzError::git_source)?.detach();
             base_tree_hex = tree_id.to_hex().to_string();
 
             if !opts.bare && opts.checkout {
@@ -646,7 +642,7 @@ fn clone_repo_blocking(opts: &CloneOptions, actor: ActorInfo) -> Result<CloneOut
 
 /// Fetches from `<remote>` (default `"origin"`) over pure-Rust `gix` Wire Protocol v2, supporting
 /// optional refspecs, `--prune`, and `--filter=blob:none`, atomically updating
-/// `refs/remotes/<remote>/*` and recording OpLog `ref_deltas`.
+/// `refs/remotes/<remote>/*` and recording `OpLog` `ref_deltas`.
 pub fn fetch_remote(
     repo: &OzoneRepo,
     opts: &FetchOptions,
@@ -674,11 +670,9 @@ fn fetch_remote_blocking(
 
     let git_cfg = repo.load_git_config(&[])?;
     let remote_urls = git_cfg.resolve_remote_urls(remote_arg);
-    let configured_url = remote_urls.fetch_url.or_else(|| {
-        read_remote_url_from_gix(&gix_repo, remote_arg, false)
-            .ok()
-            .flatten()
-    });
+    let configured_url = remote_urls
+        .fetch_url
+        .or_else(|| read_remote_url_from_gix(&gix_repo, remote_arg, false));
     let (remote_label, raw_url, is_named_remote) = match configured_url {
         Some(url) => (remote_arg.to_string(), url, true),
         None if looks_like_url_or_path(remote_arg) => (
@@ -785,7 +779,7 @@ fn fetch_remote_blocking(
                 }
                 if !spec.allow_non_fast_forward
                     && let Some(old_id) = old_oid
-                    && !is_ancestor_commit(&gix_repo, old_id, new_oid)?
+                    && !is_ancestor_commit(&gix_repo, old_id, new_oid)
                 {
                     return Err(OzError::Conflict {
                         message: format!(
@@ -801,9 +795,7 @@ fn fetch_remote_blocking(
                 let full = FullName::try_from(dst_ref.as_str())
                     .map_err(|err| OzError::Git(format!("invalid ref '{dst_ref}': {err}")))?;
                 let forced = spec.allow_non_fast_forward
-                    && old_oid.is_some_and(|old_id| {
-                        !is_ancestor_commit(&gix_repo, old_id, new_oid).unwrap_or(false)
-                    });
+                    && old_oid.is_some_and(|old_id| !is_ancestor_commit(&gix_repo, old_id, new_oid));
                 ref_edits.push(RefEdit::update(
                     full,
                     new_oid,
@@ -846,15 +838,11 @@ fn fetch_remote_blocking(
     if opts.prune && is_named_remote && opts.refspecs.is_empty() {
         let prefix = format!("refs/remotes/{remote_label}/");
         let remote_head = format!("refs/remotes/{remote_label}/HEAD");
-        let platform = gix_repo
-            .references()
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let remotes = platform
-            .remote_branches()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let platform = gix_repo.references().map_err(OzError::git_source)?;
+        let remotes = platform.remote_branches().map_err(OzError::git_source)?;
 
         for item in remotes {
-            let reference = item.map_err(|err| OzError::Git(err.to_string()))?;
+            let reference = item.map_err(OzError::git_source)?;
             let full_str = reference.name().as_bstr().to_str_lossy().into_owned();
             if !full_str.starts_with(&prefix) || full_str == remote_head {
                 continue;
@@ -863,8 +851,7 @@ fn fetch_remote_blocking(
                 continue;
             }
             if !matched_destinations.contains(&full_str) {
-                let full = FullName::try_from(full_str.as_str())
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                let full = FullName::try_from(full_str.as_str()).map_err(OzError::git_source)?;
                 ref_edits.push(RefEdit {
                     change: Change::Delete {
                         expected: PreviousValue::Any,
@@ -901,7 +888,7 @@ fn fetch_remote_blocking(
 
 /// Pushes local branches/refs over pure-Rust smart `git-receive-pack` (`file://`/local, SSH, or
 /// HTTP/HTTPS), supporting `--atomic`, `--force-with-lease[=<ref>:<oid>]`, `--delete`, and
-/// `--set-upstream`, plus updating `refs/remotes/<remote>/*` and recording an OpLog transaction.
+/// `--set-upstream`, plus updating `refs/remotes/<remote>/*` and recording an `OpLog` transaction.
 pub fn push_refs(repo: &OzoneRepo, opts: &PushOptions, actor: ActorInfo) -> Result<PushOutcome> {
     push_refs_with_options(repo, opts, false, &[], actor)
 }
@@ -958,11 +945,9 @@ fn push_refs_blocking(
         .unwrap_or("origin");
 
     let remote_urls = git_cfg.resolve_remote_urls(remote_arg);
-    let configured_url = remote_urls.push_url.or_else(|| {
-        read_remote_url_from_gix(&gix_repo, remote_arg, true)
-            .ok()
-            .flatten()
-    });
+    let configured_url = remote_urls
+        .push_url
+        .or_else(|| read_remote_url_from_gix(&gix_repo, remote_arg, true));
     let (remote_label, raw_url, is_named_remote) = match configured_url {
         Some(url) => (remote_arg.to_string(), url, true),
         None if looks_like_url_or_path(remote_arg) => (
@@ -1076,7 +1061,7 @@ fn push_refs_blocking(
         {
             let allowed_non_ff =
                 opts.force || spec.force_prefix || lease_validated_refs.contains(&spec.remote_ref);
-            if !allowed_non_ff && !is_ancestor_commit(&gix_repo, old_id, spec.new_oid)? {
+            if !allowed_non_ff && !is_ancestor_commit(&gix_repo, old_id, spec.new_oid) {
                 return Err(OzError::Conflict {
                     message: format!(
                         "push to '{}' rejected (non-fast-forward: remote is at {}, local is at {})",
@@ -1279,8 +1264,7 @@ fn push_refs_blocking(
         let old_oid = advertised_tips.get(&spec.remote_ref).copied();
         let forced = !spec.is_delete
             && old_oid.is_some_and(|old_id| {
-                old_id != spec.new_oid
-                    && !is_ancestor_commit(&gix_repo, old_id, spec.new_oid).unwrap_or(false)
+                old_id != spec.new_oid && !is_ancestor_commit(&gix_repo, old_id, spec.new_oid)
             });
 
         if is_named_remote
@@ -1421,12 +1405,10 @@ fn validate_push_leases(
 
         let actual_remote_oid = advertised_tips.get(&spec.remote_ref).copied();
         if actual_remote_oid != expected_oid {
-            let expected_desc = expected_oid
-                .map(|id| id.to_hex().to_string())
-                .unwrap_or_else(|| "<absent>".to_string());
+            let expected_desc =
+                expected_oid.map_or_else(|| "<absent>".to_string(), |id| id.to_hex().to_string());
             let actual_desc = actual_remote_oid
-                .map(|id| id.to_hex().to_string())
-                .unwrap_or_else(|| "<absent>".to_string());
+                .map_or_else(|| "<absent>".to_string(), |id| id.to_hex().to_string());
 
             return Err(OzError::Conflict {
                 message: format!(
@@ -1518,17 +1500,19 @@ fn parse_receive_pack_report<'a>(
                 if is_err {
                     errs_ref
                         .lock()
-                        .unwrap_or_else(|p| p.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(String::from_utf8_lossy(msg).trim().to_string());
                 }
                 ControlFlow::Continue(())
             })));
             reader.read_to_end(&mut raw_status_stream).map_err(|err| {
-                let errs = remote_errors.lock().unwrap_or_else(|p| p.into_inner());
-                if !errs.is_empty() {
-                    OzError::Git(format!("remote receive-pack error: {}", errs.join("; ")))
-                } else {
+                let errs = remote_errors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if errs.is_empty() {
                     OzError::Git(format!("failed reading receive-pack status stream: {err}"))
+                } else {
+                    OzError::Git(format!("remote receive-pack error: {}", errs.join("; ")))
                 }
             })?;
         }
@@ -1571,7 +1555,7 @@ fn parse_receive_pack_report<'a>(
 
     let recorded_errs = remote_errors
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     if !recorded_errs.is_empty() && lines.is_empty() {
         return Err(OzError::Git(format!(
@@ -1588,10 +1572,10 @@ fn parse_receive_pack_report<'a>(
         if let Some(rest) = cleaned.strip_prefix("unpack ") {
             unpack_status = rest.trim().to_string();
         } else if let Some(rest) = cleaned.strip_prefix("ng ") {
-            let (ref_name, reason) = rest
-                .split_once(' ')
-                .map(|(r, msg)| (r.trim().to_string(), msg.trim().to_string()))
-                .unwrap_or_else(|| (rest.trim().to_string(), "rejected".to_string()));
+            let (ref_name, reason) = rest.split_once(' ').map_or_else(
+                || (rest.trim().to_string(), "rejected".to_string()),
+                |(r, msg)| (r.trim().to_string(), msg.trim().to_string()),
+            );
             rejected_refs.push((ref_name, reason));
         }
     }
@@ -1626,6 +1610,10 @@ fn build_push_packfile(
                 OzError::Git(format!("missing required local object {oid} during push"))
             })?;
         let count = pack_out::Count::from_data(*oid, None);
+        #[expect(
+            clippy::default_trait_access,
+            reason = "Compression type lives in transitive gix-zlib crate"
+        )]
         let entry = pack_out::Entry::from_data(&count, &obj, Default::default())
             .map_err(|err| OzError::Git(format!("failed compressing pack entry {oid}: {err}")))?;
         entries.push(entry);
@@ -1771,7 +1759,7 @@ fn collect_missing_push_objects(
         let obj = gix_repo
             .objects
             .try_find(&tip, &mut buf)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .ok_or_else(|| OzError::Git(format!("pushed target object {tip} not found locally")))?;
 
         match obj.kind {
@@ -1804,10 +1792,7 @@ fn collect_missing_push_objects(
         let commit = gix_repo
             .find_commit(cid)
             .map_err(|err| OzError::Git(format!("missing commit {cid}: {err}")))?;
-        let tid = commit
-            .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
-            .detach();
+        let tid = commit.tree_id().map_err(OzError::git_source)?.detach();
         if visited.insert(tid) {
             tree_queue.push_back(tid);
         }
@@ -1828,7 +1813,7 @@ fn collect_missing_push_objects(
             .find_tree(tid)
             .map_err(|err| OzError::Git(format!("missing tree {tid}: {err}")))?;
         for entry_res in tree.iter() {
-            let entry = entry_res.map_err(|err| OzError::Git(err.to_string()))?;
+            let entry = entry_res.map_err(OzError::git_source)?;
             if entry.mode().is_commit() {
                 continue;
             }
@@ -2421,7 +2406,7 @@ fn invoke_v2_fetch_pack_inner(
             if is_err {
                 errs_ref
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(String::from_utf8_lossy(data).trim().to_string());
             }
             ControlFlow::Continue(())
@@ -2429,11 +2414,13 @@ fn invoke_v2_fetch_pack_inner(
         write_received_pack_to_odb(gix_repo, &mut reader, mark_promisor)
     };
     write_res.map_err(|err| {
-        let errs = remote_err_msgs.lock().unwrap_or_else(|p| p.into_inner());
-        if !errs.is_empty() {
-            OzError::Git(format!("remote fetch error: {} ({err})", errs.join("; ")))
-        } else {
+        let errs = remote_err_msgs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if errs.is_empty() {
             err
+        } else {
+            OzError::Git(format!("remote fetch error: {} ({err})", errs.join("; ")))
         }
     })?;
 
@@ -2573,22 +2560,38 @@ fn connect_transport(
     gix_repo: &gix::Repository,
     git_cfg: Option<&GitConfig>,
 ) -> Result<Box<dyn Transport + Send>> {
+    let trimmed_token = auth_token.map(str::trim).filter(|s| !s.is_empty());
+    let has_credentials = trimmed_token.is_some() || gix_url.password().is_some();
+    if gix_url.scheme == gix::url::Scheme::Http && has_credentials {
+        let host = gix_url.host().unwrap_or_default();
+        if !is_loopback_host(host) {
+            return Err(OzError::GuardrailViolation {
+                kind: "insecure_http_credentials".to_string(),
+                message: format!(
+                    "refusing to transmit authentication credentials over unencrypted HTTP to non-loopback host '{host}'"
+                ),
+                recovery: vec![
+                    "Switch the remote URL from http:// to https:// or ssh://.".to_string(),
+                ],
+            });
+        }
+    }
+
     let is_http = matches!(
         gix_url.scheme,
         gix::url::Scheme::Http | gix::url::Scheme::Https
     );
     let ssh_opts = if gix_url.scheme == gix::url::Scheme::Ssh {
         let loaded_cfg;
-        let effective_cfg = match git_cfg {
-            Some(c) => Some(c),
-            None => {
-                loaded_cfg = load_git_config_from_gix_repo(gix_repo, &[]).ok();
-                loaded_cfg.as_ref()
-            }
+        let effective_cfg = if let Some(c) = git_cfg {
+            Some(c)
+        } else {
+            loaded_cfg = load_git_config_from_gix_repo(gix_repo, &[]).ok();
+            loaded_cfg.as_ref()
         };
         build_gix_ssh_options(&gix_url, effective_cfg.and_then(GitConfig::ssh_command))
     } else {
-        Default::default()
+        gix_transport::client::blocking_io::ssh::connect::Options::default()
     };
 
     let mut transport = connect::connect(
@@ -2608,7 +2611,7 @@ fn connect_transport(
             ..Default::default()
         };
 
-        if let Some(raw_tok) = auth_token.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(raw_tok) = trimmed_token {
             if let Some(bearer_tok) = raw_tok.strip_prefix("Bearer ") {
                 http_opts
                     .extra_headers
@@ -2666,8 +2669,7 @@ fn resolve_transport_url_and_auth(
                 recovery: Vec::new(),
             });
         }
-        let path_bstr =
-            gix::path::into_bstr(git_dir.clone()).map_err(|err| OzError::Git(err.to_string()))?;
+        let path_bstr = gix::path::into_bstr(git_dir.clone()).map_err(OzError::git_source)?;
         let gix_url = gix::url::Url::from_parts(
             gix::url::Scheme::File,
             None,
@@ -2934,14 +2936,12 @@ fn collect_missing_blobs_in_tree(
     gix_repo: &gix::Repository,
     tree_id: ObjectId,
 ) -> Result<Vec<ObjectId>> {
-    let tree = gix_repo
-        .find_tree(tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(tree_id).map_err(OzError::git_source)?;
     let entries = tree
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let mut missing = BTreeSet::new();
     let mut buf = Vec::new();
@@ -2952,7 +2952,7 @@ fn collect_missing_blobs_in_tree(
         let exists = gix_repo
             .objects
             .try_find(&entry.oid, &mut buf)
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .is_some();
         if !exists {
             missing.insert(entry.oid);
@@ -3091,9 +3091,7 @@ fn resolve_local_push_source(
     src: &str,
 ) -> Result<(Option<String>, Option<String>, ObjectId)> {
     if src == "HEAD" {
-        let head = gix_repo
-            .head()
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let head = gix_repo.head().map_err(OzError::git_source)?;
         let branch_short = head
             .referent_name()
             .map(|n| String::from_utf8_lossy(n.shorten().as_ref()).into_owned());
@@ -3168,7 +3166,7 @@ pub(crate) fn open_gix_unrestricted(path: &Path) -> Result<gix::Repository> {
             opts.permissions.config.git_binary = true;
             gix::ThreadSafeRepository::discover_with_environment_overrides_opts(
                 path,
-                Default::default(),
+                gix::discover::upwards::Options::default(),
                 gix::sec::trust::Mapping {
                     full: opts.clone(),
                     reduced: opts,
@@ -3176,19 +3174,15 @@ pub(crate) fn open_gix_unrestricted(path: &Path) -> Result<gix::Repository> {
             )
             .map(|r| r.to_thread_local())
         })
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let _ = repo.committer_or_set_generic_fallback();
     Ok(repo)
 }
 
 fn collect_local_have_oids(gix_repo: &gix::Repository) -> Result<Vec<ObjectId>> {
     let mut seen = BTreeSet::new();
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let all_refs = platform
-        .all()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
+    let all_refs = platform.all().map_err(OzError::git_source)?;
     for item in all_refs.flatten() {
         let mut r = item;
         if matches!(r.target(), gix::refs::TargetRef::Symbolic(_)) {
@@ -3217,30 +3211,30 @@ fn has_commit_locally(gix_repo: &gix::Repository, oid: ObjectId) -> bool {
 pub(crate) fn read_ref_oid(gix_repo: &gix::Repository, full_ref: &str) -> Result<Option<ObjectId>> {
     let Some(mut r) = gix_repo
         .try_find_reference(full_ref)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     else {
         return Ok(None);
     };
     if let gix::refs::TargetRef::Object(id) = r.target() {
         return Ok(Some(id.to_owned()));
     }
-    Ok(r.peel_to_id().ok().map(|id| id.detach()))
+    Ok(r.peel_to_id().ok().map(gix::Id::detach))
 }
 
 pub(crate) fn is_ancestor_commit(
     gix_repo: &gix::Repository,
     ancestor: ObjectId,
     descendant: ObjectId,
-) -> Result<bool> {
+) -> bool {
     if ancestor == descendant {
-        return Ok(true);
+        return true;
     }
     if !has_commit_locally(gix_repo, ancestor) || !has_commit_locally(gix_repo, descendant) {
-        return Ok(false);
+        return false;
     }
     match gix_repo.merge_base(ancestor, descendant) {
-        Ok(Some(mb)) => Ok(mb.detach() == ancestor),
-        Ok(None) | Err(_) => Ok(false),
+        Ok(Some(mb)) => mb.detach() == ancestor,
+        Ok(None) | Err(_) => false,
     }
 }
 
@@ -3267,9 +3261,7 @@ fn set_symbolic_ref(
         name,
         deref: false,
     };
-    gix_repo
-        .edit_reference(edit)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    gix_repo.edit_reference(edit).map_err(OzError::git_source)?;
     Ok(())
 }
 
@@ -3289,9 +3281,7 @@ fn set_detached_head(gix_repo: &gix::Repository, oid: ObjectId, log_msg: &str) -
         name: head_name,
         deref: false,
     };
-    gix_repo
-        .edit_reference(edit)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    gix_repo.edit_reference(edit).map_err(OzError::git_source)?;
     Ok(())
 }
 
@@ -3329,5 +3319,57 @@ fn map_transport_error(stage: &str, err: &gix_transport::client::Error) -> OzErr
         }
     } else {
         OzError::Git(format!("{stage} failed: {msg}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn connect_transport_rejects_cleartext_http_credentials_on_non_loopback_hosts() {
+        let tmp = TempDir::new().expect("tempdir");
+        let gix_repo = gix::init_bare(tmp.path()).expect("init bare");
+
+        for (raw_url, scheme) in [
+            (
+                "http://github.com/acme/demo.git",
+                HttpAuthScheme::BasicToken,
+            ),
+            (
+                "http://git.corp.internal:8080/acme/demo.git",
+                HttpAuthScheme::Bearer,
+            ),
+        ] {
+            let url = gix::url::parse(raw_url).expect("parse url");
+            let Err(err) = connect_transport(
+                url,
+                Protocol::V2,
+                Some("ghp_secret_tok"),
+                scheme,
+                &gix_repo,
+                None,
+            ) else {
+                panic!("connect_transport must reject cleartext HTTP credentials");
+            };
+            match err {
+                OzError::GuardrailViolation {
+                    kind,
+                    message,
+                    recovery,
+                } => {
+                    assert_eq!(kind, "insecure_http_credentials");
+                    assert!(message.contains("unencrypted HTTP"), "got: {message}");
+                    assert_eq!(
+                        recovery,
+                        vec![
+                            "Switch the remote URL from http:// to https:// or ssh://.".to_string()
+                        ]
+                    );
+                }
+                other => panic!("expected GuardrailViolation, got {other:?}"),
+            }
+        }
     }
 }

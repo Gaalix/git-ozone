@@ -232,7 +232,10 @@ pub fn parse_git_remote_with_env(
         });
 
         let (owner, repo) = if scheme == RemoteScheme::File {
-            if parsed.path().ends_with(".git") {
+            if Path::new(parsed.path())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
+            {
                 extract_owner_repo_from_path(parsed.path())
             } else {
                 (None, None)
@@ -271,8 +274,7 @@ pub fn parse_git_remote_with_env(
     if let Some((host_part, path_part)) = split_scp_like_ssh(trimmed) {
         let host = host_part
             .rsplit_once('@')
-            .map(|(_, h)| h)
-            .unwrap_or(host_part)
+            .map_or(host_part, |(_, h)| h)
             .to_string();
         let (owner, repo) = extract_owner_repo_from_path(path_part);
         let api_base_url = compute_api_base_url(
@@ -295,7 +297,10 @@ pub fn parse_git_remote_with_env(
     }
 
     // 3. Local filesystem path (`/path/to/repo`, `./repo`, `../repo.git`, `C:\repo`).
-    let (owner, repo) = if trimmed.ends_with(".git") {
+    let (owner, repo) = if Path::new(trimmed)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
+    {
         extract_owner_repo_from_path(trimmed)
     } else {
         (None, None)
@@ -385,19 +390,27 @@ fn compute_api_base_url(
 
 /// Strips an optional `:port` suffix from a `host[:port]` authority string.
 #[must_use]
-pub fn strip_host_port(host: &str) -> &str {
+pub(crate) fn strip_host_port(host: &str) -> &str {
     if let Some((h, port)) = host.rsplit_once(':')
-        && !h.contains(':')
+        && !port.is_empty()
         && port.chars().all(|c| c.is_ascii_digit())
+        && (!h.contains(':') || (h.starts_with('[') && h.ends_with(']')))
     {
         return h;
     }
     host
 }
 
+/// Returns `true` when `host` (with optional `:port`) refers to a local loopback interface.
+#[must_use]
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let bare = strip_host_port(host.trim()).to_ascii_lowercase();
+    matches!(bare.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 /// Reads the configured URL for `remote_name` (default `"origin"`) from `repo`,
 /// resolving `includeIf`, `insteadOf` / `pushInsteadOf`, and SSH `HostName` aliases.
-pub fn resolve_repo_remote(
+pub(crate) fn resolve_repo_remote(
     repo: &OzoneRepo,
     remote_name: Option<&str>,
     api_url_override: Option<&str>,
@@ -433,7 +446,7 @@ pub fn resolve_repo_remote(
 }
 
 /// Loads layered [`GitConfig`] (`includeIf`, `insteadOf`, etc.) for an open [`gix::Repository`].
-pub fn load_git_config_from_gix_repo(
+pub(crate) fn load_git_config_from_gix_repo(
     gix_repo: &gix::Repository,
     overrides: &[(String, String)],
 ) -> Result<GitConfig> {
@@ -457,7 +470,7 @@ pub fn load_git_config_from_gix_repo(
 
 /// Reads `remote.<name>.pushurl` (when `for_push` is `true`) or `remote.<name>.url`
 /// from layered Git config, applying `includeIf` and `insteadOf` / `pushInsteadOf`.
-pub fn read_remote_url_from_repo(
+pub(crate) fn read_remote_url_from_repo(
     repo: &OzoneRepo,
     remote_name: &str,
     for_push: bool,
@@ -472,19 +485,17 @@ pub fn read_remote_url_from_repo(
     if url.is_some() {
         return Ok(url);
     }
-    let gix_repo = gix::open(&repo.git_common_dir)
-        .or_else(|_| repo.open_gix())
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    read_remote_url_from_gix(&gix_repo, remote_name, for_push)
+    let gix_repo = gix::open(&repo.git_common_dir).or_else(|_| repo.open_gix())?;
+    Ok(read_remote_url_from_gix(&gix_repo, remote_name, for_push))
 }
 
 /// Reads `remote.<name>.pushurl` or `remote.<name>.url` using layered Git config
 /// (`includeIf`, `insteadOf`, `pushInsteadOf`) for `gix_repo`.
-pub fn read_remote_url_from_gix(
+pub(crate) fn read_remote_url_from_gix(
     gix_repo: &gix::Repository,
     remote_name: &str,
     for_push: bool,
-) -> Result<Option<String>> {
+) -> Option<String> {
     if let Ok(layered) = load_git_config_from_gix_repo(gix_repo, &[]) {
         let resolved = layered.resolve_remote_urls(remote_name);
         let url = if for_push {
@@ -493,7 +504,7 @@ pub fn read_remote_url_from_gix(
             resolved.fetch_url
         };
         if url.is_some() {
-            return Ok(url);
+            return url;
         }
     }
 
@@ -503,7 +514,7 @@ pub fn read_remote_url_from_gix(
         if let Some(val) = cfg.string(&push_key) {
             let s = val.to_str_lossy().trim().to_string();
             if !s.is_empty() {
-                return Ok(Some(s));
+                return Some(s);
             }
         }
     }
@@ -511,10 +522,10 @@ pub fn read_remote_url_from_gix(
     if let Some(val) = cfg.string(&url_key) {
         let s = val.to_str_lossy().trim().to_string();
         if !s.is_empty() {
-            return Ok(Some(s));
+            return Some(s);
         }
     }
-    Ok(None)
+    None
 }
 
 /// Discovers a GitHub token strictly non-interactively in priority order:
@@ -545,6 +556,11 @@ pub fn discover_github_token_with_options(opts: &TokenDiscoveryOptions) -> Optio
     } else {
         opts.host.trim().to_string()
     };
+    let bare_host = strip_host_port(&target_host).to_ascii_lowercase();
+    let is_loopback = matches!(
+        bare_host.as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]"
+    );
 
     // 1. Explicit override
     if let Some(tok) = opts
@@ -560,25 +576,33 @@ pub fn discover_github_token_with_options(opts: &TokenDiscoveryOptions) -> Optio
         });
     }
 
-    // 2-4. Environment variables in strict priority order
-    for (env_name, source) in [
-        ("OZ_GITHUB_TOKEN", TokenSource::OzGithubTokenEnv),
-        ("GITHUB_TOKEN", TokenSource::GithubTokenEnv),
-        ("GH_TOKEN", TokenSource::GhTokenEnv),
-    ] {
-        if let Some(val) = lookup_env(opts, env_name)
-            && let trimmed = val.trim()
-            && !trimmed.is_empty()
-        {
-            return Some(DiscoveredToken {
-                token: trimmed.to_string(),
-                source,
-                host: target_host,
-            });
+    // Never auto-discover tokens over unencrypted HTTP unless targeting a loopback host.
+    if opts.protocol.trim().eq_ignore_ascii_case("http") && !is_loopback {
+        return None;
+    }
+
+    // 2-4. Environment variables in strict priority order, scoped strictly to github.com,
+    // loopback hosts, or an explicitly configured GH_HOST / OZ_GITHUB_API_URL host.
+    if env_tokens_allowed_for_host(opts, &bare_host, is_loopback) {
+        for (env_name, source) in [
+            ("OZ_GITHUB_TOKEN", TokenSource::OzGithubTokenEnv),
+            ("GITHUB_TOKEN", TokenSource::GithubTokenEnv),
+            ("GH_TOKEN", TokenSource::GhTokenEnv),
+        ] {
+            if let Some(val) = lookup_env(opts, env_name)
+                && let trimmed = val.trim()
+                && !trimmed.is_empty()
+            {
+                return Some(DiscoveredToken {
+                    token: trimmed.to_string(),
+                    source,
+                    host: target_host,
+                });
+            }
         }
     }
 
-    // 5. GitHub CLI `hosts.yml`
+    // 5. GitHub CLI `hosts.yml` (host-matched)
     for path in candidate_gh_hosts_paths(opts) {
         if path.is_file()
             && let Ok(contents) = std::fs::read_to_string(&path)
@@ -609,6 +633,45 @@ pub fn discover_github_token_with_options(opts: &TokenDiscoveryOptions) -> Optio
     }
 
     None
+}
+
+fn env_tokens_allowed_for_host(
+    opts: &TokenDiscoveryOptions,
+    bare_host: &str,
+    is_loopback: bool,
+) -> bool {
+    if bare_host == "github.com" || is_loopback {
+        return true;
+    }
+    if let Some(gh_host_raw) = lookup_env(opts, "GH_HOST") {
+        let trimmed = gh_host_raw.trim();
+        if !trimmed.is_empty() {
+            let configured_host = if trimmed.contains("://") {
+                url::Url::parse(trimmed)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| strip_host_port(h).to_ascii_lowercase()))
+            } else {
+                Some(
+                    strip_host_port(trimmed.trim_end_matches('/'))
+                        .to_ascii_lowercase(),
+                )
+            };
+            if configured_host.as_deref() == Some(bare_host) {
+                return true;
+            }
+        }
+    }
+    if let Some(api_url_raw) = lookup_env(opts, "OZ_GITHUB_API_URL") {
+        let trimmed = api_url_raw.trim();
+        if !trimmed.is_empty()
+            && let Ok(parsed) = url::Url::parse(trimmed)
+            && let Some(api_host) = parsed.host_str()
+            && strip_host_port(api_host).eq_ignore_ascii_case(bare_host)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Requires a GitHub token or returns an actionable non-interactive [`OzError`].
@@ -646,16 +709,18 @@ pub fn probe_github_auth(
         Some(RemoteScheme::Http) => "http".to_string(),
         _ => "https".to_string(),
     };
-    let api_base_url = parsed_opt
-        .as_ref()
-        .map(|p| p.api_base_url.clone())
-        .unwrap_or_else(|| {
+    let api_base_url = parsed_opt.as_ref().map_or_else(
+        || {
             std::env::var("OZ_GITHUB_API_URL")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .map(|s| s.trim().trim_end_matches('/').to_string())
-                .unwrap_or_else(|| DEFAULT_GITHUB_API_URL.to_string())
-        });
+                .map_or_else(
+                    || DEFAULT_GITHUB_API_URL.to_string(),
+                    |s| s.trim().trim_end_matches('/').to_string(),
+                )
+        },
+        |p| p.api_base_url.clone(),
+    );
 
     let opts = TokenDiscoveryOptions {
         host: host.clone(),
@@ -744,7 +809,7 @@ fn candidate_gh_hosts_paths(opts: &TokenDiscoveryOptions) -> Vec<PathBuf> {
 /// Parses GitHub CLI `hosts.yml` without external YAML dependencies, supporting both top-level
 /// `oauth_token` and multi-account `users.<active_user>.oauth_token` layouts.
 #[must_use]
-pub fn extract_token_from_gh_hosts_yml(contents: &str, target_host: &str) -> Option<String> {
+pub(crate) fn extract_token_from_gh_hosts_yml(contents: &str, target_host: &str) -> Option<String> {
     #[derive(Default)]
     struct HostEntry {
         oauth_token: Option<String>,
@@ -882,6 +947,7 @@ fn unquote_yaml_scalar(s: &str) -> String {
 
 /// Invokes `git credential fill` strictly non-interactively (`GIT_TERMINAL_PROMPT=0`,
 /// `GCM_INTERACTIVE=never`, closed stdin, bounded timeout). Never blocks on a TTY prompt.
+#[must_use]
 pub fn query_git_credential_fill(
     protocol: &str,
     host: &str,
@@ -1116,5 +1182,154 @@ ghe.corp.local:
         })
         .expect("hosts.yml ghe");
         assert_eq!(d6.token, "ghp_enterprise_token_999999");
+    }
+
+    #[test]
+    fn env_tokens_are_host_scoped_and_never_autodiscovered_over_non_loopback_http() {
+        let tmp = TempDir::new().expect("tempdir");
+        let hosts_yml = tmp.path().join("hosts.yml");
+        std::fs::write(
+            &hosts_yml,
+            "github.com:\n    oauth_token: gho_github_hosts_tok\ngitlab.example.com:\n    oauth_token: glpat_gitlab_hosts_tok\n",
+        )
+        .expect("write hosts.yml");
+
+        let empty_hosts = tmp.path().join("empty_hosts.yml");
+        std::fs::write(&empty_hosts, "").expect("write empty hosts.yml");
+
+        let mut base_env = BTreeMap::new();
+        base_env.insert("OZ_GITHUB_TOKEN".to_string(), "oz_tok".to_string());
+        base_env.insert("GITHUB_TOKEN".to_string(), "gh_actions_tok".to_string());
+        base_env.insert("GH_TOKEN".to_string(), "gh_cli_tok".to_string());
+
+        // 1. Non-GitHub HTTPS host (`https://gitlab.example.com`) MUST NOT receive GitHub env vars!
+        let gitlab_none = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "gitlab.example.com".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(base_env.clone()),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        });
+        assert!(
+            gitlab_none.is_none(),
+            "GitHub env tokens must not leak to https://gitlab.example.com"
+        );
+
+        // And when `hosts.yml` has a host-specific entry for `gitlab.example.com`, discovery
+        // skips env vars 2-4 and falls through to step 5 (`hosts.yml`).
+        let gitlab_hosts = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "gitlab.example.com".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(base_env.clone()),
+            gh_hosts_file: Some(hosts_yml.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .expect("host-matched hosts.yml token");
+        assert_eq!(gitlab_hosts.token, "glpat_gitlab_hosts_tok");
+        assert_eq!(
+            gitlab_hosts.source,
+            TokenSource::GhHostsYml {
+                path: hosts_yml.clone()
+            }
+        );
+
+        // 2. Non-loopback cleartext HTTP (`http://github.com`) MUST NOT auto-discover any token!
+        let cleartext_gh = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "github.com".to_string(),
+            protocol: "http".to_string(),
+            env_overrides: Some(base_env.clone()),
+            gh_hosts_file: Some(hosts_yml.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        });
+        assert!(
+            cleartext_gh.is_none(),
+            "tokens must never be auto-discovered over cleartext http://github.com"
+        );
+
+        // 3. `https://github.com` DOES return OZ_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN.
+        let https_gh = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "github.com".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(base_env.clone()),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .expect("https github.com token");
+        assert_eq!(https_gh.token, "oz_tok");
+        assert_eq!(https_gh.source, TokenSource::OzGithubTokenEnv);
+
+        // 4. Loopback `http://127.0.0.1:<port>`, `localhost:<port>`, and `[::1]:<port>` DO return env tokens.
+        for loopback_host in ["127.0.0.1:41234", "localhost:8080", "[::1]:9000", "::1"] {
+            let lb = discover_github_token_with_options(&TokenDiscoveryOptions {
+                host: loopback_host.to_string(),
+                protocol: "http".to_string(),
+                env_overrides: Some(base_env.clone()),
+                gh_hosts_file: Some(empty_hosts.clone()),
+                use_git_credential_helper: false,
+                ..Default::default()
+            })
+            .expect("loopback http token");
+            assert_eq!(lb.token, "oz_tok", "failed for {loopback_host}");
+        }
+
+        // 5. Explicitly configured `GH_HOST` enables env tokens ONLY for that matching host.
+        let mut gh_host_env = base_env.clone();
+        gh_host_env.remove("OZ_GITHUB_TOKEN");
+        gh_host_env.insert("GH_HOST".to_string(), "ghe.corp.internal".to_string());
+        let ghe_by_gh_host = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "ghe.corp.internal:8443".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(gh_host_env.clone()),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .expect("GH_HOST matched");
+        assert_eq!(ghe_by_gh_host.token, "gh_actions_tok");
+        assert_eq!(ghe_by_gh_host.source, TokenSource::GithubTokenEnv);
+
+        let wrong_ghe = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "other.corp.internal".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(gh_host_env),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        });
+        assert!(wrong_ghe.is_none());
+
+        // 6. Explicitly configured `OZ_GITHUB_API_URL` enables env tokens ONLY for that API host.
+        let mut api_env = base_env;
+        api_env.remove("OZ_GITHUB_TOKEN");
+        api_env.remove("GITHUB_TOKEN");
+        api_env.insert(
+            "OZ_GITHUB_API_URL".to_string(),
+            "https://git.enterprise.example/api/v3".to_string(),
+        );
+        let ghe_by_api_url = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "git.enterprise.example".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(api_env.clone()),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .expect("OZ_GITHUB_API_URL matched");
+        assert_eq!(ghe_by_api_url.token, "gh_cli_tok");
+        assert_eq!(ghe_by_api_url.source, TokenSource::GhTokenEnv);
+
+        let unmatched_api = discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "gitlab.enterprise.example".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(api_env),
+            gh_hosts_file: Some(empty_hosts),
+            use_git_credential_helper: false,
+            ..Default::default()
+        });
+        assert!(unmatched_api.is_none());
     }
 }

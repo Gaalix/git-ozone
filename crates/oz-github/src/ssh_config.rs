@@ -34,7 +34,7 @@ pub struct ResolvedSshHost {
     pub identity_agent: Option<String>,
     /// `ForwardAgent` setting.
     pub forward_agent: Option<bool>,
-    /// `PKCS11Provider` shared library path (hardware smartcards / YubiKey PIV).
+    /// `PKCS11Provider` shared library path (hardware smartcards / `YubiKey` PIV).
     pub pkcs11_provider: Option<String>,
     /// `SecurityKeyProvider` library/internal path (FIDO2 `sk-` hardware keys).
     pub security_key_provider: Option<String>,
@@ -42,14 +42,6 @@ pub struct ResolvedSshHost {
     pub user_config_file: Option<PathBuf>,
     /// Effective agent socket path resolved from `IdentityAgent` and `SSH_AUTH_SOCK`.
     pub effective_agent_sock: Option<PathBuf>,
-}
-
-impl ResolvedSshHost {
-    /// Returns the effective target hostname (`HostName` if configured, else `target_host`).
-    #[must_use]
-    pub fn effective_hostname(&self) -> &str {
-        self.hostname.as_deref().unwrap_or(&self.target_host)
-    }
 }
 
 /// Optional paths/env overrides for deterministic unit testing of SSH config resolution.
@@ -156,7 +148,7 @@ pub fn resolve_ssh_host_with_context(
 ///    `-o User=`, `-o Port=`, `-i`, `-o IdentitiesOnly=`, `-o ProxyJump=`,
 ///    `-o IdentityAgent=`, `-o PKCS11Provider=`, `-o SecurityKeyProvider=`).
 #[must_use]
-pub fn build_gix_ssh_options(
+pub(crate) fn build_gix_ssh_options(
     url: &gix::url::Url,
     core_ssh_command: Option<&str>,
 ) -> ssh::connect::Options {
@@ -305,8 +297,8 @@ fn parse_ssh_config_file(
     Ok(())
 }
 
-/// Parses an in-memory SSH config string into `out` (exposed for direct unit testing).
-pub fn parse_ssh_config_str(
+/// Parses an in-memory SSH config string into `out`.
+pub(crate) fn parse_ssh_config_str(
     content: &str,
     include_base_dir: &Path,
     target_host: &str,
@@ -461,7 +453,7 @@ fn expand_ssh_tokens(raw: &str, orig_host: &str, hostname: &str, port: &str, use
     while let Some(ch) = chars.next() {
         if ch == '%' {
             match chars.next() {
-                Some('%') => out.push('%'),
+                Some('%') | None => out.push('%'),
                 Some('h') => out.push_str(hostname),
                 Some('n') => out.push_str(orig_host),
                 Some('p') => out.push_str(port),
@@ -470,7 +462,6 @@ fn expand_ssh_tokens(raw: &str, orig_host: &str, hostname: &str, port: &str, use
                     out.push('%');
                     out.push(other);
                 }
-                None => out.push('%'),
             }
         } else {
             out.push(ch);
@@ -689,19 +680,19 @@ mod tests {
 
         fs::write(
             ssh_dir.join("conf.d/10-corp.conf"),
-            r#"
+            r"
 Host *.corp.internal !bastion.corp.internal
     User corp-git
     Port 2222
     IdentityFile ~/.ssh/id_corp_%r
     ProxyJump bastion.corp.internal:2200
-"#,
+",
         )
         .unwrap();
 
         fs::write(
             ssh_dir.join("config"),
-            r#"
+            r"
 Include conf.d/*.conf
 
 Host ghe-alias
@@ -717,7 +708,7 @@ Host *
     User fallback-user
     Port 22
     IdentityFile ~/.ssh/id_fallback
-"#,
+",
         )
         .unwrap();
 

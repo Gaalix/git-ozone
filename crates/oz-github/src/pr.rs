@@ -173,8 +173,7 @@ pub fn pr_create(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(inferred_title);
+        .map_or(inferred_title, str::to_string);
 
     let raw_body = opts.body.clone().unwrap_or(inferred_body);
     let body_with_change_id = attach_change_ids_to_body(&raw_body, &change_ids);
@@ -261,6 +260,15 @@ pub fn pr_stack(
     opts: &PrStackOptions,
     actor: ActorInfo,
 ) -> Result<PrStackOutcome> {
+    struct DraftedStackPr {
+        pr: GitHubPullRequest,
+        base_branch: String,
+        head_branch: String,
+        user_body: String,
+        created: bool,
+        change_ids: Vec<String>,
+    }
+
     let remote_name = opts
         .remote
         .as_deref()
@@ -334,15 +342,6 @@ pub fn pr_stack(
         open_by_head.entry(pr.head.ref_name.clone()).or_insert(pr);
     }
 
-    struct DraftedStackPr {
-        pr: GitHubPullRequest,
-        base_branch: String,
-        head_branch: String,
-        user_body: String,
-        created: bool,
-        change_ids: Vec<String>,
-    }
-
     let mut drafted = Vec::with_capacity(stack_chain.len());
     for node in &stack_chain {
         let expected_base = node
@@ -361,7 +360,9 @@ pub fn pr_stack(
                 existing_clean
             };
             let user_body = attach_change_ids_to_body(&base_prose, &change_ids);
-            let pr = if existing.base.ref_name != expected_base {
+            let pr = if existing.base.ref_name == expected_base {
+                existing
+            } else {
                 client.update_pull_request(
                     owner,
                     gh_repo,
@@ -371,8 +372,6 @@ pub fn pr_stack(
                         ..Default::default()
                     },
                 )?
-            } else {
-                existing
             };
 
             drafted.push(DraftedStackPr {
@@ -460,7 +459,7 @@ pub fn pr_stack(
 /// Renders the deterministic `<!-- oz-stack-start --> ... <!-- oz-stack-end -->` markdown block
 /// cross-linking every PR in the stack and marking `current_pr_number` with `👉`.
 #[must_use]
-pub fn render_stack_navigation_block(
+pub(crate) fn render_stack_navigation_block(
     root_base: &str,
     items: &[StackPrItem],
     current_pr_number: u64,
@@ -494,7 +493,7 @@ pub fn render_stack_navigation_block(
 
 /// Inserts or replaces the `<!-- oz-stack-start --> ... <!-- oz-stack-end -->` section in `body` idempotently.
 #[must_use]
-pub fn upsert_stack_navigation_block(body: &str, block: &str) -> String {
+pub(crate) fn upsert_stack_navigation_block(body: &str, block: &str) -> String {
     if let (Some(start_idx), Some(end_rel)) = (body.find(OZ_STACK_START), body.find(OZ_STACK_END))
         && end_rel >= start_idx
     {
@@ -524,7 +523,7 @@ pub fn upsert_stack_navigation_block(body: &str, block: &str) -> String {
 
 /// Removes any managed `<!-- oz-stack-start --> ... <!-- oz-stack-end -->` block from `body`.
 #[must_use]
-pub fn strip_stack_navigation_block(body: &str) -> String {
+pub(crate) fn strip_stack_navigation_block(body: &str) -> String {
     if let (Some(start_idx), Some(end_rel)) = (body.find(OZ_STACK_START), body.find(OZ_STACK_END))
         && end_rel >= start_idx
     {
@@ -696,11 +695,11 @@ fn branch_needs_lease_push(
     if local_oid == tracking_oid {
         return Ok(false);
     }
-    Ok(!is_ancestor_commit(gix_repo, tracking_oid, local_oid)?)
+    Ok(!is_ancestor_commit(gix_repo, tracking_oid, local_oid))
 }
 
 /// Inspects commits in `(base_branch..head_branch]` (oldest-first) to infer PR title, body, and `Change-Id`s.
-pub fn infer_title_body_and_change_ids(
+pub(crate) fn infer_title_body_and_change_ids(
     gix_repo: &gix::Repository,
     base_branch: &str,
     head_branch: &str,
@@ -722,7 +721,7 @@ pub fn infer_title_body_and_change_ids(
             .merge_base(b_id, head_oid)
             .ok()
             .flatten()
-            .map(|id| id.detach()),
+            .map(gix::Id::detach),
         None => None,
     };
 
@@ -732,9 +731,7 @@ pub fn infer_title_body_and_change_ids(
     let mut change_ids = Vec::new();
 
     for cid in &commits_oldest_first {
-        let commit = gix_repo
-            .find_commit(*cid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let commit = gix_repo.find_commit(*cid).map_err(OzError::git_source)?;
         let raw_msg = commit.message_raw_sloppy().to_str_lossy().into_owned();
         let (subj, body_without_trailers, cids) = split_commit_message(&raw_msg);
         if !subj.is_empty() {
@@ -858,10 +855,8 @@ fn collect_first_parent_commits(
         }
         guard += 1;
         out.push(cid);
-        let commit = gix_repo
-            .find_commit(cid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        cur = commit.parent_ids().next().map(|id| id.detach());
+        let commit = gix_repo.find_commit(cid).map_err(OzError::git_source)?;
+        cur = commit.parent_ids().next().map(gix::Id::detach);
     }
     out.reverse();
     Ok(out)
@@ -1290,11 +1285,11 @@ fn parse_hunk_header_bounds(header: &str) -> Option<(u32, u32, u32, u32)> {
 /// Parses a GitHub unified `patch` string into structured [`DiffHunk`]s with deterministic
 /// hunk IDs (`h1a`, `h1b`, ...) and exact 1-based `old_line` / `new_line` numbers.
 #[must_use]
-pub fn parse_github_patch_to_hunks(
+pub(crate) fn parse_github_patch_to_hunks(
     file_id_str: &str,
     file_num: usize,
-    path: &str,
-    patch: &str,
+    file_path: &str,
+    patch_text: &str,
 ) -> Vec<DiffHunk> {
     struct PendingHunk {
         old_start: u32,
@@ -1310,7 +1305,7 @@ pub fn parse_github_patch_to_hunks(
     let mut hunks = Vec::new();
     let mut current: Option<PendingHunk> = None;
 
-    for raw_line in patch.split('\n') {
+    for raw_line in patch_text.split('\n') {
         if raw_line.starts_with("@@ ")
             && let Some((old_start, old_lines, new_start, new_lines)) =
                 parse_hunk_header_bounds(raw_line)
@@ -1320,7 +1315,7 @@ pub fn parse_github_patch_to_hunks(
                 hunks.push(DiffHunk {
                     id: hunk_id(file_num, idx),
                     file_id: file_id_str.to_string(),
-                    path: path.to_string(),
+                    path: file_path.to_string(),
                     old_start: p.old_start,
                     old_lines: p.old_lines,
                     new_start: p.new_start,
@@ -1382,7 +1377,7 @@ pub fn parse_github_patch_to_hunks(
         hunks.push(DiffHunk {
             id: hunk_id(file_num, idx),
             file_id: file_id_str.to_string(),
-            path: path.to_string(),
+            path: file_path.to_string(),
             old_start: p.old_start,
             old_lines: p.old_lines,
             new_start: p.new_start,
@@ -1398,7 +1393,7 @@ pub fn parse_github_patch_to_hunks(
 /// Converts GitHub PR file entries into Ozone [`FileChange`] structs with deterministic IDs
 /// and line-numbered [`DiffHunk`]s.
 #[must_use]
-pub fn pr_files_to_changes(files: &[GitHubPullRequestFile]) -> Vec<FileChange> {
+pub(crate) fn pr_files_to_changes(files: &[GitHubPullRequestFile]) -> Vec<FileChange> {
     files
         .iter()
         .enumerate()
@@ -1464,7 +1459,7 @@ fn format_contiguous_ranges(lines: &BTreeSet<u32>) -> String {
 
 /// Pre-validates inline review comments against parsed PR diff hunks and converts them
 /// to GitHub REST payloads. Fails locally with valid line-range hints on any mismatch.
-pub fn validate_pr_review_comments(
+pub(crate) fn validate_pr_review_comments(
     pr_number: u64,
     pr_changes: &[FileChange],
     comments: &[PrInlineCommentInput],
@@ -1784,7 +1779,7 @@ pub(crate) fn map_issue_comments(raw: Vec<GitHubIssueComment>) -> Vec<PrConversa
 /// Groups flat REST PR review comments into `path:line` threads and enriches with optional GraphQL
 /// `isResolved`/`isOutdated` metadata.
 #[must_use]
-pub fn group_review_threads(
+pub(crate) fn group_review_threads(
     raw_comments: &[GitHubPullRequestComment],
     graphql_threads: &[GitHubReviewThreadMeta],
 ) -> Vec<PrReviewThread> {
@@ -1837,9 +1832,8 @@ pub fn group_review_threads(
         let gql_meta = items
             .iter()
             .find_map(|c| meta_by_comment.get(&c.id).copied());
-        let is_outdated = gql_meta
-            .map(|m| m.is_outdated)
-            .unwrap_or_else(|| root.line.is_none() && root.position.is_none());
+        let is_outdated =
+            gql_meta.map_or_else(|| root.line.is_none() && root.position.is_none(), |m| m.is_outdated);
 
         let thread_comments = items
             .into_iter()
@@ -2038,7 +2032,7 @@ pub fn pr_review(repo: &OzoneRepo, opts: &PrReviewOptions) -> Result<PrReviewOut
     };
 
     if opts.event == PrReviewEvent::Comment
-        && opts.body.as_deref().map(str::trim).unwrap_or("").is_empty()
+        && opts.body.as_deref().is_none_or(|b| b.trim().is_empty())
         && validated_payloads.is_empty()
     {
         return Err(OzError::InvalidUsage {

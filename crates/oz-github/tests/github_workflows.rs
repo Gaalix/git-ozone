@@ -5,8 +5,10 @@
 //! - Non-interactive token discovery (`hosts.yml`, env priority, `git credential fill` non-TTY guard, `probe_github_auth`)
 //! - `pr_create` (push + commit title/body + `Change-Id:` preservation + idempotent update)
 //! - 3-branch `pr_stack` (`main <- stack-1 <- stack-2 <- stack-3`, atomic push, cross-linked stack tables with `👉`)
-//! - `sync_repo` (`oz sync`: fetch, fast-forward `main`, auto-retarget PR #2 base to `main`, GC merged CoW workspace + prune checkpoints, rebase downstream stack via `oz-integrate`, refresh `oz-warm` baseline, plus squash-merge & offline bare-remote sync)
+//! - `sync_repo` (`oz sync`: fetch, fast-forward `main`, auto-retarget PR #2 base to `main`, GC merged `CoW` workspace + prune checkpoints, rebase downstream stack via `oz-integrate`, refresh `oz-warm` baseline, plus squash-merge & offline bare-remote sync)
 //! - `query_ci_status` (`oz ci`: check-runs + Actions jobs + plain-text & PKZIP failing log extraction)
+
+#![allow(clippy::too_many_lines)]
 
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
@@ -163,21 +165,22 @@ async fn handle_mock_github_conn(
 
     let (path, query) = raw_target
         .split_once('?')
-        .map(|(p, q)| (p, Some(q)))
-        .unwrap_or((raw_target.as_str(), None));
+        .map_or((raw_target.as_str(), None), |(p, q)| (p, Some(q)));
     let query_map = parse_query_map(query);
 
     let (status, content_type, resp_bytes) = {
-        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expected_auth = format!("Bearer {}", guard.expected_token);
-        if headers.get("authorization") != Some(&expected_auth) {
+        if headers.get("authorization") == Some(&expected_auth) {
+            route_mock_github(&method, path, &query_map, &body, &mut guard)
+        } else {
             (
                 "401 Unauthorized",
                 "application/json",
                 serde_json::to_vec(&json!({ "message": "Bad credentials" })).unwrap(),
             )
-        } else {
-            route_mock_github(&method, path, &query_map, &body, &mut guard)
         }
     };
 
@@ -216,7 +219,7 @@ fn route_mock_github(
 
         // GET /repos/:owner/:repo/pulls
         if method == "GET" && tail == ["pulls"] {
-            let state_filter = query.get("state").map(String::as_str).unwrap_or("open");
+            let state_filter = query.get("state").map_or("open", String::as_str);
             let head_filter = query.get("head").map(String::as_str);
             let base_filter = query.get("base").map(String::as_str);
 
@@ -226,7 +229,7 @@ fn route_mock_github(
                 .filter(|pr| {
                     (state_filter == "all" || pr.state == state_filter)
                         && head_filter.is_none_or(|hf| {
-                            let short = hf.split_once(':').map(|(_, b)| b).unwrap_or(hf);
+                            let short = hf.split_once(':').map_or(hf, |(_, b)| b);
                             pr.head.ref_name == short
                         })
                         && base_filter.is_none_or(|bf| pr.base.ref_name == bf)
@@ -461,8 +464,9 @@ fn build_zip_deflate(filename: &str, payload: &[u8]) -> Vec<u8> {
     let compressed = enc.finish().expect("finish");
 
     let name_bytes = filename.as_bytes();
-    let comp_len = compressed.len() as u32;
-    let uncomp_len = payload.len() as u32;
+    let name_len = u16::try_from(name_bytes.len()).expect("filename fits u16");
+    let comp_len = u32::try_from(compressed.len()).expect("compressed fits u32");
+    let uncomp_len = u32::try_from(payload.len()).expect("payload fits u32");
 
     let mut zip = Vec::new();
     zip.extend_from_slice(b"PK\x03\x04");
@@ -474,12 +478,12 @@ fn build_zip_deflate(filename: &str, payload: &[u8]) -> Vec<u8> {
     zip.extend_from_slice(&0u32.to_le_bytes());
     zip.extend_from_slice(&comp_len.to_le_bytes());
     zip.extend_from_slice(&uncomp_len.to_le_bytes());
-    zip.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    zip.extend_from_slice(&name_len.to_le_bytes());
     zip.extend_from_slice(&0u16.to_le_bytes());
     zip.extend_from_slice(name_bytes);
     zip.extend_from_slice(&compressed);
 
-    let cd_offset = zip.len() as u32;
+    let cd_offset = u32::try_from(zip.len()).expect("cd_offset fits u32");
     zip.extend_from_slice(b"PK\x01\x02");
     zip.extend_from_slice(&20u16.to_le_bytes());
     zip.extend_from_slice(&20u16.to_le_bytes());
@@ -490,7 +494,7 @@ fn build_zip_deflate(filename: &str, payload: &[u8]) -> Vec<u8> {
     zip.extend_from_slice(&0u32.to_le_bytes());
     zip.extend_from_slice(&comp_len.to_le_bytes());
     zip.extend_from_slice(&uncomp_len.to_le_bytes());
-    zip.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    zip.extend_from_slice(&name_len.to_le_bytes());
     zip.extend_from_slice(&0u16.to_le_bytes());
     zip.extend_from_slice(&0u16.to_le_bytes());
     zip.extend_from_slice(&0u16.to_le_bytes());
@@ -499,7 +503,7 @@ fn build_zip_deflate(filename: &str, payload: &[u8]) -> Vec<u8> {
     zip.extend_from_slice(&0u32.to_le_bytes());
     zip.extend_from_slice(name_bytes);
 
-    let cd_size = (zip.len() as u32) - cd_offset;
+    let cd_size = u32::try_from(zip.len()).expect("zip fits u32") - cd_offset;
     zip.extend_from_slice(b"PK\x05\x06");
     zip.extend_from_slice(&0u16.to_le_bytes());
     zip.extend_from_slice(&0u16.to_le_bytes());
@@ -599,6 +603,79 @@ fn non_interactive_token_discovery_gh_config_dir_and_credential_fill_never_hangs
     assert!(probe.authenticated);
     assert_eq!(probe.token_source, Some(TokenSource::Explicit));
     assert_eq!(probe.masked_token.as_deref(), Some("ghp_****"));
+
+    // Verify GitHub env tokens do NOT leak to third-party HTTPS hosts or cleartext HTTP hosts,
+    // while still working for github.com, loopback HTTP, GH_HOST, and OZ_GITHUB_API_URL!
+    let mut scoped_env = BTreeMap::new();
+    scoped_env.insert("GITHUB_TOKEN".to_string(), "ghp_env_tok".to_string());
+    scoped_env.insert("GH_TOKEN".to_string(), "gho_cli_tok".to_string());
+    scoped_env.insert("OZ_GITHUB_TOKEN".to_string(), "oz_tok".to_string());
+    let empty_hosts = tmp.path().join("empty_hosts.yml");
+    std::fs::write(&empty_hosts, "").expect("write empty hosts");
+
+    assert!(
+        discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "gitlab.example.com".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(scoped_env.clone()),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .is_none()
+    );
+    assert!(
+        discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "github.com".to_string(),
+            protocol: "http".to_string(),
+            env_overrides: Some(scoped_env.clone()),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .is_none()
+    );
+    assert_eq!(
+        discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "127.0.0.1:8080".to_string(),
+            protocol: "http".to_string(),
+            env_overrides: Some(scoped_env.clone()),
+            gh_hosts_file: Some(empty_hosts.clone()),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .expect("loopback http allowed")
+        .token,
+        "oz_tok"
+    );
+
+    let mut ghe_env = scoped_env;
+    ghe_env.insert("GH_HOST".to_string(), "ghe.example.com".to_string());
+    assert_eq!(
+        discover_github_token_with_options(&TokenDiscoveryOptions {
+            host: "ghe.example.com".to_string(),
+            protocol: "https".to_string(),
+            env_overrides: Some(ghe_env),
+            gh_hosts_file: Some(empty_hosts),
+            use_git_credential_helper: false,
+            ..Default::default()
+        })
+        .expect("GH_HOST allowed")
+        .token,
+        "oz_tok"
+    );
+
+    let bad_http_client = GitHubClient::new("http://ghe.example.com/api/v3", Some("tok".into()));
+    let bad_err = bad_http_client
+        .get_pull_request("acme", "demo", 1)
+        .expect_err("cleartext non-loopback HTTP credentials must fail");
+    assert!(
+        matches!(
+            bad_err,
+            oz_core::OzError::GuardrailViolation { ref kind, .. } if kind == "insecure_http_credentials"
+        ),
+        "got {bad_err:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

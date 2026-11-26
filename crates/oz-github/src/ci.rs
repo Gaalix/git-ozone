@@ -87,7 +87,7 @@ pub enum CiWatchOutcome {
 }
 
 impl CiWatchOutcome {
-    /// Canonical snake_case identifier for JSON/error codes.
+    /// Canonical `snake_case` identifier for JSON/error codes.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -229,6 +229,7 @@ pub struct CiJobLogReport {
     pub log_excerpt: Option<String>,
 }
 
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_usize(v: &usize) -> bool {
     *v == 0
 }
@@ -578,10 +579,10 @@ fn query_ci_status_with_client(
     let (ref_name, commit_sha, resolved_pr_num, _initial_pr_head_sha) =
         resolve_ci_target(repo, client, owner, gh_repo, opts)?;
 
-    let query_ref = if !commit_sha.is_empty() {
-        commit_sha.as_str()
-    } else {
+    let query_ref = if commit_sha.is_empty() {
         ref_name.as_str()
+    } else {
+        commit_sha.as_str()
     };
 
     let check_runs = client
@@ -913,8 +914,7 @@ where
             }
             let jobs = jobs_cache
                 .get(&run.id)
-                .map(|(_, j)| j.as_slice())
-                .unwrap_or(&[]);
+                .map_or([].as_slice(), |(_, j)| j.as_slice());
             run_summaries.push(build_single_workflow_run_summary(
                 &client,
                 owner,
@@ -962,7 +962,7 @@ where
             None,
         );
 
-        let total_jobs = report.runs.first().map(|r| r.jobs.len()).unwrap_or(0);
+        let total_jobs = report.runs.first().map_or(0, |r| r.jobs.len());
         if !report.runs.is_empty() {
             if report.failing_count > 0 && watch_opts.fail_fast {
                 let stopped_early = report.pending_count > 0;
@@ -1106,8 +1106,11 @@ fn fetch_workflow_runs_resolved(
 ) -> Result<(String, Vec<GitHubWorkflowRun>)> {
     let normalized = normalize_workflow_selector(workflow_query);
     let looks_direct = normalized.chars().all(|c| c.is_ascii_digit())
-        || normalized.ends_with(".yml")
-        || normalized.ends_with(".yaml");
+        || std::path::Path::new(&normalized)
+            .extension()
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+            });
 
     if looks_direct {
         match client.list_workflow_runs_for_workflow(
@@ -1392,10 +1395,10 @@ where
     let mut preexisting_other_run_ids: HashSet<u64> = HashSet::new();
     let mut seen_watched_workflow_run = false;
 
-    let query_ref = if !commit_sha.is_empty() {
-        commit_sha.clone()
-    } else {
+    let query_ref = if commit_sha.is_empty() {
         ref_name.clone()
+    } else {
+        commit_sha.clone()
     };
     let branch_filter = (!ref_name.is_empty() && ref_name != commit_sha && ref_name != "HEAD")
         .then_some(ref_name.as_str());
@@ -2142,7 +2145,7 @@ fn is_sha_ancestor_of_watched(
     let Ok(watched_oid) = gix::hash::ObjectId::from_hex(watched_sha.as_bytes()) else {
         return false;
     };
-    is_ancestor_commit(repo, cand_oid, watched_oid).unwrap_or(false)
+    is_ancestor_commit(repo, cand_oid, watched_oid)
 }
 
 fn resolve_ci_target(
@@ -2197,15 +2200,15 @@ fn resolve_ci_target(
         });
     }
 
-    let matched_pr = if branch != "HEAD" {
+    let matched_pr = if branch == "HEAD" {
+        None
+    } else {
         let head_filter = format!("{owner}:{branch}");
         client
             .list_pull_requests(owner, gh_repo, Some("open"), Some(&head_filter), None)
             .ok()
             .and_then(|list| list.into_iter().find(|p| p.head.ref_name == branch))
             .map(|p| (p.number, p.head.sha))
-    } else {
-        None
     };
 
     let (pr_num, pr_head_sha) = match matched_pr {
@@ -2276,9 +2279,8 @@ fn build_check_summary(
             .map(|st| st.name.clone())
     });
 
-    let cache_key = job_id_opt
-        .map(|jid| format!("job:{jid}"))
-        .unwrap_or_else(|| format!("name:{name}"));
+    let cache_key =
+        job_id_opt.map_or_else(|| format!("name:{name}"), |jid| format!("job:{jid}"));
     if let Some((cached_step, cached_excerpt)) = failure_cache.get(&cache_key) {
         return CiCheckSummary {
             name,
@@ -2341,7 +2343,7 @@ fn build_check_summary(
 
 pub(crate) fn is_failing_conclusion(conclusion: Option<&str>) -> bool {
     matches!(
-        conclusion.map(|s| s.to_ascii_lowercase()).as_deref(),
+        conclusion.map(str::to_ascii_lowercase).as_deref(),
         Some("failure" | "timed_out" | "cancelled" | "startup_failure" | "action_required")
     )
 }
@@ -2376,7 +2378,7 @@ fn extract_actions_run_id_from_url(url: Option<&str>) -> Option<u64> {
 }
 
 /// Decodes raw job log bytes as either a PKZIP archive (`PK\x03\x04` / `PK\x05\x06`) or UTF-8 text.
-pub fn extract_log_text_from_bytes(
+pub(crate) fn extract_log_text_from_bytes(
     bytes: &[u8],
     preferred_step_name: Option<&str>,
 ) -> Result<String> {
@@ -2431,7 +2433,7 @@ pub fn extract_log_text_from_bytes(
 
 fn sanitize_step_needle(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -2582,7 +2584,7 @@ fn decode_zip_payload(compressed: &[u8], method: u16) -> Result<String> {
 /// escape sequences), infers `failing_step` from `##[group]` markers when missing, and extracts
 /// a concise, high-signal `log_excerpt` focused on compiler errors, panics, and test failures.
 #[must_use]
-pub fn summarize_failing_log(
+pub(crate) fn summarize_failing_log(
     raw_log: &str,
     known_step: Option<&str>,
     max_lines: usize,
@@ -2653,7 +2655,13 @@ pub fn summarize_failing_log(
         }
     }
 
-    let excerpt_lines: Vec<String> = if !selected_indices.is_empty() {
+    let excerpt_lines: Vec<String> = if selected_indices.is_empty() {
+        let start = cleaned_lines.len().saturating_sub(max_lines);
+        if inferred_step.is_none() {
+            inferred_step = group_for_line.last().cloned().flatten();
+        }
+        cleaned_lines[start..].to_vec()
+    } else {
         selected_indices.sort_unstable();
         selected_indices.dedup();
         selected_indices
@@ -2661,12 +2669,6 @@ pub fn summarize_failing_log(
             .take(max_lines)
             .map(|i| cleaned_lines[i].clone())
             .collect()
-    } else {
-        let start = cleaned_lines.len().saturating_sub(max_lines);
-        if inferred_step.is_none() {
-            inferred_step = group_for_line.last().cloned().flatten();
-        }
-        cleaned_lines[start..].to_vec()
     };
 
     let max_chars = excerpt_char_budget(max_lines);
@@ -2740,10 +2742,10 @@ fn extract_cleaned_log_tail(
         all_cleaned.push(normalized);
     }
 
-    let source = if !step_cleaned.is_empty() {
-        step_cleaned
-    } else {
+    let source = if step_cleaned.is_empty() {
         all_cleaned
+    } else {
+        step_cleaned
     };
     if source.is_empty() {
         return None;
@@ -2779,7 +2781,7 @@ fn is_high_signal_error_line(line: &str) -> bool {
 
 /// Strips a leading GitHub Actions runner timestamp like `2026-11-18T13:20:01.1234567Z `.
 #[must_use]
-pub fn strip_actions_timestamp(line: &str) -> &str {
+pub(crate) fn strip_actions_timestamp(line: &str) -> &str {
     let bytes = line.as_bytes();
     // Minimum `YYYY-MM-DDTHH:MM:SSZ ` is 21 bytes.
     if bytes.len() >= 21
@@ -2812,7 +2814,7 @@ pub fn strip_actions_timestamp(line: &str) -> &str {
 
 /// Strips ANSI CSI (`\x1b[...m`) and OSC (`\x1b]...\x07`) escape sequences.
 #[must_use]
-pub fn strip_ansi_escapes(input: &str) -> String {
+pub(crate) fn strip_ansi_escapes(input: &str) -> String {
     if !input.contains('\x1b') {
         return input.to_string();
     }
@@ -2863,8 +2865,9 @@ mod tests {
         let compressed = encoder.finish().expect("finish deflate");
 
         let name_bytes = filename.as_bytes();
-        let comp_len = compressed.len() as u32;
-        let uncomp_len = content.len() as u32;
+        let name_len = u16::try_from(name_bytes.len()).expect("filename fits u16");
+        let comp_len = u32::try_from(compressed.len()).expect("compressed fits u32");
+        let uncomp_len = u32::try_from(content.len()).expect("content fits u32");
 
         let mut zip = Vec::new();
         // Local File Header (`PK\x03\x04`)
@@ -2877,12 +2880,12 @@ mod tests {
         zip.extend_from_slice(&0u32.to_le_bytes()); // crc32 (unchecked)
         zip.extend_from_slice(&comp_len.to_le_bytes());
         zip.extend_from_slice(&uncomp_len.to_le_bytes());
-        zip.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&name_len.to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes()); // extra len
         zip.extend_from_slice(name_bytes);
         zip.extend_from_slice(&compressed);
 
-        let cd_offset = zip.len() as u32;
+        let cd_offset = u32::try_from(zip.len()).expect("cd_offset fits u32");
         // Central Directory Header (`PK\x01\x02`)
         zip.extend_from_slice(b"PK\x01\x02");
         zip.extend_from_slice(&20u16.to_le_bytes()); // version made by
@@ -2894,7 +2897,7 @@ mod tests {
         zip.extend_from_slice(&0u32.to_le_bytes());
         zip.extend_from_slice(&comp_len.to_le_bytes());
         zip.extend_from_slice(&uncomp_len.to_le_bytes());
-        zip.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&name_len.to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes());
         zip.extend_from_slice(&0u16.to_le_bytes());
@@ -2903,7 +2906,7 @@ mod tests {
         zip.extend_from_slice(&0u32.to_le_bytes()); // local header offset = 0
         zip.extend_from_slice(name_bytes);
 
-        let cd_size = (zip.len() as u32) - cd_offset;
+        let cd_size = u32::try_from(zip.len()).expect("zip fits u32") - cd_offset;
         // End of Central Directory (`PK\x05\x06`)
         zip.extend_from_slice(b"PK\x05\x06");
         zip.extend_from_slice(&0u16.to_le_bytes());

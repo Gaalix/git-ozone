@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Integration tests for pure-Rust Wire Protocol v2 `clone_repo` (including `--filter=blob:none`
-//! and `--branch`), `fetch_remote` (including `--prune` and OpLog `ref_deltas`), and `push_refs`
+//! and `--branch`), `fetch_remote` (including `--prune` and `OpLog` `ref_deltas`), and `push_refs`
 //! (`--atomic`, `--force-with-lease` success + stale-lease rejection, and `--set-upstream`)
 //! against both local bare Git repositories and a real `tokio` smart-HTTP Git endpoint.
+
+#![allow(clippy::too_many_lines)]
 
 use base64::Engine;
 use gix::prelude::Find;
@@ -153,8 +155,7 @@ fn local_bare_partial_clone_fetch_prune_and_push_atomic_with_lease() {
         .collect();
     assert!(
         pack_entries.iter().any(|n| n.ends_with(".promisor")),
-        "expected .promisor marker in {:?}",
-        pack_entries
+        "expected .promisor marker in {pack_entries:?}"
     );
 
     let gix_cloned = gix::open(&clone_dst).expect("open cloned gix");
@@ -465,8 +466,7 @@ async fn handle_smart_http_conn(
     let git_protocol = headers.get("git-protocol").cloned();
     let (path, query) = raw_target
         .split_once('?')
-        .map(|(p, q)| (p, Some(q)))
-        .unwrap_or((raw_target.as_str(), None));
+        .map_or((raw_target.as_str(), None), |(p, q)| (p, Some(q)));
 
     if method == "GET" && path.ends_with("/info/refs") {
         let service = query
@@ -619,7 +619,7 @@ async fn smart_http_clone_partial_fetch_and_push_atomic_with_auth() {
     let bad_err = clone_repo(&bad_opts, test_actor()).expect_err("wrong token must fail");
     assert!(matches!(
         bad_err,
-        OzError::CheckFailed { .. } | OzError::Git(_)
+        OzError::CheckFailed { .. } | OzError::Git(_) | OzError::GitSource { .. }
     ));
 
     // 2. Authenticated partial clone (`--filter=blob:none`) over Smart HTTP v2!
@@ -847,4 +847,87 @@ fn clone_empty_unborn_remote_push_initial_commit_and_delete_remote_branch() {
     assert!(del_out.pushed_refs[0].deleted);
     let refs_now = run_git(&empty_bare, &["for-each-ref", "--format=%(refname)"]);
     assert!(!refs_now.contains("refs/heads/temp-branch"));
+}
+
+#[test]
+fn cleartext_non_loopback_http_with_credentials_fails_closed_with_guardrail() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    let assert_guardrail = |err: OzError| match err {
+        OzError::GuardrailViolation {
+            kind,
+            message,
+            recovery,
+        } => {
+            assert_eq!(kind, "insecure_http_credentials");
+            assert!(message.contains("unencrypted HTTP"), "got: {message}");
+            assert_eq!(
+                recovery,
+                vec!["Switch the remote URL from http:// to https:// or ssh://.".to_string()]
+            );
+        }
+        other => panic!("expected GuardrailViolation(insecure_http_credentials), got {other:?}"),
+    };
+
+    // 1. Explicit `auth_token` on non-loopback `http://` clone fails closed immediately.
+    let mut clone_opts = CloneOptions::new(
+        "http://github.com/acme/demo.git",
+        tmp.path().join("blocked-clone"),
+    );
+    clone_opts.auth_token = Some("ghp_explicit_secret".to_string());
+    assert_guardrail(clone_repo(&clone_opts, test_actor()).unwrap_err());
+
+    // 2. Inline URL password (`http://user:pass@non-loopback/...`) also fails closed.
+    let inline_opts = CloneOptions::new(
+        "http://x-access-token:ghp_inline_secret@git.example.com/acme/demo.git",
+        tmp.path().join("blocked-inline"),
+    );
+    assert_guardrail(clone_repo(&inline_opts, test_actor()).unwrap_err());
+
+    // 3. `fetch_remote` and `push_refs` on a repo with a non-loopback `http://` remote and explicit token fail closed.
+    let repo_dir = tmp.path().join("local-repo");
+    std::fs::create_dir_all(&repo_dir).expect("mkdir local-repo");
+    run_git(&repo_dir, &["init", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.name", "Test"]);
+    run_git(&repo_dir, &["config", "user.email", "test@ozone.dev"]);
+    run_git(
+        &repo_dir,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "http://git.example.com/acme/demo.git",
+        ],
+    );
+    std::fs::write(repo_dir.join("README.md"), "hi\n").expect("write");
+    let oz_initial = OzoneRepo::discover(Some(&repo_dir)).expect("discover");
+    let _ = commit_changes(&oz_initial, &CommitOptions::new("chore: init")).expect("commit");
+    let oz = OzoneRepo::discover(Some(&repo_dir)).expect("rediscover");
+
+    let fetch_err = fetch_remote(
+        &oz,
+        &FetchOptions {
+            remote: Some("origin".to_string()),
+            auth_token: Some("ghp_fetch_secret".to_string()),
+            auth_scheme: HttpAuthScheme::Bearer,
+            ..Default::default()
+        },
+        test_actor(),
+    )
+    .unwrap_err();
+    assert_guardrail(fetch_err);
+
+    let push_err = push_refs(
+        &oz,
+        &PushOptions {
+            remote: Some("origin".to_string()),
+            refspecs: vec!["main".to_string()],
+            auth_token: Some("ghp_push_secret".to_string()),
+            auth_scheme: HttpAuthScheme::BasicToken,
+            ..Default::default()
+        },
+        test_actor(),
+    )
+    .unwrap_err();
+    assert_guardrail(push_err);
 }
