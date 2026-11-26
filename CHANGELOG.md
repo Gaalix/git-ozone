@@ -2,6 +2,22 @@
 
 All notable changes to Ozone (`oz` / `git-ozone` / `oz-vfsd`) are documented in this file.
 
+## [1.4.0] — 2026-11-26
+
+### Security & Soundness Hardening
+- **Host-Scoped GitHub Token Discovery & Cleartext HTTP Credential Guardrail (`oz-github`):** Scoped `OZ_GITHUB_TOKEN`, `GITHUB_TOKEN`, and `GH_TOKEN` environment token discovery strictly to `github.com`, loopback endpoints, and hosts explicitly configured via `GH_HOST` or `OZ_GITHUB_API_URL`, blocking automatic token discovery over non-loopback `http://`. Enforced fail-closed `OzError::GuardrailViolation` (`insecure_http_credentials`) across `wire::connect_transport` and `GitHubClient` whenever credentials would be sent over non-loopback cleartext `http://`.
+- **Drop-Safe Poison Recovery & Zero Production `.expect()`/`.unwrap()` (`oz-core`, `oz-oplog`, `oz-cow`, `oz-warm`, `oz-github`, `oz-agent`, `oz-integrate`):** Replaced lock-poisoning `.expect()` calls in `WorkerFlush::drop` with `PoisonError::into_inner` recovery to prevent double-panic aborts during unwind, eliminated remaining production `.expect()`/`.unwrap()` calls across all 10 workspace crates, and upgraded lossy `OzError::Git` string conversions to causal `OzError::git_source` / `OzError::git_context` error chains.
+- **Width-Safe Arithmetic & Baseline Budget Clamping (`oz-integrate`, `oz-warm`):** Replaced unchecked `isize`/`as u32` casts in `oz radar` (`project_pos_onto_base`) with clamped `i64` arithmetic and added overflow-safe upper-bound clamping for warm-cache GC byte budgets (`gc_baselines`).
+
+### Features & Performance
+- **`regex-automata` `oz grep` Engine & Parallel Working-Tree Scanning (`oz-core`):** Replaced the custom NFA in `SimpleRegex` with `regex-automata` (`meta::Regex` + `regex-syntax`), adding full Rust regex support including Unicode word boundaries (`\b`, `\B`), bounded quantifiers (`{m,n}`), and allocation-free case-insensitive fixed-string (`-F -i`) matching. Parallelized working-tree `oz grep` via `ignore::WalkBuilder::build_parallel()` with 8 KiB NUL-byte binary sniffing before full-file reads, allocation-free path separator normalization, and deterministic `(path, line_number)` ordering.
+- **Lock-Free Rayon + `Cow` CAS Materialization (`oz-cow`):** Updated `link_file_via_cas` to borrow cached BLAKE3 digests via `Cow<'a, str>` (zero per-file `String` allocations on warm workspace spawns) and replaced mutex-contended digest collection in `materialize_cas_workspace` with lock-free Rayon parallel collection.
+- **Lock-Split `McpServer`, Bounded OpLog Locks & Linear `fsck` (`oz-agent`, `oz-oplog`):** Split `McpServer` session state locking so `MutexGuard` is dropped before executing blocking `tools/call` handlers (allowing concurrent `tools/list` and fast tools while `oz_ci_logs` waits), refactored `IN_PROCESS_LOCKS` to `Weak<Mutex<()>>` with dead-entry pruning for bounded memory in long-lived MCP servers, and replaced quadratic `oz fsck` head-reachability filtering with a single `O(V + E)` reverse-children graph walk.
+
+### Dependencies, Hygiene & Static Analysis
+- **Lean Workspace Dependencies & `clap`-Free `oz-vfsd` (`oz-vfsd`, workspace):** Replaced `clap` in `oz-vfsd` with a lightweight `std::env::args_os()` parser, removed unused `bytes` from workspace dependencies, hoisted `regex-automata` and `regex-syntax` to `[workspace.dependencies]`, and trimmed base workspace `tokio` to `["rt"]` with exact per-crate feature sets.
+- **Workspace-Wide Pedantic, Perf & Dependency Lints:** Narrowed crate-internal helpers to `pub(crate)`, removed dead internal methods, ignored `.hallmark/`, and made all 10 workspace crates warning-free under `-W clippy::pedantic -W clippy::perf` and `-W unused-crate-dependencies`.
+
 ## [1.3.0] — 2026-11-26
 
 ### Features & CLI UX
