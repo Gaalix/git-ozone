@@ -15,12 +15,13 @@ use clap::{CommandFactory, Parser, Subcommand};
 pub use commands::build_mcp_server;
 use commands::{
     AgentCommand, BlameArgs, CheckpointArgs, CiArgs, CloneArgs, CommitArgs, DiffArgs, FetchArgs,
-    IntegrateArgs, IssueCommand, McpArgs, MergeArgs, PrCommand, PullArgs, PushArgs, RadarArgs,
-    ResolveArgs, SetupArgs, StackCommand, StatusArgs, SyncArgs, UndoArgs, WsCommand, handle_agent,
-    handle_blame, handle_checkpoint, handle_ci, handle_clone, handle_commit, handle_diff,
-    handle_fetch, handle_integrate, handle_issue, handle_mcp, handle_merge, handle_pr, handle_pull,
-    handle_push, handle_radar, handle_redo, handle_resolve, handle_setup, handle_stack,
-    handle_status, handle_sync, handle_undo, handle_ws, print_json_envelope, write_stdout_line,
+    IntegrateArgs, IssueCommand, McpArgs, MergeArgs, OplogArgs, PrCommand, PullArgs, PushArgs,
+    RadarArgs, ResolveArgs, SetupArgs, StackCommand, StatusArgs, SyncArgs, UndoArgs, WsCommand,
+    handle_agent, handle_blame, handle_checkpoint, handle_ci, handle_clone, handle_commit,
+    handle_diff, handle_fetch, handle_integrate, handle_issue, handle_mcp, handle_merge,
+    handle_oplog, handle_pr, handle_pull, handle_push, handle_radar, handle_redo, handle_resolve,
+    handle_setup, handle_stack, handle_status, handle_sync, handle_undo, handle_ws,
+    print_json_envelope, write_stdout_line,
 };
 use daily::{
     BranchArgs, CherryPickArgs, CompletionsArgs, GrepArgs, LogArgs, RestoreArgs, RevParseArgs,
@@ -41,16 +42,142 @@ use oz_vfsd::{PROJFS_ENABLE_POWERSHELL_CMD, find_oz_vfsd_bin, ping_daemon, proje
 #[doc(hidden)]
 pub use pager::{PagerChoice, PagerSelectionInput, resolve_pager_spec};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+const CLI_HELP_TEMPLATE: &str = "\
+{before-help}{about-with-newline}
+{usage-heading} {usage}
+
+Options:
+{options}{after-help}";
+
+/// Domain headings used to organize top-level subcommands in `oz --help`.
+const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Inspection",
+        &[
+            "status",
+            "diff",
+            "log",
+            "show",
+            "grep",
+            "blame",
+            "rev-parse",
+        ],
+    ),
+    (
+        "Editing & Undo",
+        &[
+            "commit",
+            "checkpoint",
+            "oplog",
+            "undo",
+            "redo",
+            "restore",
+            "stash",
+        ],
+    ),
+    (
+        "Branches & History",
+        &["branch", "switch", "merge", "cherry-pick", "revert", "tag"],
+    ),
+    (
+        "Workspaces & Stacks",
+        &["ws", "radar", "integrate", "resolve", "stack", "sync"],
+    ),
+    (
+        "Remotes & GitHub (PR / Issue / CI)",
+        &["clone", "fetch", "pull", "push", "pr", "issue", "ci"],
+    ),
+    (
+        "Maintenance, Agents & Setup",
+        &[
+            "agent",
+            "mcp",
+            "setup",
+            "doctor",
+            "gc",
+            "fsck",
+            "git",
+            "completions",
+            "version",
+        ],
+    ),
+];
+
+fn grouped_subcommands_help() -> &'static str {
+    static RENDERED: OnceLock<String> = OnceLock::new();
+    RENDERED.get_or_init(|| {
+        let probe = Commands::augment_subcommands(clap::Command::new("oz"));
+        let mut descriptions: HashMap<String, String> = HashMap::new();
+        let mut all_names: Vec<String> = Vec::new();
+        for sub in probe.get_subcommands() {
+            if sub.is_hide_set() {
+                continue;
+            }
+            let name = sub.get_name().to_string();
+            let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
+            all_names.push(name.clone());
+            descriptions.insert(name, about);
+        }
+
+        let name_width = all_names
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(10)
+            .max(11);
+
+        let mut assigned: HashSet<&str> = HashSet::new();
+        let mut out = String::new();
+        for (heading, names) in HELP_COMMAND_GROUPS {
+            let _ = writeln!(out, "{heading}:");
+            for &name in *names {
+                assigned.insert(name);
+                if let Some(about) = descriptions.get(name) {
+                    let _ = writeln!(out, "  {name:<name_width$}  {about}");
+                }
+            }
+            out.push('\n');
+        }
+
+        let mut unassigned: Vec<&str> = all_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !assigned.contains(name) && *name != "help")
+            .collect();
+        if !unassigned.is_empty() {
+            unassigned.sort_unstable();
+            let _ = writeln!(out, "Other Commands:");
+            for name in unassigned {
+                if let Some(about) = descriptions.get(name) {
+                    let _ = writeln!(out, "  {name:<name_width$}  {about}");
+                }
+            }
+            out.push('\n');
+        }
+
+        let _ = write!(
+            out,
+            "Run `oz <command> --help` for detailed flags and usage of any subcommand."
+        );
+        out
+    })
+}
 
 /// Top-level CLI options shared across `oz` and `git-ozone`.
 #[derive(Debug, Parser)]
 #[command(
     name = "oz",
     disable_version_flag = true,
-    about = "Pure-Rust CoW Git client and multi-agent workspace engine"
+    about = "Pure-Rust CoW Git client and multi-agent workspace engine",
+    help_template = CLI_HELP_TEMPLATE,
+    after_help = grouped_subcommands_help()
 )]
 pub struct Cli {
     /// Emit canonical `oz.v1` JSON output envelope.
@@ -87,9 +214,11 @@ pub enum Commands {
     Commit(CommitArgs),
     /// Capture an `< 10 ms` MVCC working-tree checkpoint in the OpLog.
     Checkpoint(CheckpointArgs),
-    /// Sub-10 ms undo of recent OpLog mutations/checkpoints or un-checkpointed edits.
+    /// List recent MVCC OpLog entries with `op_...` IDs and undo/redo cursor status (use with `oz undo [OP_ID]`).
+    Oplog(OplogArgs),
+    /// Sub-10 ms undo of recent OpLog mutations/checkpoints or un-checkpointed edits (`--list` or `oz oplog` to find `OP_ID`s).
     Undo(UndoArgs),
-    /// Re-apply the most recently undone operation.
+    /// Re-apply the most recently undone operation from the OpLog (inspect redo stack with `oz oplog`).
     Redo,
     /// Detect overlapping hunks, shared-file edits, and out-of-scope changes across workspaces.
     Radar(RadarArgs),
@@ -110,15 +239,15 @@ pub enum Commands {
     Pull(PullArgs),
     /// Push refs over pure-Rust smart `git-receive-pack` (`--atomic`, `--force-with-lease`).
     Push(PushArgs),
-    /// Inspect, comment-read, diff, read, review, create, and orchestrate GitHub Pull Requests (`view`, `comments`, `diff`, `read`, `review`, `create`, `stack`).
+    /// Manage and review GitHub Pull Requests (`create`, `edit`, `list`, `status`, `view`, `comments`, `reply`, `resolve`, `diff`, `read`, `review`, `stack`).
     #[command(subcommand)]
     Pr(PrCommand),
-    /// Inspect GitHub Issues via REST (`view`, avoiding deprecated classic GraphQL fields).
+    /// Inspect, search, and comment on GitHub Issues via REST (`view`, `list`, `comment`).
     #[command(subcommand)]
     Issue(IssueCommand),
     /// Sync with remote: fetch, fast-forward base, retarget stacked PRs, rebase, and GC merged workspaces.
     Sync(SyncArgs),
-    /// Inspect GitHub Check Runs, multi-PR checks (`--pr 1,2,3`), Actions workflows (`--workflow`), and failing job log excerpts.
+    /// Inspect and watch GitHub CI checks, workflow runs, and job logs (`--watch`, `--runs`, `--pr`, `--workflow`, `--job`).
     Ci(CiArgs),
     /// Configure coding agent harnesses (`setup` for Claude Code, Cursor, Codex CLI, Windsurf, Antigravity).
     #[command(subcommand)]
@@ -413,6 +542,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Checkpoint(args)) => {
             handle_checkpoint(&args, cli.directory.as_deref(), mode)
         }
+        Some(Commands::Oplog(args)) => handle_oplog(&args, cli.directory.as_deref(), mode),
         Some(Commands::Undo(args)) => handle_undo(&args, cli.directory.as_deref(), mode),
         Some(Commands::Redo) => handle_redo(cli.directory.as_deref(), mode),
         Some(Commands::Radar(args)) => handle_radar(&args, cli.directory.as_deref(), mode),
@@ -1995,5 +2125,79 @@ mod tests {
             find_git_subcommand_index(&to_os(&["oz", "--directory=/tmp/repo", "git", "status"])),
             Some(2)
         );
+    }
+
+    #[test]
+    fn help_command_groups_cover_every_subcommand_without_duplicates() {
+        let probe = Commands::augment_subcommands(clap::Command::new("oz"));
+        let actual: HashSet<String> = probe
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set() && c.get_name() != "help")
+            .map(|c| c.get_name().to_string())
+            .collect();
+
+        let mut grouped: HashSet<String> = HashSet::new();
+        for (heading, names) in HELP_COMMAND_GROUPS {
+            assert!(!names.is_empty(), "group '{heading}' must not be empty");
+            for &name in *names {
+                assert!(
+                    grouped.insert(name.to_string()),
+                    "subcommand '{name}' listed more than once in HELP_COMMAND_GROUPS"
+                );
+                assert!(
+                    actual.contains(name),
+                    "subcommand '{name}' in HELP_COMMAND_GROUPS does not exist on Commands"
+                );
+            }
+        }
+
+        let missing: Vec<&String> = actual.difference(&grouped).collect();
+        assert!(
+            missing.is_empty(),
+            "subcommands missing from HELP_COMMAND_GROUPS: {missing:?}"
+        );
+        assert!(
+            !grouped_subcommands_help().contains("Other Commands:"),
+            "grouped help should not contain fallback 'Other Commands:' heading"
+        );
+    }
+
+    #[test]
+    fn parses_oplog_and_undo_list_flags_and_enforces_conflicts() {
+        let cli = Cli::try_parse_from(["oz", "oplog"]).expect("oz oplog");
+        match cli.command {
+            Some(Commands::Oplog(args)) => {
+                assert_eq!(args.limit, oz_oplog::DEFAULT_OPLOG_LIST_LIMIT);
+                assert!(!args.all);
+            }
+            other => panic!("expected Oplog, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["oz", "oplog", "-n", "7", "--all", "--json"])
+            .expect("oz oplog -n 7 --all --json");
+        assert!(cli.json);
+        match cli.command {
+            Some(Commands::Oplog(args)) => {
+                assert_eq!(args.limit, 7);
+                assert!(args.all);
+            }
+            other => panic!("expected Oplog, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["oz", "undo", "--list", "--limit", "5", "--all"])
+            .expect("oz undo --list --limit 5 --all");
+        match cli.command {
+            Some(Commands::Undo(args)) => {
+                assert!(args.list);
+                assert_eq!(args.limit, Some(5));
+                assert!(args.all);
+            }
+            other => panic!("expected Undo, got {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["oz", "undo", "--list", "op_01TEST"]).is_err());
+        assert!(Cli::try_parse_from(["oz", "undo", "--list", "--steps", "2"]).is_err());
+        assert!(Cli::try_parse_from(["oz", "undo", "-n", "5"]).is_err());
+        assert!(Cli::try_parse_from(["oz", "undo", "--all"]).is_err());
     }
 }

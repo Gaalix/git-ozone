@@ -216,6 +216,102 @@ pub struct RedoOutcome {
     pub entry: OpLogEntry,
 }
 
+/// Default number of OpLog entries returned by [`crate::inspect_oplog`] (`oz oplog` / `oz undo --list`).
+pub const DEFAULT_OPLOG_LIST_LIMIT: usize = 20;
+
+/// Effective lifecycle status of an [`OpLogEntry`] within a workspace's undo/redo timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpLogEntryStatus {
+    /// Forward mutation or checkpoint currently active (eligible for `oz undo`).
+    Active,
+    /// Forward mutation or checkpoint currently reverted by an active undo.
+    Undone,
+    /// An `undo` entry currently on the redo stack (eligible for `oz redo`).
+    Redoable,
+    /// An `undo` entry that was already reversed by a subsequent `oz redo` or explicit undo.
+    Redone,
+    /// An `undo` entry whose redo slot was cleared by a newer forward mutation or checkpoint.
+    Superseded,
+    /// A `redo` entry (or undo-of-undo) that re-applied a prior undone operation.
+    Applied,
+}
+
+impl OpLogEntryStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Undone => "undone",
+            Self::Redoable => "redoable",
+            Self::Redone => "redone",
+            Self::Superseded => "superseded",
+            Self::Applied => "applied",
+        }
+    }
+}
+
+/// Options controlling read-only OpLog inspection ([`crate::inspect_oplog`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpLogListOptions {
+    /// Maximum number of entries to return, ordered newest first (default `20`).
+    pub limit: usize,
+    /// Include operations from all workspaces instead of only the active workspace.
+    pub all_workspaces: bool,
+}
+
+impl Default for OpLogListOptions {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_OPLOG_LIST_LIMIT,
+            all_workspaces: false,
+        }
+    }
+}
+
+/// Single summarized operation returned by [`crate::inspect_oplog`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpLogListItem {
+    pub op_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub kind: OpKind,
+    pub command: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub actor_kind: ActorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    pub status: OpLogEntryStatus,
+    pub is_head: bool,
+    pub is_next_undo: bool,
+    pub is_next_redo: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undone_ops: Vec<String>,
+    pub ref_count: usize,
+}
+
+/// Read-only inspection report returned by [`crate::inspect_oplog`] (`oz oplog` / `oz undo --list`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpLogListReport {
+    pub workspace: String,
+    pub all_workspaces: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_op_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_cursor_op_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo_cursor_op_id: Option<String>,
+    pub active_count: usize,
+    pub redo_depth: usize,
+    pub total_entries: usize,
+    pub limit: usize,
+    pub truncated: bool,
+    pub entries: Vec<OpLogListItem>,
+}
+
 /// Default retention window (in days) for OpLog compaction (`oz gc --oplog-days`).
 pub const DEFAULT_OPLOG_RETENTION_DAYS: u64 = 30;
 

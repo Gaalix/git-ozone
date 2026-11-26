@@ -1892,3 +1892,206 @@ fn undo_after_switch_force_reset_hard_and_mode_commit_keep_index_accurate() {
         assert_eq!(git_status_porcelain(&repo_dir), "");
     }
 }
+
+#[test]
+fn inspect_oplog_reports_cursors_statuses_limits_and_is_read_only() {
+    use oz_oplog::{OpLogEntryStatus, OpLogListOptions, inspect_oplog};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    let (repo, _head) = init_repo_with_commit(&repo_dir, &[("a.txt", "v0\n")]);
+
+    // 1. Fresh repo without `.git/ozone/oplog`: read-only inspection returns empty without creating files.
+    assert!(!repo.layout.oplog_dir().exists());
+    let empty_report = inspect_oplog(&repo, OpLogListOptions::default()).expect("inspect empty");
+    assert!(empty_report.entries.is_empty());
+    assert_eq!(empty_report.total_entries, 0);
+    assert_eq!(empty_report.active_count, 0);
+    assert_eq!(empty_report.redo_depth, 0);
+    assert_eq!(empty_report.head_op_id, None);
+    assert_eq!(empty_report.undo_cursor_op_id, None);
+    assert_eq!(empty_report.redo_cursor_op_id, None);
+    assert!(!empty_report.truncated);
+    assert!(
+        !repo.layout.oplog_dir().exists(),
+        "inspect_oplog must not create .git/ozone/oplog on disk"
+    );
+
+    // 2. Reject limit == 0 cleanly.
+    let zero_err = inspect_oplog(
+        &repo,
+        OpLogListOptions {
+            limit: 0,
+            all_workspaces: false,
+        },
+    )
+    .expect_err("limit 0 should fail");
+    assert!(matches!(zero_err, OzError::InvalidUsage { .. }));
+
+    // 3. Record commit1 -> checkpoint1 -> commit2.
+    fs::write(repo_dir.join("a.txt"), "v1\n").unwrap();
+    let op_c1 = oz_commit_with_oplog(&repo, &oz_core::CommitOptions::new("feat: first commit"))
+        .1
+        .op_id;
+
+    fs::write(repo_dir.join("a.txt"), "v1-wip\n").unwrap();
+    let cp1 = checkpoint(
+        &repo,
+        "oz checkpoint",
+        Some("before second"),
+        agent_actor(None),
+        None,
+    )
+    .expect("checkpoint");
+
+    fs::write(repo_dir.join("a.txt"), "v2\n").unwrap();
+    let op_c2 = oz_commit_with_oplog(&repo, &oz_core::CommitOptions::new("feat: second commit"))
+        .1
+        .op_id;
+
+    let r1 = inspect_oplog(&repo, OpLogListOptions::default()).expect("inspect 3 ops");
+    assert_eq!(r1.total_entries, 3);
+    assert_eq!(r1.entries.len(), 3);
+    assert_eq!(r1.active_count, 3);
+    assert_eq!(r1.redo_depth, 0);
+    assert!(!r1.truncated);
+    assert_eq!(r1.head_op_id.as_deref(), Some(op_c2.as_str()));
+    assert_eq!(r1.undo_cursor_op_id.as_deref(), Some(op_c2.as_str()));
+    assert_eq!(r1.redo_cursor_op_id, None);
+    // Newest first order: op_c2, cp1, op_c1.
+    assert_eq!(r1.entries[0].op_id, op_c2);
+    assert_eq!(r1.entries[0].status, OpLogEntryStatus::Active);
+    assert!(r1.entries[0].is_head);
+    assert!(r1.entries[0].is_next_undo);
+    assert!(!r1.entries[0].is_next_redo);
+    assert!(r1.entries[0].summary.contains("feat: second commit"));
+
+    assert_eq!(r1.entries[1].op_id, cp1.op_id);
+    assert_eq!(r1.entries[1].kind, OpKind::Checkpoint);
+    assert_eq!(r1.entries[1].status, OpLogEntryStatus::Active);
+    assert_eq!(r1.entries[1].summary, "before second");
+    assert!(!r1.entries[1].is_next_undo);
+
+    assert_eq!(r1.entries[2].op_id, op_c1);
+    assert_eq!(r1.entries[2].status, OpLogEntryStatus::Active);
+
+    // 4. Undo 1 step -> op_c2 becomes Undone, undo1 becomes Redoable (HEAD + next_redo), cp1 becomes next_undo.
+    let u1 = undo(&repo, 1usize, agent_actor(None)).expect("undo 1");
+    let r2 = inspect_oplog(&repo, OpLogListOptions::default()).expect("inspect after undo");
+    assert_eq!(r2.total_entries, 4);
+    assert_eq!(r2.active_count, 2);
+    assert_eq!(r2.redo_depth, 1);
+    assert_eq!(r2.head_op_id.as_deref(), Some(u1.op_id.as_str()));
+    assert_eq!(r2.undo_cursor_op_id.as_deref(), Some(cp1.op_id.as_str()));
+    assert_eq!(r2.redo_cursor_op_id.as_deref(), Some(u1.op_id.as_str()));
+
+    assert_eq!(r2.entries[0].op_id, u1.op_id);
+    assert_eq!(r2.entries[0].kind, OpKind::Undo);
+    assert_eq!(r2.entries[0].status, OpLogEntryStatus::Redoable);
+    assert!(r2.entries[0].is_head);
+    assert!(r2.entries[0].is_next_redo);
+    assert!(!r2.entries[0].is_next_undo);
+
+    assert_eq!(r2.entries[1].op_id, op_c2);
+    assert_eq!(r2.entries[1].status, OpLogEntryStatus::Undone);
+    assert!(!r2.entries[1].is_next_undo);
+
+    assert_eq!(r2.entries[2].op_id, cp1.op_id);
+    assert_eq!(r2.entries[2].status, OpLogEntryStatus::Active);
+    assert!(r2.entries[2].is_next_undo);
+
+    // 5. Redo -> u1 becomes Redone, redo1 is Applied (HEAD), op_c2 is Active & next_undo again.
+    let rd1 = redo(&repo, agent_actor(None)).expect("redo 1");
+    let r3 = inspect_oplog(&repo, OpLogListOptions::default()).expect("inspect after redo");
+    assert_eq!(r3.active_count, 3);
+    assert_eq!(r3.redo_depth, 0);
+    assert_eq!(r3.undo_cursor_op_id.as_deref(), Some(op_c2.as_str()));
+    assert_eq!(r3.redo_cursor_op_id, None);
+    assert_eq!(r3.entries[0].op_id, rd1.op_id);
+    assert_eq!(r3.entries[0].status, OpLogEntryStatus::Applied);
+    assert!(r3.entries[0].is_head);
+    assert_eq!(r3.entries[1].op_id, u1.op_id);
+    assert_eq!(r3.entries[1].status, OpLogEntryStatus::Redone);
+    assert_eq!(r3.entries[2].op_id, op_c2);
+    assert_eq!(r3.entries[2].status, OpLogEntryStatus::Active);
+    assert!(r3.entries[2].is_next_undo);
+
+    // 6. Undo then record a new forward mutation -> that undo becomes Superseded.
+    let u2 = undo(&repo, 1usize, agent_actor(None)).expect("undo 2");
+    fs::write(repo_dir.join("a.txt"), "v3\n").unwrap();
+    let op_c3 = oz_commit_with_oplog(&repo, &oz_core::CommitOptions::new("feat: third commit"))
+        .1
+        .op_id;
+
+    let r4 = inspect_oplog(&repo, OpLogListOptions::default()).expect("inspect after supersede");
+    assert_eq!(r4.redo_depth, 0);
+    assert_eq!(r4.redo_cursor_op_id, None);
+    assert_eq!(r4.undo_cursor_op_id.as_deref(), Some(op_c3.as_str()));
+    let u2_item = r4
+        .entries
+        .iter()
+        .find(|e| e.op_id == u2.op_id)
+        .expect("u2 item");
+    assert_eq!(u2_item.status, OpLogEntryStatus::Superseded);
+
+    // 7. Limit & truncation.
+    let limited = inspect_oplog(
+        &repo,
+        OpLogListOptions {
+            limit: 2,
+            all_workspaces: false,
+        },
+    )
+    .expect("inspect limited");
+    assert_eq!(limited.entries.len(), 2);
+    assert!(limited.truncated);
+    assert_eq!(limited.total_entries, r4.total_entries);
+    assert_eq!(limited.entries[0].op_id, op_c3);
+    assert_eq!(limited.entries[1].op_id, u2.op_id);
+
+    // 8. Workspace filtering vs `--all`.
+    let other_op_id = new_op_id();
+    let other_entry = OpLogEntry {
+        op_id: other_op_id.clone(),
+        parents: Vec::new(),
+        timestamp: Utc::now(),
+        actor: agent_actor(Some("agent-other")),
+        kind: OpKind::Checkpoint,
+        command: "oz checkpoint".to_string(),
+        message: Some("other ws checkpoint".to_string()),
+        inverse_of: None,
+        undone_ops: Vec::new(),
+        rewound_uncheckpointed: false,
+        ref_deltas: BTreeMap::new(),
+        ws_snapshots: BTreeMap::new(),
+    };
+    append_entry(&repo.layout, other_entry).expect("append other ws entry");
+
+    let default_only = inspect_oplog(
+        &repo,
+        OpLogListOptions {
+            limit: 20,
+            all_workspaces: false,
+        },
+    )
+    .expect("inspect default ws");
+    assert!(!default_only.entries.iter().any(|e| e.op_id == other_op_id));
+
+    let all_ws = inspect_oplog(
+        &repo,
+        OpLogListOptions {
+            limit: 20,
+            all_workspaces: true,
+        },
+    )
+    .expect("inspect all ws");
+    let other_item = all_ws
+        .entries
+        .iter()
+        .find(|e| e.op_id == other_op_id)
+        .expect("other ws entry included with all_workspaces");
+    assert_eq!(other_item.workspace.as_deref(), Some("agent-other"));
+    assert_eq!(other_item.status, OpLogEntryStatus::Active);
+    assert!(!other_item.is_next_undo);
+    assert!(other_item.is_head);
+}

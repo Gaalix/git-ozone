@@ -50,8 +50,9 @@ use oz_integrate::{
     resolve_conflict, scan_radar, stack_rebase, stack_status,
 };
 use oz_oplog::{
-    ActorInfo, ActorKind, CheckpointOutcome, MutationTransaction, RedoOutcome, UndoOutcome,
-    UndoTarget, checkpoint, redo, undo,
+    ActorInfo, ActorKind, CheckpointOutcome, DEFAULT_OPLOG_LIST_LIMIT, MutationTransaction, OpKind,
+    OpLogListItem, OpLogListOptions, OpLogListReport, RedoOutcome, UndoOutcome, UndoTarget,
+    checkpoint, inspect_oplog, redo, undo,
 };
 use oz_warm::{BaselineSource, gc_baselines};
 use serde::Serialize;
@@ -201,13 +202,38 @@ pub struct CheckpointArgs {
     pub quiet: bool,
 }
 
+/// Inspect recent MVCC OpLog entries (newest first) with `op_...` IDs, operation kinds,
+/// summaries, and undo/redo cursor status (read-only; use with `oz undo [OP_ID]`).
+#[derive(Debug, Args)]
+pub struct OplogArgs {
+    /// Maximum number of recent OpLog entries to display (default: 20).
+    #[arg(short = 'n', long = "limit", default_value_t = DEFAULT_OPLOG_LIST_LIMIT, value_name = "N")]
+    pub limit: usize,
+    /// Include operations across all workspaces instead of only the current workspace.
+    #[arg(long = "all")]
+    pub all: bool,
+}
+
+/// Sub-10 ms undo of recent OpLog mutations/checkpoints or un-checkpointed edits.
+///
+/// Inspect operation IDs (`op_...`) and undo/redo cursors without mutating state via
+/// `oz undo --list` or `oz oplog`.
 #[derive(Debug, Args)]
 pub struct UndoArgs {
-    /// Specific operation ID (`op_...`) to undo instead of stepping back sequentially.
+    /// Specific operation ID (`op_...`) to undo instead of stepping back sequentially (inspect IDs with `oz oplog` or `oz undo --list`).
     pub op_id: Option<String>,
     /// Number of sequential operations to undo (defaults to `1`).
     #[arg(long, value_name = "N")]
     pub steps: Option<usize>,
+    /// List recent OpLog entries without mutating repository state (equivalent to `oz oplog`).
+    #[arg(long = "list", conflicts_with_all = ["op_id", "steps"])]
+    pub list: bool,
+    /// Maximum number of OpLog entries to display with `--list` (default: 20).
+    #[arg(short = 'n', long = "limit", value_name = "N", requires = "list")]
+    pub limit: Option<usize>,
+    /// Include operations across all workspaces when used with `--list`.
+    #[arg(long = "all", requires = "list")]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -480,7 +506,7 @@ pub struct PushArgs {
     pub progress: bool,
 }
 
-/// Pull request subcommands (`oz pr ...`).
+/// Manage and review GitHub Pull Requests (`create`, `edit`, `list`, `status`, `view`, `comments`, `reply`, `resolve`, `diff`, `read`, `review`, `stack`).
 #[derive(Debug, Subcommand)]
 pub enum PrCommand {
     /// Create or idempotently update a GitHub Pull Request preserving `Change-Id:`.
@@ -671,7 +697,7 @@ pub struct PrCommentsArgs {
     pub remote: Option<String>,
 }
 
-/// GitHub Issue subcommands (`oz issue ...`).
+/// Inspect, search, and comment on GitHub Issues via REST (`view`, `list`, `comment`).
 #[derive(Debug, Subcommand)]
 pub enum IssueCommand {
     /// Inspect a GitHub Issue via REST (`oz issue view <number|url>`) without deprecated GraphQL fields.
@@ -910,6 +936,7 @@ pub struct SyncArgs {
     pub push: bool,
 }
 
+/// Inspect and watch GitHub CI checks, workflow runs, and job logs (`--watch`, `--runs`, `--pr`, `--workflow`, `--job`).
 #[derive(Debug, Args)]
 pub struct CiArgs {
     /// Target Git revision, branch, or commit SHA to inspect.
@@ -1869,11 +1896,135 @@ pub(crate) fn handle_checkpoint(
     })
 }
 
+fn truncate_human_summary(summary: &str, max_chars: usize) -> String {
+    if summary.chars().count() <= max_chars {
+        summary.to_string()
+    } else {
+        let prefix: String = summary.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{prefix}…")
+    }
+}
+
+fn format_op_kind_label(kind: OpKind) -> &'static str {
+    match kind {
+        OpKind::Mutate => "mutate",
+        OpKind::Checkpoint => "checkpoint",
+        OpKind::Undo => "undo",
+        OpKind::Redo => "redo",
+    }
+}
+
+fn format_oplog_status_badge(item: &OpLogListItem, show_workspace: bool) -> String {
+    let mut parts = vec![item.status.as_str().to_string()];
+    if item.is_next_undo {
+        parts.push("next-undo".to_string());
+    }
+    if item.is_next_redo {
+        parts.push("next-redo".to_string());
+    }
+    if item.is_head {
+        parts.push("HEAD".to_string());
+    }
+    if show_workspace && let Some(ref ws) = item.workspace {
+        parts.push(format!("ws:{ws}"));
+    }
+    format!("[{}]", parts.join(", "))
+}
+
+pub(crate) fn handle_oplog(
+    args: &OplogArgs,
+    directory: Option<&Path>,
+    mode: InteractionMode,
+) -> ExitCode {
+    let res = (|| -> Result<Envelope<OpLogListReport>> {
+        if args.limit == 0 {
+            return Err(OzError::InvalidUsage {
+                message: "`--limit` must be at least 1".to_string(),
+                recovery: vec!["Pass `-n 20` or omit `--limit`.".to_string()],
+            });
+        }
+        let repo = discover_and_recover_repo(directory, false)?;
+        let report = inspect_oplog(
+            &repo,
+            OpLogListOptions {
+                limit: args.limit,
+                all_workspaces: args.all,
+            },
+        )?;
+        Ok(Envelope::success(report)
+            .with_workspace(repo.workspace)
+            .with_branch(repo.branch)
+            .with_head_oid(repo.head_oid))
+    })();
+
+    render_command_result(mode, res, |env| {
+        let d = &env.data;
+        if d.entries.is_empty() {
+            if d.all_workspaces {
+                println!("No operations recorded in OpLog");
+            } else {
+                println!(
+                    "No operations recorded in OpLog for workspace '{}'",
+                    d.workspace
+                );
+            }
+            return;
+        }
+
+        let scope_label = if d.all_workspaces {
+            format!("all workspaces, current '{}'", d.workspace)
+        } else {
+            format!("workspace '{}'", d.workspace)
+        };
+        let mut cursor_bits = Vec::new();
+        if let Some(ref next_undo) = d.undo_cursor_op_id {
+            cursor_bits.push(format!("next undo: {next_undo}"));
+        }
+        if let Some(ref next_redo) = d.redo_cursor_op_id {
+            cursor_bits.push(format!("next redo: {next_redo}"));
+        }
+        let cursor_suffix = if cursor_bits.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", cursor_bits.join(", "))
+        };
+        println!(
+            "OpLog ({scope_label}; showing {} of {}{cursor_suffix})",
+            d.entries.len(),
+            d.total_entries
+        );
+
+        let badges: Vec<String> = d
+            .entries
+            .iter()
+            .map(|item| format_oplog_status_badge(item, d.all_workspaces))
+            .collect();
+        let badge_width = badges.iter().map(String::len).max().unwrap_or(0);
+        for (item, badge) in d.entries.iter().zip(badges.iter()) {
+            let ts = item.timestamp.format("%Y-%m-%d %H:%M:%SZ");
+            let kind = format_op_kind_label(item.kind);
+            let summary = truncate_human_summary(&item.summary, 120);
+            println!(
+                "  {}  {ts}  {kind:<10}  {badge:<badge_width$}  {summary}",
+                item.op_id
+            );
+        }
+    })
+}
+
 pub(crate) fn handle_undo(
     args: &UndoArgs,
     directory: Option<&Path>,
     mode: InteractionMode,
 ) -> ExitCode {
+    if args.list {
+        let oplog_args = OplogArgs {
+            limit: args.limit.unwrap_or(DEFAULT_OPLOG_LIST_LIMIT),
+            all: args.all,
+        };
+        return handle_oplog(&oplog_args, directory, mode);
+    }
+
     let res = (|| -> Result<Envelope<UndoData>> {
         let target = match (&args.op_id, args.steps) {
             (Some(_), Some(_)) => {

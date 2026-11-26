@@ -204,7 +204,8 @@ pub fn load_entry(layout: &OzoneLayout, op_id: &str) -> Result<OpLogEntry> {
             return Err(OzError::InvalidUsage {
                 message: format!("operation '{op_id}' not found in oplog"),
                 recovery: vec![
-                    "Inspect available operations in .git/ozone/oplog/ops/.".to_string(),
+                    "Run `oz oplog` (or `oz undo --list`) to inspect available operation IDs."
+                        .to_string(),
                 ],
             });
         }

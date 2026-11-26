@@ -25,12 +25,14 @@ pub use store::{
     load_entry, ops_dir, read_head_op_id,
 };
 pub use types::{
-    ActorInfo, ActorKind, CheckpointOutcome, DEFAULT_OPLOG_RETENTION_DAYS, DEFAULT_WORKSPACE_KEY,
-    DirtyFileSnapshot, DirtyFileState, FsckCategory, FsckCheckStatus, FsckCheckSummary, FsckIssue,
-    FsckOptions, FsckReport, FsckSeverity, OpKind, OpLogEntry, OpLogGcOptions, OpLogGcOutcome,
-    RedoOutcome, RefDelta, UndoOutcome, UndoTarget, WsSnapshot,
+    ActorInfo, ActorKind, CheckpointOutcome, DEFAULT_OPLOG_LIST_LIMIT,
+    DEFAULT_OPLOG_RETENTION_DAYS, DEFAULT_WORKSPACE_KEY, DirtyFileSnapshot, DirtyFileState,
+    FsckCategory, FsckCheckStatus, FsckCheckSummary, FsckIssue, FsckOptions, FsckReport,
+    FsckSeverity, OpKind, OpLogEntry, OpLogEntryStatus, OpLogGcOptions, OpLogGcOutcome,
+    OpLogListItem, OpLogListOptions, OpLogListReport, RedoOutcome, RefDelta, UndoOutcome,
+    UndoTarget, WsSnapshot,
 };
-pub use undo::{redo, undo, undo_with_dirty};
+pub use undo::{inspect_oplog, redo, undo, undo_with_dirty};
 
 use std::sync::{Mutex, OnceLock};
 use ulid::{Generator, Ulid};

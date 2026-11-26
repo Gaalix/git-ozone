@@ -10,10 +10,10 @@ use crate::dirty::{
     sync_git_index_diff, sync_workspace_state_file, workspace_key,
 };
 use crate::new_op_id;
-use crate::store::{append_entry, ensure_oplog_dirs, list_entries, load_entry};
+use crate::store::{append_entry, ensure_oplog_dirs, list_entries, load_entry, read_head_op_id};
 use crate::types::{
-    ActorInfo, DEFAULT_WORKSPACE_KEY, OpKind, OpLogEntry, RedoOutcome, RefDelta, UndoOutcome,
-    UndoTarget, WsSnapshot,
+    ActorInfo, DEFAULT_WORKSPACE_KEY, OpKind, OpLogEntry, OpLogEntryStatus, OpLogListItem,
+    OpLogListOptions, OpLogListReport, RedoOutcome, RefDelta, UndoOutcome, UndoTarget, WsSnapshot,
 };
 use chrono::Utc;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
@@ -34,8 +34,12 @@ fn entry_affects_workspace(entry: &OpLogEntry, ws_key: &str) -> bool {
 
 struct WorkspaceTimeline<'a> {
     active_forward: Vec<&'a OpLogEntry>,
+    redo_stack: Vec<&'a OpLogEntry>,
     latest_unredone_undo: Option<&'a OpLogEntry>,
     undone_set: HashSet<String>,
+    redoable_undo_ids: HashSet<String>,
+    redone_undo_ids: HashSet<String>,
+    applied_redo_alias_ids: HashSet<String>,
 }
 
 fn analyze_workspace_timeline<'a>(
@@ -48,6 +52,8 @@ fn analyze_workspace_timeline<'a>(
     }
 
     let mut undone_set: HashSet<String> = HashSet::new();
+    let mut redone_undo_ids: HashSet<String> = HashSet::new();
+    let mut applied_redo_alias_ids: HashSet<String> = HashSet::new();
     let mut undo_stack: Vec<&'a OpLogEntry> = Vec::new();
     let mut forward_entries: Vec<&'a OpLogEntry> = Vec::new();
 
@@ -67,6 +73,8 @@ fn analyze_workspace_timeline<'a>(
                     && let Some(target_entry) = entry_by_id.get(inv.as_str())
                     && target_entry.kind == OpKind::Undo
                 {
+                    applied_redo_alias_ids.insert(entry.op_id.clone());
+                    redone_undo_ids.insert(inv.clone());
                     undo_stack.retain(|u| u.op_id != *inv);
                     if !target_entry.rewound_uncheckpointed {
                         for id in undone_targets(target_entry) {
@@ -85,6 +93,7 @@ fn analyze_workspace_timeline<'a>(
             }
             OpKind::Redo => {
                 if let Some(ref undo_id) = entry.inverse_of {
+                    redone_undo_ids.insert(undo_id.clone());
                     undo_stack.retain(|u| u.op_id != *undo_id);
                     if let Some(target_undo) = entry_by_id.get(undo_id.as_str())
                         && !target_undo.rewound_uncheckpointed
@@ -102,12 +111,166 @@ fn analyze_workspace_timeline<'a>(
         .into_iter()
         .filter(|e| !undone_set.contains(&e.op_id))
         .collect();
+    let redoable_undo_ids: HashSet<String> = undo_stack.iter().map(|u| u.op_id.clone()).collect();
+    let latest_unredone_undo = undo_stack.last().copied();
 
     WorkspaceTimeline {
         active_forward,
-        latest_unredone_undo: undo_stack.last().copied(),
+        redo_stack: undo_stack,
+        latest_unredone_undo,
         undone_set,
+        redoable_undo_ids,
+        redone_undo_ids,
+        applied_redo_alias_ids,
     }
+}
+
+fn entry_primary_workspace(entry: &OpLogEntry) -> Option<String> {
+    if let Some(ref ws) = entry.actor.workspace {
+        return Some(ws.clone());
+    }
+    if entry.ws_snapshots.len() == 1 {
+        return entry.ws_snapshots.keys().next().cloned();
+    }
+    if entry.ws_snapshots.contains_key(DEFAULT_WORKSPACE_KEY) {
+        return Some(DEFAULT_WORKSPACE_KEY.to_string());
+    }
+    entry.ws_snapshots.keys().next().cloned()
+}
+
+fn entry_summary(entry: &OpLogEntry) -> String {
+    let first_msg_line = entry
+        .message
+        .as_deref()
+        .and_then(|m| m.lines().map(str::trim).find(|l| !l.is_empty()));
+    match (entry.kind, first_msg_line) {
+        (OpKind::Mutate, Some(msg)) => {
+            let cmd = entry.command.trim();
+            if cmd.is_empty() || msg == cmd {
+                msg.to_string()
+            } else {
+                format!("{cmd}: {msg}")
+            }
+        }
+        (OpKind::Checkpoint | OpKind::Undo | OpKind::Redo, Some(msg)) => msg.to_string(),
+        (_, None) => entry.command.trim().to_string(),
+    }
+}
+
+fn classify_entry_status(entry: &OpLogEntry, timeline: &WorkspaceTimeline<'_>) -> OpLogEntryStatus {
+    match entry.kind {
+        OpKind::Mutate | OpKind::Checkpoint => {
+            if timeline.undone_set.contains(&entry.op_id) {
+                OpLogEntryStatus::Undone
+            } else {
+                OpLogEntryStatus::Active
+            }
+        }
+        OpKind::Undo => {
+            if timeline.applied_redo_alias_ids.contains(&entry.op_id) {
+                OpLogEntryStatus::Applied
+            } else if timeline.redoable_undo_ids.contains(&entry.op_id) {
+                OpLogEntryStatus::Redoable
+            } else if timeline.redone_undo_ids.contains(&entry.op_id) {
+                OpLogEntryStatus::Redone
+            } else {
+                OpLogEntryStatus::Superseded
+            }
+        }
+        OpKind::Redo => OpLogEntryStatus::Applied,
+    }
+}
+
+/// Inspects the MVCC OpLog without mutating repository state, returning recent entries ordered
+/// newest-first along with the active workspace's undo/redo cursors and per-entry status.
+pub fn inspect_oplog(repo: &OzoneRepo, options: OpLogListOptions) -> Result<OpLogListReport> {
+    if options.limit == 0 {
+        return Err(OzError::InvalidUsage {
+            message: "oplog limit must be at least 1".to_string(),
+            recovery: vec!["Pass `--limit 20` (or omit `--limit`).".to_string()],
+        });
+    }
+
+    let entries = list_entries(&repo.layout)?;
+    let head_op_id = read_head_op_id(&repo.layout)?;
+    let ws_key = workspace_key(repo).to_string();
+
+    let current_timeline = analyze_workspace_timeline(&entries, &ws_key);
+    let undo_cursor_op_id = current_timeline
+        .active_forward
+        .last()
+        .map(|e| e.op_id.clone());
+    let redo_cursor_op_id = current_timeline
+        .latest_unredone_undo
+        .map(|e| e.op_id.clone());
+    let active_count = current_timeline.active_forward.len();
+    let redo_depth = current_timeline.redo_stack.len();
+
+    let filtered: Vec<&OpLogEntry> = if options.all_workspaces {
+        entries.iter().collect()
+    } else {
+        entries
+            .iter()
+            .filter(|e| entry_affects_workspace(e, &ws_key))
+            .collect()
+    };
+
+    let total_entries = filtered.len();
+    let mut other_timelines: HashMap<String, WorkspaceTimeline<'_>> = HashMap::new();
+    let mut items = Vec::with_capacity(total_entries.min(options.limit));
+
+    for entry in filtered.into_iter().rev().take(options.limit) {
+        let affects_current = entry_affects_workspace(entry, &ws_key);
+        let status = if affects_current {
+            classify_entry_status(entry, &current_timeline)
+        } else {
+            let entry_ws =
+                entry_primary_workspace(entry).unwrap_or_else(|| DEFAULT_WORKSPACE_KEY.to_string());
+            let timeline = other_timelines
+                .entry(entry_ws.clone())
+                .or_insert_with(|| analyze_workspace_timeline(&entries, &entry_ws));
+            classify_entry_status(entry, timeline)
+        };
+
+        let is_head = head_op_id.as_deref() == Some(entry.op_id.as_str());
+        let is_next_undo =
+            affects_current && undo_cursor_op_id.as_deref() == Some(entry.op_id.as_str());
+        let is_next_redo =
+            affects_current && redo_cursor_op_id.as_deref() == Some(entry.op_id.as_str());
+
+        items.push(OpLogListItem {
+            op_id: entry.op_id.clone(),
+            timestamp: entry.timestamp,
+            kind: entry.kind,
+            command: entry.command.clone(),
+            summary: entry_summary(entry),
+            message: entry.message.clone(),
+            actor_kind: entry.actor.kind.clone(),
+            workspace: entry_primary_workspace(entry),
+            status,
+            is_head,
+            is_next_undo,
+            is_next_redo,
+            inverse_of: entry.inverse_of.clone(),
+            undone_ops: entry.undone_ops.clone(),
+            ref_count: entry.ref_deltas.len(),
+        });
+    }
+
+    let truncated = total_entries > items.len();
+    Ok(OpLogListReport {
+        workspace: ws_key,
+        all_workspaces: options.all_workspaces,
+        head_op_id,
+        undo_cursor_op_id,
+        redo_cursor_op_id,
+        active_count,
+        redo_depth,
+        total_entries,
+        limit: options.limit,
+        truncated,
+        entries: items,
+    })
 }
 
 fn undone_targets(entry: &OpLogEntry) -> Vec<String> {
@@ -547,7 +710,10 @@ pub fn undo_with_dirty(
                     message: format!(
                         "operation '{op_id}' is not an active operation for workspace '{target_ws_key}'"
                     ),
-                    recovery: vec!["Check `op_id` in `.git/ozone/oplog/ops/`.".to_string()],
+                    recovery: vec![
+                        "Run `oz oplog` (or `oz undo --list`) to inspect available operation IDs."
+                            .to_string(),
+                    ],
                 });
             };
 
