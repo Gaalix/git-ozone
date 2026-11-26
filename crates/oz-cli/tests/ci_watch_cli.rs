@@ -7,6 +7,8 @@
 //! - `oz push --watch --json` (push to local bare remote + watch pushed SHA)
 //! - `oz mcp` stdio session exercising `oz_ci_logs` bounded `wait_seconds` & `job_id` drill-down
 
+#![allow(clippy::too_many_lines)]
+
 use oz_github::{
     GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput, GitHubJobStep, GitHubPrRef,
     GitHubPullRequest,

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Atomic 100%-in-memory 3-way multi-source integration (`oz integrate`) with
-//! ephemeral CoW `_integrate/` sandbox, `--verify` gate, main working-tree + `.git/index` sync,
-//! and OpLog `< 10 ms` undo support.
+//! ephemeral `CoW` `_integrate/` sandbox, `--verify` gate, main working-tree + `.git/index` sync,
+//! and `OpLog` `< 10 ms` undo support.
 
 use crate::guardrails::{
     IntegrationGuardrailOptions, check_branch_guardrails_for_integration,
@@ -293,12 +293,12 @@ fn run_merge_pipeline(
 
         let merge_opts: gix::merge::commit::Options = gix_repo
             .tree_merge_options()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .into();
         let labels = merge_labels("base", &ctx.into_branch, &src.name);
         let mut outcome = gix_repo
             .merge_commits(current_tip_oid, src_oid, labels, merge_opts)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
 
         if outcome
             .tree_merge
@@ -308,7 +308,7 @@ fn run_merge_pipeline(
                 .tree_merge
                 .tree
                 .write()
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .detach();
             let (stored_conflicts, conflict_entries) = extract_unresolved_conflicts(
                 gix_repo,
@@ -377,7 +377,7 @@ fn run_merge_pipeline(
             .tree_merge
             .tree
             .write()
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .detach();
         current_tip_oid = create_merge_commit(
             gix_repo,
@@ -440,34 +440,31 @@ fn finalize_integration(
     let mut created_temp_sandbox = false;
 
     if let Some(ref verify_cmd) = ctx.verify_cmd {
-        match existing_sandbox {
-            Some((existing_dir, resolved_tree_id)) => {
-                if resolved_tree_id != final_tree_id {
-                    apply_tree_delta_with_cleanup(
-                        gix_repo,
-                        resolved_tree_id,
-                        final_tree_id,
-                        existing_dir,
-                    )?;
-                }
-                if let Err(err) = run_verify_command(existing_dir, verify_cmd) {
-                    let _ = cleanup_session_and_sandbox(main_repo, Some(existing_dir));
-                    return Err(err);
-                }
-            }
-            None => {
-                materialize_integrate_sandbox(
-                    main_repo,
+        if let Some((existing_dir, resolved_tree_id)) = existing_sandbox {
+            if resolved_tree_id != final_tree_id {
+                apply_tree_delta_with_cleanup(
                     gix_repo,
-                    &sandbox_dir,
+                    resolved_tree_id,
                     final_tree_id,
-                    Some(ctx.original_into_oid),
+                    existing_dir,
                 )?;
-                created_temp_sandbox = true;
-                if let Err(err) = run_verify_command(&sandbox_dir, verify_cmd) {
-                    let _ = cleanup_session_and_sandbox(main_repo, Some(&sandbox_dir));
-                    return Err(err);
-                }
+            }
+            if let Err(err) = run_verify_command(existing_dir, verify_cmd) {
+                let _ = cleanup_session_and_sandbox(main_repo, Some(existing_dir));
+                return Err(err);
+            }
+        } else {
+            materialize_integrate_sandbox(
+                main_repo,
+                gix_repo,
+                &sandbox_dir,
+                final_tree_id,
+                Some(ctx.original_into_oid),
+            )?;
+            created_temp_sandbox = true;
+            if let Err(err) = run_verify_command(&sandbox_dir, verify_cmd) {
+                let _ = cleanup_session_and_sandbox(main_repo, Some(&sandbox_dir));
+                return Err(err);
             }
         }
     }
@@ -607,7 +604,7 @@ fn finalize_integration(
 
     let full_ref_name = format!("refs/heads/{}", ctx.into_branch);
     let full_name = FullName::try_from(full_ref_name.as_str())
-        .map_err(|err| OzError::Git(format!("invalid ref '{full_ref_name}': {err}")))?;
+        .map_err(|err| OzError::git_context(format!("invalid ref '{full_ref_name}'"), err))?;
     let reflog_msg = format!(
         "oz integrate {} into {}",
         merged_sources.join(", "),

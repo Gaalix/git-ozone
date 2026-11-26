@@ -3,6 +3,13 @@
 
 //! Ozone CLI (`oz` and `git-ozone`) argument parsing, `oz.v1` JSON rendering, and subcommands.
 
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::struct_excessive_bools,
+    clippy::fn_params_excessive_bools
+)]
+
 pub(crate) mod aliases;
 pub(crate) mod commands;
 pub(crate) mod daily;
@@ -12,7 +19,6 @@ pub(crate) mod pager;
 pub(crate) mod recovery;
 
 use clap::{CommandFactory, Parser, Subcommand};
-pub use commands::build_mcp_server;
 use commands::{
     AgentCommand, BlameArgs, CheckpointArgs, CiArgs, CloneArgs, CommitArgs, DiffArgs, FetchArgs,
     IntegrateArgs, IssueCommand, McpArgs, MergeArgs, OplogArgs, PrCommand, PullArgs, PushArgs,
@@ -121,7 +127,10 @@ fn grouped_subcommands_help() -> &'static str {
                 continue;
             }
             let name = sub.get_name().to_string();
-            let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
+            let about = sub
+                .get_about()
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default();
             all_names.push(name.clone());
             descriptions.insert(name, about);
         }
@@ -212,17 +221,17 @@ pub enum Commands {
     Diff(DiffArgs),
     /// Stage-free commit (whole tree or `--pick` / `--exclude` partial) with guardrails & `Change-Id`.
     Commit(CommitArgs),
-    /// Capture an `< 10 ms` MVCC working-tree checkpoint in the OpLog.
+    /// Capture an `< 10 ms` MVCC working-tree checkpoint in the `OpLog`.
     Checkpoint(CheckpointArgs),
-    /// List recent MVCC OpLog entries with `op_...` IDs and undo/redo cursor status (use with `oz undo [OP_ID]`).
+    /// List recent MVCC `OpLog` entries with `op_...` IDs and undo/redo cursor status (use with `oz undo [OP_ID]`).
     Oplog(OplogArgs),
-    /// Sub-10 ms undo of recent OpLog mutations/checkpoints or un-checkpointed edits (`--list` or `oz oplog` to find `OP_ID`s).
+    /// Sub-10 ms undo of recent `OpLog` mutations/checkpoints or un-checkpointed edits (`--list` or `oz oplog` to find `OP_ID`s).
     Undo(UndoArgs),
-    /// Re-apply the most recently undone operation from the OpLog (inspect redo stack with `oz oplog`).
+    /// Re-apply the most recently undone operation from the `OpLog` (inspect redo stack with `oz oplog`).
     Redo,
     /// Detect overlapping hunks, shared-file edits, and out-of-scope changes across workspaces.
     Radar(RadarArgs),
-    /// Merge revision(s) (e.g. `origin/main`) into the current branch in memory (OpLog-reversible via `oz undo`).
+    /// Merge revision(s) (e.g. `origin/main`) into the current branch in memory (`OpLog`-reversible via `oz undo`).
     Merge(MergeArgs),
     /// Atomically integrate workspaces or branches in memory with `--verify` and conflict sandbox.
     Integrate(IntegrateArgs),
@@ -233,9 +242,9 @@ pub enum Commands {
     Stack(StackCommand),
     /// Clone a remote repository over pure-Rust Git Wire Protocol v2 (supports `--filter=blob:none`).
     Clone(CloneArgs),
-    /// Fetch remote updates over pure-Rust Git Wire Protocol v2 with OpLog `ref_deltas`.
+    /// Fetch remote updates over pure-Rust Git Wire Protocol v2 with `OpLog` `ref_deltas`.
     Fetch(FetchArgs),
-    /// Fetch and incorporate upstream changes (`--ff-only`, `--rebase`, or merge) with OpLog undo.
+    /// Fetch and incorporate upstream changes (`--ff-only`, `--rebase`, or merge) with `OpLog` undo.
     Pull(PullArgs),
     /// Push refs over pure-Rust smart `git-receive-pack` (`--atomic`, `--force-with-lease`).
     Push(PushArgs),
@@ -263,35 +272,35 @@ pub enum Commands {
     /// Resolve revisions to full/short OIDs or query repo paths (`--show-toplevel`, `--is-inside-work-tree`, `--short`, `--verify`).
     #[command(name = "rev-parse")]
     RevParse(RevParseArgs),
-    /// Save and restore dirty working-tree snapshots (`push`, `pop`, `list`, `drop`) backed by OpLog.
+    /// Save and restore dirty working-tree snapshots (`push`, `pop`, `list`, `drop`) backed by `OpLog`.
     Stash(StashArgs),
-    /// Apply the changes introduced by an existing commit onto `HEAD` (recorded in OpLog).
+    /// Apply the changes introduced by an existing commit onto `HEAD` (recorded in `OpLog`).
     CherryPick(CherryPickArgs),
-    /// Create a new commit reverting the changes introduced by an existing commit (recorded in OpLog).
+    /// Create a new commit reverting the changes introduced by an existing commit (recorded in `OpLog`).
     Revert(RevertArgs),
-    /// Create, list, delete, and SSH-sign tags (recorded in OpLog).
+    /// Create, list, delete, and SSH-sign tags (recorded in `OpLog`).
     Tag(TagArgs),
-    /// List, create, rename, and delete local or remote-tracking branches (`-a`, `-r`, recorded in OpLog).
+    /// List, create, rename, and delete local or remote-tracking branches (`-a`, `-r`, recorded in `OpLog`).
     Branch(BranchArgs),
     /// Search working-tree files or any Git revision's tree (`oz grep <pat> [<rev>] [-- <paths...>]`).
     Grep(GrepArgs),
-    /// Switch branches or detach `HEAD` via native `gix` tree-delta checkout (recorded in OpLog).
+    /// Switch branches or detach `HEAD` via native `gix` tree-delta checkout (recorded in `OpLog`).
     Switch(SwitchArgs),
-    /// Restore working-tree files from HEAD or `--source <REV>` (recorded in OpLog for `oz undo`).
+    /// Restore working-tree files from `HEAD` or `--source <REV>` (recorded in `OpLog` for `oz undo`).
     Restore(RestoreArgs),
     /// Generate shell completion scripts (`bash`, `zsh`, `fish`, `powershell`).
     Completions(CompletionsArgs),
-    /// Initialize colocated `.git/ozone/` metadata, `systemd --user`, or Windows ProjFS.
+    /// Initialize colocated `.git/ozone/` metadata, `systemd --user`, or Windows `ProjFS`.
     Setup(SetupArgs),
     /// Inspect OS, filesystem (`statfs`), FUSE3/reflink readiness, and colocated repo status.
     Doctor,
-    /// Compact `.git/ozone/oplog/` and prune expired OpLog entries/snapshots safely.
+    /// Compact `.git/ozone/oplog/` and prune expired `OpLog` entries/snapshots safely.
     Gc(maintenance::GcArgs),
-    /// Verify colocated `.git/`, OpLog chain, snapshot reachability, and orphaned mounts/baselines.
+    /// Verify colocated `.git/`, `OpLog` chain, snapshot reachability, and orphaned mounts/baselines.
     Fsck(maintenance::FsckArgs),
     /// Print version information (equivalent to `--version`).
     Version,
-    /// Git-compatible command shim (`alias git="oz git"`) backed by Ozone + MVCC OpLog.
+    /// Git-compatible command shim (`alias git="oz git"`) backed by Ozone + MVCC `OpLog`.
     Git(git_shim::GitShimArgs),
 }
 
@@ -308,7 +317,7 @@ struct VersionData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DoctorCheckStatus {
+pub(crate) enum DoctorCheckStatus {
     Ok,
     Warn,
     Fail,
@@ -316,125 +325,126 @@ pub enum DoctorCheckStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DoctorCheck {
-    pub id: &'static str,
-    pub category: &'static str,
-    pub status: DoctorCheckStatus,
-    pub summary: String,
+pub(crate) struct DoctorCheck {
+    pub(crate) id: &'static str,
+    pub(crate) category: &'static str,
+    pub(crate) status: DoctorCheckStatus,
+    pub(crate) summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remediation: Vec<String>,
+    pub(crate) remediation: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DoctorFilesystem {
+pub(crate) struct DoctorFilesystem {
     #[serde(rename = "type")]
-    pub fs_type: String,
+    pub(crate) fs_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub magic: Option<String>,
-    pub reflink_ready: bool,
-    pub apfs_clonefile_ready: bool,
-    pub dev_drive_refs: bool,
+    pub(crate) magic: Option<String>,
+    pub(crate) reflink_ready: bool,
+    pub(crate) apfs_clonefile_ready: bool,
+    pub(crate) dev_drive_refs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DoctorWindowsDiagnostics {
-    pub projfs_feature: &'static str,
-    pub projfs_dll_path: PathBuf,
-    pub projfs_dll_exists: bool,
-    pub projfs_ready: bool,
-    pub dev_drive_detected: bool,
-    pub refs_clone_ready: bool,
+pub(crate) struct DoctorWindowsDiagnostics {
+    pub(crate) projfs_feature: &'static str,
+    pub(crate) projfs_dll_path: PathBuf,
+    pub(crate) projfs_dll_exists: bool,
+    pub(crate) projfs_ready: bool,
+    pub(crate) dev_drive_detected: bool,
+    pub(crate) refs_clone_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DoctorMacOsDiagnostics {
-    pub apfs_detected: bool,
-    pub clonefile_ready: bool,
+pub(crate) struct DoctorMacOsDiagnostics {
+    pub(crate) apfs_detected: bool,
+    pub(crate) clonefile_ready: bool,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DoctorVfsd {
-    pub found: bool,
-    pub path: Option<PathBuf>,
-    pub daemon_required: bool,
-    pub daemon_running: bool,
-    pub daemon_health: &'static str,
+pub(crate) struct DoctorVfsd {
+    pub(crate) found: bool,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) daemon_required: bool,
+    pub(crate) daemon_running: bool,
+    pub(crate) daemon_health: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub daemon_pid: Option<u32>,
+    pub(crate) daemon_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub daemon_version: Option<String>,
+    pub(crate) daemon_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub socket_path: Option<PathBuf>,
+    pub(crate) socket_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DoctorGitOzoneAlias {
-    pub invoked_as: &'static str,
-    pub found_on_path: Option<PathBuf>,
-    pub resolved: bool,
+pub(crate) struct DoctorGitOzoneAlias {
+    pub(crate) invoked_as: &'static str,
+    pub(crate) found_on_path: Option<PathBuf>,
+    pub(crate) resolved: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sibling_path: Option<PathBuf>,
+    pub(crate) sibling_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DoctorActiveMount {
-    pub workspace: String,
-    pub branch: String,
-    pub backend: BackendKind,
-    pub mount_point: PathBuf,
-    pub mounted: bool,
-    pub health: &'static str,
+pub(crate) struct DoctorActiveMount {
+    pub(crate) workspace: String,
+    pub(crate) branch: String,
+    pub(crate) backend: BackendKind,
+    pub(crate) mount_point: PathBuf,
+    pub(crate) mounted: bool,
+    pub(crate) health: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub daemon_pid: Option<u32>,
+    pub(crate) daemon_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub upper_dir: Option<PathBuf>,
+    pub(crate) upper_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DoctorRepoStatus {
-    pub in_repo: bool,
-    pub colocated: bool,
-    pub repo_root: Option<PathBuf>,
-    pub git_dir: Option<PathBuf>,
-    pub git_common_dir: Option<PathBuf>,
-    pub ozone_dir: Option<PathBuf>,
-    pub ozone_initialized: bool,
-    pub is_linked_worktree: bool,
-    pub workspace: Option<String>,
-    pub branch: Option<String>,
-    pub head_oid: Option<String>,
-    pub mount_health: Option<&'static str>,
-    pub repo_config_present: bool,
-    pub local_config_present: bool,
-    pub active_mount_count: usize,
-    pub unhealthy_mount_count: usize,
-    pub active_mounts: Vec<DoctorActiveMount>,
+pub(crate) struct DoctorRepoStatus {
+    pub(crate) in_repo: bool,
+    pub(crate) colocated: bool,
+    pub(crate) repo_root: Option<PathBuf>,
+    pub(crate) git_dir: Option<PathBuf>,
+    pub(crate) git_common_dir: Option<PathBuf>,
+    pub(crate) ozone_dir: Option<PathBuf>,
+    pub(crate) ozone_initialized: bool,
+    pub(crate) is_linked_worktree: bool,
+    pub(crate) workspace: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) head_oid: Option<String>,
+    pub(crate) mount_health: Option<&'static str>,
+    pub(crate) repo_config_present: bool,
+    pub(crate) local_config_present: bool,
+    pub(crate) active_mount_count: usize,
+    pub(crate) unhealthy_mount_count: usize,
+    pub(crate) active_mounts: Vec<DoctorActiveMount>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DoctorReport {
-    pub invoked_as: &'static str,
-    pub version: &'static str,
-    pub non_interactive: bool,
-    pub os: String,
-    pub arch: String,
-    pub target_path: PathBuf,
-    pub filesystem: DoctorFilesystem,
-    pub fuse: Option<LinuxFuseReadiness>,
-    pub projfs_ready: Option<bool>,
-    pub windows: Option<DoctorWindowsDiagnostics>,
-    pub macos: Option<DoctorMacOsDiagnostics>,
-    pub recommended_backend: BackendKind,
-    pub oz_vfsd: DoctorVfsd,
-    pub git_ozone_alias: DoctorGitOzoneAlias,
-    pub repo: DoctorRepoStatus,
-    pub ssh_signing: SshSigningReport,
-    pub github_auth: GitHubAuthProbe,
-    pub checks: Vec<DoctorCheck>,
-    pub remediation_hints: Vec<String>,
+pub(crate) struct DoctorReport {
+    pub(crate) invoked_as: &'static str,
+    pub(crate) version: &'static str,
+    pub(crate) non_interactive: bool,
+    pub(crate) os: String,
+    pub(crate) arch: String,
+    pub(crate) target_path: PathBuf,
+    pub(crate) filesystem: DoctorFilesystem,
+    pub(crate) fuse: Option<LinuxFuseReadiness>,
+    pub(crate) projfs_ready: Option<bool>,
+    pub(crate) windows: Option<DoctorWindowsDiagnostics>,
+    pub(crate) macos: Option<DoctorMacOsDiagnostics>,
+    pub(crate) recommended_backend: BackendKind,
+    pub(crate) oz_vfsd: DoctorVfsd,
+    pub(crate) git_ozone_alias: DoctorGitOzoneAlias,
+    pub(crate) repo: DoctorRepoStatus,
+    pub(crate) ssh_signing: SshSigningReport,
+    pub(crate) github_auth: GitHubAuthProbe,
+    pub(crate) checks: Vec<DoctorCheck>,
+    pub(crate) remediation_hints: Vec<String>,
 }
 
 /// Entrypoint shared by `oz` and `git-ozone` binaries.
+#[must_use]
 pub fn run_cli() -> std::process::ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     run_with_args(args).to_process_exit_code()
@@ -471,31 +481,27 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Ok(cli) => cli,
         Err(err) => {
             use clap::error::ErrorKind;
-            match err.kind() {
-                ErrorKind::DisplayHelp => {
-                    let _ = err.print();
-                    return ExitCode::Success;
-                }
-                _ => {
-                    if raw_json_hint {
-                        let mode = InteractionMode::detect(true, raw_agent_hint);
-                        let _ = mode;
-                        let env = Envelope::failure(
-                            "invalid_usage",
-                            ExitCode::UsageOrGuardrail,
-                            err.to_string().trim().to_string(),
-                        )
-                        .with_recovery_command("oz --help");
-                        write_stdout_line(
-                            &env.to_json_pretty()
-                                .unwrap_or_else(|_| "{\"schema\":\"oz.v1\",\"ok\":false}".into()),
-                        );
-                    } else {
-                        let _ = err.print();
-                    }
-                    return ExitCode::UsageOrGuardrail;
-                }
+            if err.kind() == ErrorKind::DisplayHelp {
+                let _ = err.print();
+                return ExitCode::Success;
             }
+            if raw_json_hint {
+                let mode = InteractionMode::detect(true, raw_agent_hint);
+                let _ = mode;
+                let env = Envelope::failure(
+                    "invalid_usage",
+                    ExitCode::UsageOrGuardrail,
+                    err.to_string().trim().to_string(),
+                )
+                .with_recovery_command("oz --help");
+                write_stdout_line(
+                    &env.to_json_pretty()
+                        .unwrap_or_else(|_| "{\"schema\":\"oz.v1\",\"ok\":false}".into()),
+                );
+            } else {
+                let _ = err.print();
+            }
+            return ExitCode::UsageOrGuardrail;
         }
     };
 
@@ -508,7 +514,7 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
     if let Some(ref dir) = cli.directory
         && !matches!(
             cli.command,
-            Some(Commands::Clone(_)) | Some(Commands::Git(_)) | Some(Commands::Version) | None
+            Some(Commands::Clone(_) | Commands::Git(_) | Commands::Version) | None
         )
         && !dir.exists()
         && probe_mount_health_os(dir) != MountHealth::DisconnectedEnotconn
@@ -677,7 +683,7 @@ fn handle_doctor(invocation: CliInvocation, cli: &Cli, mode: InteractionMode) ->
 }
 
 /// Computes diagnostics and builds the `oz.v1` [`Envelope`] for `oz doctor`.
-pub fn build_doctor_envelope(
+pub(crate) fn build_doctor_envelope(
     invocation: CliInvocation,
     directory: Option<&Path>,
     mode: InteractionMode,
@@ -712,8 +718,7 @@ pub fn build_doctor_envelope(
 
     let probe_path = repo_opt
         .as_ref()
-        .map(|r| r.repo_root.as_path())
-        .unwrap_or(target_path.as_path());
+        .map_or(target_path.as_path(), |r| r.repo_root.as_path());
     let probe: FilesystemProbe = detect_filesystem(probe_path)?;
 
     let configured_backend = repo_opt.as_ref().and_then(|r| r.config.backend);
@@ -1402,8 +1407,7 @@ fn evaluate_doctor_checks(
                 ssh_signing
                     .issues
                     .first()
-                    .map(String::as_str)
-                    .unwrap_or("no valid unencrypted Ed25519 signing key found")
+                    .map_or("no valid unencrypted Ed25519 signing key found", String::as_str)
             ));
             for r in &rem {
                 push_unique(&mut recovery_commands, r.clone());
@@ -1412,10 +1416,10 @@ fn evaluate_doctor_checks(
         for r in &rem {
             push_unique(&mut remediation_hints, r.clone());
         }
-        let summary = if !ssh_signing.issues.is_empty() {
-            ssh_signing.issues.join("; ")
-        } else {
+        let summary = if ssh_signing.issues.is_empty() {
             "No valid unencrypted Ed25519 SSH signing key configured".to_string()
+        } else {
+            ssh_signing.issues.join("; ")
         };
         checks.push(DoctorCheck {
             id: "ssh_signing",
@@ -1431,8 +1435,7 @@ fn evaluate_doctor_checks(
         let source = github_auth
             .token_source
             .as_ref()
-            .map(|s| s.label())
-            .unwrap_or("unknown");
+            .map_or("unknown", oz_github::TokenSource::label);
         let masked = github_auth.masked_token.as_deref().unwrap_or("****");
         checks.push(DoctorCheck {
             id: "github_auth",
@@ -1710,8 +1713,7 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
             fuse.dev_fuse_rw,
             fuse.fusermount3_path
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "missing".to_string())
+                .map_or_else(|| "missing".to_string(), |p| p.display().to_string())
         );
     }
     if let Some(ref win) = d.windows {
@@ -1740,8 +1742,7 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
         d.oz_vfsd
             .path
             .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "not found".to_string()),
+            .map_or_else(|| "not found".to_string(), |p| p.display().to_string()),
         d.oz_vfsd.daemon_health,
         d.oz_vfsd.daemon_running
     );
@@ -1751,8 +1752,7 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
         d.git_ozone_alias
             .found_on_path
             .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "not on PATH".to_string())
+            .map_or_else(|| "not on PATH".to_string(), |p| p.display().to_string())
     );
     println!(
         "  SSH signing:         ready={} (default={}, fingerprint={})",
@@ -1767,8 +1767,7 @@ fn print_doctor_human(env: &Envelope<DoctorReport>) {
         d.github_auth
             .token_source
             .as_ref()
-            .map(|s| s.label())
-            .unwrap_or("none")
+            .map_or("none", oz_github::TokenSource::label)
     );
     if d.repo.in_repo {
         println!(
@@ -2024,9 +2023,9 @@ mod tests {
         assert_eq!(fuse_chk.status, DoctorCheckStatus::Warn);
         assert!(fuse_chk.remediation.iter().any(|r| r.contains("fuse3")));
         assert!(fuse_chk.remediation.iter().any(|r| r.contains("usermod")));
-        assert!(!warnings.is_empty());
-        assert!(!recovery.is_empty());
-        assert!(!hints.is_empty());
+        assert_ne!(warnings.len(), 0);
+        assert_ne!(recovery.len(), 0);
+        assert_ne!(hints.len(), 0);
 
         // 2. Windows NTFS without ProjFS / Dev Drive
         let win_probe = FilesystemProbe {

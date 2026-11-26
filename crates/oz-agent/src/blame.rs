@@ -129,10 +129,10 @@ pub fn blame_file(
 
     let target_commit = gix_repo
         .find_commit(target_commit_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let target_tree_id = target_commit
         .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
     let Some(target_blob_id) = lookup_blob_in_tree(&gix_repo, target_tree_id, &rel_path)? else {
@@ -144,7 +144,7 @@ pub fn blame_file(
 
     let target_blob = gix_repo
         .find_blob(target_blob_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     if is_binary_bytes(&target_blob.data) {
         return Err(OzError::InvalidUsage {
             message: format!("cannot blame binary file '{rel_path}'"),
@@ -185,18 +185,18 @@ pub fn blame_file(
     let mut human_lines = 0usize;
 
     for (idx, content) in final_lines.into_iter().enumerate() {
+        let line_num = u32::try_from(idx + 1).unwrap_or(u32::MAX);
         let origin = origins[idx].unwrap_or(LineOrigin {
             commit_id: target_commit_id,
-            origin_line_1: (idx + 1) as u32,
+            origin_line_1: line_num,
         });
 
-        let meta = match meta_cache.get(&origin.commit_id) {
-            Some(m) => m.clone(),
-            None => {
-                let loaded = load_commit_meta(&gix_repo, origin.commit_id)?;
-                meta_cache.insert(origin.commit_id, loaded.clone());
-                loaded
-            }
+        let meta = if let Some(m) = meta_cache.get(&origin.commit_id) {
+            m.clone()
+        } else {
+            let loaded = load_commit_meta(&gix_repo, origin.commit_id)?;
+            meta_cache.insert(origin.commit_id, loaded.clone());
+            loaded
         };
 
         let (author_kind, client, model, session_id) = match notes_map.get(&meta.commit_hex) {
@@ -211,7 +211,7 @@ pub fn blame_file(
         }
 
         blame_lines.push(BlameLine {
-            line_number: (idx + 1) as u32,
+            line_number: line_num,
             origin_line_number: origin.origin_line_1,
             content,
             commit_oid: meta.commit_hex,
@@ -227,7 +227,11 @@ pub fn blame_file(
         });
     }
 
-    let agent_percentage = ((agent_lines as f64 * 10000.0) / (total_lines as f64)).round() / 100.0;
+    let agent_u128 = u128::try_from(agent_lines).unwrap_or(0);
+    let total_u128 = u128::try_from(total_lines).unwrap_or(1).max(1);
+    let basis_points = (agent_u128 * 20_000 + total_u128) / (2 * total_u128);
+    let bp_u32 = u32::try_from(basis_points).unwrap_or(10_000);
+    let agent_percentage = f64::from(bp_u32) / 100.0;
 
     Ok(BlameReport {
         path: rel_path,
@@ -307,7 +311,7 @@ fn trace_line_origins(
     let initial_suspects: Vec<Suspect> = (0..total_lines)
         .map(|i| Suspect {
             final_idx: i,
-            line_idx: i as u32,
+            line_idx: u32::try_from(i).unwrap_or(u32::MAX),
         })
         .collect();
 
@@ -332,11 +336,8 @@ fn trace_line_origins(
 
         let commit = gix_repo
             .find_commit(commit_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let tree_id = commit
-            .tree_id()
-            .map_err(|err| OzError::Git(err.to_string()))?
-            .detach();
+            .map_err(OzError::git_source)?;
+        let tree_id = commit.tree_id().map_err(OzError::git_source)?.detach();
 
         let Some(curr_blob_id) = lookup_blob_in_tree(gix_repo, tree_id, rel_path)? else {
             for s in suspects {
@@ -348,7 +349,7 @@ fn trace_line_origins(
             continue;
         };
 
-        let parent_ids: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+        let parent_ids: Vec<ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
         if parent_ids.is_empty() {
             for s in suspects {
                 resolved[s.final_idx] = Some(LineOrigin {
@@ -361,13 +362,8 @@ fn trace_line_origins(
 
         let mut parent_blobs: Vec<(ObjectId, ObjectId)> = Vec::with_capacity(parent_ids.len());
         for pid in parent_ids {
-            let p_commit = gix_repo
-                .find_commit(pid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
-            let p_tree_id = p_commit
-                .tree_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach();
+            let p_commit = gix_repo.find_commit(pid).map_err(OzError::git_source)?;
+            let p_tree_id = p_commit.tree_id().map_err(OzError::git_source)?.detach();
             if let Some(p_blob_id) = lookup_blob_in_tree(gix_repo, p_tree_id, rel_path)? {
                 parent_blobs.push((pid, p_blob_id));
             }
@@ -415,7 +411,7 @@ fn trace_line_origins(
 
         let curr_blob = gix_repo
             .find_blob(curr_blob_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let curr_bytes = &curr_blob.data;
 
         let mut remaining = suspects;
@@ -425,7 +421,7 @@ fn trace_line_origins(
             }
             let parent_blob = gix_repo
                 .find_blob(parent_blob_id)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
             if is_binary_bytes(&parent_blob.data) {
                 continue;
             }
@@ -597,10 +593,10 @@ fn lookup_blob_in_tree(
     for (idx, comp) in parts.iter().enumerate() {
         let tree = gix_repo
             .find_tree(current_tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let mut found = None;
         for entry_res in tree.iter() {
-            let entry = entry_res.map_err(|err| OzError::Git(err.to_string()))?;
+            let entry = entry_res.map_err(OzError::git_source)?;
             if entry.filename() == comp.as_bytes() {
                 found = Some((entry.mode(), entry.object_id()));
                 break;
@@ -627,25 +623,19 @@ fn lookup_blob_in_tree(
 }
 
 fn commit_committer_seconds(gix_repo: &gix::Repository, commit_id: ObjectId) -> Result<i64> {
-    let commit = gix_repo
-        .find_commit(commit_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let committer = commit
-        .committer()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let commit = gix_repo.find_commit(commit_id).map_err(OzError::git_source)?;
+    let committer = commit.committer().map_err(OzError::git_source)?;
     let time = committer.time().unwrap_or_default();
     Ok(time.seconds)
 }
 
 fn load_commit_meta(gix_repo: &gix::Repository, commit_id: ObjectId) -> Result<CommitMeta> {
-    let commit = gix_repo
-        .find_commit(commit_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let commit = gix_repo.find_commit(commit_id).map_err(OzError::git_source)?;
     let author = commit
         .author()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .to_owned()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     let author_name = String::from_utf8_lossy(author.name.as_bytes()).into_owned();
     let author_email = String::from_utf8_lossy(author.email.as_bytes()).into_owned();

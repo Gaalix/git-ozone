@@ -10,6 +10,8 @@
 //! - `oz mcp` binary stdio session exercising `initialize`, `tools/list`, `oz_status`, `oz_commit`, and live `oz_ci_logs` (`oz-github` `CiLogProvider`)
 //! - `oz doctor --json` reporting `ssh_signing` and `github_auth`
 
+#![allow(clippy::too_many_lines)]
+
 use oz_agent::{AiProvenanceNote, OZ_CHECKPOINT_HOOK_CMD};
 use oz_cli::run_with_args;
 use oz_core::{ExitCode, OZ_SCHEMA_V1};
@@ -253,21 +255,20 @@ async fn handle_mock_github_conn(
 
     let (path, query) = raw_target
         .split_once('?')
-        .map(|(p, q)| (p, Some(q)))
-        .unwrap_or((raw_target.as_str(), None));
+        .map_or((raw_target.as_str(), None), |(p, q)| (p, Some(q)));
     let query_map = parse_query_map(query);
 
     let (status, content_type, resp_bytes) = {
-        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let expected_auth = format!("Bearer {}", guard.expected_token);
-        if headers.get("authorization") != Some(&expected_auth) {
+        if headers.get("authorization") == Some(&expected_auth) {
+            route_mock_github(&method, path, &query_map, &body, &mut guard)
+        } else {
             (
                 "401 Unauthorized",
                 "application/json",
                 serde_json::to_vec(&json!({ "message": "Bad credentials" })).unwrap(),
             )
-        } else {
-            route_mock_github(&method, path, &query_map, &body, &mut guard)
         }
     };
 
@@ -303,7 +304,7 @@ fn route_mock_github(
         let tail = &segs[3..];
 
         if method == "GET" && tail == ["pulls"] {
-            let state_filter = query.get("state").map(String::as_str).unwrap_or("open");
+            let state_filter = query.get("state").map_or("open", String::as_str);
             let head_filter = query.get("head").map(String::as_str);
             let base_filter = query.get("base").map(String::as_str);
 
@@ -313,7 +314,7 @@ fn route_mock_github(
                 .filter(|pr| {
                     (state_filter == "all" || pr.state == state_filter)
                         && head_filter.is_none_or(|hf| {
-                            let short = hf.split_once(':').map(|(_, b)| b).unwrap_or(hf);
+                            let short = hf.split_once(':').map_or(hf, |(_, b)| b);
                             pr.head.ref_name == short
                         })
                         && base_filter.is_none_or(|bf| pr.base.ref_name == bf)
@@ -1025,11 +1026,9 @@ fn clone_partial_fetch_undo_and_push_atomic_force_with_lease_stale_rejection() {
     assert_eq!(stale_json["ok"], false);
     assert_eq!(stale_json["error"]["exit_code"], 1);
     assert_eq!(stale_json["conflicts"][0]["id"], "stale-lease");
-    assert!(
-        !stale_json["recovery_commands"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_ne!(
+        stale_json["recovery_commands"].as_array().unwrap().len(),
+        0
     );
 }
 
@@ -1308,10 +1307,10 @@ fn pr_create_pr_stack_ci_and_sync_against_mock_github_api() {
     }
     let ci_pass = run_oz(&ws2_path, &["ci", "--pr", "2", "--json"], &gh_env);
     assert_eq!(ci_pass.code, 0, "stderr: {}", ci_pass.stderr);
-    let cip_json = ci_pass.unwrap_json();
-    assert_eq!(cip_json["ok"], true);
-    assert_eq!(cip_json["data"]["all_passed"], true);
-    assert_eq!(cip_json["data"]["overall_status"], "passing");
+    let ci_pass_json = ci_pass.unwrap_json();
+    assert_eq!(ci_pass_json["ok"], true);
+    assert_eq!(ci_pass_json["data"]["all_passed"], true);
+    assert_eq!(ci_pass_json["data"]["overall_status"], "passing");
 
     // 4. Simulate merging PR #1 (`feat-1`) into `main` on upstream + GitHub mock, then `oz sync --json`!
     let merger_clone = tmp.path().join("upstream-merger");
@@ -1399,7 +1398,7 @@ fn agent_setup_all_and_check_is_idempotent_and_non_destructive() {
     assert_eq!(pcj["ok"], true);
     assert_eq!(pcj["data"]["check_only"], true);
     assert_eq!(pcj["data"]["harnesses"].as_array().unwrap().len(), 5);
-    assert!(!pcj["data"]["created"].as_array().unwrap().is_empty());
+    assert_ne!(pcj["data"]["created"].as_array().unwrap().len(), 0);
     assert!(!repo_dir.join(".claude/skills/oz/SKILL.md").exists());
 
     // 2. Apply `--all`.
@@ -1435,14 +1434,9 @@ fn agent_setup_all_and_check_is_idempotent_and_non_destructive() {
     );
     assert_eq!(post_check.code, 0);
     let post_json = post_check.unwrap_json();
-    assert!(post_json["data"]["created"].as_array().unwrap().is_empty());
-    assert!(post_json["data"]["updated"].as_array().unwrap().is_empty());
-    assert!(
-        !post_json["data"]["unchanged"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(post_json["data"]["created"].as_array().unwrap().len(), 0);
+    assert_eq!(post_json["data"]["updated"].as_array().unwrap().len(), 0);
+    assert_ne!(post_json["data"]["unchanged"].as_array().unwrap().len(), 0);
 }
 
 // ============================================================================
@@ -1451,6 +1445,19 @@ fn agent_setup_all_and_check_is_idempotent_and_non_destructive() {
 
 #[test]
 fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
+    fn rpc(
+        stdin: &mut std::process::ChildStdin,
+        stdout: &mut StdBufReader<std::process::ChildStdout>,
+        req: &Value,
+    ) -> Value {
+        writeln!(stdin, "{}", serde_json::to_string(req).unwrap()).unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).unwrap();
+        assert!(n > 0, "unexpected EOF from oz mcp");
+        serde_json::from_str(&line).expect("valid JSON-RPC response")
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1500,19 +1507,6 @@ fn mcp_binary_stdio_session_exercises_status_commit_and_live_ci_logs() {
     let mut child = cmd.spawn().expect("spawn oz mcp");
     let mut child_stdin = child.stdin.take().expect("child stdin");
     let mut child_stdout = StdBufReader::new(child.stdout.take().expect("child stdout"));
-
-    fn rpc(
-        stdin: &mut std::process::ChildStdin,
-        stdout: &mut StdBufReader<std::process::ChildStdout>,
-        req: &Value,
-    ) -> Value {
-        writeln!(stdin, "{}", serde_json::to_string(req).unwrap()).unwrap();
-        stdin.flush().unwrap();
-        let mut line = String::new();
-        let n = stdout.read_line(&mut line).unwrap();
-        assert!(n > 0, "unexpected EOF from oz mcp");
-        serde_json::from_str(&line).expect("valid JSON-RPC response")
-    }
 
     // 1. initialize
     let init_resp = rpc(

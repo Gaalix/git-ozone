@@ -17,10 +17,10 @@ use oz_core::{OzError, OzoneRepo, Result, is_binary_bytes};
 use std::collections::BTreeMap;
 
 /// Canonical Git notes reference storing structured AI commit provenance.
-pub const AI_NOTES_REF: &str = "refs/notes/ai";
+pub(crate) const AI_NOTES_REF: &str = "refs/notes/ai";
 
 /// Current schema version for [`AiProvenanceNote`].
-pub const AI_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const AI_PROVENANCE_SCHEMA_VERSION: u32 = 1;
 
 const MAX_CAS_RETRIES: usize = 32;
 
@@ -91,7 +91,7 @@ pub fn detect_agent_session() -> Option<DetectedAgentSession> {
 /// `CLAUDE_CODE_*` / `CLAUDECODE`, `CURSOR_TRACE_ID`, `CODEX_*`, `WINDSURF_*`,
 /// `ANTIGRAVITY_*`, and `OZ_AGENT=1`.
 #[must_use]
-pub fn detect_agent_session_from_map(
+pub(crate) fn detect_agent_session_from_map(
     env: &BTreeMap<String, String>,
 ) -> Option<DetectedAgentSession> {
     let explicit_session = nonempty_env(env, "OZ_AGENT_SESSION");
@@ -170,7 +170,7 @@ pub fn detect_agent_session_from_map(
 /// advancing `refs/notes/ai` from its prior commit tip.
 ///
 /// Returns the hex OID of the commit now at `refs/notes/ai`.
-pub fn write_provenance_note(
+pub(crate) fn write_provenance_note(
     repo: &OzoneRepo,
     commit_or_rev: &str,
     note: &AiProvenanceNote,
@@ -183,12 +183,12 @@ pub fn write_provenance_note(
     payload.push('\n');
     let note_blob_id = gix_repo
         .write_blob(payload.as_bytes())
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .detach();
 
     let (author_sig, committer_sig) = resolve_note_signatures(&gix_repo)?;
     let notes_ref_name = FullName::try_from(AI_NOTES_REF)
-        .map_err(|err| OzError::Git(format!("invalid notes ref '{AI_NOTES_REF}': {err}")))?;
+        .map_err(|err| OzError::git_context(format!("invalid notes ref '{AI_NOTES_REF}'"), err))?;
 
     for attempt in 0..MAX_CAS_RETRIES {
         let current_tip = read_notes_tip(&gix_repo)?;
@@ -213,14 +213,11 @@ pub fn write_provenance_note(
 
         let mut editor = gix_repo
             .edit_tree(base_tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         editor
             .upsert(note_rel_path.as_str(), EntryKind::Blob, note_blob_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
-        let new_notes_tree_id = editor
-            .write()
-            .map_err(|err| OzError::Git(err.to_string()))?
-            .detach();
+            .map_err(OzError::git_source)?;
+        let new_notes_tree_id = editor.write().map_err(OzError::git_source)?.detach();
 
         let mut author_buf = gix::date::parse::TimeBuf::default();
         let mut committer_buf = gix::date::parse::TimeBuf::default();
@@ -236,7 +233,7 @@ pub fn write_provenance_note(
                 new_notes_tree_id,
                 parents,
             )
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let new_notes_commit_id = notes_commit.id;
 
         let expected = match prev_commit_oid {
@@ -254,9 +251,12 @@ pub fn write_provenance_note(
             Ok(_) => return Ok(new_notes_commit_id.to_hex().to_string()),
             Err(err) => {
                 if attempt + 1 == MAX_CAS_RETRIES {
-                    return Err(OzError::Git(format!(
-                        "failed to update '{AI_NOTES_REF}' after {MAX_CAS_RETRIES} CAS attempts: {err}"
-                    )));
+                    return Err(OzError::git_context(
+                        format!(
+                            "failed to update '{AI_NOTES_REF}' after {MAX_CAS_RETRIES} CAS attempts"
+                        ),
+                        err,
+                    ));
                 }
                 let backoff_ms = 5
                     + (attempt as u64).min(10) * 3
@@ -289,9 +289,7 @@ pub fn read_provenance_note(
         return Ok(None);
     };
 
-    let blob = gix_repo
-        .find_blob(blob_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let blob = gix_repo.find_blob(blob_id).map_err(OzError::git_source)?;
     let note: AiProvenanceNote = serde_json::from_slice(&blob.data)?;
     Ok(Some(note))
 }
@@ -316,7 +314,7 @@ pub(crate) fn load_provenance_notes_gix(
     for (commit_hex, entry) in index.by_oid {
         let blob = gix_repo
             .find_blob(entry.blob_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         if let Ok(note) = serde_json::from_slice::<AiProvenanceNote>(&blob.data) {
             out.insert(commit_hex, note);
         }
@@ -343,19 +341,16 @@ pub(crate) fn compute_commit_line_attributions_gix(
 ) -> Result<Vec<LineRangeAttribution>> {
     let commit = gix_repo
         .find_commit(commit_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let new_tree_id = commit
-        .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+        .map_err(OzError::git_source)?;
+    let new_tree_id = commit.tree_id().map_err(OzError::git_source)?.detach();
     let parent_tree_id = match commit.parent_ids().next() {
         Some(parent_id) => {
             let parent_commit = gix_repo
                 .find_commit(parent_id.detach())
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
             parent_commit
                 .tree_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .detach()
         }
         None => ObjectId::empty_tree(gix_repo.object_hash()),
@@ -375,7 +370,7 @@ pub(crate) fn compute_commit_line_attributions_gix(
     for item in changed_blobs {
         let new_blob = gix_repo
             .find_blob(item.new_blob_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         let new_bytes = &new_blob.data;
         if new_bytes.is_empty() || is_binary_bytes(new_bytes) {
             continue;
@@ -383,7 +378,8 @@ pub(crate) fn compute_commit_line_attributions_gix(
 
         match item.old_blob_id {
             None => {
-                let line_count = sources::byte_lines(new_bytes).count() as u32;
+                let line_count =
+                    u32::try_from(sources::byte_lines(new_bytes).count()).unwrap_or(u32::MAX);
                 if line_count > 0 {
                     attributions.push(LineRangeAttribution {
                         path: item.path,
@@ -394,9 +390,7 @@ pub(crate) fn compute_commit_line_attributions_gix(
                 }
             }
             Some(old_id) => {
-                let old_blob = gix_repo
-                    .find_blob(old_id)
-                    .map_err(|err| OzError::Git(err.to_string()))?;
+                let old_blob = gix_repo.find_blob(old_id).map_err(OzError::git_source)?;
                 let old_bytes = &old_blob.data;
                 if is_binary_bytes(old_bytes) {
                     continue;
@@ -531,10 +525,10 @@ pub(crate) fn open_gix_with_fallback(repo: &OzoneRepo) -> Result<gix::Repository
     } else {
         &repo.repo_root
     };
-    let mut gix_repo = gix::open(target).map_err(|err| OzError::Git(err.to_string()))?;
+    let mut gix_repo = gix::open(target).map_err(OzError::git_source)?;
     gix_repo
         .committer_or_set_fallback("Ozone", "oz@ozone.dev")
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     Ok(gix_repo)
 }
 
@@ -559,28 +553,23 @@ pub(crate) fn resolve_commit_oid(
     let spec = gix_repo
         .rev_parse_single(trimmed)
         .map_err(|err| OzError::Git(format!("unable to resolve revision '{trimmed}': {err}")))?;
-    let object = spec.object().map_err(|err| OzError::Git(err.to_string()))?;
+    let object = spec.object().map_err(OzError::git_source)?;
     let commit = object
         .peel_to_commit()
-        .map_err(|err| OzError::Git(format!("revision '{trimmed}' is not a commit: {err}")))?;
+        .map_err(|err| OzError::git_context(format!("revision '{trimmed}' is not a commit"), err))?;
     Ok(commit.id)
 }
 
 fn read_notes_tip(gix_repo: &gix::Repository) -> Result<Option<(ObjectId, ObjectId)>> {
     let Some(mut reference) = gix_repo
         .try_find_reference(AI_NOTES_REF)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     else {
         return Ok(None);
     };
 
-    let commit = reference
-        .peel_to_commit()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    let tree_id = commit
-        .tree_id()
-        .map_err(|err| OzError::Git(err.to_string()))?
-        .detach();
+    let commit = reference.peel_to_commit().map_err(OzError::git_source)?;
+    let tree_id = commit.tree_id().map_err(OzError::git_source)?.detach();
     Ok(Some((commit.id, tree_id)))
 }
 
@@ -589,9 +578,9 @@ fn resolve_note_signatures(
 ) -> Result<(gix::actor::Signature, gix::actor::Signature)> {
     let committer = match gix_repo.committer() {
         Some(res) => res
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
         None => gix::actor::Signature {
             name: "Ozone".into(),
             email: "oz@ozone.dev".into(),
@@ -600,9 +589,9 @@ fn resolve_note_signatures(
     };
     let author = match gix_repo.author() {
         Some(res) => res
-            .map_err(|err| OzError::Git(err.to_string()))?
+            .map_err(OzError::git_source)?
             .to_owned()
-            .map_err(|err| OzError::Git(err.to_string()))?,
+            .map_err(OzError::git_source)?,
         None => committer.clone(),
     };
     Ok((author, committer))
@@ -616,10 +605,10 @@ fn find_note_blob_in_tree(
     // Fast direct lookup for flat layout (`<40-hex>`) and 2-hex fanout (`<2-hex>/<38-hex>`).
     let root_tree = gix_repo
         .find_tree(notes_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     for entry_res in root_tree.iter() {
-        let entry = entry_res.map_err(|err| OzError::Git(err.to_string()))?;
+        let entry = entry_res.map_err(OzError::git_source)?;
         if entry.mode().is_blob() && entry.filename() == target_hex.as_bytes() {
             return Ok(Some(entry.object_id()));
         }
@@ -629,10 +618,10 @@ fn find_note_blob_in_tree(
         {
             let sub_tree = gix_repo
                 .find_tree(entry.object_id())
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
             let rest = &target_hex.as_bytes()[2..];
             for sub_res in sub_tree.iter() {
-                let sub = sub_res.map_err(|err| OzError::Git(err.to_string()))?;
+                let sub = sub_res.map_err(OzError::git_source)?;
                 if sub.mode().is_blob() && sub.filename() == rest {
                     return Ok(Some(sub.object_id()));
                 }
@@ -669,12 +658,10 @@ fn walk_notes_tree_recursive(
     expected_hex_len: usize,
     out: &mut NotesTreeIndex,
 ) -> Result<()> {
-    let tree = gix_repo
-        .find_tree(tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(tree_id).map_err(OzError::git_source)?;
 
     for entry_res in tree.iter() {
-        let entry = entry_res.map_err(|err| OzError::Git(err.to_string()))?;
+        let entry = entry_res.map_err(OzError::git_source)?;
         let Some(seg) = entry.filename().to_str().ok() else {
             continue;
         };
@@ -737,9 +724,9 @@ fn diff_tree_changed_blobs(
     if old_tree_id != empty_id {
         let old_tree = gix_repo
             .find_tree(old_tree_id)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+            .map_err(OzError::git_source)?;
         for res in old_tree.iter() {
-            let e = res.map_err(|err| OzError::Git(err.to_string()))?;
+            let e = res.map_err(OzError::git_source)?;
             let name = String::from_utf8_lossy(e.filename().as_bytes()).into_owned();
             old_entries.insert(name, (e.mode(), e.object_id()));
         }
@@ -751,10 +738,10 @@ fn diff_tree_changed_blobs(
 
     let new_tree = gix_repo
         .find_tree(new_tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
 
     for res in new_tree.iter() {
-        let new_e = res.map_err(|err| OzError::Git(err.to_string()))?;
+        let new_e = res.map_err(OzError::git_source)?;
         let name = String::from_utf8_lossy(new_e.filename().as_bytes()).into_owned();
         let full_path = if prefix.is_empty() {
             name.clone()
@@ -806,7 +793,8 @@ fn is_regular_file_mode(mode: gix::objs::tree::EntryMode) -> bool {
 
 fn nonempty_env(env: &BTreeMap<String, String>, key: &str) -> Option<String> {
     env.get(key)
-        .map(|s| s.trim())
+        .map(String::as_str)
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
 }

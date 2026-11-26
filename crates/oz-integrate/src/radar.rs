@@ -310,12 +310,10 @@ fn read_leaf_bytes(
     if *tree_id == gix_repo.empty_tree().id().detach() {
         return Ok(None);
     }
-    let tree = gix_repo
-        .find_tree(*tree_id)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let tree = gix_repo.find_tree(*tree_id).map_err(OzError::git_source)?;
     let Some(entry) = tree
         .lookup_entry_by_path(rel_path)
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
     else {
         return Ok(None);
     };
@@ -326,9 +324,7 @@ fn read_leaf_bytes(
 }
 
 fn read_blob_bytes(gix_repo: &gix::Repository, oid: ObjectId) -> Result<Vec<u8>> {
-    let blob = gix_repo
-        .find_blob(oid)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let blob = gix_repo.find_blob(oid).map_err(OzError::git_source)?;
     Ok(blob.data.clone())
 }
 
@@ -395,17 +391,18 @@ fn build_workspace_file_edit(
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
 
-    let proj_hunks: Vec<Hunk> = if fork_slice != base_slice {
+    let proj_hunks: Vec<Hunk> = if fork_slice == base_slice {
+        Vec::new()
+    } else {
         let proj_input = InternedInput::new(fork_slice, base_slice);
         let mut p_diff = Diff::compute(Algorithm::Histogram, &proj_input);
         p_diff.postprocess_lines(&proj_input);
         p_diff.hunks().collect()
-    } else {
-        Vec::new()
     };
 
-    let base_line_count = sources::byte_lines(base_slice).count() as u32;
-    let eff_line_count = sources::byte_lines(eff_slice).count() as u32;
+    let base_line_count =
+        u32::try_from(sources::byte_lines(base_slice).count()).unwrap_or(u32::MAX);
+    let eff_line_count = u32::try_from(sources::byte_lines(eff_slice).count()).unwrap_or(u32::MAX);
 
     let mut spans = Vec::new();
     for rh in diff.hunks() {
@@ -474,11 +471,18 @@ fn project_range_onto_base(range: &Range<u32>, proj_hunks: &[Hunk]) -> Range<u32
     }
 }
 
+fn clamp_projected_pos(pos: u32, offset: i64) -> u32 {
+    let shifted = i64::from(pos)
+        .saturating_add(offset)
+        .clamp(0, i64::from(u32::MAX));
+    u32::try_from(shifted).unwrap_or(u32::MAX)
+}
+
 fn project_pos_onto_base(pos: u32, is_end: bool, proj_hunks: &[Hunk]) -> u32 {
-    let mut offset: isize = 0;
+    let mut offset: i64 = 0;
     for ph in proj_hunks {
         if pos < ph.before.start {
-            return (pos as isize + offset).max(0) as u32;
+            return clamp_projected_pos(pos, offset);
         }
         if pos <= ph.before.end {
             if pos == ph.before.start && !is_end {
@@ -488,11 +492,13 @@ fn project_pos_onto_base(pos: u32, is_end: bool, proj_hunks: &[Hunk]) -> u32 {
                 return ph.after.end;
             }
             let rel = pos.saturating_sub(ph.before.start);
-            return (ph.after.start + rel).min(ph.after.end);
+            return ph.after.start.saturating_add(rel).min(ph.after.end);
         }
-        offset += ph.after.len() as isize - ph.before.len() as isize;
+        let after_len = i64::try_from(ph.after.len()).unwrap_or(i64::from(u32::MAX));
+        let before_len = i64::try_from(ph.before.len()).unwrap_or(i64::from(u32::MAX));
+        offset = offset.saturating_add(after_len.saturating_sub(before_len));
     }
-    (pos as isize + offset).max(0) as u32
+    clamp_projected_pos(pos, offset)
 }
 
 fn format_projected_spans(spans: &[ProjectedSpan]) -> String {
@@ -619,5 +625,39 @@ const fn severity_rank(severity: CollisionSeverity) -> u8 {
         CollisionSeverity::OverlappingHunks => 0,
         CollisionSeverity::OutOfScope => 1,
         CollisionSeverity::SameFileDifferentLines => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Hunk, project_pos_onto_base};
+
+    #[test]
+    fn project_pos_onto_base_clamps_underflow_and_u32_max_overflow() {
+        let shrink_hunk = [Hunk {
+            before: 0..100,
+            after: 0..5,
+        }];
+        assert_eq!(project_pos_onto_base(120, false, &shrink_hunk), 25);
+
+        let huge_delete_then_gap = [
+            Hunk {
+                before: 0..500,
+                after: 0..0,
+            },
+            Hunk {
+                before: 600..610,
+                after: 0..10,
+            },
+        ];
+        // `pos = 510` minus `500` -> `10`; artificial extreme shrink clamps to `0`.
+        assert_eq!(project_pos_onto_base(510, false, &huge_delete_then_gap), 10);
+
+        let huge_insert = [Hunk {
+            before: 0..1,
+            after: 0..u32::MAX,
+        }];
+        assert_eq!(project_pos_onto_base(10, false, &huge_insert), u32::MAX);
+        assert_eq!(project_pos_onto_base(u32::MAX, true, &huge_insert), u32::MAX);
     }
 }

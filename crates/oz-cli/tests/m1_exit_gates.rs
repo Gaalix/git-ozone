@@ -5,11 +5,13 @@
 //! compiled `oz`, `git-ozone`, and `oz-vfsd` binaries on real Linux `ext4` + FUSE3.
 
 #![cfg(target_os = "linux")]
+#![allow(clippy::too_many_lines)]
 
 use oz_core::{MountRecord, OZ_SCHEMA_V1, OzoneConfig, OzoneRepo};
 use oz_oplog::{ActorInfo, ActorKind, checkpoint, redo, undo};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs::FileTimes;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -391,9 +393,9 @@ fn git_commit_all(repo_root: &Path, msg: &str) -> String {
 
 fn set_mtime_unix_secs(path: &Path, secs: i64) {
     let st = if secs >= 0 {
-        UNIX_EPOCH + Duration::from_secs(secs as u64)
+        UNIX_EPOCH + Duration::from_secs(secs.cast_unsigned())
     } else {
-        UNIX_EPOCH - Duration::from_secs((-secs) as u64)
+        UNIX_EPOCH - Duration::from_secs((-secs).cast_unsigned())
     };
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -615,10 +617,13 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
             .success()
     );
 
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_secs() as i64;
+    let now_secs = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs(),
+    )
+    .expect("epoch fits i64");
     let source_mtime_secs = now_secs - 180;
     let cache_mtime_secs = now_secs - 60;
 
@@ -697,10 +702,13 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
 
     let repo_inodes = collect_inodes(&repo);
     let ext4_used_before = ext4_allocated_bytes(&repo);
-    let spawn_window_start_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_secs() as i64
+    let spawn_window_start_secs = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs(),
+    )
+    .expect("epoch fits i64")
         - 1;
 
     let mut latencies_ms = Vec::with_capacity(10);
@@ -740,7 +748,8 @@ fn gate_m1_ext4_fuse3_space_and_speed_10_workspaces_and_warm_cache() {
         latencies_ms.push(elapsed_ms);
     }
 
-    let mean_ms = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
+    let mean_ms = latencies_ms.iter().sum::<f64>()
+        / f64::from(u32::try_from(latencies_ms.len()).expect("len fits u32"));
     let max_ms = latencies_ms.iter().copied().fold(0.0_f64, f64::max);
 
     let backing_paths = vec![
@@ -1057,7 +1066,10 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
     let mut sandbox = GateSandbox::new("vcs-gate");
     let repo = sandbox.repo_root.clone();
 
-    let orig_a: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    let mut orig_a = String::new();
+    for i in 1..=30 {
+        let _ = writeln!(orig_a, "line {i}");
+    }
     std::fs::write(repo.join("a_multi.txt"), &orig_a).expect("write a_multi");
     std::fs::write(repo.join("b_full.txt"), "original b\n").expect("write b_full");
     std::fs::write(repo.join("c_keep.txt"), "original c\n").expect("write c_keep");
@@ -1114,7 +1126,7 @@ fn gate_m1_stage_free_partial_commit_guardrails_and_sub10ms_undo_redo() {
 
     let quiet_cp = run_bin(&oz_bin(), &ws_vcs, &["checkpoint", "--quiet"], &[]);
     assert_eq!(quiet_cp.code, 0);
-    assert!(quiet_cp.stdout.is_empty());
+    assert_eq!(quiet_cp.stdout, "");
 
     // Stage-free partial commit: --pick f2 h1a
     let commit_out = run_bin(

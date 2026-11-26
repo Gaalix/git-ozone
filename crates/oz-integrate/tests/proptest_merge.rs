@@ -4,6 +4,8 @@
 //! Property-based safety tests for `oz integrate`, `oz resolve`, and post-merge `oz undo`
 //! across unicode paths, symlinks, executable bits, renames, binary files, and nested directories.
 
+#![allow(clippy::too_many_lines)]
+
 use oz_core::{OzError, OzoneRepo};
 use oz_integrate::{
     IntegrateOptions, ResolveOptions, TakeSide, active_session, continue_integration, integrate,
@@ -168,9 +170,9 @@ fn snapshot_worktree_disk(root: &Path) -> BTreeMap<String, TreeEntry> {
 fn collect_worktree_recursive(root: &Path, dir: &Path, out: &mut BTreeMap<String, TreeEntry>) {
     let mut children: Vec<_> = fs::read_dir(dir)
         .expect("read_dir")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
-    children.sort_by_key(|e| e.file_name());
+    children.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in children {
         let name = entry.file_name();
@@ -430,10 +432,15 @@ fn arb_base_snapshot() -> BoxedStrategy<BTreeMap<String, TreeEntry>> {
             m.insert(
                 "deep/a/b/c/mod.rs".to_string(),
                 TreeEntry::File {
-                    bytes: (1..=12)
-                        .map(|i| format!("pub const C_{i}: usize = {i}; // {tok}\n"))
-                        .collect::<String>()
-                        .into_bytes(),
+                    bytes: {
+                        use std::fmt::Write as _;
+                        (1..=12)
+                            .fold(String::new(), |mut acc, i| {
+                                let _ = writeln!(acc, "pub const C_{i}: usize = {i}; // {tok}");
+                                acc
+                            })
+                            .into_bytes()
+                    },
                     executable: false,
                 },
             );

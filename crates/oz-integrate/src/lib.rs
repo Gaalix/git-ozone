@@ -4,17 +4,20 @@
 //! Path guardrails (`--scope`/`--deny`), `oz radar` collision detection, atomic in-memory
 //! merge (`oz integrate`), conflict sandbox resolution (`oz resolve`), and stacked rebasing.
 
-pub mod guardrails;
-pub mod merge;
-pub mod radar;
-pub mod resolve;
-pub(crate) mod sandbox;
-pub mod stack;
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::struct_excessive_bools
+)]
 
-pub use guardrails::{
-    IntegrationGuardrailOptions, check_branch_guardrails_for_integration,
-    check_workspace_scope_for_integration,
-};
+pub(crate) mod guardrails;
+pub(crate) mod merge;
+pub(crate) mod radar;
+pub(crate) mod resolve;
+pub(crate) mod sandbox;
+pub(crate) mod stack;
+
+pub use guardrails::{IntegrationGuardrailOptions, check_workspace_scope_for_integration};
 pub use merge::{
     IntegrateOptions, IntegrateOutcome, MergeFastForwardMode, continue_integration,
     continue_integration_with_verify, integrate,

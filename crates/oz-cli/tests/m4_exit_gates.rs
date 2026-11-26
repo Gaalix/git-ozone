@@ -29,6 +29,8 @@
 //!    - `setup` -> `ws spawn` -> edit -> `status` -> `diff` -> `commit` -> `checkpoint` ->
 //!      `undo`/`redo` -> `radar` -> `integrate` -> `ws rm` -> `git fsck --full`.
 
+#![allow(clippy::too_many_lines)]
+
 use oz_core::{MountRecord, OZ_SCHEMA_V1};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -885,7 +887,7 @@ fn gate4_cli_edge_cases_exit_codes_and_json_envelope_invariants() {
     ] {
         let h = run_bin(&bin, non_repo_dir.path(), &args, &[]);
         assert_eq!(h.code, 0, "help {:?} failed: {}", args, h.stderr);
-        assert!(!h.stdout.trim().is_empty());
+        assert_ne!(h.stdout.trim(), "");
     }
 
     // 3. Invalid flags & missing subcommand return exit 2 with valid `oz.v1` JSON envelope.
@@ -907,7 +909,7 @@ fn gate4_cli_edge_cases_exit_codes_and_json_envelope_invariants() {
         assert_oz_v1_envelope_invariants(&v, false);
         assert_eq!(v["error"]["code"], "invalid_usage");
         assert_eq!(v["error"]["exit_code"], 2);
-        assert!(!v["recovery_commands"].as_array().unwrap().is_empty());
+        assert_ne!(v["recovery_commands"].as_array().unwrap().len(), 0);
     }
 
     // 4. Nonexistent `-C <DIR>` returns exit 2 with `invalid_usage` JSON envelope.
@@ -1108,13 +1110,13 @@ fn gate5_end_to_end_core_workflow_smoke() {
         "undo must revert scratch.txt"
     );
 
-    let redo = run_bin(&oz_bin(), &ws_path, &["redo", "--json"], &[]);
+    let redo_out = run_bin(&oz_bin(), &ws_path, &["redo", "--json"], &[]);
     assert_eq!(
-        redo.code, 0,
+        redo_out.code, 0,
         "redo failed: {}\n{}",
-        redo.stdout, redo.stderr
+        redo_out.stdout, redo_out.stderr
     );
-    assert_oz_v1_envelope_invariants(&redo.json.expect("redo json"), true);
+    assert_oz_v1_envelope_invariants(&redo_out.json.expect("redo json"), true);
     assert!(
         ws_path.join("scratch.txt").exists(),
         "redo must restore scratch.txt"

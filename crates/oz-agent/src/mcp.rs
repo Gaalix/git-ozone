@@ -30,31 +30,31 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Default MCP protocol version negotiated when client requests an unknown or older version.
-pub const MCP_PROTOCOL_VERSION_2024: &str = "2024-11-05";
+pub(crate) const MCP_PROTOCOL_VERSION_2024: &str = "2024-11-05";
 /// Newer MCP streamable/stdio protocol revision supported seamlessly by `oz mcp`.
-pub const MCP_PROTOCOL_VERSION_2025: &str = "2025-03-26";
+pub(crate) const MCP_PROTOCOL_VERSION_2025: &str = "2025-03-26";
 
 /// JSON-RPC 2.0 standard error code: Invalid JSON was received by the server.
-pub const JSONRPC_PARSE_ERROR: i32 = -32700;
+pub(crate) const JSONRPC_PARSE_ERROR: i32 = -32700;
 /// JSON-RPC 2.0 standard error code: The JSON sent is not a valid Request object.
-pub const JSONRPC_INVALID_REQUEST: i32 = -32600;
+pub(crate) const JSONRPC_INVALID_REQUEST: i32 = -32600;
 /// JSON-RPC 2.0 standard error code: The method does not exist / is not available.
-pub const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
+pub(crate) const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 /// JSON-RPC 2.0 standard error code: Invalid method parameter(s).
-pub const JSONRPC_INVALID_PARAMS: i32 = -32602;
+pub(crate) const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 standard error code: Internal JSON-RPC error.
-pub const JSONRPC_INTERNAL_ERROR: i32 = -32603;
+pub(crate) const JSONRPC_INTERNAL_ERROR: i32 = -32603;
 
 /// Maximum permitted length in bytes of a single MCP framing line (header or JSON-RPC line).
-pub const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum permitted length in bytes of a single MCP `Content-Length`-framed message payload.
-pub const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum permitted number of header lines in a single `Content-Length`-framed MCP message.
-pub const MAX_MCP_HEADER_LINES: usize = 32;
+pub(crate) const MAX_MCP_HEADER_LINES: usize = 32;
 
 /// Wire framing auto-detected per incoming MCP message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageFraming {
+pub(crate) enum MessageFraming {
     /// Newline-delimited JSON-RPC (`<json>\n`).
     JsonLine,
     /// `Content-Length: N\r\n\r\n<N bytes>` framing.
@@ -158,7 +158,7 @@ where
 
 /// MCP tool output block (`{ "type": "text", "text": "..." }`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpToolContent {
+pub(crate) struct McpToolContent {
     #[serde(rename = "type")]
     pub kind: String,
     pub text: String,
@@ -167,7 +167,7 @@ pub struct McpToolContent {
 impl McpToolContent {
     /// Creates a text content block containing serialized JSON.
     #[must_use]
-    pub fn text(text: impl Into<String>) -> Self {
+    pub(crate) fn text(text: impl Into<String>) -> Self {
         Self {
             kind: "text".to_string(),
             text: text.into(),
@@ -177,7 +177,7 @@ impl McpToolContent {
 
 /// Structured MCP `CallToolResult` payload returned by `tools/call`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpCallToolResult {
+pub(crate) struct McpCallToolResult {
     pub content: Vec<McpToolContent>,
     #[serde(rename = "isError")]
     pub is_error: bool,
@@ -192,7 +192,16 @@ struct McpServerState {
     ci_provider: Option<Arc<dyn CiLogProvider>>,
 }
 
+#[derive(Clone)]
+struct McpSessionSnapshot {
+    root_dir: Option<PathBuf>,
+    session_id: String,
+    client_name: Option<String>,
+    ci_provider: Option<Arc<dyn CiLogProvider>>,
+}
+
 /// Built-in Ozone Model Context Protocol (`oz mcp`) server instance.
+#[derive(Clone)]
 pub struct McpServer {
     state: Arc<Mutex<McpServerState>>,
 }
@@ -217,19 +226,6 @@ impl McpServer {
                 ci_provider: None,
             })),
         }
-    }
-
-    /// Attaches a [`CiLogProvider`] implementation used to fulfill `oz_ci_logs` tool calls.
-    #[must_use]
-    pub fn with_ci_provider<P>(self, provider: P) -> Self
-    where
-        P: CiLogProvider + 'static,
-    {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ci_provider = Some(Arc::new(provider));
-        self
     }
 
     /// Attaches a closure used to fulfill `oz_ci_logs` tool calls with full parameter type inference.
@@ -272,20 +268,6 @@ impl McpServer {
         Ok(())
     }
 
-    /// Runs the MCP server synchronously over `std::io::stdin()` and `std::io::stdout()`.
-    pub fn serve_process_stdio(&mut self) -> Result<()> {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        self.serve_stdio(stdin.lock(), stdout.lock())
-    }
-
-    /// Runs the MCP server asynchronously over `tokio::io::stdin()` and `tokio::io::stdout()`.
-    pub async fn serve_tokio_stdio(&mut self) -> Result<()> {
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let stdout = tokio::io::stdout();
-        self.serve_async(stdin, stdout).await
-    }
-
     /// Runs the MCP server asynchronously over any `AsyncBufRead` + `AsyncWrite` streams until EOF.
     ///
     /// Offloads synchronous repository and tool execution onto Tokio's blocking pool via
@@ -297,15 +279,11 @@ impl McpServer {
         W: AsyncWrite + Unpin,
     {
         while let Some((framing, raw_payload)) = read_framed_message_async(&mut reader).await? {
-            let state = Arc::clone(&self.state);
-            let maybe_resp = tokio::task::spawn_blocking(move || {
-                let mut guard = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.process_raw_payload(&raw_payload)
-            })
-            .await
-            .map_err(|err| OzError::Other(format!("MCP worker task failed: {err}")))??;
+            let server = self.clone();
+            let maybe_resp =
+                tokio::task::spawn_blocking(move || server.process_raw_payload(&raw_payload))
+                    .await
+                    .map_err(|err| OzError::Other(format!("MCP worker task failed: {err}")))??;
             if let Some(resp_json) = maybe_resp {
                 write_framed_message_async(&mut writer, framing, &resp_json).await?;
             }
@@ -315,16 +293,10 @@ impl McpServer {
 
     /// Processes a single raw JSON-RPC payload string and returns the serialized JSON-RPC response
     /// (or `Ok(None)` for JSON-RPC notifications).
-    pub fn process_raw_payload(&mut self, raw: &str) -> Result<Option<String>> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .process_raw_payload(raw)
-    }
-}
-
-impl McpServerState {
-    fn process_raw_payload(&mut self, raw: &str) -> Result<Option<String>> {
+    ///
+    /// Locks internal session metadata only briefly when reading/updating session state, dropping
+    /// the mutex guard before executing blocking `tools/call` handlers.
+    pub fn process_raw_payload(&self, raw: &str) -> Result<Option<String>> {
         let parsed: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(err) => {
@@ -386,7 +358,7 @@ impl McpServerState {
         }
     }
 
-    fn handle_single_message(&mut self, mut obj: Map<String, Value>) -> Option<Value> {
+    fn handle_single_message(&self, mut obj: Map<String, Value>) -> Option<Value> {
         let has_id = obj.contains_key("id");
         let raw_id = obj.remove("id").unwrap_or(Value::Null);
 
@@ -431,7 +403,10 @@ impl McpServerState {
         // JSON-RPC notifications (no `id` key) never emit a response on the wire.
         if !has_id {
             if method == "notifications/initialized" || method == "initialized" {
-                self.initialized = true;
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .initialized = true;
             }
             return None;
         }
@@ -439,7 +414,10 @@ impl McpServerState {
         let dispatch_res = match method.as_str() {
             "initialize" => self.handle_initialize(params.as_ref()),
             "notifications/initialized" | "initialized" => {
-                self.initialized = true;
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .initialized = true;
                 Ok(json!({}))
             }
             "ping" => Ok(json!({})),
@@ -458,9 +436,12 @@ impl McpServerState {
     }
 
     fn handle_initialize(
-        &mut self,
+        &self,
         params: Option<&Value>,
     ) -> std::result::Result<Value, (i32, String)> {
+        let mut negotiated_version_update: Option<String> = None;
+        let mut client_name_update: Option<String> = None;
+
         if let Some(p) = params {
             let Some(map) = p.as_object() else {
                 return Err((
@@ -469,11 +450,10 @@ impl McpServerState {
                 ));
             };
             if let Some(req_ver) = map.get("protocolVersion").and_then(Value::as_str) {
-                self.protocol_version = match req_ver {
+                negotiated_version_update = Some(match req_ver {
                     MCP_PROTOCOL_VERSION_2025 => MCP_PROTOCOL_VERSION_2025.to_string(),
-                    MCP_PROTOCOL_VERSION_2024 => MCP_PROTOCOL_VERSION_2024.to_string(),
                     _ => MCP_PROTOCOL_VERSION_2024.to_string(),
-                };
+                });
             }
             if let Some(client_name) = map
                 .get("clientInfo")
@@ -482,12 +462,26 @@ impl McpServerState {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
             {
-                self.client_name = Some(client_name.trim().to_string());
+                client_name_update = Some(client_name.trim().to_string());
             }
         }
 
+        let protocol_version = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(ver) = negotiated_version_update {
+                guard.protocol_version = ver;
+            }
+            if let Some(name) = client_name_update {
+                guard.client_name = Some(name);
+            }
+            guard.protocol_version.clone()
+        };
+
         Ok(json!({
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": protocol_version,
             "capabilities": {
                 "tools": {
                     "listChanged": false
@@ -500,8 +494,21 @@ impl McpServerState {
         }))
     }
 
+    fn snapshot_session(&self) -> McpSessionSnapshot {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        McpSessionSnapshot {
+            root_dir: guard.root_dir.clone(),
+            session_id: guard.session_id.clone(),
+            client_name: guard.client_name.clone(),
+            ci_provider: guard.ci_provider.as_ref().map(Arc::clone),
+        }
+    }
+
     fn handle_tools_call(
-        &mut self,
+        &self,
         params: Option<Value>,
     ) -> std::result::Result<Value, (i32, String)> {
         let Some(Value::Object(mut map)) = params else {
@@ -532,50 +539,54 @@ impl McpServerState {
             }
         };
 
+        // Snapshot immutable session metadata and drop `MutexGuard<McpServerState>` BEFORE
+        // running blocking tool execution!
+        let session = self.snapshot_session();
+
         let tool_outcome: Result<Value> = match tool_name.as_str() {
             "oz_status" => {
                 let args: StatusToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_status(&args)
+                session.exec_oz_status(&args)
             }
             "oz_diff" => {
                 let args: DiffToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_diff(&args)
+                session.exec_oz_diff(&args)
             }
             "oz_commit" => {
                 let args: CommitToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_commit(args)
+                session.exec_oz_commit(args)
             }
             "oz_ws_spawn" => {
                 let args: WsSpawnToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_ws_spawn(args)
+                session.exec_oz_ws_spawn(args)
             }
             "oz_radar" => {
                 let args: RadarToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_radar(args)
+                session.exec_oz_radar(args)
             }
             "oz_checkpoint" => {
                 let args: CheckpointToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_checkpoint(&args)
+                session.exec_oz_checkpoint(&args)
             }
             "oz_undo" => {
                 let args: UndoToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_undo(args)
+                session.exec_oz_undo(args)
             }
             "oz_ci_logs" => {
                 let args: CiLogsToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_ci_logs(args)
+                session.exec_oz_ci_logs(args)
             }
             "oz_log" => {
                 let args: LogToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_log(args)
+                session.exec_oz_log(args)
             }
             "oz_restore" => {
                 let args: RestoreToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_restore(args)
+                session.exec_oz_restore(args)
             }
             "oz_show" => {
                 let args: ShowToolArgs = parse_tool_args(&tool_name, args_val)?;
-                self.exec_oz_show(args)
+                session.exec_oz_show(args)
             }
             _ => {
                 return Err((
@@ -612,6 +623,9 @@ impl McpServerState {
 
         serde_json::to_value(call_result).map_err(|e| (JSONRPC_INTERNAL_ERROR, e.to_string()))
     }
+}
+
+impl McpSessionSnapshot {
 
     fn discover_target_repo(
         &self,
@@ -760,6 +774,16 @@ impl McpServerState {
     }
 
     fn exec_oz_commit(&self, args: CommitToolArgs) -> Result<Value> {
+        #[derive(Serialize)]
+        struct McpCommitResponse {
+            ok: bool,
+            op_id: String,
+            #[serde(flatten)]
+            outcome: CommitOutcome,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            provenance: Option<AiProvenanceNote>,
+        }
+
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let pre_status = compute_status(&repo)?;
@@ -797,16 +821,6 @@ impl McpServerState {
         let provenance: Option<AiProvenanceNote> =
             record_commit_provenance(&repo, &outcome.commit_oid, &prov_opts)?;
 
-        #[derive(Serialize)]
-        struct McpCommitResponse {
-            ok: bool,
-            op_id: String,
-            #[serde(flatten)]
-            outcome: CommitOutcome,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            provenance: Option<AiProvenanceNote>,
-        }
-
         Ok(serde_json::to_value(McpCommitResponse {
             ok: true,
             op_id: entry.op_id,
@@ -816,6 +830,23 @@ impl McpServerState {
     }
 
     fn exec_oz_ws_spawn(&self, args: WsSpawnToolArgs) -> Result<Value> {
+        #[derive(Serialize)]
+        struct McpSpawnResponse {
+            ok: bool,
+            op_id: String,
+            workspace: String,
+            branch: String,
+            worktree_path: PathBuf,
+            git_worktree_dir: PathBuf,
+            backend: BackendKind,
+            base_commit: Option<String>,
+            base_tree: String,
+            baseline_id: Option<String>,
+            baseline_source: Option<&'static str>,
+            scope: Vec<String>,
+            deny: Vec<String>,
+        }
+
         let repo = self.discover_target_repo(args.directory.as_deref(), None)?;
         let pre_status = compute_status(&repo)?;
         let actor = self.mcp_actor(&repo);
@@ -838,23 +869,6 @@ impl McpServerState {
             BaselineSource::FallbackPrior => "fallback_prior",
         });
 
-        #[derive(Serialize)]
-        struct McpSpawnResponse {
-            ok: bool,
-            op_id: String,
-            workspace: String,
-            branch: String,
-            worktree_path: PathBuf,
-            git_worktree_dir: PathBuf,
-            backend: BackendKind,
-            base_commit: Option<String>,
-            base_tree: String,
-            baseline_id: Option<String>,
-            baseline_source: Option<&'static str>,
-            scope: Vec<String>,
-            deny: Vec<String>,
-        }
-
         Ok(serde_json::to_value(McpSpawnResponse {
             ok: true,
             op_id: entry.op_id,
@@ -873,6 +887,13 @@ impl McpServerState {
     }
 
     fn exec_oz_radar(&self, args: RadarToolArgs) -> Result<Value> {
+        #[derive(Serialize)]
+        struct McpRadarResponse {
+            ok: bool,
+            #[serde(flatten)]
+            report: RadarReport,
+        }
+
         let repo = self.discover_target_repo(args.directory.as_deref(), None)?;
         let report: RadarReport = scan_radar(
             &repo,
@@ -883,17 +904,17 @@ impl McpServerState {
             },
         )?;
 
-        #[derive(Serialize)]
-        struct McpRadarResponse {
-            ok: bool,
-            #[serde(flatten)]
-            report: RadarReport,
-        }
-
         Ok(serde_json::to_value(McpRadarResponse { ok: true, report })?)
     }
 
     fn exec_oz_checkpoint(&self, args: &CheckpointToolArgs) -> Result<Value> {
+        #[derive(Serialize)]
+        struct McpCheckpointResponse {
+            ok: bool,
+            #[serde(flatten)]
+            outcome: CheckpointOutcome,
+        }
+
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let status = compute_status(&repo)?;
@@ -906,13 +927,6 @@ impl McpServerState {
             Some(&status.changes),
         )?;
 
-        #[derive(Serialize)]
-        struct McpCheckpointResponse {
-            ok: bool,
-            #[serde(flatten)]
-            outcome: CheckpointOutcome,
-        }
-
         Ok(serde_json::to_value(McpCheckpointResponse {
             ok: true,
             outcome,
@@ -920,6 +934,13 @@ impl McpServerState {
     }
 
     fn exec_oz_undo(&self, args: UndoToolArgs) -> Result<Value> {
+        #[derive(Serialize)]
+        struct McpUndoResponse {
+            ok: bool,
+            #[serde(flatten)]
+            outcome: UndoOutcome,
+        }
+
         if args.op_id.is_some() && args.steps.is_some() {
             return Err(OzError::InvalidUsage {
                 message: "cannot pass both 'op_id' and 'steps' to oz_undo".to_string(),
@@ -937,17 +958,17 @@ impl McpServerState {
         let actor = self.mcp_actor(&repo);
         let outcome: UndoOutcome = undo_with_dirty(&repo, target, actor, Some(&status.changes))?;
 
-        #[derive(Serialize)]
-        struct McpUndoResponse {
-            ok: bool,
-            #[serde(flatten)]
-            outcome: UndoOutcome,
-        }
-
         Ok(serde_json::to_value(McpUndoResponse { ok: true, outcome })?)
     }
 
     fn exec_oz_ci_logs(&self, args: CiLogsToolArgs) -> Result<Value> {
+        #[derive(Serialize)]
+        struct McpCiResponse {
+            ok: bool,
+            #[serde(flatten)]
+            report: CiLogsReport,
+        }
+
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let Some(ref provider) = self.ci_provider else {
@@ -975,13 +996,6 @@ impl McpServerState {
             ignore_checks: args.ignore_checks.unwrap_or_default(),
         };
         let report = provider.fetch_ci_logs(&repo, &req)?;
-
-        #[derive(Serialize)]
-        struct McpCiResponse {
-            ok: bool,
-            #[serde(flatten)]
-            report: CiLogsReport,
-        }
 
         Ok(serde_json::to_value(McpCiResponse { ok: true, report })?)
     }
@@ -1031,6 +1045,14 @@ impl McpServerState {
     }
 
     fn exec_oz_restore(&self, args: RestoreToolArgs) -> Result<Value> {
+        #[derive(Serialize)]
+        struct McpRestoreResponse {
+            ok: bool,
+            op_id: String,
+            #[serde(flatten)]
+            outcome: RestoreOutcome,
+        }
+
         let repo =
             self.discover_target_repo(args.directory.as_deref(), args.workspace.as_deref())?;
         let pre_status = compute_status(&repo)?;
@@ -1048,14 +1070,6 @@ impl McpServerState {
         )?;
         let post_status = compute_status(&repo)?;
         let entry = tx.finish(&repo, Some(&post_status.changes))?;
-
-        #[derive(Serialize)]
-        struct McpRestoreResponse {
-            ok: bool,
-            op_id: String,
-            #[serde(flatten)]
-            outcome: RestoreOutcome,
-        }
 
         Ok(serde_json::to_value(McpRestoreResponse {
             ok: true,
@@ -1651,7 +1665,7 @@ where
 
 /// Returns the canonical MCP `tools/list` schema descriptors for all 11 Ozone MCP tools.
 #[must_use]
-pub fn mcp_tool_definitions() -> Vec<Value> {
+pub(crate) fn mcp_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "oz_status",
@@ -2187,21 +2201,21 @@ mod tests {
         assert_eq!(radar_json["scanned_workspaces"], json!(["agent-sub"]));
 
         // 9: oz_checkpoint
-        let (is_err, cp_json) = extract_tool_json(&responses[8]);
+        let (is_err, checkpoint_json) = extract_tool_json(&responses[8]);
         assert!(!is_err);
-        assert!(cp_json["op_id"].as_str().unwrap().starts_with("op_"));
+        assert!(checkpoint_json["op_id"].as_str().unwrap().starts_with("op_"));
 
         // 10: oz_undo
         let (is_err, undo_json) = extract_tool_json(&responses[9]);
         assert!(!is_err, "undo error: {undo_json}");
         assert!(undo_json["op_id"].as_str().unwrap().starts_with("op_"));
-        assert_eq!(undo_json["undone_op_ids"][0], cp_json["op_id"]);
+        assert_eq!(undo_json["undone_op_ids"][0], checkpoint_json["op_id"]);
 
         // 11: oz_ci_logs
-        let (is_err, ci_json) = extract_tool_json(&responses[10]);
+        let (is_err, ci_logs_json) = extract_tool_json(&responses[10]);
         assert!(!is_err);
-        assert_eq!(ci_json["all_passed"], false);
-        assert_eq!(ci_json["checks"][0]["name"], "cargo-test");
+        assert_eq!(ci_logs_json["all_passed"], false);
+        assert_eq!(ci_logs_json["checks"][0]["name"], "cargo-test");
     }
 
     #[test]
@@ -2216,7 +2230,7 @@ mod tests {
 
     #[test]
     fn mcp_returns_standard_jsonrpc_error_codes() {
-        let mut server = McpServer::new(None);
+        let server = McpServer::new(None);
 
         // -32700 Parse error
         let r1: Value = serde_json::from_str(
@@ -2313,8 +2327,13 @@ mod tests {
 
     #[test]
     fn mcp_status_omits_lines_by_default_and_includes_on_request() {
+        use std::fmt::Write as _;
+
         let (_parent, repo_dir) = setup_mcp_repo();
-        let big_body: String = (0..400).map(|i| format!("line_{i} = true\n")).collect();
+        let mut big_body = String::new();
+        for i in 0..400 {
+            let _ = writeln!(big_body, "line_{i} = true");
+        }
         fs::write(repo_dir.join("large.txt"), &big_body).expect("write large");
 
         let mut server = McpServer::new(Some(repo_dir));
@@ -2793,5 +2812,100 @@ mod tests {
         assert_eq!(resps.len(), 1);
         let (is_err, _) = extract_tool_json(&resps[0]);
         assert!(!is_err);
+    }
+
+    #[test]
+    fn mcp_concurrent_tools_list_and_status_complete_while_ci_logs_blocks() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_parent, repo_dir) = setup_mcp_repo();
+        fs::write(repo_dir.join("dirty.txt"), "concurrent status check\n").expect("write dirty");
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let release_rx = Mutex::new(release_rx);
+
+        let server = McpServer::new(Some(repo_dir)).with_ci_provider_fn(move |_repo, req| {
+            entered_tx.send(()).expect("signal ci provider entered");
+            release_rx
+                .lock()
+                .expect("lock release_rx")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("wait for release signal");
+            Ok(CiLogsReport {
+                branch: req.branch.clone(),
+                commit_oid: req.commit_oid.clone(),
+                all_passed: true,
+                overall_status: Some("passing".to_string()),
+                failing_count: Some(0),
+                pending_count: Some(0),
+                watch_outcome: Some("all_passed".to_string()),
+                elapsed_secs: Some(1),
+                superseded_by_sha: None,
+                recommended_poll_secs: None,
+                checks: Vec::new(),
+            })
+        });
+
+        let ci_server = server.clone();
+        let ci_handle = std::thread::spawn(move || {
+            ci_server
+                .process_raw_payload(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oz_ci_logs","arguments":{"wait_seconds":120}}}"#,
+                )
+                .expect("oz_ci_logs process_raw_payload")
+                .expect("oz_ci_logs response")
+        });
+
+        // Wait until `oz_ci_logs` is actively blocked inside `CiLogProvider::fetch_ci_logs`.
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("oz_ci_logs must enter provider");
+
+        // On a cloned `McpServer`, both `tools/list` and `oz_status` must complete immediately
+        // without waiting for the blocked `oz_ci_logs` call to release any mutex!
+        let concurrent_server = server.clone();
+        let (fast_tx, fast_rx) = mpsc::channel::<(String, String)>();
+        let fast_handle = std::thread::spawn(move || {
+            let list_raw = concurrent_server
+                .process_raw_payload(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+                .expect("tools/list call")
+                .expect("tools/list response");
+            let status_raw = concurrent_server
+                .process_raw_payload(
+                    r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"oz_status","arguments":{}}}"#,
+                )
+                .expect("oz_status call")
+                .expect("oz_status response");
+            fast_tx
+                .send((list_raw, status_raw))
+                .expect("send concurrent results");
+        });
+
+        let (list_raw, status_raw) = fast_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("concurrent tools/list and oz_status must complete while oz_ci_logs is blocked");
+        fast_handle.join().expect("join fast thread");
+
+        let list_val: Value = serde_json::from_str(&list_raw).expect("parse tools/list");
+        assert_eq!(list_val["id"], 2);
+        assert_eq!(list_val["result"]["tools"].as_array().unwrap().len(), 11);
+
+        let status_val: Value = serde_json::from_str(&status_raw).expect("parse oz_status");
+        assert_eq!(status_val["id"], 3);
+        let (status_err, status_payload) = extract_tool_json(&status_val);
+        assert!(!status_err);
+        assert_eq!(status_payload["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(status_payload["changes"][0]["path"], "dirty.txt");
+
+        // Now unblock `oz_ci_logs` and verify it also completes cleanly.
+        release_tx.send(()).expect("release ci provider");
+        let ci_raw = ci_handle.join().expect("join ci thread");
+        let ci_val: Value = serde_json::from_str(&ci_raw).expect("parse oz_ci_logs");
+        assert_eq!(ci_val["id"], 1);
+        let (ci_err, ci_payload) = extract_tool_json(&ci_val);
+        assert!(!ci_err);
+        assert_eq!(ci_payload["all_passed"], true);
     }
 }

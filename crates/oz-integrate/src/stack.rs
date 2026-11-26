@@ -103,14 +103,9 @@ pub fn stack_status(repo: &OzoneRepo, onto: Option<&str>) -> Result<StackStatusR
 
     let ws_by_branch = map_workspaces_by_branch(&main_repo)?;
     let mut all_branches: Vec<(String, ObjectId)> = Vec::new();
-    let platform = gix_repo
-        .references()
-        .map_err(|err| OzError::Git(err.to_string()))?;
-    for item in platform
-        .local_branches()
-        .map_err(|err| OzError::Git(err.to_string()))?
-    {
-        let mut r = item.map_err(|err| OzError::Git(err.to_string()))?;
+    let platform = gix_repo.references().map_err(OzError::git_source)?;
+    for item in platform.local_branches().map_err(OzError::git_source)? {
+        let mut r = item.map_err(OzError::git_source)?;
         let full = r.name().as_bstr().to_str_lossy().into_owned();
         let short = normalize_branch_short(&full).to_string();
         if short == onto_branch {
@@ -399,10 +394,10 @@ fn execute_stack_rebase_loop(
             let orig_commit_oid = parse_oid(&orig_commit_hex)?;
             let orig_commit = gix_repo
                 .find_commit(orig_commit_oid)
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
             let commit_tree = orig_commit
                 .tree_id()
-                .map_err(|err| OzError::Git(err.to_string()))?
+                .map_err(OzError::git_source)?
                 .detach();
             let parent_tree = match orig_commit.parent_ids().next() {
                 Some(pid) => commit_tree_id(gix_repo, pid.detach())?,
@@ -412,9 +407,7 @@ fn execute_stack_rebase_loop(
             let current_onto_oid = parse_oid(&state.current_onto_oid)?;
             let current_onto_tree = commit_tree_id(gix_repo, current_onto_oid)?;
 
-            let merge_opts = gix_repo
-                .tree_merge_options()
-                .map_err(|err| OzError::Git(err.to_string()))?;
+            let merge_opts = gix_repo.tree_merge_options().map_err(OzError::git_source)?;
             let short_hex = &orig_commit_hex[..orig_commit_hex.len().min(8)];
             let labels = merge_labels("parent", &state.onto_branch, short_hex);
             let mut outcome = gix_repo
@@ -425,14 +418,10 @@ fn execute_stack_rebase_loop(
                     labels,
                     merge_opts,
                 )
-                .map_err(|err| OzError::Git(err.to_string()))?;
+                .map_err(OzError::git_source)?;
 
             if outcome.has_unresolved_conflicts(TreatAsUnresolved::git()) {
-                let merged_tree_id = outcome
-                    .tree
-                    .write()
-                    .map_err(|err| OzError::Git(err.to_string()))?
-                    .detach();
+                let merged_tree_id = outcome.tree.write().map_err(OzError::git_source)?.detach();
                 let (stored_conflicts, conflict_entries) =
                     extract_unresolved_conflicts(gix_repo, &outcome.conflicts, merged_tree_id)?;
 
@@ -481,11 +470,7 @@ fn execute_stack_rebase_loop(
                 });
             }
 
-            let new_tree_id = outcome
-                .tree
-                .write()
-                .map_err(|err| OzError::Git(err.to_string()))?
-                .detach();
+            let new_tree_id = outcome.tree.write().map_err(OzError::git_source)?.detach();
 
             let (new_commit_oid, change_id) = build_rebased_commit_from_original(
                 gix_repo,
@@ -553,7 +538,7 @@ fn finalize_stack_rebase(
         if old_oid != new_oid {
             let full_ref = format!("refs/heads/{}", plan.branch);
             let full_name = FullName::try_from(full_ref.as_str())
-                .map_err(|err| OzError::Git(format!("invalid ref '{full_ref}': {err}")))?;
+                .map_err(|err| OzError::git_context(format!("invalid ref '{full_ref}'"), err))?;
             ref_edits.push(RefEdit::update(
                 full_name,
                 new_oid,
@@ -738,12 +723,12 @@ fn build_rebased_commit_from_original(
 ) -> Result<(ObjectId, String)> {
     let orig_commit = gix_repo
         .find_commit(orig_commit_oid)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let orig_author = orig_commit
         .author()
-        .map_err(|err| OzError::Git(err.to_string()))?
+        .map_err(OzError::git_source)?
         .to_owned()
-        .map_err(|err| OzError::Git(err.to_string()))?;
+        .map_err(OzError::git_source)?;
     let orig_msg = orig_commit.message_raw_sloppy().to_str_lossy().into_owned();
 
     let (author, committer) = resolve_signatures(gix_repo, actor, Some(orig_author))?;
@@ -941,11 +926,9 @@ fn collect_commit_range(
         if Some(cid) == stop_exclusive || !visited.insert(cid) {
             break;
         }
-        let commit = gix_repo
-            .find_commit(cid)
-            .map_err(|err| OzError::Git(err.to_string()))?;
+        let commit = gix_repo.find_commit(cid).map_err(OzError::git_source)?;
         commits.push(cid);
-        cursor = commit.parent_ids().next().map(|id| id.detach());
+        cursor = commit.parent_ids().next().map(gix::Id::detach);
     }
 
     commits.reverse();
@@ -961,9 +944,7 @@ fn count_first_parent_commits(
 }
 
 fn summarize_commit(gix_repo: &gix::Repository, oid: ObjectId) -> Result<StackCommitSummary> {
-    let commit = gix_repo
-        .find_commit(oid)
-        .map_err(|err| OzError::Git(err.to_string()))?;
+    let commit = gix_repo.find_commit(oid).map_err(OzError::git_source)?;
     let raw = commit.message_raw_sloppy().to_str_lossy().into_owned();
     let subject = raw.lines().next().unwrap_or("").trim().to_string();
     let change_id = extract_change_id_from_msg(&raw);

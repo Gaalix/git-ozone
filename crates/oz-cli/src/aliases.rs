@@ -13,7 +13,7 @@ const MAX_ALIAS_EXPANSION_DEPTH: usize = 8;
 
 /// Built-in top-level `oz` subcommands (never shadowed by aliases).
 #[must_use]
-pub fn is_builtin_subcommand(name: &str) -> bool {
+pub(crate) fn is_builtin_subcommand(name: &str) -> bool {
     matches!(
         name,
         "ws" | "status"
@@ -63,7 +63,7 @@ pub fn is_builtin_subcommand(name: &str) -> bool {
 
 /// Expands configured aliases in `args` before clap parses them, preserving leading/trailing
 /// global flags (`--json`, `--agent`, `-C`/`--directory <DIR>`).
-pub fn expand_aliases(args: Vec<OsString>) -> Result<Vec<OsString>> {
+pub(crate) fn expand_aliases(args: Vec<OsString>) -> Result<Vec<OsString>> {
     let Some((subcmd_idx, dir_opt)) = locate_subcommand_and_dir(&args) else {
         return Ok(args);
     };

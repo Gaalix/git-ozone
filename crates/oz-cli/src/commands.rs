@@ -83,7 +83,7 @@ pub struct WsSpawnArgs {
     /// Base revision or commit to branch from (defaults to `HEAD`).
     #[arg(long = "from", value_name = "REV")]
     pub from_ref: Option<String>,
-    /// Explicit CoW backend override (`auto`, `cas_hardlink`, `linux_fuse3`, `linux_ficlone`, `apfs_clonefile`, `windows_refs_clone`, `windows_proj_fs`).
+    /// Explicit `CoW` backend override (`auto`, `cas_hardlink`, `linux_fuse3`, `linux_ficlone`, `apfs_clonefile`, `windows_refs_clone`, `windows_proj_fs`).
     #[arg(long = "backend", value_name = "BACKEND")]
     pub backend: Option<String>,
     /// Skip warm build/dependency cache baseline capture and mtime preservation.
@@ -202,11 +202,11 @@ pub struct CheckpointArgs {
     pub quiet: bool,
 }
 
-/// Inspect recent MVCC OpLog entries (newest first) with `op_...` IDs, operation kinds,
+/// Inspect recent MVCC `OpLog` entries (newest first) with `op_...` IDs, operation kinds,
 /// summaries, and undo/redo cursor status (read-only; use with `oz undo [OP_ID]`).
 #[derive(Debug, Args)]
 pub struct OplogArgs {
-    /// Maximum number of recent OpLog entries to display (default: 20).
+    /// Maximum number of recent `OpLog` entries to display (default: 20).
     #[arg(short = 'n', long = "limit", default_value_t = DEFAULT_OPLOG_LIST_LIMIT, value_name = "N")]
     pub limit: usize,
     /// Include operations across all workspaces instead of only the current workspace.
@@ -214,7 +214,7 @@ pub struct OplogArgs {
     pub all: bool,
 }
 
-/// Sub-10 ms undo of recent OpLog mutations/checkpoints or un-checkpointed edits.
+/// Sub-10 ms undo of recent `OpLog` mutations/checkpoints or un-checkpointed edits.
 ///
 /// Inspect operation IDs (`op_...`) and undo/redo cursors without mutating state via
 /// `oz undo --list` or `oz oplog`.
@@ -225,10 +225,10 @@ pub struct UndoArgs {
     /// Number of sequential operations to undo (defaults to `1`).
     #[arg(long, value_name = "N")]
     pub steps: Option<usize>,
-    /// List recent OpLog entries without mutating repository state (equivalent to `oz oplog`).
+    /// List recent `OpLog` entries without mutating repository state (equivalent to `oz oplog`).
     #[arg(long = "list", conflicts_with_all = ["op_id", "steps"])]
     pub list: bool,
-    /// Maximum number of OpLog entries to display with `--list` (default: 20).
+    /// Maximum number of `OpLog` entries to display with `--list` (default: 20).
     #[arg(short = 'n', long = "limit", value_name = "N", requires = "list")]
     pub limit: Option<usize>,
     /// Include operations across all workspaces when used with `--list`.
@@ -925,7 +925,7 @@ pub struct SyncArgs {
     /// Skip rebasing downstream local stacked branches onto updated base.
     #[arg(long = "no-rebase")]
     pub no_rebase: bool,
-    /// Skip merged CoW workspace & checkpoint garbage collection.
+    /// Skip merged `CoW` workspace & checkpoint garbage collection.
     #[arg(long = "no-gc")]
     pub no_gc: bool,
     /// Skip warm build baseline refresh.
@@ -1241,11 +1241,10 @@ pub(crate) fn handle_ws(
         WsCommand::Spawn(args) => {
             render_command_result(mode, execute_ws_spawn(&args, directory, mode), |env| {
                 let d = &env.data;
-                let commit_suffix = d
-                    .base_commit
-                    .as_deref()
-                    .map(|oid| format!("clean @ {}", &oid[..oid.len().min(12)]))
-                    .unwrap_or_else(|| "clean".to_string());
+                let commit_suffix = d.base_commit.as_deref().map_or_else(
+                    || "clean".to_string(),
+                    |oid| format!("clean @ {}", &oid[..oid.len().min(12)]),
+                );
                 println!(
                     "spawned workspace '{}' on branch '{}' ({}, {}, {:.1} ms) -> {}",
                     d.workspace,
@@ -1316,7 +1315,7 @@ fn execute_ws_spawn(
     let tx = MutationTransaction::begin(&repo, cmd_str, actor, Some(&pre_status.changes))?;
 
     let backend_override = match args.backend.as_deref().map(str::trim) {
-        None | Some("") | Some("auto") => None,
+        None | Some("" | "auto") => None,
         Some(raw) => {
             let parsed = raw
                 .parse::<BackendKind>()
@@ -1494,7 +1493,7 @@ fn execute_ws_gc(
 
     let max_baseline_gb = args.max_gb.unwrap_or(repo.config.max_baseline_gb);
     let baseline_gc = if args.dry_run {
-        Default::default()
+        oz_warm::GcReport::default()
     } else {
         gc_baselines(&repo.layout.ozone_dir, max_baseline_gb)?
     };
@@ -2788,7 +2787,10 @@ fn derive_clone_destination_name(raw_url: &str, bare: bool) -> PathBuf {
         .rsplit(['/', '\\', ':'])
         .find(|seg| !seg.is_empty())
         .unwrap_or("repo");
-    if bare && !last.ends_with(".git") {
+    let has_git_ext = Path::new(last)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("git"));
+    if bare && !has_git_ext {
         PathBuf::from(format!("{last}.git"))
     } else {
         PathBuf::from(last)
@@ -3142,8 +3144,7 @@ pub(crate) fn handle_push(
                 let new_short = r
                     .new_oid
                     .as_deref()
-                    .map(|s| &s[..s.len().min(10)])
-                    .unwrap_or("-");
+                    .map_or("-", |s| &s[..s.len().min(10)]);
                 println!(
                     "  {} -> {} ({new_short}{})",
                     r.local_ref.as_deref().unwrap_or("HEAD"),
@@ -3557,10 +3558,9 @@ fn handle_pr_status(
         for item in &d.prs {
             let verdict = item.review_decision.as_deref().unwrap_or("PENDING");
             let merge_str = match (item.mergeable, item.mergeable_state.as_deref()) {
-                (Some(true), Some(st)) => format!("merge={st}"),
+                (Some(true) | None, Some(st)) => format!("merge={st}"),
                 (Some(true), None) => "merge=clean".to_string(),
                 (Some(false), _) => "merge=CONFLICT".to_string(),
-                (None, Some(st)) => format!("merge={st}"),
                 (None, None) => "merge=unknown".to_string(),
             };
             println!(
@@ -3616,8 +3616,7 @@ fn handle_issue_view(
         let author = issue
             .user
             .as_ref()
-            .map(|u| u.login.as_str())
-            .unwrap_or("unknown");
+            .map_or("unknown", |u| u.login.as_str());
         println!(
             "{kind_label} #{} [{}] {}",
             issue.number,
@@ -3807,11 +3806,7 @@ fn handle_pr_view(args: &PrViewArgs, directory: Option<&Path>, mode: Interaction
         } else {
             pr.state.as_str()
         };
-        let author = pr
-            .user
-            .as_ref()
-            .map(|u| u.login.as_str())
-            .unwrap_or("unknown");
+        let author = pr.user.as_ref().map_or("unknown", |u| u.login.as_str());
         println!("PR #{} [{}] {}", pr.number, state, pr.title);
         println!(
             "  {} -> {}  author={}  (+{}/-{}, {} files)",
@@ -4277,7 +4272,7 @@ pub(crate) fn handle_ci(
             let d = &env.data;
             let conc = d.conclusion.as_deref().unwrap_or(&d.status);
             println!("CI job {} ({}) [{}]", d.job_id, d.name, conc);
-            if let Some(ref step) = d.selected_step.as_ref().or(d.failing_step.as_ref()) {
+            if let Some(step) = d.selected_step.as_ref().or(d.failing_step.as_ref()) {
                 println!("  step: {step}");
             }
             if let Some(ref excerpt) = d.log_excerpt {
@@ -4467,8 +4462,7 @@ pub(crate) fn handle_ci(
             for r in &d.reports {
                 let pr_tag = r
                     .pr_number
-                    .map(|n| format!("PR #{n}"))
-                    .unwrap_or_else(|| r.ref_name.clone());
+                    .map_or_else(|| r.ref_name.clone(), |n| format!("PR #{n}"));
                 let short_sha = &r.commit_sha[..r.commit_sha.len().min(10)];
                 println!(
                     "\n{pr_tag} ({} @ {short_sha}): {} ({} total, {} failing, {} pending)",
@@ -4647,8 +4641,7 @@ fn apply_ci_report_to_envelope<T>(env: &mut Envelope<T>, report: &CiReport) -> E
                 let newer = watch
                     .superseded_by_sha
                     .as_deref()
-                    .map(|s| &s[..s.len().min(10)])
-                    .unwrap_or("newer commit");
+                    .map_or("newer commit", |s| &s[..s.len().min(10)]);
                 let msg = format!("CI watch on {} was superseded by {newer}", report.ref_name);
                 env.ok = false;
                 env.error = Some(EnvelopeError {
@@ -4994,7 +4987,7 @@ fn handle_agent_setup(
 /// Builds an [`McpServer`] wired with a live `oz-github` [`CiLogProvider`](oz_agent::CiLogProvider)
 /// so the `oz_ci_logs` MCP tool queries GitHub / `OZ_GITHUB_API_URL` directly.
 #[must_use]
-pub fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -> McpServer {
+pub(crate) fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<String>) -> McpServer {
     let mut server = McpServer::new(root_dir).with_ci_provider_fn(|repo, req| {
         let max_lines = req
             .max_excerpt_lines
