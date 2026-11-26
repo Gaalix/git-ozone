@@ -19,7 +19,6 @@ gix.workspace = true
 globset.workspace = true
 libc.workspace = true
 oz-core.workspace = true
-oz-vfsd.workspace = true
 oz-warm.workspace = true
 rayon.workspace = true
 reflink-copy.workspace = true
@@ -27,7 +26,11 @@ serde.workspace = true
 serde_json.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+oz-vfsd.workspace = true
+
 [dev-dependencies]
+oz-vfsd.workspace = true
 tempfile.workspace = true
 
 [lints]

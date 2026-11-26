@@ -1015,12 +1015,22 @@ fn pager_selection_and_strict_non_tty_json_agent_suppression() {
 }
 
 #[cfg(unix)]
-fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
-    use std::io::Read;
+fn open_pty_pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     let mut master_fd: libc::c_int = -1;
     let mut slave_fd: libc::c_int = -1;
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_env = "uclibc")
+    ))]
+    let (termp, winp) = (std::ptr::null(), std::ptr::null());
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_env = "uclibc")
+    )))]
+    let (termp, winp) = (std::ptr::null_mut(), std::ptr::null_mut());
+
     // SAFETY: `master_fd` and `slave_fd` are valid writable out-pointers and the optional
     // name/termios/winsize pointers are null as permitted by `openpty(3)`.
     let rc = unsafe {
@@ -1028,8 +1038,8 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
             &raw mut master_fd,
             &raw mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            termp,
+            winp,
         )
     };
     assert_eq!(rc, 0, "openpty failed");
@@ -1037,6 +1047,14 @@ fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
     let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
     // SAFETY: `openpty(3)` returned `0`, yielding newly opened, uniquely owned file descriptors.
     let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    (master, slave)
+}
+
+#[cfg(unix)]
+fn run_pty_pager_verification(repo: &Path, spy_pager: &Path, marker: &Path) {
+    use std::io::Read;
+
+    let (master, slave) = open_pty_pair();
     let mut pty_master = std::fs::File::from(master);
     let drainer = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -1286,7 +1304,6 @@ fn edge_cases_multi_stash_conflicts_no_commit_unborn_and_pty_diff_delta() {
 #[cfg(unix)]
 fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
     use std::io::Read;
-    use std::os::fd::{FromRawFd, OwnedFd};
 
     let marker = scratch.join("diff_pager_invoked");
     let spy = scratch.join("diff-spy.sh");
@@ -1297,24 +1314,7 @@ fn run_pty_diff_and_delta_check(repo: &Path, scratch: &Path) {
     .unwrap();
     fs::set_permissions(&spy, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut master_fd: libc::c_int = -1;
-    let mut slave_fd: libc::c_int = -1;
-    // SAFETY: `master_fd` and `slave_fd` are valid writable out-pointers and the optional
-    // name/termios/winsize pointers are null as permitted by `openpty(3)`.
-    let rc = unsafe {
-        libc::openpty(
-            &raw mut master_fd,
-            &raw mut slave_fd,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty failed");
-    // SAFETY: `openpty(3)` returned `0`, yielding newly opened, uniquely owned file descriptors.
-    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
-    // SAFETY: `openpty(3)` returned `0`, yielding newly opened, uniquely owned file descriptors.
-    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    let (master, slave) = open_pty_pair();
     let mut pty_master = std::fs::File::from(master);
     let drainer = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
