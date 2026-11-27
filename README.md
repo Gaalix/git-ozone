@@ -6,7 +6,6 @@
 [![Release](https://img.shields.io/github/v/release/Gaalix/git-ozone)](https://github.com/Gaalix/git-ozone/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Pure Rust](https://img.shields.io/badge/pure--rust-zero%20C%20bindings-orange.svg)](#tiered-cross-platform-cow-architecture)
-[![Website](https://img.shields.io/badge/site-gaalix.github.io%2Fgit--ozone-brightgreen.svg)](https://gaalix.github.io/git-ozone/)
 
 Ozone operates **100% colocated inside standard `.git/` repositories** — no repository conversion, no lock-in, and full compatibility with `git`, GitHub, IDEs, `gh`, and CI. It eliminates the four failure modes of canonical C `git` under heavy parallel agent workloads:
 
@@ -72,11 +71,16 @@ brew install --formula ./oz.rb
 ### Windows (`winget`)
 
 ```powershell
-winget install OzoneVCS.Ozone
+# Download the checksum-verified winget manifests from the latest GitHub Release
+mkdir oz-winget; cd oz-winget
+foreach ($f in "OzoneVCS.Ozone.yaml","OzoneVCS.Ozone.installer.yaml","OzoneVCS.Ozone.locale.en-US.yaml") {
+  Invoke-WebRequest "https://github.com/Gaalix/git-ozone/releases/latest/download/$f" -OutFile $f
+}
+winget install --manifest .
 ```
 
 > [!NOTE]
-> Checksum-populated Homebrew (`oz.rb`) and `winget` (`OzoneVCS.Ozone*.yaml`) manifests are generated automatically from `SHA256SUMS.txt` and attached to every tagged [GitHub Release](https://github.com/Gaalix/git-ozone/releases). The checked-in files under `packaging/homebrew/` and `packaging/winget/` are release templates; before a release is published (or for direct checksum-verified installs), use `packaging/install.sh` / `packaging/install.ps1` or Cargo above.
+> Checksum-populated Homebrew (`oz.rb`) and `winget` (`OzoneVCS.Ozone*.yaml`) manifests are generated automatically from `SHA256SUMS.txt` and attached to every tagged [GitHub Release](https://github.com/Gaalix/git-ozone/releases). While the community `winget-pkgs` listing (`winget install OzoneVCS.Ozone`) is pending, install from the release manifests above or use the one-line PowerShell installer (`packaging/install.ps1`) or `cargo binstall` above.
 
 ### Verify Your Environment
 
@@ -138,7 +142,7 @@ oz integrate agent-auth agent-billing --into main --verify "cargo test"
 oz blame crates/auth/src/token.rs
 ```
 
-To expose Ozone directly to MCP-capable agents without shell-quoting overhead, configure `oz mcp` as a stdio MCP server (see [docs/quickstart.md](docs/quickstart.md#connecting-oz-mcp)).
+To expose Ozone directly to MCP-capable agents without shell-quoting overhead, register `oz mcp` as a stdio MCP server (`{"command": "oz", "args": ["mcp"]}`).
 
 ---
 
@@ -159,22 +163,25 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz ws <spawn\|list\|rm\|gc>` | Manage isolated CoW/VFS workspaces (`--from`, `--branch`, `--backend`, warm cache LRU GC). |
 | `oz status [--hunks]` | Indexless `O(dirty_files)` status emitting deterministic `[f1]` file and collapsed/full `h1a` hunk IDs. |
 | `oz diff [--base/--rev \| A..B] [--exclude PAT] [--line-numbers] [TARGETS...]` | Histogram unified diffs (working tree or revision ranges) with explicit `old_line`/`new_line`, `--exclude` / `:!<path>`, file/hunk IDs, or `--stat`. |
+| `oz grep <PATTERN> [REV] [-- <PATHS...>]` | Search working-tree files or any Git revision's tree with full Rust regex (`regex-automata`), `-F`, `-i`, `-l`, `--exclude` / `:!<path>`, and line-length caps. |
 | `oz commit -m "..."` | Stage-free commit (`--pick`, `--exclude`, `--amend`, `--no-edit`, `-S/--sign`, `--no-verify`, hooks, guardrails, `Change-Id:`). |
-| `oz log` / `oz show` / `oz rev-parse` | Commit graph (`--oneline`, `--author`, `--grep`, `-S`/`--pickaxe`, `-G`/`--grep-diff`, `--since`, `-- <paths...>`), commit & `<rev>:<path> --lines` blob inspection, and native `rev-parse`. |
+| `oz log` / `oz show` / `oz rev-parse` | Commit graph (`--oneline`, `--left-right`, `--no-notes`, `--format fuller`, `--author`, `--grep`, `-S`/`--pickaxe`, `-G`/`--grep-diff`, `--since`, `-- <paths...>`), commit & `<rev>:<path> --lines` blob inspection, and native `rev-parse`. |
 | `oz stash` | `push` / `pop` / `list` / `drop` backed by MVCC OpLog snapshots so `oz undo` reverses stash operations too. |
+| `oz merge <SOURCES...>` | In-memory 3-way merge (e.g. `origin/main`) into the current branch (`--ff-only`, `--no-ff`, `--verify "<cmd>"`, `--continue`/`--abort`, `OpLog`-reversible via `oz undo`). |
 | `oz cherry-pick` / `oz revert` | In-memory cherry-pick & revert with `--no-commit`, `--json`, and OpLog undo support. |
-| `oz branch` / `oz switch` / `oz tag` | Branch list/create/rename/delete, safe branch switching (`-c`/`-d`/`-f`), and tag management with OpLog undo. |
+| `oz branch [-a\|-r]` / `oz switch` / `oz tag` | Branch list/create/rename/delete, safe branch switching (`-c`/`-d`/`-f`), and tag management with OpLog undo. |
 | `oz restore` | Selectively restore working-tree paths or file IDs (`f1`) from `HEAD` or `--source` (recorded in OpLog for `oz undo`). |
 | `oz checkpoint` | Capture `< 10 ms` MVCC working-tree checkpoint (`-q/--quiet` for agent hooks). |
-| `oz undo [OP_ID \| --steps N]` / `oz redo` | Sub-10 ms OpLog rewind & re-apply for refs and working-tree edits. |
+| `oz oplog [-n N]` / `oz undo [OP_ID \| --steps N \| --list]` / `oz redo` | Inspect recent MVCC `OpLog` entries (`op_...` IDs & cursor) and sub-10 ms rewind & re-apply for refs and working-tree edits. |
 | `oz radar` | Detect overlapping hunks, shared-file edits, and out-of-scope edits across workspaces. |
 | `oz integrate <SOURCES...>` | In-memory 3-way merge into `--into <branch>` with `--verify "<cmd>"` and `_integrate/` sandbox. |
 | `oz resolve <ID \| --all> --take <ours\|theirs\|base>` | Resolve structured conflict IDs (`c1`, `c2`) with optional `--continue`. |
 | `oz stack <status\|rebase>` | Inspect and in-memory rebase stacked branches while preserving `Change-Id:` trailers. |
 | `oz clone` / `oz fetch` / `oz pull` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--ff-only`, `--rebase`, `--atomic`, `--force-with-lease`, `--watch`, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
-| `oz pr <view\|diff\|read\|review\|create\|stack>` | Inspect PRs, view line-numbered PR diffs, read files at PR head, submit pre-validated inline reviews, and create/update single or stacked PRs. |
+| `oz pr <create\|edit\|list\|status\|view\|comments\|reply\|resolve\|diff\|read\|review\|stack>` | Create/edit/list PRs, check one-line multi-PR verdicts, inspect/reply/resolve `[t1]` inline review threads, view line-numbered PR diffs, read files at PR head, submit pre-validated reviews, and push stacked PRs. |
+| `oz issue <view\|list\|comment>` | Inspect, search, and comment on GitHub Issues via REST (`--state`, `--search`, `--label`, `--assignee`, `--limit`). |
 | `oz sync` | Fetch, fast-forward base, retarget stacked PRs, rebase downstream, GC merged workspaces, refresh warm baseline. |
-| `oz ci` | Inspect GitHub Check Runs, watch CI (`--watch --json`), and drill into failing Actions job logs (`--job <id>`). |
+| `oz ci` | Inspect GitHub Check Runs & workflow runs (`--runs`, `--pr`, `--workflow`), watch CI (`--watch --json`), and drill into failing Actions job logs (`--job <id>`). |
 | `oz agent setup` | Install idempotent skills/rules and `oz checkpoint --quiet` hooks for 5 agent harnesses. |
 | `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (11 tools). |
 | `oz blame <PATH>` | Line-level human vs. AI (`refs/notes/ai`) authorship attribution. |
@@ -215,20 +222,17 @@ Measured via `./benchmarks/run_all.sh --full` on **AMD Ryzen 9 7900X** (24 logic
 | **Agent VCBench** (4 canonical tasks, 100% tree parity) | `50` cmds · `4,257` tok~ | — | **`16` cmds · `1,163` tok~** | **-68.0% commands**, **-72.7% tokens** (`-69.7%` lexical) |
 | **10-Agent Concurrent Commits** (distinct / shared `.git/index`) | `0%` distinct / **`73.3%` (`22/30`)** shared | — | **`0.0%` lock errors (`0/30`)** | **Zero `.git/index.lock` errors** (`git fsck` PASS) |
 
-*Honest trade-offs:* If your repo has no build caches at all, raw cold `git worktree add` (`243.9 ms` / `12.2 ms` per ws) is faster than warm `oz ws spawn` (`444.5 ms` incl. `79.7 ms` baseline capture), and C `git` has higher raw throughput on tiny 1-file distinct-branch commits (`1,131.2 c/s` vs `496.0 c/s` due to MVCC OpLog journaling). See **[docs/benchmarks.md](docs/benchmarks.md)** for full per-suite tables, methodology, and reproduction commands.
+*Honest trade-offs:* If your repo has no build caches at all, raw cold `git worktree add` (`243.9 ms` / `12.2 ms` per ws) is faster than warm `oz ws spawn` (`444.5 ms` incl. `79.7 ms` baseline capture), and C `git` has higher raw throughput on tiny 1-file distinct-branch commits (`1,131.2 c/s` vs `496.0 c/s` due to MVCC OpLog journaling). See **[benchmarks/README.md](benchmarks/README.md)** for full per-suite methodology and reproduction commands.
 
 ---
 
 ## Documentation & Resources
 
-* **[Website & Interactive Demo](https://gaalix.github.io/git-ozone/)** — Interactive install commands, `git` vs `oz` comparisons, and live v1.0.0 benchmarks (`site/index.html`).
-* **[Quickstart Guide](docs/quickstart.md)** — Solo developer workflow, `.ozone.toml` configuration, parallel AI agent setups (`oz agent setup`, `oz mcp`), and provenance (`refs/notes/ai`).
-* **[Migrating from `git worktree`](docs/migration-from-git-worktree.md)** — Command mapping table, colocated `.git/` safety, `oz git` shim, and zero-lock-in uninstall steps.
-* **[JSON Schema Reference (`oz.v1`)](docs/json-schema-reference.md)** & **[JSON Schema File](docs/schemas/oz.v1.envelope.schema.json)** — Canonical envelope contract, exit codes (`0`/`1`/`2`), deterministic IDs (`f1`, `h1a`, `c1`), command payload schemas, and `oz mcp` tool definitions.
-* **[Benchmarks & Methodology](docs/benchmarks.md)** & **[Benchmark Suite](benchmarks/README.md)** — Reproducible scripts comparing `git` vs `oz` (and `jj` / `worktrunk` / `simgit` when installed) on 20-agent spawn time/disk, 250k-file `status` latency, VCBench agent token reduction, warm incremental builds, and concurrent commit lock contention.
+* **[JSON Schema Contract (`oz.v1`)](docs/schemas/oz.v1.envelope.schema.json)** — Canonical Draft 2020-12 envelope schema (`schema`, `ok`, `op_id`, `data`, `error`, `conflicts`, `recovery_commands`).
+* **[Reproducible Benchmark Suite](benchmarks/README.md)** — Zero-dependency Python + POSIX bash scripts comparing `git` vs `oz` (and `jj` / `worktrunk` / `simgit` when installed) on 20-agent spawn time/disk, 250k-file `status` latency, VCBench agent token reduction, warm incremental builds, and concurrent commit lock contention.
 * **[Architecture Specification](ARCHITECTURE.md)** — Deep dive into crate boundaries, MVCC OpLog, warm cache `mtime` preservation, and `oz-cloud-api` open-core seams.
-* **[Implementation Roadmap](ROADMAP.md)** & **[Changelog](CHANGELOG.md)** — Milestones 0–5 and release history.
-* **[Contributing](CONTRIBUTING.md)** · **[Security Policy](SECURITY.md)** · **[Code of Conduct](CODE_OF_CONDUCT.md)** — How to contribute, verify pure-Rust supply chain guarantees, and report security issues.
+* **[Implementation Roadmap](ROADMAP.md)** & **[GitHub Releases](https://github.com/Gaalix/git-ozone/releases)** — Milestones 0–5 and release notes / artifacts.
+* **[Contributing](CONTRIBUTING.md)** · **[Security Policy](SECURITY.md)** · **[Code of Conduct](CODE_OF_CONDUCT.md)** — How to contribute, verify pure-Rust supply chain guarantees, and report security issues privately.
 
 ---
 

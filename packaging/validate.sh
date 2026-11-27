@@ -219,7 +219,6 @@ wg_loc_path = winget_dir / "OzoneVCS.Ozone.locale.en-US.yaml"
 yaml_files = [
     pathlib.Path(".github/workflows/ci.yml"),
     pathlib.Path(".github/workflows/release.yml"),
-    pathlib.Path(".github/workflows/pages.yml"),
     wg_ver_path,
     wg_inst_path,
     wg_loc_path,
