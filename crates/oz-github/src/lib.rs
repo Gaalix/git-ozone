@@ -14,6 +14,7 @@ pub mod auth;
 pub mod ci;
 pub mod issue;
 pub mod pr;
+pub mod release;
 pub mod ssh_config;
 pub mod sync;
 pub mod wire;
@@ -22,7 +23,8 @@ pub use api::{
     GitHubActionsJob, GitHubCheckRun, GitHubCheckRunOutput, GitHubClient, GitHubIssue,
     GitHubIssueComment, GitHubIssuePullRequestRef, GitHubJobStep, GitHubLabel, GitHubMilestone,
     GitHubPrRef, GitHubPullRequest, GitHubPullRequestComment, GitHubPullRequestFile,
-    GitHubPullRequestReview, GitHubUser, GitHubWorkflow, GitHubWorkflowRun,
+    GitHubPullRequestReview, GitHubRelease, GitHubReleaseAsset, GitHubUser, GitHubWorkflow,
+    GitHubWorkflowRun,
 };
 pub use auth::{
     DEFAULT_GITHUB_API_URL, DiscoveredToken, GitHubAuthProbe, ParsedGitRemote, RemoteScheme,
@@ -53,6 +55,12 @@ pub use pr::{
     PrStatusOutcome, PrViewFileSummary, PrViewOptions, PrViewOutcome, PrViewReviewSummary,
     StackPrItem, parse_inline_comment_spec, pr_comments, pr_create, pr_diff, pr_edit, pr_list,
     pr_read, pr_reply, pr_resolve, pr_review, pr_stack, pr_status, pr_view,
+};
+pub use release::{
+    ReleaseAssetSummary, ReleaseCreateOptions, ReleaseCreateOutcome, ReleaseEditOptions,
+    ReleaseEditOutcome, ReleaseListItem, ReleaseListOptions, ReleaseListOutcome,
+    ReleaseViewOptions, ReleaseViewOutcome, release_create, release_edit, release_list,
+    release_view,
 };
 pub use ssh_config::{
     ResolvedSshHost, SshConfigSearchContext, format_openssh_command, resolve_ssh_host,

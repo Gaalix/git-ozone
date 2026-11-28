@@ -253,7 +253,7 @@ fn oz_help_groups_subcommands_and_updates_stale_descriptions() {
         "Editing & Undo:",
         "Branches & History:",
         "Workspaces & Stacks:",
-        "Remotes & GitHub (PR / Issue / CI):",
+        "Remotes & GitHub (PR / Issue / CI / Release):",
         "Maintenance, Agents & Setup:",
     ] {
         assert!(

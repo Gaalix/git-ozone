@@ -404,6 +404,95 @@ struct ActionsJobsEnvelope {
     jobs: Vec<GitHubActionsJob>,
 }
 
+/// Binary/file asset attached to a GitHub Release.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubReleaseAsset {
+    pub id: u64,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub download_count: u64,
+    #[serde(default)]
+    pub browser_download_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// GitHub Release representation returned by REST endpoints (`/repos/{owner}/{repo}/releases`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRelease {
+    pub id: u64,
+    pub tag_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_commitish: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default)]
+    pub html_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<GitHubUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub assets: Vec<GitHubReleaseAsset>,
+}
+
+/// Request body for `POST /repos/{owner}/{repo}/releases`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreateReleasePayload {
+    pub tag_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_commitish: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prerelease: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_release_notes: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub make_latest: Option<String>,
+}
+
+/// Partial update payload for `PATCH /repos/{owner}/{repo}/releases/{release_id}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UpdateReleasePayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_commitish: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prerelease: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub make_latest: Option<String>,
+}
+
 /// Outcome of a conditional HTTP GET supporting `If-None-Match` / `ETag` and rate-limit backoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConditionalGet<T> {
@@ -1386,6 +1475,58 @@ impl GitHubClient {
             })?;
             Ok(bytes.to_vec())
         })
+    }
+
+    /// Lists GitHub Releases (`GET /repos/{owner}/{repo}/releases?per_page=...`).
+    pub fn list_releases(
+        &self,
+        owner: &str,
+        repo: &str,
+        per_page: usize,
+        page: u32,
+    ) -> Result<Vec<GitHubRelease>> {
+        let path = format!("/repos/{owner}/{repo}/releases");
+        let mut params = vec![("per_page".to_string(), per_page.clamp(1, 100).to_string())];
+        if page > 1 {
+            params.push(("page".to_string(), page.to_string()));
+        }
+        self.get_json_with_query(&path, &params)
+    }
+
+    /// Fetches the latest published GitHub Release (`GET /repos/{owner}/{repo}/releases/latest`).
+    pub fn get_latest_release(&self, owner: &str, repo: &str) -> Result<GitHubRelease> {
+        let path = format!("/repos/{owner}/{repo}/releases/latest");
+        self.get_json_with_query(&path, &[])
+    }
+
+    /// Fetches a published GitHub Release by tag name (`GET /repos/{owner}/{repo}/releases/tags/{tag}`).
+    pub fn get_release_by_tag(&self, owner: &str, repo: &str, tag: &str) -> Result<GitHubRelease> {
+        let encoded_tag = encode_path_segment(tag);
+        let path = format!("/repos/{owner}/{repo}/releases/tags/{encoded_tag}");
+        self.get_json_with_query(&path, &[])
+    }
+
+    /// Creates a new GitHub Release (`POST /repos/{owner}/{repo}/releases`).
+    pub(crate) fn create_release(
+        &self,
+        owner: &str,
+        repo: &str,
+        payload: &CreateReleasePayload,
+    ) -> Result<GitHubRelease> {
+        let path = format!("/repos/{owner}/{repo}/releases");
+        self.send_json(http::Method::POST, &path, payload)
+    }
+
+    /// Updates an existing GitHub Release by numeric ID (`PATCH /repos/{owner}/{repo}/releases/{release_id}`).
+    pub(crate) fn update_release(
+        &self,
+        owner: &str,
+        repo: &str,
+        release_id: u64,
+        payload: &UpdateReleasePayload,
+    ) -> Result<GitHubRelease> {
+        let path = format!("/repos/{owner}/{repo}/releases/{release_id}");
+        self.send_json(http::Method::PATCH, &path, payload)
     }
 
     fn attach_auth(

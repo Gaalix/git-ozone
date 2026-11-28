@@ -17,6 +17,7 @@ pub(crate) mod git_shim;
 pub(crate) mod maintenance;
 pub(crate) mod pager;
 pub(crate) mod recovery;
+pub(crate) mod release;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use commands::{
@@ -97,8 +98,10 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         &["ws", "radar", "integrate", "resolve", "stack", "sync"],
     ),
     (
-        "Remotes & GitHub (PR / Issue / CI)",
-        &["clone", "fetch", "pull", "push", "pr", "issue", "ci"],
+        "Remotes & GitHub (PR / Issue / CI / Release)",
+        &[
+            "clone", "fetch", "pull", "push", "pr", "issue", "ci", "release",
+        ],
     ),
     (
         "Maintenance, Agents & Setup",
@@ -273,6 +276,9 @@ pub enum Commands {
     Sync(SyncArgs),
     /// Inspect and watch GitHub CI checks, workflow runs, and job logs (`--watch`, `--runs`, `--pr`, `--workflow`, `--job`).
     Ci(CiArgs),
+    /// Manage and inspect GitHub Releases via REST (`list`, `view`, `create`, `edit`).
+    #[command(subcommand)]
+    Release(release::ReleaseCommand),
     /// Configure coding agent harnesses (`setup` for Claude Code, Cursor, Codex CLI, Windsurf, Antigravity).
     #[command(subcommand)]
     Agent(AgentCommand),
@@ -582,6 +588,9 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         Some(Commands::Issue(issue_cmd)) => handle_issue(issue_cmd, target_dir, mode),
         Some(Commands::Sync(args)) => handle_sync(&args, target_dir, mode),
         Some(Commands::Ci(args)) => handle_ci(&args, target_dir, mode),
+        Some(Commands::Release(release_cmd)) => {
+            release::handle_release(release_cmd, target_dir, mode)
+        }
         Some(Commands::Agent(agent_cmd)) => handle_agent(agent_cmd, target_dir, mode),
         Some(Commands::Mcp(args)) => handle_mcp(&args, target_dir, mode),
         Some(Commands::Blame(args)) => handle_blame(&args, target_dir, mode),
