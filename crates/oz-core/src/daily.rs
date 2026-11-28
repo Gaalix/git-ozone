@@ -35,7 +35,7 @@ use gix::refs::{FullName, Target};
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -811,11 +811,26 @@ pub(crate) fn parse_since_timestamp(raw: &str, now: DateTime<Utc>) -> Result<Dat
 // 1. `oz log`
 // ============================================================================
 
+/// Ref decoration style for [`log_commits`] (`--decorate[=short|full|auto|no]` / `--no-decorate`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogDecorate {
+    /// Short ref names (`HEAD -> main`, `tag: v1.0`, `origin/main`).
+    #[default]
+    Short,
+    /// Full ref names (`HEAD -> refs/heads/main`, `tag: refs/tags/v1.0`, `refs/remotes/origin/main`).
+    Full,
+    /// Automatic short decorations.
+    Auto,
+    /// Hide ref decorations (`--no-decorate` / `--decorate=no`).
+    No,
+}
+
 /// Options controlling [`log_commits`].
 #[derive(Debug, Clone)]
 pub struct LogOptions {
     pub rev: Option<String>,
-    /// Optional multiple starting revisions, ranges (`A..B`, `A...B`), or `^exclude` refs.
+    /// Optional multiple starting revisions, ranges (`A..B`, `A...B`), `^exclude` refs, or auto-detected paths.
     pub revs: Vec<String>,
     pub all: bool,
     pub limit: Option<usize>,
@@ -827,6 +842,7 @@ pub struct LogOptions {
     pub search_diff_regex: Option<String>,
     pub since: Option<String>,
     pub graph: bool,
+    pub decorate: LogDecorate,
     pub paths: Vec<String>,
 }
 
@@ -845,6 +861,7 @@ impl Default for LogOptions {
             search_diff_regex: None,
             since: None,
             graph: true,
+            decorate: LogDecorate::Short,
             paths: Vec::new(),
         }
     }
@@ -908,8 +925,11 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
         .map(|s| parse_since_timestamp(s, Utc::now()))
         .transpose()?;
 
+    let (resolved_revs, effective_paths) =
+        split_log_revs_and_paths(repo, &gix_repo, &opts.revs, &opts.paths);
+
     let (starts, hidden, target_label, symmetric_sides) =
-        resolve_log_bounds(repo, &gix_repo, opts)?;
+        resolve_log_bounds(repo, &gix_repo, opts, &resolved_revs)?;
     if starts.is_empty() {
         return Ok(LogReport {
             target_rev: target_label,
@@ -930,13 +950,12 @@ pub fn log_commits(repo: &OzoneRepo, opts: &LogOptions) -> Result<LogReport> {
         HashSet::new()
     };
 
-    let normalized_paths: Vec<LogPathFilter> = opts
-        .paths
+    let normalized_paths: Vec<LogPathFilter> = effective_paths
         .iter()
         .map(|p| LogPathFilter::compile(p))
         .collect::<Result<Vec<_>>>()?;
 
-    let ref_decorations = collect_ref_decorations(repo, &gix_repo)?;
+    let ref_decorations = collect_ref_decorations(repo, &gix_repo, opts.decorate)?;
     let has_content_filter = opts.author.is_some()
         || opts.grep.is_some()
         || opts.search_string.is_some()
@@ -1097,11 +1116,123 @@ fn collect_reachable_excluding(
     Ok(set)
 }
 
+fn resolves_as_log_rev_range(gix_repo: &gix::Repository, spec: &str) -> bool {
+    if let Some((lhs, rhs)) = spec.split_once("...") {
+        let left_spec = if lhs.trim().is_empty() {
+            "HEAD"
+        } else {
+            lhs.trim()
+        };
+        let right_spec = if rhs.trim().is_empty() {
+            "HEAD"
+        } else {
+            rhs.trim()
+        };
+        return resolve_commit_oid(gix_repo, left_spec).is_ok()
+            && resolve_commit_oid(gix_repo, right_spec).is_ok();
+    }
+    if let Some((lhs, rhs)) = spec.split_once("..")
+        && !rhs.starts_with('.')
+    {
+        let left_spec = if lhs.trim().is_empty() {
+            "HEAD"
+        } else {
+            lhs.trim()
+        };
+        let right_spec = if rhs.trim().is_empty() {
+            "HEAD"
+        } else {
+            rhs.trim()
+        };
+        return resolve_commit_oid(gix_repo, left_spec).is_ok()
+            && resolve_commit_oid(gix_repo, right_spec).is_ok();
+    }
+    if let Some(neg) = spec.strip_prefix('^') {
+        return resolve_commit_oid(gix_repo, neg).is_ok();
+    }
+    false
+}
+
+fn path_exists_in_repo_or_head(
+    repo: &OzoneRepo,
+    head_tree: Option<&gix::Tree<'_>>,
+    raw: &str,
+) -> bool {
+    let norm = normalize_grep_pat(raw);
+    if norm.is_empty() || norm == "." {
+        return true;
+    }
+    if repo.workdir_path.join(&norm).exists() {
+        return true;
+    }
+    head_tree.is_some_and(|tree| {
+        tree.lookup_entry_by_path(norm.as_str())
+            .ok()
+            .flatten()
+            .is_some()
+    })
+}
+
+/// Splits positional `oz log` arguments into actual revisions/ranges vs. auto-detected paths
+/// when `--` was not explicitly provided.
+fn split_log_revs_and_paths(
+    repo: &OzoneRepo,
+    gix_repo: &gix::Repository,
+    raw_revs: &[String],
+    explicit_paths: &[String],
+) -> (Vec<String>, Vec<String>) {
+    if !explicit_paths.is_empty() || raw_revs.is_empty() {
+        return (raw_revs.to_vec(), explicit_paths.to_vec());
+    }
+
+    let head_tree = resolve_workspace_head(repo, gix_repo)
+        .ok()
+        .and_then(|h| h.commit_oid)
+        .and_then(|oid| commit_tree_id(gix_repo, oid).ok())
+        .and_then(|tid| gix_repo.find_tree(tid).ok());
+
+    let mut revs = Vec::new();
+    let mut paths = Vec::new();
+    for raw in raw_revs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "HEAD" || resolves_as_log_rev_range(gix_repo, trimmed) {
+            revs.push(raw.clone());
+            continue;
+        }
+        let explicitly_path_shaped = trimmed == "."
+            || trimmed == ".."
+            || trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || trimmed.ends_with('/')
+            || trimmed.contains('*')
+            || trimmed.contains('?')
+            || trimmed.contains('[')
+            || trimmed.contains('{');
+        if explicitly_path_shaped {
+            paths.push(raw.clone());
+            continue;
+        }
+        if resolve_commit_oid(gix_repo, trimmed).is_ok() {
+            revs.push(raw.clone());
+        } else if path_exists_in_repo_or_head(repo, head_tree.as_ref(), trimmed) {
+            paths.push(raw.clone());
+        } else {
+            // Preserve unknown specs as revs so `resolve_log_bounds` reports a clear error.
+            revs.push(raw.clone());
+        }
+    }
+    (revs, paths)
+}
+
 #[allow(clippy::type_complexity)]
 fn resolve_log_bounds(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
     opts: &LogOptions,
+    resolved_revs: &[String],
 ) -> Result<(
     Vec<ObjectId>,
     Vec<ObjectId>,
@@ -1136,7 +1267,7 @@ fn resolve_log_bounds(
     if let Some(ref single) = opts.rev {
         raw_specs.push(single.as_str());
     }
-    for r in &opts.revs {
+    for r in resolved_revs {
         raw_specs.push(r.as_str());
     }
 
@@ -1232,12 +1363,18 @@ fn resolve_log_bounds(
 fn collect_ref_decorations(
     repo: &OzoneRepo,
     gix_repo: &gix::Repository,
+    decorate: LogDecorate,
 ) -> Result<HashMap<ObjectId, Vec<String>>> {
     let mut map: HashMap<ObjectId, Vec<String>> = HashMap::new();
+    if decorate == LogDecorate::No {
+        return Ok(map);
+    }
+    let full = decorate == LogDecorate::Full;
     let head = resolve_workspace_head(repo, gix_repo)?;
 
     if let Some(head_oid) = head.commit_oid {
         let label = match head.branch {
+            Some(ref b) if full => format!("HEAD -> refs/heads/{b}"),
             Some(ref b) => format!("HEAD -> {b}"),
             None => "HEAD".to_string(),
         };
@@ -1248,28 +1385,43 @@ fn collect_ref_decorations(
 
     for item in platform.local_branches().map_err(OzError::git_source)? {
         let mut r = item.map_err(OzError::git_source)?;
-        let name = r.name().shorten().to_str_lossy().into_owned();
-        if head.branch.as_deref() == Some(name.as_str()) {
+        let short_name = r.name().shorten().to_str_lossy().into_owned();
+        if head.branch.as_deref() == Some(short_name.as_str()) {
             continue;
         }
+        let display_name = if full {
+            r.name().as_bstr().to_str_lossy().into_owned()
+        } else {
+            short_name
+        };
         if let Ok(c) = r.peel_to_commit() {
-            map.entry(c.id).or_default().push(name);
+            map.entry(c.id).or_default().push(display_name);
         }
     }
 
     for item in platform.tags().map_err(OzError::git_source)? {
         let mut r = item.map_err(OzError::git_source)?;
-        let name = r.name().shorten().to_str_lossy().into_owned();
+        let display_name = if full {
+            r.name().as_bstr().to_str_lossy().into_owned()
+        } else {
+            r.name().shorten().to_str_lossy().into_owned()
+        };
         if let Ok(c) = r.peel_to_commit() {
-            map.entry(c.id).or_default().push(format!("tag: {name}"));
+            map.entry(c.id)
+                .or_default()
+                .push(format!("tag: {display_name}"));
         }
     }
 
     for item in platform.remote_branches().map_err(OzError::git_source)? {
         let mut r = item.map_err(OzError::git_source)?;
-        let name = r.name().shorten().to_str_lossy().into_owned();
+        let display_name = if full {
+            r.name().as_bstr().to_str_lossy().into_owned()
+        } else {
+            r.name().shorten().to_str_lossy().into_owned()
+        };
         if let Ok(c) = r.peel_to_commit() {
-            map.entry(c.id).or_default().push(name);
+            map.entry(c.id).or_default().push(display_name);
         }
     }
 
@@ -4196,7 +4348,7 @@ pub fn branch_list_with_options(
 // 8. `oz grep` (Working-Tree & Revision-Scoped Pure-Rust Tree Grep)
 // ============================================================================
 
-/// Options controlling [`grep_repo`] (`oz grep <pattern> [<rev>] [-- <paths...>]`).
+/// Options controlling [`grep_repo`] (`oz grep <pattern> [<rev>] [<paths...>]`).
 #[derive(Debug, Clone, Default)]
 pub struct GrepOptions {
     pub pattern: String,
@@ -4212,14 +4364,29 @@ pub struct GrepOptions {
     pub fixed_strings: bool,
     /// Only return matching file paths without individual line entries (`-l` / `--files-with-matches`).
     pub files_with_matches: bool,
-    /// Optional cap on total returned line matches.
+    /// Only return per-file match counts without individual line entries (`-c` / `--count`).
+    pub count_only: bool,
+    /// Number of leading context lines before each match (`-B` / `-C`).
+    pub before_context: usize,
+    /// Number of trailing context lines after each match (`-A` / `-C`).
+    pub after_context: usize,
+    /// Optional cap on total returned matches (`Some(0)` or `None` disables the cap).
     pub max_matches: Option<usize>,
-    /// Optional maximum display length (in characters) per matched line before truncating (`None` or `Some(0)` disables truncation).
+    /// Optional cap on returned matches per file (`-m` / `--max-per-file`; `Some(0)` or `None` disables the cap).
+    pub max_per_file: Option<usize>,
+    /// Optional maximum display length (in characters) per line before truncating (`None` or `Some(0)` disables truncation).
     pub max_line_len: Option<usize>,
 }
 
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
+}
+
+/// Surrounding non-matching context line attached to a [`GrepMatch`] (`-A` / `-B` / `-C`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrepContextLine {
+    pub line_number: usize,
+    pub line: String,
 }
 
 /// Single matching line returned by [`grep_repo`].
@@ -4228,6 +4395,10 @@ pub struct GrepMatch {
     pub path: String,
     pub line_number: usize,
     pub line: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_context: Vec<GrepContextLine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_context: Vec<GrepContextLine>,
 }
 
 /// Structured grep result returned by [`grep_repo`].
@@ -4240,11 +4411,84 @@ pub struct GrepReport {
     pub commit_oid: Option<String>,
     pub total_matches: usize,
     pub matched_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_counts: Option<BTreeMap<String, usize>>,
     pub matches: Vec<GrepMatch>,
     #[serde(default)]
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub omitted_matches: usize,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub omitted_files: usize,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub lines_truncated: usize,
+}
+
+/// Disambiguates positional `oz grep <pattern> [targets...] [-- paths...]` arguments into
+/// `(Option<rev>, paths)` without requiring `--` for working-tree paths.
+///
+/// Disambiguation rules:
+/// - When explicit `-- <paths...>` are provided (`!explicit_paths.is_empty()`), at most one
+///   positional target before `--` is accepted and treated as the revision.
+/// - Without `--`, `targets[0]` is treated as a commit/revision (with `targets[1..]` as paths)
+///   only when it is NOT a pathspec exclusion (`:!` / `:(exclude)`), has no glob metacharacters
+///   (`*`, `?`, `[`, `{`), does not have explicit path syntax (`.`, `..`, `./`, `../`, trailing `/`),
+///   does NOT exist as a path on disk in the working tree, AND resolves to a commit via
+///   `resolve_commit_oid`. Otherwise all `targets` are treated as working-tree path filters.
+pub fn disambiguate_grep_targets(
+    repo: &OzoneRepo,
+    targets: &[String],
+    explicit_paths: &[String],
+) -> Result<(Option<String>, Vec<String>)> {
+    if targets.is_empty() {
+        return Ok((None, explicit_paths.to_vec()));
+    }
+
+    if !explicit_paths.is_empty() {
+        if targets.len() == 1 {
+            return Ok((Some(targets[0].clone()), explicit_paths.to_vec()));
+        }
+        return Err(OzError::InvalidUsage {
+            message: format!(
+                "expected at most one revision before `--`, found {} positional arguments",
+                targets.len()
+            ),
+            recovery: vec![
+                "oz grep <pattern> [<rev>] -- <paths...>".to_string(),
+                "oz grep <pattern> <path1> <path2>".to_string(),
+            ],
+        });
+    }
+
+    let first = targets[0].trim();
+    if first.is_empty()
+        || first.starts_with(":!")
+        || first.starts_with(":(exclude)")
+        || first.contains('*')
+        || first.contains('?')
+        || first.contains('[')
+        || first.contains('{')
+        || first == "."
+        || first == ".."
+        || first.starts_with("./")
+        || first.starts_with("../")
+        || first.ends_with('/')
+    {
+        return Ok((None, targets.to_vec()));
+    }
+
+    // Prefer an existing working-tree path over an identically-named ref when `--` was omitted.
+    let norm = normalize_grep_pat(first);
+    if !norm.is_empty() && repo.workdir_path.join(&norm).exists() {
+        return Ok((None, targets.to_vec()));
+    }
+
+    let gix_repo = open_gix_for_workspace(repo)?;
+    if resolve_commit_oid(&gix_repo, first).is_ok() {
+        Ok((Some(first.to_string()), targets[1..].to_vec()))
+    } else {
+        Ok((None, targets.to_vec()))
+    }
 }
 
 fn normalize_grep_pat(raw: &str) -> String {
@@ -4320,12 +4564,14 @@ struct GrepLineHit {
     line_number: usize,
     line: String,
     was_cut: bool,
+    before_context: Vec<GrepContextLine>,
+    after_context: Vec<GrepContextLine>,
 }
 
 struct FileGrepResult {
     path: String,
-    matches: Vec<GrepLineHit>,
-    truncated: bool,
+    total_file_matches: usize,
+    kept_hits: Vec<GrepLineHit>,
 }
 
 struct GrepWorkerFlush<'a> {
@@ -4352,7 +4598,7 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
     if opts.pattern.is_empty() {
         return Err(OzError::InvalidUsage {
             message: "grep pattern cannot be empty".to_string(),
-            recovery: vec!["oz grep <pattern> [<rev>] [-- <paths...>]".to_string()],
+            recovery: vec!["oz grep <pattern> [<rev>] [<paths...>]".to_string()],
         });
     }
 
@@ -4452,12 +4698,13 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
         })
     };
 
-    let mut matches: Vec<GrepMatch> = Vec::new();
-    let mut matched_files: Vec<String> = Vec::new();
-    let mut truncated = false;
-    let mut lines_truncated = 0usize;
-    let max_matches = opts.max_matches.unwrap_or(usize::MAX);
+    let max_matches = opts.max_matches.filter(|&n| n > 0).unwrap_or(usize::MAX);
+    let max_per_file = opts.max_per_file.filter(|&n| n > 0).unwrap_or(usize::MAX);
+    let per_file_collect_cap = max_matches.min(max_per_file);
     let max_line_len = opts.max_line_len.unwrap_or(0);
+    let need_context = !opts.files_with_matches
+        && !opts.count_only
+        && (opts.before_context > 0 || opts.after_context > 0);
 
     let scan_non_binary_bytes = |rel_path: String, bytes: &[u8]| -> Option<FileGrepResult> {
         let text = String::from_utf8_lossy(bytes);
@@ -4467,86 +4714,110 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
                 if regex.is_match(line) {
                     return Some(FileGrepResult {
                         path: rel_path,
-                        matches: Vec::new(),
-                        truncated: false,
+                        total_file_matches: 1,
+                        kept_hits: Vec::new(),
                     });
                 }
             }
             return None;
         }
 
-        let mut file_hits: Vec<GrepLineHit> = Vec::new();
-        let mut file_truncated = false;
-        for (idx, raw_line) in text.lines().enumerate() {
-            let line = raw_line.trim_end_matches('\r');
-            if regex.is_match(line) {
-                if file_hits.len() >= max_matches {
-                    file_truncated = true;
-                    break;
+        if opts.count_only {
+            let mut total_file_matches = 0usize;
+            for raw_line in text.lines() {
+                let line = raw_line.trim_end_matches('\r');
+                if regex.is_match(line) {
+                    total_file_matches += 1;
                 }
-                let (rendered_line, was_cut) = truncate_grep_line(line, max_line_len);
-                file_hits.push(GrepLineHit {
-                    line_number: idx + 1,
-                    line: rendered_line,
-                    was_cut,
-                });
             }
-        }
-        if file_hits.is_empty() && !file_truncated {
-            None
-        } else {
-            Some(FileGrepResult {
+            return (total_file_matches > 0).then_some(FileGrepResult {
                 path: rel_path,
-                matches: file_hits,
-                truncated: file_truncated,
-            })
+                total_file_matches,
+                kept_hits: Vec::new(),
+            });
         }
-    };
 
-    let commit_oid = if let Some(ref rev_spec) = opts.rev {
-        let mut scan_tree_bytes = |rel_path: &str, bytes: &[u8]| -> bool {
-            if truncated || is_binary_bytes(bytes) {
-                return truncated;
-            }
-            let text = String::from_utf8_lossy(bytes);
-            let mut file_hit = false;
+        if !need_context {
+            let mut kept_hits: Vec<GrepLineHit> = Vec::new();
+            let mut total_file_matches = 0usize;
             for (idx, raw_line) in text.lines().enumerate() {
                 let line = raw_line.trim_end_matches('\r');
                 if regex.is_match(line) {
-                    if !file_hit {
-                        file_hit = true;
-                        matched_files.push(rel_path.to_string());
-                        if opts.files_with_matches {
-                            return false;
-                        }
+                    total_file_matches += 1;
+                    if kept_hits.len() < per_file_collect_cap {
+                        let (rendered_line, was_cut) = truncate_grep_line(line, max_line_len);
+                        kept_hits.push(GrepLineHit {
+                            line_number: idx + 1,
+                            line: rendered_line,
+                            was_cut,
+                            before_context: Vec::new(),
+                            after_context: Vec::new(),
+                        });
                     }
-                    if matches.len() >= max_matches {
-                        truncated = true;
-                        return true;
-                    }
-                    let (rendered_line, was_cut) = truncate_grep_line(line, max_line_len);
-                    if was_cut {
-                        lines_truncated += 1;
-                    }
-                    matches.push(GrepMatch {
-                        path: rel_path.to_string(),
-                        line_number: idx + 1,
-                        line: rendered_line,
-                    });
                 }
             }
-            false
-        };
+            return (total_file_matches > 0).then_some(FileGrepResult {
+                path: rel_path,
+                total_file_matches,
+                kept_hits,
+            });
+        }
 
+        // Context mode: avoid allocating the line vector unless the file has at least one hit.
+        let mut match_indices: Vec<usize> = Vec::new();
+        let mut total_file_matches = 0usize;
+        for (idx, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim_end_matches('\r');
+            if regex.is_match(line) {
+                total_file_matches += 1;
+                if match_indices.len() < per_file_collect_cap {
+                    match_indices.push(idx);
+                }
+            }
+        }
+        if total_file_matches == 0 {
+            return None;
+        }
+        let all_lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).collect();
+        let mut kept_hits = Vec::with_capacity(match_indices.len());
+        for mi in match_indices {
+            let (rendered_line, was_cut) = truncate_grep_line(all_lines[mi], max_line_len);
+            let before_start = mi.saturating_sub(opts.before_context);
+            let before_context = (before_start..mi)
+                .map(|b_idx| GrepContextLine {
+                    line_number: b_idx + 1,
+                    line: truncate_grep_line(all_lines[b_idx], max_line_len).0,
+                })
+                .collect();
+            let after_end = (mi + 1 + opts.after_context).min(all_lines.len());
+            let after_context = ((mi + 1)..after_end)
+                .map(|a_idx| GrepContextLine {
+                    line_number: a_idx + 1,
+                    line: truncate_grep_line(all_lines[a_idx], max_line_len).0,
+                })
+                .collect();
+            kept_hits.push(GrepLineHit {
+                line_number: mi + 1,
+                line: rendered_line,
+                was_cut,
+                before_context,
+                after_context,
+            });
+        }
+        Some(FileGrepResult {
+            path: rel_path,
+            total_file_matches,
+            kept_hits,
+        })
+    };
+
+    let (commit_oid, mut file_results) = if let Some(ref rev_spec) = opts.rev {
         let gix_repo = open_gix_for_workspace(repo)?;
         let cid = resolve_commit_oid(&gix_repo, rev_spec)?;
         let tree_id = commit_tree_id(&gix_repo, cid)?;
         let mut stack: Vec<(String, ObjectId)> = vec![(String::new(), tree_id)];
-        let mut stop = false;
+        let mut results: Vec<FileGrepResult> = Vec::new();
         while let Some((prefix, tid)) = stack.pop() {
-            if stop {
-                break;
-            }
             let tree = gix_repo.find_tree(tid).map_err(OzError::git_source)?;
             let mut subtrees = Vec::new();
             let mut blobs = Vec::new();
@@ -4571,16 +4842,16 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
             blobs.sort_by(|a, b| a.0.cmp(&b.0));
             for (rel, oid) in blobs {
                 if let Ok(bytes) = read_blob_bytes(&gix_repo, oid)
-                    && scan_tree_bytes(&rel, &bytes)
+                    && !is_binary_bytes(&bytes)
+                    && let Some(hit) = scan_non_binary_bytes(rel, &bytes)
                 {
-                    stop = true;
-                    break;
+                    results.push(hit);
                 }
             }
             subtrees.sort_by(|a, b| b.0.cmp(&a.0));
             stack.extend(subtrees);
         }
-        Some(cid.to_hex().to_string())
+        (Some(cid.to_hex().to_string()), results)
     } else {
         let shared_results: std::sync::Mutex<Vec<FileGrepResult>> =
             std::sync::Mutex::new(Vec::new());
@@ -4631,24 +4902,68 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
             })
         });
 
-        let mut file_results = shared_results
+        let results = shared_results
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        file_results.sort_by(|a, b| a.path.cmp(&b.path));
-        if opts.files_with_matches {
-            matched_files = file_results.into_iter().map(|r| r.path).collect();
-        } else {
-            'merge: for file_res in file_results {
-                let mut pushed_file = false;
-                for lm in file_res.matches {
-                    if matches.len() >= max_matches {
-                        truncated = true;
-                        break 'merge;
-                    }
-                    if !pushed_file {
-                        pushed_file = true;
-                        matched_files.push(file_res.path.clone());
-                    }
+        (None, results)
+    };
+
+    file_results.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut matches: Vec<GrepMatch> = Vec::new();
+    let mut matched_files: Vec<String> = Vec::new();
+    let mut file_counts: Option<BTreeMap<String, usize>> = None;
+    let mut truncated = false;
+    let mut omitted_matches = 0usize;
+    let mut omitted_files = 0usize;
+    let mut lines_truncated = 0usize;
+    let total_matches: usize;
+
+    if opts.files_with_matches {
+        total_matches = file_results.len();
+        for file_res in file_results {
+            if matched_files.len() < max_matches {
+                matched_files.push(file_res.path);
+            } else {
+                truncated = true;
+                omitted_files += 1;
+            }
+        }
+    } else if opts.count_only {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut total_all = 0usize;
+        for file_res in file_results {
+            total_all += file_res.total_file_matches;
+            let capped = file_res.total_file_matches.min(max_per_file);
+            if counts.len() < max_matches {
+                matched_files.push(file_res.path.clone());
+                counts.insert(file_res.path, capped);
+                if file_res.total_file_matches > capped {
+                    truncated = true;
+                    omitted_matches += file_res.total_file_matches - capped;
+                    omitted_files += 1;
+                }
+            } else {
+                truncated = true;
+                omitted_matches += file_res.total_file_matches;
+                omitted_files += 1;
+            }
+        }
+        file_counts = Some(counts);
+        total_matches = total_all;
+    } else {
+        let mut total_all = 0usize;
+        for file_res in file_results {
+            total_all += file_res.total_file_matches;
+            let remaining_global = max_matches.saturating_sub(matches.len());
+            let take_n = file_res
+                .kept_hits
+                .len()
+                .min(max_per_file)
+                .min(remaining_global);
+            if take_n > 0 {
+                matched_files.push(file_res.path.clone());
+                for lm in file_res.kept_hits.into_iter().take(take_n) {
                     if lm.was_cut {
                         lines_truncated += 1;
                     }
@@ -4656,25 +4971,20 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
                         path: file_res.path.clone(),
                         line_number: lm.line_number,
                         line: lm.line,
+                        before_context: lm.before_context,
+                        after_context: lm.after_context,
                     });
                 }
-                if file_res.truncated {
-                    truncated = true;
-                    break 'merge;
-                }
             }
-            matches.sort_by(|a, b| {
-                (a.path.as_str(), a.line_number).cmp(&(b.path.as_str(), b.line_number))
-            });
+            let omitted_in_file = file_res.total_file_matches.saturating_sub(take_n);
+            if omitted_in_file > 0 {
+                truncated = true;
+                omitted_matches += omitted_in_file;
+                omitted_files += 1;
+            }
         }
-        None
-    };
-
-    let total_matches = if opts.files_with_matches {
-        matched_files.len()
-    } else {
-        matches.len()
-    };
+        total_matches = total_all;
+    }
 
     Ok(GrepReport {
         pattern: opts.pattern.clone(),
@@ -4682,8 +4992,11 @@ pub fn grep_repo(repo: &OzoneRepo, opts: &GrepOptions) -> Result<GrepReport> {
         commit_oid,
         total_matches,
         matched_files,
+        file_counts,
         matches,
         truncated,
+        omitted_matches,
+        omitted_files,
         lines_truncated,
     })
 }
@@ -5373,7 +5686,7 @@ mod tests {
             vec![("a_dir/first.rs", 4), ("z_dir/second.rs", 3)]
         );
 
-        // 3. Deterministic `max_matches` truncation & `files_with_matches`
+        // 3. Deterministic `max_matches` truncation, true omitted counts, & `files_with_matches`
         let capped = grep_repo(
             &repo,
             &GrepOptions {
@@ -5387,10 +5700,85 @@ mod tests {
         .expect("grep max_matches");
         assert!(capped.truncated);
         assert_eq!(capped.matches.len(), 2);
+        assert_eq!(capped.total_matches, 3);
+        assert_eq!(capped.omitted_matches, 1);
+        assert_eq!(capped.omitted_files, 1);
         assert_eq!(capped.matches[0].path, "a_dir/first.rs");
         assert_eq!(capped.matches[0].line_number, 1);
         assert_eq!(capped.matches[1].path, "a_dir/first.rs");
         assert_eq!(capped.matches[1].line_number, 3);
+
+        // 4. `max_per_file` caps each file independently while reporting exact omitted counts
+        let per_file = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: "foo.bar[0]+".to_string(),
+                ignore_case: true,
+                fixed_strings: true,
+                max_per_file: Some(1),
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep max_per_file");
+        assert!(per_file.truncated);
+        assert_eq!(per_file.matches.len(), 2);
+        assert_eq!(per_file.total_matches, 3);
+        assert_eq!(per_file.omitted_matches, 1);
+        assert_eq!(per_file.omitted_files, 1);
+        assert_eq!(per_file.matches[0].path, "a_dir/first.rs");
+        assert_eq!(per_file.matches[1].path, "z_dir/second.rs");
+
+        // 5. `count_only` (`-c`) populates `file_counts` and `total_matches`
+        let counted = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: "foo.bar[0]+".to_string(),
+                ignore_case: true,
+                fixed_strings: true,
+                count_only: true,
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep -c");
+        assert!(!counted.truncated);
+        assert_eq!(counted.total_matches, 3);
+        assert!(counted.matches.is_empty());
+        let fc = counted.file_counts.expect("file_counts present");
+        assert_eq!(fc.get("a_dir/first.rs"), Some(&2));
+        assert_eq!(fc.get("z_dir/second.rs"), Some(&1));
+
+        // 6. Context lines (`before_context` / `after_context`)
+        let ctx_report = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: r"\bunsafe\b".to_string(),
+                before_context: 1,
+                after_context: 1,
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep context");
+        assert_eq!(ctx_report.matches.len(), 2);
+        assert_eq!(ctx_report.matches[0].line_number, 4);
+        assert_eq!(ctx_report.matches[0].before_context.len(), 1);
+        assert_eq!(ctx_report.matches[0].before_context[0].line_number, 3);
+        assert!(ctx_report.matches[0].after_context.is_empty());
+
+        // 7. `max_matches: Some(0)` explicitly disables capping
+        let uncapped = grep_repo(
+            &repo,
+            &GrepOptions {
+                pattern: "foo.bar[0]+".to_string(),
+                ignore_case: true,
+                fixed_strings: true,
+                max_matches: Some(0),
+                ..GrepOptions::default()
+            },
+        )
+        .expect("grep limit 0");
+        assert!(!uncapped.truncated);
+        assert_eq!(uncapped.matches.len(), 3);
+        assert_eq!(uncapped.omitted_matches, 0);
 
         let files_only = grep_repo(
             &repo,

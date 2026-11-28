@@ -202,7 +202,7 @@ fn parse_leading_git_globals(
     let mut effective_dir = initial_directory.map(Path::to_path_buf);
     let mut delegated_globals = Vec::new();
     let mut config_overrides = Vec::new();
-    let mut no_pager = false;
+    let mut no_pager = crate::pager::is_no_pager_active();
     let mut mode = base_mode;
     let mut subcommand = None;
     let mut subcommand_args = Vec::new();
@@ -264,7 +264,7 @@ fn parse_leading_git_globals(
             continue;
         }
 
-        if s == "--no-pager" {
+        if s == "--no-pager" || s == "-P" {
             no_pager = true;
             delegated_globals.push(arg.clone());
             i += 1;

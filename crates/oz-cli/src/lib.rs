@@ -196,9 +196,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub agent: bool,
 
+    /// Run as if `oz` was started in `<DIR>` instead of the current working directory (before subcommand).
+    #[arg(short = 'C', value_name = "DIR")]
+    pub chdir: Option<PathBuf>,
+
     /// Run as if `oz` was started in `<DIR>` instead of the current working directory.
-    #[arg(short = 'C', long = "directory", value_name = "DIR", global = true)]
+    #[arg(long = "directory", value_name = "DIR", global = true)]
     pub directory: Option<PathBuf>,
+
+    /// Do not pipe output into a pager (equivalent to `git -P` / `git --no-pager`).
+    #[arg(short = 'P', long = "no-pager", global = true)]
+    pub no_pager: bool,
 
     /// Print version information (supports `--json`).
     #[arg(short = 'V', long = "version", global = true)]
@@ -206,6 +214,14 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+impl Cli {
+    /// Returns the effective working directory from `--directory` or top-level `-C`.
+    #[must_use]
+    pub fn effective_directory(&self) -> Option<&Path> {
+        self.directory.as_deref().or(self.chdir.as_deref())
+    }
 }
 
 /// Supported Ozone subcommands.
@@ -264,7 +280,7 @@ pub enum Commands {
     Mcp(McpArgs),
     /// Show line-level human vs. AI (`refs/notes/ai`) authorship attribution for a file.
     Blame(BlameArgs),
-    /// Show commit history graph with filtering (`--oneline`, `-n`, `--author`, `--grep`, `-S`, `-G`, `--since`).
+    /// Show commit history graph with filtering and auto-detected paths (`--oneline`, `-n`, `--decorate`, `--author`, `--grep`, `-S`, `-G`, `--since`).
     Log(LogArgs),
     /// Show commit metadata, `Change-Id`, `refs/notes/ai` provenance, diff, or `<rev>:<path>` blob (`--lines`, `--stat`, `--json`).
     Show(ShowArgs),
@@ -281,7 +297,7 @@ pub enum Commands {
     Tag(TagArgs),
     /// List, create, rename, and delete local or remote-tracking branches (`-a`, `-r`, recorded in `OpLog`).
     Branch(BranchArgs),
-    /// Search working-tree files or any Git revision's tree (`oz grep <pat> [<rev>] [-- <paths...>]`).
+    /// Search working-tree files or any Git revision (`oz grep <pat> [<rev>] [<paths...>]`, `-c`, `-A/-B/-C`, `--limit`, `--max-per-file`).
     Grep(GrepArgs),
     /// Switch branches or detach `HEAD` via native `gix` tree-delta checkout (recorded in `OpLog`).
     Switch(SwitchArgs),
@@ -505,12 +521,15 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
     };
 
     let mode = InteractionMode::detect(cli.json, cli.agent);
+    let _no_pager_guard = pager::NoPagerGuard::enter(cli.no_pager);
 
     if cli.version || matches!(cli.command, Some(Commands::Version)) {
         return handle_version(invocation, mode);
     }
 
-    if let Some(ref dir) = cli.directory
+    let target_dir = cli.effective_directory().map(Path::to_path_buf);
+
+    if let Some(ref dir) = target_dir
         && !matches!(
             cli.command,
             Some(Commands::Clone(_) | Commands::Git(_) | Commands::Version) | None
@@ -533,65 +552,61 @@ pub fn run_with_args(args: Vec<OsString>) -> ExitCode {
         return err.exit_code();
     }
 
+    let target_dir = target_dir.as_deref();
+
     match cli.command {
-        Some(Commands::Ws(ws_cmd)) => handle_ws(ws_cmd, cli.directory.as_deref(), mode),
-        Some(Commands::Status(args)) => handle_status(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Ws(ws_cmd)) => handle_ws(ws_cmd, target_dir, mode),
+        Some(Commands::Status(args)) => handle_status(&args, target_dir, mode),
         Some(Commands::Diff(args)) => {
             if pager::pager_allowed_for_mode(mode) {
-                handle_diff_paged(&args, cli.directory.as_deref(), mode)
+                handle_diff_paged(&args, target_dir, mode)
             } else {
-                handle_diff(&args, cli.directory.as_deref(), mode)
+                handle_diff(&args, target_dir, mode)
             }
         }
-        Some(Commands::Commit(args)) => handle_commit(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Checkpoint(args)) => {
-            handle_checkpoint(&args, cli.directory.as_deref(), mode)
-        }
-        Some(Commands::Oplog(args)) => handle_oplog(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Undo(args)) => handle_undo(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Redo) => handle_redo(cli.directory.as_deref(), mode),
-        Some(Commands::Radar(args)) => handle_radar(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Merge(args)) => handle_merge(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Integrate(args)) => handle_integrate(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Resolve(args)) => handle_resolve(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Stack(stack_cmd)) => handle_stack(stack_cmd, cli.directory.as_deref(), mode),
-        Some(Commands::Clone(args)) => handle_clone(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Fetch(args)) => handle_fetch(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Pull(args)) => handle_pull(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Push(args)) => handle_push(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Pr(pr_cmd)) => handle_pr(pr_cmd, cli.directory.as_deref(), mode),
-        Some(Commands::Issue(issue_cmd)) => handle_issue(issue_cmd, cli.directory.as_deref(), mode),
-        Some(Commands::Sync(args)) => handle_sync(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Ci(args)) => handle_ci(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Agent(agent_cmd)) => handle_agent(agent_cmd, cli.directory.as_deref(), mode),
-        Some(Commands::Mcp(args)) => handle_mcp(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Blame(args)) => handle_blame(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Log(args)) => handle_log(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Show(args)) => handle_show(&args, cli.directory.as_deref(), mode),
-        Some(Commands::RevParse(args)) => handle_rev_parse(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Stash(args)) => handle_stash(&args, cli.directory.as_deref(), mode),
-        Some(Commands::CherryPick(args)) => {
-            handle_cherry_pick(&args, cli.directory.as_deref(), mode)
-        }
-        Some(Commands::Revert(args)) => handle_revert(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Tag(args)) => handle_tag(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Branch(args)) => handle_branch(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Grep(args)) => handle_grep(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Switch(args)) => handle_switch(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Restore(args)) => handle_restore(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Commit(args)) => handle_commit(&args, target_dir, mode),
+        Some(Commands::Checkpoint(args)) => handle_checkpoint(&args, target_dir, mode),
+        Some(Commands::Oplog(args)) => handle_oplog(&args, target_dir, mode),
+        Some(Commands::Undo(args)) => handle_undo(&args, target_dir, mode),
+        Some(Commands::Redo) => handle_redo(target_dir, mode),
+        Some(Commands::Radar(args)) => handle_radar(&args, target_dir, mode),
+        Some(Commands::Merge(args)) => handle_merge(&args, target_dir, mode),
+        Some(Commands::Integrate(args)) => handle_integrate(&args, target_dir, mode),
+        Some(Commands::Resolve(args)) => handle_resolve(&args, target_dir, mode),
+        Some(Commands::Stack(stack_cmd)) => handle_stack(stack_cmd, target_dir, mode),
+        Some(Commands::Clone(args)) => handle_clone(&args, target_dir, mode),
+        Some(Commands::Fetch(args)) => handle_fetch(&args, target_dir, mode),
+        Some(Commands::Pull(args)) => handle_pull(&args, target_dir, mode),
+        Some(Commands::Push(args)) => handle_push(&args, target_dir, mode),
+        Some(Commands::Pr(pr_cmd)) => handle_pr(pr_cmd, target_dir, mode),
+        Some(Commands::Issue(issue_cmd)) => handle_issue(issue_cmd, target_dir, mode),
+        Some(Commands::Sync(args)) => handle_sync(&args, target_dir, mode),
+        Some(Commands::Ci(args)) => handle_ci(&args, target_dir, mode),
+        Some(Commands::Agent(agent_cmd)) => handle_agent(agent_cmd, target_dir, mode),
+        Some(Commands::Mcp(args)) => handle_mcp(&args, target_dir, mode),
+        Some(Commands::Blame(args)) => handle_blame(&args, target_dir, mode),
+        Some(Commands::Log(args)) => handle_log(&args, target_dir, mode),
+        Some(Commands::Show(args)) => handle_show(&args, target_dir, mode),
+        Some(Commands::RevParse(args)) => handle_rev_parse(&args, target_dir, mode),
+        Some(Commands::Stash(args)) => handle_stash(&args, target_dir, mode),
+        Some(Commands::CherryPick(args)) => handle_cherry_pick(&args, target_dir, mode),
+        Some(Commands::Revert(args)) => handle_revert(&args, target_dir, mode),
+        Some(Commands::Tag(args)) => handle_tag(&args, target_dir, mode),
+        Some(Commands::Branch(args)) => handle_branch(&args, target_dir, mode),
+        Some(Commands::Grep(args)) => handle_grep(&args, target_dir, mode),
+        Some(Commands::Switch(args)) => handle_switch(&args, target_dir, mode),
+        Some(Commands::Restore(args)) => handle_restore(&args, target_dir, mode),
         Some(Commands::Completions(args)) => handle_completions(&args, Cli::command(), mode),
-        Some(Commands::Setup(args)) => handle_setup(&args, cli.directory.as_deref(), mode),
+        Some(Commands::Setup(args)) => handle_setup(&args, target_dir, mode),
         Some(Commands::Doctor) => handle_doctor(invocation, &cli, mode),
-        Some(Commands::Gc(args)) => maintenance::handle_gc(&args, cli.directory.as_deref(), mode),
-        Some(Commands::Fsck(args)) => {
-            maintenance::handle_fsck(&args, cli.directory.as_deref(), mode)
-        }
+        Some(Commands::Gc(args)) => maintenance::handle_gc(&args, target_dir, mode),
+        Some(Commands::Fsck(args)) => maintenance::handle_fsck(&args, target_dir, mode),
         Some(Commands::Version) => handle_version(invocation, mode),
         Some(Commands::Git(mut git_args)) => {
             if let Some(raw_tail) = trailing_git_args {
                 git_args.args = raw_tail;
             }
-            git_shim::handle_git(&git_args, cli.directory.as_deref(), mode)
+            git_shim::handle_git(&git_args, target_dir, mode)
         }
         None => {
             let msg = "no subcommand provided; run `oz --help` or `oz doctor --json`";
@@ -614,7 +629,7 @@ fn find_git_subcommand_index(args: &[OsString]) -> Option<usize> {
         let s = args[i].to_string_lossy();
         if matches!(
             s.as_ref(),
-            "--json" | "--agent" | "-V" | "--version" | "-h" | "--help"
+            "--json" | "--agent" | "-P" | "--no-pager" | "-V" | "--version" | "-h" | "--help"
         ) {
             i += 1;
             continue;
@@ -660,7 +675,7 @@ fn handle_version(invocation: CliInvocation, mode: InteractionMode) -> ExitCode 
 }
 
 fn handle_doctor(invocation: CliInvocation, cli: &Cli, mode: InteractionMode) -> ExitCode {
-    match build_doctor_envelope(invocation, cli.directory.as_deref(), mode) {
+    match build_doctor_envelope(invocation, cli.effective_directory(), mode) {
         Ok(env) => {
             if mode.json {
                 print_json_envelope(&env);
@@ -2098,8 +2113,43 @@ mod tests {
             vec!["oz", "status", "--directory", "/tmp/repo"],
         ] {
             let cli = Cli::try_parse_from(&argv).expect("parse directory flag");
-            assert_eq!(cli.directory.as_deref(), Some(Path::new("/tmp/repo")));
+            assert_eq!(cli.effective_directory(), Some(Path::new("/tmp/repo")));
             assert!(matches!(cli.command, Some(Commands::Status(_))));
+        }
+
+        // `-C` is strictly top-level so `oz grep -C 3` and `oz -C <dir> grep -C 3` never collide.
+        let grep_ctx = Cli::try_parse_from(["oz", "grep", "-C", "3", "foo"]).expect("grep -C 3");
+        assert_eq!(grep_ctx.effective_directory(), None);
+        match grep_ctx.command {
+            Some(Commands::Grep(args)) => {
+                assert_eq!(args.context, Some(3));
+                assert_eq!(args.pattern, "foo");
+            }
+            other => panic!("expected Grep, got {other:?}"),
+        }
+
+        let chdir_and_ctx =
+            Cli::try_parse_from(["oz", "-C", "/tmp/repo", "grep", "-C", "2", "foo"])
+                .expect("-C dir grep -C 2");
+        assert_eq!(
+            chdir_and_ctx.effective_directory(),
+            Some(Path::new("/tmp/repo"))
+        );
+        match chdir_and_ctx.command {
+            Some(Commands::Grep(args)) => assert_eq!(args.context, Some(2)),
+            other => panic!("expected Grep, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["oz", "status", "-C", "/tmp/repo"]).is_err());
+
+        // Global `--no-pager` / `-P` works before or after any subcommand.
+        for argv in [
+            vec!["oz", "--no-pager", "log"],
+            vec!["oz", "-P", "log"],
+            vec!["oz", "log", "--no-pager"],
+            vec!["oz", "grep", "-P", "foo"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parse no-pager flag");
+            assert!(cli.no_pager);
         }
 
         let to_os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
@@ -2113,6 +2163,14 @@ mod tests {
         );
         assert_eq!(
             find_git_subcommand_index(&to_os(&["oz", "--directory=/tmp/repo", "git", "status"])),
+            Some(2)
+        );
+        assert_eq!(
+            find_git_subcommand_index(&to_os(&["oz", "--no-pager", "git", "status"])),
+            Some(2)
+        );
+        assert_eq!(
+            find_git_subcommand_index(&to_os(&["oz", "-P", "git", "status"])),
             Some(2)
         );
     }

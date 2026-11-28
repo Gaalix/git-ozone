@@ -941,7 +941,7 @@ cm = "commit -m"
 
     let lg_custom = run_oz(
         &outside,
-        &["--json", "lg", "-C", repo.to_str().unwrap()],
+        &["--json", "lg", "--directory", repo.to_str().unwrap()],
         &[],
     );
     assert_eq!(lg_custom.code, 0, "lg_custom stderr: {}", lg_custom.stderr);

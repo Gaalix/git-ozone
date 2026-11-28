@@ -13,10 +13,39 @@
 //! or when the configured pager is empty or `"cat"`.
 
 use oz_core::InteractionMode;
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+thread_local! {
+    static NO_PAGER_OVERRIDE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard suppressing terminal paging for the current CLI invocation (`--no-pager` / `-P`).
+pub(crate) struct NoPagerGuard {
+    prev: bool,
+}
+
+impl NoPagerGuard {
+    pub(crate) fn enter(no_pager: bool) -> Self {
+        let prev = NO_PAGER_OVERRIDE.with(|flag| flag.replace(no_pager));
+        Self { prev }
+    }
+}
+
+impl Drop for NoPagerGuard {
+    fn drop(&mut self) {
+        NO_PAGER_OVERRIDE.with(|flag| flag.set(self.prev));
+    }
+}
+
+/// Returns `true` when `--no-pager` / `-P` is active for the current CLI invocation.
+#[must_use]
+pub(crate) fn is_no_pager_active() -> bool {
+    NO_PAGER_OVERRIDE.with(Cell::get)
+}
 
 /// Inputs controlling deterministic pager selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +83,10 @@ fn is_truthy_env(val: Option<&str>) -> bool {
 
 /// Returns `true` when paging is permitted for the given [`InteractionMode`].
 ///
-/// Strictly disabled under `--json`, `--agent`, `OZ_AGENT=1`, `CI=1`, or non-TTY stdout.
+/// Strictly disabled under `--no-pager` / `-P`, `--json`, `--agent`, `OZ_AGENT=1`, `CI=1`, or non-TTY stdout.
 #[must_use]
-pub(crate) const fn pager_allowed_for_mode(mode: InteractionMode) -> bool {
-    !mode.json && !mode.agent && !mode.ci && mode.stdout_is_tty
+pub(crate) fn pager_allowed_for_mode(mode: InteractionMode) -> bool {
+    !is_no_pager_active() && !mode.json && !mode.agent && !mode.ci && mode.stdout_is_tty
 }
 
 /// Resolves the active pager purely from explicit inputs without reading ambient process state.
@@ -452,5 +481,26 @@ mod tests {
             }),
             PagerChoice::Disabled
         );
+    }
+
+    #[test]
+    fn no_pager_guard_suppresses_paging_even_on_tty_and_restores_on_drop() {
+        let tty_mode = InteractionMode {
+            non_interactive: false,
+            json: false,
+            agent: false,
+            ci: false,
+            stdout_is_tty: true,
+            stdin_is_tty: true,
+        };
+        assert!(pager_allowed_for_mode(tty_mode));
+        {
+            let _guard = NoPagerGuard::enter(true);
+            assert!(is_no_pager_active());
+            assert!(!pager_allowed_for_mode(tty_mode));
+            assert_eq!(resolve_current_pager(tty_mode), PagerChoice::Disabled);
+        }
+        assert!(!is_no_pager_active());
+        assert!(pager_allowed_for_mode(tty_mode));
     }
 }

@@ -34,6 +34,7 @@ pub(crate) fn is_builtin_subcommand(name: &str) -> bool {
             | "push"
             | "pr"
             | "issue"
+            | "release"
             | "sync"
             | "ci"
             | "agent"
@@ -205,7 +206,7 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
         let s = args[i].to_string_lossy();
         if matches!(
             s.as_ref(),
-            "--json" | "--agent" | "-V" | "--version" | "-h" | "--help"
+            "--json" | "--agent" | "-P" | "--no-pager" | "-V" | "--version" | "-h" | "--help"
         ) {
             i += 1;
             continue;
@@ -243,7 +244,8 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
         return Some((idx, dir_before));
     }
 
-    // Also inspect trailing `-C <DIR>` / `--directory <DIR>` (global clap flag).
+    // Also inspect trailing `--directory <DIR>` / `--directory=<DIR>` (global clap flag;
+    // `-C` is strictly top-level so subcommand flags like `oz grep -C 3` are never misparsed).
     let mut trailing_dir: Option<PathBuf> = None;
     let mut j = idx + 1;
     while j < args.len() {
@@ -251,7 +253,7 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
         if s == "--" {
             break;
         }
-        if s == "-C" || s == "--directory" {
+        if s == "--directory" {
             if let Some(val) = args.get(j + 1) {
                 let cand = PathBuf::from(val);
                 if cand.exists() {
@@ -261,14 +263,7 @@ fn locate_subcommand_and_dir(args: &[OsString]) -> Option<(usize, Option<PathBuf
             j += 2;
             continue;
         }
-        if let Some(rest) = s.strip_prefix("-C")
-            && !rest.is_empty()
-        {
-            let cand = PathBuf::from(rest);
-            if cand.exists() {
-                trailing_dir = Some(cand);
-            }
-        } else if let Some(rest) = s.strip_prefix("--directory=")
+        if let Some(rest) = s.strip_prefix("--directory=")
             && !rest.is_empty()
         {
             let cand = PathBuf::from(rest);
@@ -449,6 +444,7 @@ mod tests {
         let mut shadowed = map.clone();
         shadowed.insert("gc".to_string(), "log".to_string());
         shadowed.insert("fsck".to_string(), "status".to_string());
+        shadowed.insert("release".to_string(), "tag".to_string());
         assert_eq!(
             expand_aliases_with_map(os(&["oz", "gc", "--dry-run"]), &shadowed).unwrap(),
             os(&["oz", "gc", "--dry-run"])
@@ -456,6 +452,18 @@ mod tests {
         assert_eq!(
             expand_aliases_with_map(os(&["oz", "fsck", "--json"]), &shadowed).unwrap(),
             os(&["oz", "fsck", "--json"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "release", "list"]), &shadowed).unwrap(),
+            os(&["oz", "release", "list"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "--no-pager", "st"]), &map).unwrap(),
+            os(&["oz", "--no-pager", "status"])
+        );
+        assert_eq!(
+            expand_aliases_with_map(os(&["oz", "-P", "lg", "-n", "2"]), &map).unwrap(),
+            os(&["oz", "-P", "log", "-n", "2"])
         );
     }
 }

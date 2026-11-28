@@ -16,16 +16,16 @@ use oz_agent::{
 use oz_core::{
     BranchCreateOutcome, BranchDeleteOutcome, BranchListOptions, BranchListReport,
     BranchRenameOutcome, CherryPickOptions, CherryPickOutcome, Envelope, ExitCode, GrepOptions,
-    GrepReport, InteractionMode, LogCommitEntry, LogOptions, OZ_STASH_REF, OzError, OzoneRepo,
-    RestoreOptions, RestoreOutcome, Result, RevParseOptions, RevParseReport, RevertOptions,
-    RevertOutcome, ShowBlobOptions, ShowBlobReport, ShowOptions, ShowReport, StashDropOutcome,
-    StashListReport, StashPopOutcome, StashPushOutcome, SwitchOptions, SwitchOutcome,
-    TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome, apply_stash_pop,
-    branch_create, branch_delete, branch_list_with_options, branch_rename, cherry_pick_commit,
-    compute_status, format_numbered_blob_lines, grep_repo, log_commits, parse_line_range,
-    parse_rev_path_spec, prepare_stash_pop, restore_paths, rev_parse, revert_commit, show_blob,
-    show_commit, stash_drop, stash_list, stash_push, switch_branch, tag_create, tag_delete,
-    tag_list, tag_verify,
+    GrepReport, InteractionMode, LogCommitEntry, LogDecorate, LogOptions, OZ_STASH_REF, OzError,
+    OzoneRepo, RestoreOptions, RestoreOutcome, Result, RevParseOptions, RevParseReport,
+    RevertOptions, RevertOutcome, ShowBlobOptions, ShowBlobReport, ShowOptions, ShowReport,
+    StashDropOutcome, StashListReport, StashPopOutcome, StashPushOutcome, SwitchOptions,
+    SwitchOutcome, TagCreateOptions, TagDeleteOutcome, TagInfo, TagListReport, TagVerifyOutcome,
+    apply_stash_pop, branch_create, branch_delete, branch_list_with_options, branch_rename,
+    cherry_pick_commit, compute_status, disambiguate_grep_targets, format_numbered_blob_lines,
+    grep_repo, log_commits, parse_line_range, parse_rev_path_spec, prepare_stash_pop,
+    restore_paths, rev_parse, revert_commit, show_blob, show_commit, stash_drop, stash_list,
+    stash_push, switch_branch, tag_create, tag_delete, tag_list, tag_verify,
 };
 use oz_oplog::{ActorInfo, ActorKind, MutationTransaction};
 use serde::Serialize;
@@ -112,11 +112,31 @@ where
 // 1. `oz log`
 // ============================================================================
 
+/// Ref decoration mode for `oz log --decorate[=short|full|auto|no]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DecorateWhen {
+    Short,
+    Full,
+    Auto,
+    No,
+}
+
+impl From<DecorateWhen> for LogDecorate {
+    fn from(value: DecorateWhen) -> Self {
+        match value {
+            DecorateWhen::Short => Self::Short,
+            DecorateWhen::Full => Self::Full,
+            DecorateWhen::Auto => Self::Auto,
+            DecorateWhen::No => Self::No,
+        }
+    }
+}
+
 /// Show commit history (`[AI:...]` badges are rendered from local `refs/notes/ai` git notes,
 /// never stored in commit messages; pass `--no-notes` to hide them or `--format fuller` for full author/committer headers).
 #[derive(Debug, Args)]
 pub struct LogArgs {
-    /// Optional starting revision(s), branches, tags, `A..B`, or `A...B` symmetric ranges (defaults to `HEAD`).
+    /// Optional revision(s), ranges (`A..B`, `A...B`), or file/directory paths without `--` (e.g. `oz log -n 5 crates/oz-core`).
     pub revs: Vec<String>,
     /// Optional starting revision passed as a named flag (alias for positional `[REV]`).
     #[arg(long = "rev", value_name = "REV")]
@@ -130,6 +150,22 @@ pub struct LogArgs {
     /// Output format (`oneline`, `medium`, `full`, `fuller`).
     #[arg(long = "format", alias = "pretty", value_name = "FORMAT")]
     pub format: Option<String>,
+    /// Control ref name decorations (`--decorate`, `--decorate=short|full|auto|no`).
+    #[arg(
+        long = "decorate",
+        value_enum,
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "short"
+    )]
+    pub decorate: Option<DecorateWhen>,
+    /// Hide branch/tag ref decorations from log output (equivalent to `--decorate=no`).
+    #[arg(long = "no-decorate", conflicts_with = "decorate")]
+    pub no_decorate: bool,
+    /// Show abbreviated commit hashes (already abbreviated in `--oneline`; accepted for Git parity).
+    #[arg(long = "abbrev-commit")]
+    pub abbrev_commit: bool,
     /// Hide local `refs/notes/ai` provenance badges (`[AI:...]`) from log output.
     #[arg(long = "no-notes")]
     pub no_notes: bool,
@@ -166,7 +202,7 @@ pub struct LogArgs {
     /// When to emit ANSI color escapes (`auto`, `always`, `never`).
     #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
     pub color: ColorWhen,
-    /// Optional file or directory path filters after `--` (e.g. `oz log -n 10 --oneline -- crates/oz-core/`).
+    /// Optional explicit file or directory path filters after `--` (paths also auto-detect without `--`).
     #[arg(last = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }
@@ -230,6 +266,11 @@ pub(crate) fn handle_log(
             });
         }
         let repo = discover_and_recover_repo(directory, false)?;
+        let decorate = if args.no_decorate {
+            LogDecorate::No
+        } else {
+            args.decorate.map_or(LogDecorate::Short, LogDecorate::from)
+        };
         let opts = LogOptions {
             rev: args.rev_flag.clone(),
             revs: args.revs.clone(),
@@ -243,6 +284,7 @@ pub(crate) fn handle_log(
             search_diff_regex: args.search_diff_regex.clone(),
             since: args.since.clone(),
             graph: !args.no_graph,
+            decorate,
             paths: args.paths.clone(),
         };
         let report = log_commits(&repo, &opts)?;
@@ -1795,37 +1837,119 @@ pub(crate) fn handle_switch(
 // 10. `oz grep` (working-tree & rev-scoped tree grep)
 // ============================================================================
 
+/// Default match cap applied in `--agent` / `OZ_AGENT=1` mode when neither `--limit`/`--max-matches`,
+/// `-l`, nor `-c` was explicitly passed (override with `--limit 0`).
+pub const DEFAULT_AGENT_GREP_LIMIT: usize = 100;
+
 /// Search working-tree files or any committed revision (`origin/main`) using Rust/ERE regex (`a|b`, NOT Git BRE `a\|b`).
+///
+/// Paths work directly without `--` (e.g. `oz grep 'foo|bar' crates/a crates/b`), and a leading
+/// revision also works with or without `--` (e.g. `oz grep foo origin/main crates/a`).
 #[derive(Debug, Args)]
 pub struct GrepArgs {
     /// Rust/ERE regex (e.g. `foo|bar`, not `foo\|bar`) or literal string with `-F`.
     pub pattern: String,
-    /// Optional revision, branch, or remote-tracking ref (e.g. `origin/main`) to search without checking out.
-    pub rev: Option<String>,
+    /// Optional revision (e.g. `origin/main`) and/or path filters without `--` (e.g. `oz grep pat crates/a crates/b`).
+    #[arg(value_name = "REV_OR_PATH")]
+    pub targets: Vec<String>,
     /// Case-insensitive matching (`-i` / `--ignore-case`).
     #[arg(short = 'i', long = "ignore-case")]
     pub ignore_case: bool,
     /// Match pattern as a literal substring instead of a regular expression (`-F` / `--fixed-strings`).
     #[arg(short = 'F', long = "fixed-strings")]
     pub fixed_strings: bool,
+    /// Use extended regular expressions (always enabled by default; accepted for `git grep` / `rg` parity).
+    #[arg(short = 'E', long = "extended-regexp")]
+    pub extended_regexp: bool,
+    /// Prefix each match with its filename (always enabled by default; accepted for `git grep` / `rg` parity).
+    #[arg(short = 'H', long = "with-filename")]
+    pub with_filename: bool,
     /// Show 1-based line numbers (always enabled by default; accepted for `git grep` / `rg` parity).
     #[arg(short = 'n', long = "line-number")]
     pub line_number: bool,
     /// Only output matching file paths (`-l` / `--files-with-matches`).
     #[arg(short = 'l', long = "files-with-matches")]
     pub files_with_matches: bool,
+    /// Only output per-file match counts (`path:N`; `-c` / `--count`).
+    #[arg(short = 'c', long = "count", conflicts_with = "files_with_matches")]
+    pub count: bool,
+    /// Show `<N>` lines of trailing context after each match (`-A` / `--after-context`).
+    #[arg(short = 'A', long = "after-context", value_name = "N")]
+    pub after_context: Option<usize>,
+    /// Show `<N>` lines of leading context before each match (`-B` / `--before-context`).
+    #[arg(short = 'B', long = "before-context", value_name = "N")]
+    pub before_context: Option<usize>,
+    /// Show `<N>` lines of context before and after each match (`-C` / `--context`).
+    #[arg(short = 'C', long = "context", value_name = "N")]
+    pub context: Option<usize>,
     /// Exclude matching file paths, directory prefixes, or globs (repeatable, e.g. `--exclude '*.json' --exclude snapshots/`).
     #[arg(long = "exclude", num_args = 1.., action = clap::ArgAction::Append, value_name = "PATTERN")]
     pub exclude: Vec<String>,
-    /// Cap total returned line matches.
-    #[arg(long = "max-matches", value_name = "N")]
+    /// Cap total returned matches (pass `0` to disable; defaults to 100 in `--agent` mode).
+    #[arg(long = "max-matches", visible_alias = "limit", value_name = "N")]
     pub max_matches: Option<usize>,
-    /// Truncate individual matched lines longer than `<N>` characters (default: 400; pass `0` to disable).
+    /// Cap returned matches per file (`-m` / `--max-per-file` / `--max-count`; pass `0` to disable).
+    #[arg(
+        short = 'm',
+        long = "max-per-file",
+        visible_alias = "max-count",
+        value_name = "N"
+    )]
+    pub max_per_file: Option<usize>,
+    /// Truncate individual lines longer than `<N>` characters (default: 400; pass `0` to disable).
     #[arg(long = "max-line-len", default_value_t = 400, value_name = "N")]
     pub max_line_len: usize,
-    /// Optional path prefixes, file paths, globs, or `:!<path>` exclusions after `--` (e.g. `oz grep foo origin/main -- tvva-ui/`).
+    /// Optional explicit path prefixes, file paths, globs, or `:!<path>` exclusions after `--`.
     #[arg(last = true, value_name = "PATH")]
     pub paths: Vec<String>,
+}
+
+fn format_grep_truncation_footer(
+    d: &GrepReport,
+    files_with_matches: bool,
+    effective_max_matches: Option<usize>,
+    effective_max_per_file: Option<usize>,
+) -> String {
+    if files_with_matches {
+        let file_word = if d.omitted_files == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        return format!(
+            "... truncated: +{} more {file_word} (pass --limit 0 for all)\n",
+            d.omitted_files
+        );
+    }
+
+    let match_word = if d.omitted_matches == 1 {
+        "match"
+    } else {
+        "matches"
+    };
+    let file_word = if d.omitted_files == 1 {
+        "file"
+    } else {
+        "files"
+    };
+
+    let hit_global_cap = effective_max_matches.is_some_and(|cap| {
+        if d.file_counts.is_some() {
+            d.matched_files.len() >= cap
+        } else {
+            d.matches.len() >= cap
+        }
+    });
+    let hint = match (hit_global_cap, effective_max_per_file.is_some()) {
+        (true, true) => "pass --limit 0 --max-per-file 0 for all",
+        (false, true) => "pass --max-per-file 0 for all",
+        _ => "pass --limit 0 for all",
+    };
+
+    format!(
+        "... truncated: +{} more {match_word} across {} {file_word} ({hint})\n",
+        d.omitted_matches, d.omitted_files
+    )
 }
 
 pub(crate) fn handle_grep(
@@ -1834,19 +1958,36 @@ pub(crate) fn handle_grep(
     mode: InteractionMode,
 ) -> ExitCode {
     let bre_alternation_hint = !args.fixed_strings && args.pattern.contains(r"\|");
+    let before_context = args.before_context.or(args.context).unwrap_or(0);
+    let after_context = args.after_context.or(args.context).unwrap_or(0);
+    let effective_max_matches = match args.max_matches {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None if mode.agent && !args.files_with_matches && !args.count => {
+            Some(DEFAULT_AGENT_GREP_LIMIT)
+        }
+        None => None,
+    };
+    let effective_max_per_file = args.max_per_file.filter(|&n| n > 0);
+
     let res = (|| -> Result<Envelope<GrepReport>> {
         let repo = discover_and_recover_repo(directory, false)?;
+        let (rev, paths) = disambiguate_grep_targets(&repo, &args.targets, &args.paths)?;
         let report = grep_repo(
             &repo,
             &GrepOptions {
                 pattern: args.pattern.clone(),
-                rev: args.rev.clone(),
-                paths: args.paths.clone(),
+                rev,
+                paths,
                 excludes: args.exclude.clone(),
                 ignore_case: args.ignore_case,
                 fixed_strings: args.fixed_strings,
                 files_with_matches: args.files_with_matches,
-                max_matches: args.max_matches,
+                count_only: args.count,
+                before_context,
+                after_context,
+                max_matches: effective_max_matches,
+                max_per_file: effective_max_per_file,
                 max_line_len: (args.max_line_len > 0).then_some(args.max_line_len),
             },
         )?;
@@ -1872,10 +2013,67 @@ pub(crate) fn handle_grep(
             for f in &d.matched_files {
                 let _ = writeln!(out, "{prefix}{f}");
             }
+        } else if args.count {
+            if let Some(ref counts) = d.file_counts {
+                for (path, count) in counts {
+                    let _ = writeln!(out, "{prefix}{path}:{count}");
+                }
+            }
+        } else if before_context > 0 || after_context > 0 {
+            let mut idx = 0usize;
+            let mut file_idx = 0usize;
+            while idx < d.matches.len() {
+                let path = d.matches[idx].path.as_str();
+                let mut end = idx + 1;
+                while end < d.matches.len() && d.matches[end].path == path {
+                    end += 1;
+                }
+                if file_idx > 0 {
+                    out.push_str("--\n");
+                }
+                let mut file_lines: BTreeMap<usize, (bool, &str)> = BTreeMap::new();
+                for m in &d.matches[idx..end] {
+                    for ctx in &m.before_context {
+                        file_lines
+                            .entry(ctx.line_number)
+                            .or_insert((false, ctx.line.as_str()));
+                    }
+                    file_lines.insert(m.line_number, (true, m.line.as_str()));
+                    for ctx in &m.after_context {
+                        file_lines
+                            .entry(ctx.line_number)
+                            .or_insert((false, ctx.line.as_str()));
+                    }
+                }
+                let mut prev_line: Option<usize> = None;
+                for (line_no, (is_match, text)) in file_lines {
+                    if let Some(prev) = prev_line
+                        && line_no > prev + 1
+                    {
+                        out.push_str("--\n");
+                    }
+                    prev_line = Some(line_no);
+                    if is_match {
+                        let _ = writeln!(out, "{prefix}{path}:{line_no}:{text}");
+                    } else {
+                        let _ = writeln!(out, "{prefix}{path}-{line_no}-{text}");
+                    }
+                }
+                file_idx += 1;
+                idx = end;
+            }
         } else {
             for m in &d.matches {
                 let _ = writeln!(out, "{prefix}{}:{}:{}", m.path, m.line_number, m.line);
             }
+        }
+        if d.truncated {
+            out.push_str(&format_grep_truncation_footer(
+                d,
+                args.files_with_matches,
+                effective_max_matches,
+                effective_max_per_file,
+            ));
         }
         if !out.is_empty() {
             emit_paged_output(mode, &out)?;
