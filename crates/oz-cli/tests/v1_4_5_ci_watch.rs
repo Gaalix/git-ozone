@@ -23,7 +23,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1020,5 +1020,135 @@ fn human_output_renders_clickable_urls_for_ci_runs_workflow_and_job() {
     assert!(
         s_job.contains("url: https://github.com/acme/rocket/actions/runs/900/job/701"),
         "`oz ci --job` must print job URL, got:\n{s_job}"
+    );
+}
+
+#[test]
+fn mcp_oz_ci_logs_workflow_filter_and_watch_peels_annotated_tag() {
+    let tmp = TempDir::new().expect("tmp");
+    let sha = init_repo(tmp.path(), "main", "https://github.com/acme/rocket.git");
+    run_git(tmp.path(), &["tag", "-a", "v1.4.5", "-m", "Release v1.4.5"]);
+
+    let mut jobs_by_run = HashMap::new();
+    jobs_by_run.insert(
+        601,
+        vec![GitHubActionsJob {
+            id: 801,
+            run_id: Some(601),
+            name: "publish-release".to_string(),
+            status: "completed".to_string(),
+            conclusion: Some("success".to_string()),
+            html_url: Some("https://github.com/acme/rocket/actions/runs/601/job/801".to_string()),
+            steps: vec![],
+        }],
+    );
+
+    let mock = MockGitHub::start(MockState {
+        workflows: vec![GitHubWorkflow {
+            id: 42,
+            name: "Release".to_string(),
+            path: ".github/workflows/release.yml".to_string(),
+            state: "active".to_string(),
+        }],
+        workflow_run_steps: vec![
+            vec![make_wf_run(
+                601,
+                "Release",
+                "v1.4.5",
+                &sha,
+                "in_progress",
+                None,
+            )],
+            vec![make_wf_run(
+                601,
+                "Release",
+                "v1.4.5",
+                &sha,
+                "completed",
+                Some("success"),
+            )],
+        ],
+        jobs_by_run,
+        ..Default::default()
+    });
+
+    let mut child = Command::new(oz_bin())
+        .current_dir(tmp.path())
+        .env("GITHUB_TOKEN", "test-tok")
+        .env("OZ_GITHUB_API_URL", mock.base_url())
+        .env("OZ_CI_POLL_INTERVAL_MS", "15")
+        .args(["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oz mcp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let reqs = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-03-26", "clientInfo": { "name": "test", "version": "1.0" } }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "oz_ci_logs",
+                "arguments": {
+                    "directory": tmp.path().to_string_lossy(),
+                    "workflow": "Release",
+                    "commit_oid": "v1.4.5",
+                    "wait_seconds": 5
+                }
+            }
+        }),
+    ];
+    for r in &reqs {
+        writeln!(stdin, "{}", serde_json::to_string(r).unwrap()).unwrap();
+    }
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("mcp wait");
+    assert!(
+        output.status.success(),
+        "oz mcp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("jsonrpc line"))
+        .collect();
+    assert_eq!(lines.len(), 2);
+
+    let payload: Value =
+        serde_json::from_str(lines[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["ok"], true, "payload: {payload}");
+    assert_eq!(payload["all_passed"], true);
+    assert_eq!(payload["watch_outcome"], "passed");
+    assert_eq!(payload["commit_oid"], sha);
+    assert_eq!(payload["checks"][0]["name"], "publish-release");
+    assert_eq!(payload["checks"][0]["run_id"], 601);
+    assert_eq!(payload["checks"][0]["job_id"], 801);
+
+    let reqs = mock.state.lock().unwrap().requests.clone();
+    let wf_run_reqs: Vec<&RecordedRequest> = reqs
+        .iter()
+        .filter(|r| r.path.contains("/actions/workflows/42/runs"))
+        .collect();
+    assert!(!wf_run_reqs.is_empty(), "expected workflow 42 run queries");
+    assert!(
+        wf_run_reqs
+            .iter()
+            .all(|r| r.query.get("head_sha").map(String::as_str) == Some(sha.as_str())),
+        "annotated tag v1.4.5 must peel to commit SHA in head_sha query, got: {wf_run_reqs:?}"
+    );
+    assert!(
+        wf_run_reqs.iter().all(|r| !r.query.contains_key("branch")),
+        "tag rev must NOT be sent as ?branch=, got: {wf_run_reqs:?}"
     );
 }

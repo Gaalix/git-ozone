@@ -75,6 +75,8 @@ pub struct CiLogsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
     #[serde(default)]
     pub raw: bool,
@@ -978,12 +980,26 @@ impl McpSessionSnapshot {
             });
         };
 
+        let workflow = args
+            .workflow
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty());
+        let (branch, commit_oid) = if workflow.is_some() {
+            (args.branch, args.commit_oid)
+        } else {
+            (
+                args.branch.or_else(|| repo.branch.clone()),
+                args.commit_oid.or_else(|| repo.head_oid.clone()),
+            )
+        };
+
         let req = CiLogsRequest {
-            branch: args.branch.or_else(|| repo.branch.clone()),
-            commit_oid: args.commit_oid.or_else(|| repo.head_oid.clone()),
+            branch,
+            commit_oid,
             pr_number: args.pr_number,
             run_id: args.run_id,
             job_id: args.job_id,
+            workflow,
             step: args.step,
             raw: args.raw.unwrap_or(false),
             max_excerpt_lines: args.max_excerpt_lines,
@@ -1347,6 +1363,7 @@ struct CiLogsToolArgs {
     pr_number: Option<u64>,
     run_id: Option<u64>,
     job_id: Option<u64>,
+    workflow: Option<String>,
     step: Option<String>,
     raw: Option<bool>,
     max_excerpt_lines: Option<usize>,
@@ -1785,7 +1802,7 @@ pub(crate) fn mcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "oz_ci_logs",
-            "description": "Fetch GitHub CI check status, compact failing step logs, optional bounded long-poll watching (wait_seconds <= 120), or single-job log drill-down (job_id).",
+            "description": "Fetch GitHub CI check status, workflow-level runs (workflow), compact failing step logs, optional bounded long-poll watching (wait_seconds <= 120), or single-job log drill-down (job_id).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1794,6 +1811,7 @@ pub(crate) fn mcp_tool_definitions() -> Vec<Value> {
                     "pr_number": { "type": "integer" },
                     "run_id": { "type": "integer" },
                     "job_id": { "type": "integer", "description": "Directly fetch cleaned logs for a single GitHub Actions job ID." },
+                    "workflow": { "type": "string", "description": "Optional GitHub Actions workflow filename (e.g. 'release.yml'), path, numeric ID, or display name to inspect or watch." },
                     "step": { "type": "string", "description": "Optional step name filter when inspecting a job_id." },
                     "raw": { "type": "boolean", "description": "Return cleaned tail lines instead of error-anchor excerpts (with job_id)." },
                     "max_excerpt_lines": { "type": "integer", "minimum": 1, "description": "Maximum lines per failing check or job log excerpt (default: 40)." },
@@ -2911,5 +2929,90 @@ mod tests {
         let (ci_err, ci_payload) = extract_tool_json(&ci_val);
         assert!(!ci_err);
         assert_eq!(ci_payload["all_passed"], true);
+    }
+
+    #[test]
+    fn mcp_ci_logs_supports_workflow_parameter_and_keeps_11_tools() {
+        let (_parent, repo_dir) = setup_mcp_repo();
+        let captured = Arc::new(Mutex::new(Vec::<CiLogsRequest>::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        let mut server = McpServer::new(Some(repo_dir)).with_ci_provider_fn(move |_repo, req| {
+            captured_clone
+                .lock()
+                .expect("lock captured")
+                .push(req.clone());
+            Ok(CiLogsReport {
+                branch: req.branch.clone(),
+                commit_oid: req.commit_oid.clone(),
+                all_passed: true,
+                overall_status: Some("passing".to_string()),
+                failing_count: Some(0),
+                pending_count: Some(0),
+                watch_outcome: req.wait_seconds.map(|_| "passed".to_string()),
+                elapsed_secs: req.wait_seconds.map(|_| 1),
+                superseded_by_sha: None,
+                recommended_poll_secs: None,
+                checks: vec![CiLogEntry {
+                    name: req
+                        .workflow
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                    status: "completed".to_string(),
+                    conclusion: Some("success".to_string()),
+                    failing_step: None,
+                    log_excerpt: None,
+                    job_id: Some(777),
+                    run_id: Some(501),
+                    html_url: Some("https://github.com/acme/rocket/actions/runs/501".to_string()),
+                }],
+            })
+        });
+
+        let reqs = [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"oz_ci_logs","arguments":{"workflow":"Release"}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"oz_ci_logs","arguments":{"workflow":"Release","commit_oid":"v1.4.5","wait_seconds":30}}}),
+        ];
+        let mut input = Vec::new();
+        for req in &reqs {
+            input.extend_from_slice(&encode_msg(MessageFraming::JsonLine, req));
+        }
+        let mut out = Vec::new();
+        server
+            .serve_stdio(Cursor::new(input), &mut out)
+            .expect("serve_stdio");
+        let resps = decode_all_responses(MessageFraming::JsonLine, &out);
+        assert_eq!(resps.len(), 3);
+
+        let tools = resps[0]["result"]["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 11, "oz mcp must stay at 11 tools");
+        let ci_tool = tools
+            .iter()
+            .find(|t| t["name"] == "oz_ci_logs")
+            .expect("oz_ci_logs schema");
+        assert_eq!(
+            ci_tool["inputSchema"]["properties"]["workflow"]["type"],
+            "string"
+        );
+
+        let (err1, p1) = extract_tool_json(&resps[1]);
+        assert!(!err1, "workflow call err: {p1}");
+        assert_eq!(p1["all_passed"], true);
+        assert_eq!(p1["checks"][0]["name"], "Release");
+
+        let (err2, p2) = extract_tool_json(&resps[2]);
+        assert!(!err2, "workflow watch call err: {p2}");
+        assert_eq!(p2["watch_outcome"], "passed");
+
+        let seen = captured.lock().expect("lock captured");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].workflow.as_deref(), Some("Release"));
+        assert_eq!(seen[0].branch, None);
+        assert_eq!(seen[0].commit_oid, None);
+        assert_eq!(seen[1].workflow.as_deref(), Some("Release"));
+        assert_eq!(seen[1].branch, None);
+        assert_eq!(seen[1].commit_oid.as_deref(), Some("v1.4.5"));
+        assert_eq!(seen[1].wait_seconds, Some(30));
     }
 }

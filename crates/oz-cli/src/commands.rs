@@ -5362,6 +5362,142 @@ pub(crate) fn build_mcp_server(root_dir: Option<PathBuf>, session_id: Option<Str
             });
         }
 
+        // Workflow-level CI lookup/watch (`workflow` provided).
+        if let Some(ref workflow) = req.workflow {
+            let (branch_filter, head_sha_filter) = if req.commit_oid.is_some() {
+                let (_, sha) = oz_github::ci::resolve_workflow_target_filters(
+                    repo,
+                    None,
+                    req.commit_oid.as_deref(),
+                );
+                let (br, _) = oz_github::ci::resolve_workflow_target_filters(
+                    repo,
+                    req.branch.as_deref(),
+                    None,
+                );
+                (br, sha)
+            } else {
+                oz_github::ci::resolve_workflow_target_filters(repo, req.branch.as_deref(), None)
+            };
+            let wf_opts = CiWorkflowOptions {
+                workflow: workflow.clone(),
+                branch: branch_filter,
+                head_sha: head_sha_filter,
+                min_created_at: None,
+                ignore_run_ids: std::collections::HashSet::new(),
+                limit: 1,
+                max_excerpt_lines: max_lines,
+                include_checks: req.check_filter.clone(),
+                ignore_checks: req.ignore_checks.clone(),
+                remote: None,
+                auth_token: None,
+                api_url: None,
+            };
+            let wait_secs = req.wait_seconds.unwrap_or(0).min(MAX_MCP_WAIT_SECONDS);
+            let wf_report = if wait_secs > 0 {
+                let startup_secs = req.startup_timeout_seconds.unwrap_or(30).min(wait_secs);
+                let watch_opts = CiWatchOptions {
+                    query: CiQueryOptions::default(),
+                    fail_fast: req.fail_fast.unwrap_or(true),
+                    timeout: Duration::from_secs(wait_secs),
+                    startup_timeout: Duration::from_secs(startup_secs),
+                    poll_interval: resolve_ci_poll_interval(None),
+                };
+                watch_workflow_ci_status(repo, &wf_opts, &watch_opts, |_| {})?
+            } else {
+                query_workflow_ci_status(repo, &wf_opts)?
+            };
+
+            let watch_meta = wf_report.watch;
+            let latest_run = wf_report.runs.into_iter().next();
+            let (branch, commit_oid, checks) = if let Some(run) = latest_run {
+                let run_branch = run.branch.or(wf_report.branch_filter);
+                let run_sha = (!run.commit_sha.is_empty())
+                    .then_some(run.commit_sha)
+                    .or(wf_report.head_sha_filter);
+                let entries: Vec<CiLogEntry> = if run.jobs.is_empty() {
+                    let is_failing_run = matches!(
+                        run.conclusion.as_deref(),
+                        Some(
+                            "failure"
+                                | "timed_out"
+                                | "cancelled"
+                                | "action_required"
+                                | "startup_failure"
+                                | "stale"
+                        )
+                    );
+                    if req.failing_only && !is_failing_run {
+                        Vec::new()
+                    } else {
+                        vec![CiLogEntry {
+                            name: run.workflow_name.unwrap_or(wf_report.workflow),
+                            status: run.status,
+                            conclusion: run.conclusion,
+                            failing_step: None,
+                            log_excerpt: None,
+                            job_id: None,
+                            run_id: Some(run.run_id),
+                            html_url: run.html_url,
+                        }]
+                    }
+                } else {
+                    run.jobs
+                        .into_iter()
+                        .filter(|c| {
+                            if !req.failing_only {
+                                return true;
+                            }
+                            matches!(
+                                c.conclusion.as_deref(),
+                                Some(
+                                    "failure"
+                                        | "timed_out"
+                                        | "cancelled"
+                                        | "action_required"
+                                        | "startup_failure"
+                                        | "stale"
+                                )
+                            )
+                        })
+                        .map(|c| CiLogEntry {
+                            name: c.name,
+                            status: c.status,
+                            conclusion: c.conclusion,
+                            failing_step: c.failing_step,
+                            log_excerpt: c.log_excerpt,
+                            job_id: c.job_id,
+                            run_id: c.run_id.or(Some(run.run_id)),
+                            html_url: c.html_url.or_else(|| run.html_url.clone()),
+                        })
+                        .collect()
+                };
+                (run_branch, run_sha, entries)
+            } else {
+                (
+                    wf_report.branch_filter,
+                    wf_report.head_sha_filter,
+                    Vec::new(),
+                )
+            };
+
+            return Ok(CiLogsReport {
+                branch,
+                commit_oid,
+                all_passed: wf_report.all_passed,
+                overall_status: Some(wf_report.overall_status),
+                failing_count: Some(wf_report.failing_count),
+                pending_count: Some(wf_report.pending_count),
+                watch_outcome: watch_meta.as_ref().map(|w| w.outcome.as_str().to_string()),
+                elapsed_secs: watch_meta.as_ref().map(|w| w.elapsed_secs),
+                superseded_by_sha: watch_meta
+                    .as_ref()
+                    .and_then(|w| w.superseded_by_sha.clone()),
+                recommended_poll_secs: watch_meta.as_ref().and_then(|w| w.recommended_poll_secs),
+                checks,
+            });
+        }
+
         let explicit_commit_override = req
             .commit_oid
             .as_deref()
