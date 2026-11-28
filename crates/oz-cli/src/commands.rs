@@ -472,6 +472,9 @@ pub struct PushArgs {
     /// Watch GitHub CI checks for the pushed commit until pass, fail-fast, or timeout.
     #[arg(short = 'w', long = "watch")]
     pub watch: bool,
+    /// Watch a specific GitHub Actions workflow after pushing (requires `--watch`, e.g. `oz push origin v0.7.0 --watch --workflow Release`).
+    #[arg(long = "workflow", value_name = "WORKFLOW")]
+    pub workflow: Option<String>,
     /// Exit immediately on the first failing CI check when `--watch` is enabled (default).
     #[arg(long = "fail-fast")]
     pub fail_fast: bool,
@@ -939,8 +942,8 @@ pub struct SyncArgs {
 /// Inspect and watch GitHub CI checks, workflow runs, and job logs (`--watch`, `--runs`, `--pr`, `--workflow`, `--job`).
 #[derive(Debug, Args)]
 pub struct CiArgs {
-    /// Target Git revision, branch, or commit SHA to inspect.
-    #[arg(long = "ref", value_name = "REV")]
+    /// Target Git revision, branch, tag, or commit SHA to inspect.
+    #[arg(long = "ref", visible_alias = "rev", value_name = "REV")]
     pub target_ref: Option<String>,
     /// Target branch name to inspect.
     #[arg(long = "branch", value_name = "BRANCH")]
@@ -3016,6 +3019,22 @@ pub(crate) fn handle_pull(
     })
 }
 
+#[derive(Debug, Serialize)]
+struct PushWithWorkflowOutcome {
+    #[serde(flatten)]
+    push: PushOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_ci: Option<CiWorkflowReport>,
+}
+
+struct PushedCiInfo {
+    target_ref: Option<String>,
+    head_sha: Option<String>,
+    branch: Option<String>,
+    is_tag: bool,
+    display_ref: Option<String>,
+}
+
 pub(crate) fn handle_push(
     args: &PushArgs,
     directory: Option<&Path>,
@@ -3031,6 +3050,27 @@ pub(crate) fn handle_push(
         };
         return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {});
     }
+    if args.workflow.is_some() && !args.watch {
+        let err = OzError::InvalidUsage {
+            message: "`--workflow` on `oz push` requires `--watch`".to_string(),
+            recovery: vec![
+                "oz push origin <tag> --watch --workflow Release --json".to_string(),
+                "oz push --watch --workflow ci.yml --json".to_string(),
+            ],
+        };
+        return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {});
+    }
+    if args
+        .workflow
+        .as_deref()
+        .is_some_and(|w| w.trim().is_empty())
+    {
+        let err = OzError::InvalidUsage {
+            message: "`--workflow` requires a non-empty workflow filename, ID, or name".to_string(),
+            recovery: vec!["oz push origin <tag> --watch --workflow Release --json".to_string()],
+        };
+        return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {});
+    }
     if args.fail_fast && args.wait_all {
         let err = OzError::InvalidUsage {
             message: "cannot pass both `--fail-fast` and `--wait-all` to `oz push`".to_string(),
@@ -3042,9 +3082,38 @@ pub(crate) fn handle_push(
         return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {});
     }
 
-    let push_res = (|| -> Result<(OzoneRepo, PushOutcome)> {
+    let push_res = (|| -> Result<(OzoneRepo, PushOutcome, Option<CiWorkflowReport>)> {
         let repo = discover_and_recover_repo(directory, false)?;
         let actor = actor_from_mode(mode, &repo);
+
+        // Snapshot pre-existing workflow/check IDs BEFORE pushing so tag pushes and
+        // `--watch --workflow` wait for newly triggered runs instead of short-circuiting
+        // on previously completed runs for the same commit SHA.
+        let mut preexisting_wf_run_ids = std::collections::HashSet::new();
+        let mut preexisting_ci_snapshot = oz_github::ci::CiPrePushSnapshot::default();
+        if args.watch {
+            let (pre_branch, pre_sha, pre_is_tag) =
+                resolve_pre_push_watch_hint(&repo, &args.refspecs);
+            if let Some(ref wf) = args.workflow {
+                let pre_wf_opts = CiWorkflowOptions {
+                    workflow: wf.clone(),
+                    branch: if pre_is_tag { None } else { pre_branch },
+                    head_sha: pre_sha,
+                    remote: args.remote.clone(),
+                    ..CiWorkflowOptions::default()
+                };
+                preexisting_wf_run_ids =
+                    oz_github::ci::snapshot_preexisting_workflow_run_ids(&repo, &pre_wf_opts);
+            } else if pre_is_tag && let Some(ref sha) = pre_sha {
+                preexisting_ci_snapshot = oz_github::ci::snapshot_preexisting_ci_ids(
+                    &repo,
+                    args.remote.as_deref(),
+                    sha,
+                    None,
+                    None,
+                );
+            }
+        }
 
         let mut use_default_lease = false;
         let mut lease_specs = Vec::new();
@@ -3070,46 +3139,112 @@ pub(crate) fn handle_push(
         };
 
         let mut outcome = push_refs_with_options(&repo, &opts, args.no_verify, &[], actor)?;
+        let mut workflow_ci: Option<CiWorkflowReport> = None;
 
         if args.watch {
-            let target_ref = select_pushed_ci_target(&repo, &outcome);
+            let pushed_info = select_pushed_ci_info(&repo, &outcome);
             let emit_progress =
                 args.progress || (mode.stdout_is_tty && !mode.json && !mode.non_interactive);
-            let watch_opts = CiWatchOptions {
-                query: CiQueryOptions {
-                    target_ref,
-                    pr_number: None,
-                    remote: args.remote.clone(),
+            let poll_interval = resolve_ci_poll_interval(args.interval);
+
+            if let Some(ref workflow) = args.workflow {
+                let wf_opts = CiWorkflowOptions {
+                    workflow: workflow.clone(),
+                    branch: pushed_info.branch.clone(),
+                    head_sha: pushed_info.head_sha.clone(),
+                    min_created_at: None,
+                    ignore_run_ids: preexisting_wf_run_ids,
+                    limit: 1,
                     max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
                     include_checks: args.checks.clone(),
                     ignore_checks: args.ignore_checks.clone(),
+                    remote: args.remote.clone(),
                     auth_token: None,
                     api_url: None,
-                },
-                fail_fast: !args.wait_all,
-                timeout: Duration::from_secs(args.timeout),
-                startup_timeout: Duration::from_secs(args.startup_timeout),
-                poll_interval: resolve_ci_poll_interval(args.interval),
-            };
-            let ci_report = watch_ci_status(&repo, &watch_opts, |ev| {
-                if emit_progress {
-                    render_watch_progress_event(&ev);
-                }
-            })?;
-            outcome.ci = Some(ci_report);
+                };
+                let watch_opts = CiWatchOptions {
+                    query: CiQueryOptions::default(),
+                    fail_fast: !args.wait_all,
+                    timeout: Duration::from_secs(args.timeout),
+                    startup_timeout: Duration::from_secs(args.startup_timeout),
+                    poll_interval,
+                };
+                let wf_report = watch_workflow_ci_status(&repo, &wf_opts, &watch_opts, |ev| {
+                    if emit_progress {
+                        render_watch_progress_event(&ev);
+                    }
+                })?;
+                outcome.ci = Some(workflow_report_to_ci_report(
+                    &wf_report,
+                    pushed_info.display_ref.as_deref(),
+                    pushed_info.head_sha.as_deref(),
+                ));
+                workflow_ci = Some(wf_report);
+            } else {
+                let target_ref = select_pushed_ci_target(&repo, &outcome);
+                let watch_opts = CiWatchOptions {
+                    query: CiQueryOptions {
+                        target_ref,
+                        pr_number: None,
+                        remote: args.remote.clone(),
+                        max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
+                        include_checks: args.checks.clone(),
+                        ignore_checks: args.ignore_checks.clone(),
+                        auth_token: None,
+                        api_url: None,
+                    },
+                    fail_fast: !args.wait_all,
+                    timeout: Duration::from_secs(args.timeout),
+                    startup_timeout: Duration::from_secs(args.startup_timeout),
+                    poll_interval,
+                };
+                let ci_report = if pushed_info.is_tag
+                    && (!preexisting_ci_snapshot.check_run_ids.is_empty()
+                        || !preexisting_ci_snapshot.workflow_run_ids.is_empty())
+                {
+                    let grace = if args.startup_timeout == DEFAULT_WATCH_STARTUP_TIMEOUT_SECS {
+                        Duration::from_secs(15)
+                    } else {
+                        Duration::from_secs(args.startup_timeout)
+                    };
+                    oz_github::ci::watch_ci_status_after_push(
+                        &repo,
+                        &watch_opts,
+                        &preexisting_ci_snapshot,
+                        Some(grace),
+                        |ev| {
+                            if emit_progress {
+                                render_watch_progress_event(&ev);
+                            }
+                        },
+                    )?
+                } else {
+                    watch_ci_status(&repo, &watch_opts, |ev| {
+                        if emit_progress {
+                            render_watch_progress_event(&ev);
+                        }
+                    })?
+                };
+                outcome.ci = Some(ci_report);
+            }
         }
 
-        Ok((repo, outcome))
+        Ok((repo, outcome, workflow_ci))
     })();
 
-    let (repo, outcome) = match push_res {
-        Ok(pair) => pair,
+    let (repo, outcome, workflow_ci) = match push_res {
+        Ok(triple) => triple,
         Err(err) => return render_command_result::<PushOutcome, _>(mode, Err(err), |_| {}),
     };
 
     let op_id = outcome.op_id.clone();
     let ci_snapshot = outcome.ci.clone();
-    let mut env = Envelope::success(outcome)
+    let wf_snapshot = workflow_ci.clone();
+    let payload = PushWithWorkflowOutcome {
+        push: outcome,
+        workflow_ci,
+    };
+    let mut env = Envelope::success(payload)
         .with_workspace(repo.workspace)
         .with_branch(repo.branch)
         .with_head_oid(repo.head_oid);
@@ -3119,7 +3254,9 @@ pub(crate) fn handle_push(
             .with_recovery_command(format!("oz undo {id}"));
     }
 
-    let exit_code = if let Some(ref ci_report) = ci_snapshot {
+    let exit_code = if let Some(ref wf_report) = wf_snapshot {
+        apply_workflow_report_to_envelope(&mut env, wf_report)
+    } else if let Some(ref ci_report) = ci_snapshot {
         apply_ci_report_to_envelope(&mut env, ci_report)
     } else {
         ExitCode::Success
@@ -3128,7 +3265,7 @@ pub(crate) fn handle_push(
     if mode.json {
         print_json_envelope(&env);
     } else {
-        let d = &env.data;
+        let d = &env.data.push;
         println!(
             "Pushed {} ref(s) to '{}' ({} objects, {} bytes)",
             d.pushed_refs.len(),
@@ -3149,7 +3286,9 @@ pub(crate) fn handle_push(
                 );
             }
         }
-        if let Some(ref ci_report) = d.ci {
+        if let Some(ref wf_report) = env.data.workflow_ci {
+            render_workflow_report_human(wf_report);
+        } else if let Some(ref ci_report) = d.ci {
             render_ci_report_human(ci_report);
         }
     }
@@ -3157,28 +3296,157 @@ pub(crate) fn handle_push(
     exit_code
 }
 
-fn select_pushed_ci_target(repo: &OzoneRepo, outcome: &PushOutcome) -> Option<String> {
-    if let Some(ref active_branch) = repo.branch {
-        let expected_remote = format!("refs/heads/{active_branch}");
-        if let Some(pushed) = outcome
-            .pushed_refs
-            .iter()
-            .find(|r| !r.deleted && r.remote_ref == expected_remote)
-        {
-            return pushed
-                .new_oid
-                .clone()
-                .or_else(|| Some(active_branch.clone()));
+fn resolve_pre_push_watch_hint(
+    repo: &OzoneRepo,
+    refspecs: &[String],
+) -> (Option<String>, Option<String>, bool) {
+    for raw in refspecs {
+        let spec = raw.trim().trim_start_matches('+');
+        if spec.is_empty() || spec.starts_with(':') {
+            continue;
         }
+        let (src, dst) = spec
+            .split_once(':')
+            .map_or((spec, spec), |(s, d)| (s.trim(), d.trim()));
+        if src.is_empty() {
+            continue;
+        }
+        let is_tag = dst.starts_with("refs/tags/") || oz_github::ci::is_local_tag_ref(repo, src);
+        let peeled_sha = oz_github::ci::peel_rev_to_commit_sha(repo, src);
+        let branch = if is_tag {
+            None
+        } else if let Some(b) = dst.strip_prefix("refs/heads/") {
+            Some(b.to_string())
+        } else if let Some(b) = src.strip_prefix("refs/heads/") {
+            Some(b.to_string())
+        } else if src != "HEAD" {
+            Some(src.to_string())
+        } else {
+            repo.branch.clone()
+        };
+        return (branch, peeled_sha, is_tag);
     }
-    if let Some(pushed) = outcome
-        .pushed_refs
-        .iter()
-        .find(|r| !r.deleted && r.new_oid.is_some())
-    {
-        return pushed.new_oid.clone();
+
+    let head_sha = repo
+        .head_oid
+        .clone()
+        .or_else(|| oz_github::ci::peel_rev_to_commit_sha(repo, "HEAD"));
+    (repo.branch.clone(), head_sha, false)
+}
+
+fn workflow_report_to_ci_report(
+    wf: &CiWorkflowReport,
+    display_ref: Option<&str>,
+    fallback_sha: Option<&str>,
+) -> CiReport {
+    let latest = wf.runs.first();
+    let checks = latest.map(|r| r.jobs.clone()).unwrap_or_default();
+    let total_count = if !checks.is_empty() {
+        checks.len()
+    } else {
+        usize::from(latest.is_some())
+    };
+    let overall_status = if wf.overall_status == "no_runs" {
+        "no_checks".to_string()
+    } else {
+        wf.overall_status.clone()
+    };
+    let commit_sha = latest
+        .map(|r| r.commit_sha.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| wf.head_sha_filter.clone())
+        .or_else(|| fallback_sha.map(str::to_string))
+        .unwrap_or_default();
+    let ref_name = display_ref
+        .map(str::to_string)
+        .or_else(|| wf.branch_filter.clone())
+        .or_else(|| latest.and_then(|r| r.branch.clone()))
+        .unwrap_or_else(|| wf.workflow.clone());
+    let html_url = latest.and_then(|r| r.html_url.clone());
+
+    CiReport {
+        ref_name,
+        commit_sha,
+        pr_number: None,
+        html_url,
+        overall_status,
+        all_passed: wf.all_passed,
+        total_count,
+        failing_count: wf.failing_count,
+        pending_count: wf.pending_count,
+        passed_count: 0,
+        passed_checks: Vec::new(),
+        checks,
+        watch: wf.watch.clone(),
     }
-    repo.branch.clone().or_else(|| repo.head_oid.clone())
+}
+
+fn select_pushed_ci_info(repo: &OzoneRepo, outcome: &PushOutcome) -> PushedCiInfo {
+    let selected = repo
+        .branch
+        .as_ref()
+        .and_then(|active_branch| {
+            let expected_remote = format!("refs/heads/{active_branch}");
+            outcome
+                .pushed_refs
+                .iter()
+                .find(|r| !r.deleted && r.remote_ref == expected_remote)
+        })
+        .or_else(|| {
+            outcome
+                .pushed_refs
+                .iter()
+                .find(|r| !r.deleted && r.new_oid.is_some())
+        });
+
+    if let Some(pushed) = selected {
+        let is_tag = pushed.remote_ref.starts_with("refs/tags/");
+        let peeled_oid = pushed
+            .new_oid
+            .as_deref()
+            .and_then(|oid| oz_github::ci::peel_rev_to_commit_sha(repo, oid))
+            .or_else(|| {
+                pushed
+                    .local_ref
+                    .as_deref()
+                    .and_then(|r| oz_github::ci::peel_rev_to_commit_sha(repo, r))
+            })
+            .or_else(|| pushed.new_oid.clone());
+        let branch = pushed
+            .remote_ref
+            .strip_prefix("refs/heads/")
+            .map(str::to_string);
+        let display_ref = pushed
+            .remote_ref
+            .strip_prefix("refs/tags/")
+            .or_else(|| pushed.remote_ref.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+            .or_else(|| peeled_oid.clone());
+        let target_ref = peeled_oid.clone().or_else(|| branch.clone());
+        return PushedCiInfo {
+            target_ref,
+            head_sha: peeled_oid,
+            branch: if is_tag { None } else { branch },
+            is_tag,
+            display_ref,
+        };
+    }
+
+    let head_sha = repo
+        .head_oid
+        .clone()
+        .or_else(|| oz_github::ci::peel_rev_to_commit_sha(repo, "HEAD"));
+    PushedCiInfo {
+        target_ref: repo.branch.clone().or_else(|| head_sha.clone()),
+        head_sha,
+        branch: repo.branch.clone(),
+        is_tag: false,
+        display_ref: repo.branch.clone(),
+    }
+}
+
+fn select_pushed_ci_target(repo: &OzoneRepo, outcome: &PushOutcome) -> Option<String> {
+    select_pushed_ci_info(repo, outcome).target_ref
 }
 
 fn read_body_or_file(body: Option<&str>, body_file: Option<&str>) -> Result<Option<String>> {
@@ -4260,6 +4528,11 @@ pub(crate) fn handle_ci(
             let d = &env.data;
             let conc = d.conclusion.as_deref().unwrap_or(&d.status);
             println!("CI job {} ({}) [{}]", d.job_id, d.name, conc);
+            if let Some(ref url) = d.html_url
+                && !url.is_empty()
+            {
+                println!("  url: {url}");
+            }
             if let Some(step) = d.selected_step.as_ref().or(d.failing_step.as_ref()) {
                 println!("  step: {step}");
             }
@@ -4318,6 +4591,11 @@ pub(crate) fn handle_ci(
                     "  run {} [{}] {}  branch={} sha={} event={}",
                     run.run_id, conc, wf, br, short_sha, ev
                 );
+                if let Some(ref url) = run.html_url
+                    && !url.is_empty()
+                {
+                    println!("    url: {url}");
+                }
             }
         }
         return ExitCode::Success;
@@ -4327,9 +4605,17 @@ pub(crate) fn handle_ci(
     if let Some(ref workflow) = args.workflow {
         let wf_res = (|| -> Result<(OzoneRepo, CiWorkflowReport)> {
             let repo = discover_and_recover_repo(directory, false)?;
+            let (branch_filter, head_sha_filter) = oz_github::ci::resolve_workflow_target_filters(
+                &repo,
+                args.branch.as_deref(),
+                args.target_ref.as_deref(),
+            );
             let wf_opts = CiWorkflowOptions {
                 workflow: workflow.clone(),
-                branch: args.branch.clone().or_else(|| args.target_ref.clone()),
+                branch: branch_filter,
+                head_sha: head_sha_filter,
+                min_created_at: None,
+                ignore_run_ids: std::collections::HashSet::new(),
                 limit: args.limit.unwrap_or(DEFAULT_WORKFLOW_RUN_LIMIT),
                 max_excerpt_lines: args.max_excerpt_lines,
                 include_checks: args.checks.clone(),
@@ -4455,6 +4741,11 @@ pub(crate) fn handle_ci(
                     "\n{pr_tag} ({} @ {short_sha}): {} ({} total, {} failing, {} pending)",
                     r.ref_name, r.overall_status, r.total_count, r.failing_count, r.pending_count
                 );
+                if let Some(ref url) = r.html_url
+                    && !url.is_empty()
+                {
+                    println!("  url: {url}");
+                }
                 if r.passed_count > 0 {
                     println!(
                         "  [passed x{}] {}",
@@ -4468,6 +4759,11 @@ pub(crate) fn handle_ci(
                         println!("  [{}] {} (job {})", conc, check.name, jid);
                     } else {
                         println!("  [{}] {}", conc, check.name);
+                    }
+                    if let Some(ref url) = check.html_url
+                        && !url.is_empty()
+                    {
+                        println!("    url: {url}");
                     }
                     if let Some(ref step) = check.failing_step {
                         println!("    failing step: {step}");
@@ -4686,8 +4982,12 @@ fn render_watch_progress_event(event: &CiWatchEvent) {
             commit_sha,
             ..
         } => {
-            let short = &commit_sha[..commit_sha.len().min(10)];
-            eprintln!("oz ci: waiting for checks on {ref_name} ({short})...");
+            if commit_sha.is_empty() {
+                eprintln!("oz ci: waiting for checks on {ref_name}...");
+            } else {
+                let short = &commit_sha[..commit_sha.len().min(10)];
+                eprintln!("oz ci: waiting for checks on {ref_name} ({short})...");
+            }
         }
         CiWatchEvent::CheckUpdated {
             name,
@@ -4744,6 +5044,16 @@ fn apply_workflow_report_to_envelope<T>(
                     exit_code: code.as_i32(),
                     message: format!("workflow '{}' failed", report.workflow),
                 });
+                if let Some(job_id) = report.runs.first().and_then(|r| {
+                    r.jobs
+                        .iter()
+                        .find(|j| j.log_excerpt.is_some() || j.failing_step.is_some())
+                        .and_then(|j| j.job_id)
+                }) {
+                    env.recovery_commands.push(format!(
+                        "oz ci --job {job_id} --max-excerpt-lines 150 --json"
+                    ));
+                }
                 return code;
             }
             CiWatchOutcome::TimedOut => {
@@ -4801,13 +5111,15 @@ fn apply_workflow_report_to_envelope<T>(
 }
 
 fn render_workflow_report_human(d: &CiWorkflowReport) {
-    let branch_suffix = d
-        .branch_filter
-        .as_deref()
-        .map_or_default(|b| format!(" (branch: {b})"));
+    let filter_suffix = match (&d.branch_filter, &d.head_sha_filter) {
+        (Some(b), Some(s)) => format!(" (branch: {b}, sha: {})", &s[..s.len().min(10)]),
+        (Some(b), None) => format!(" (branch: {b})"),
+        (None, Some(s)) => format!(" (sha: {})", &s[..s.len().min(10)]),
+        (None, None) => String::new(),
+    };
     println!(
         "Workflow '{}'{} : {} ({} run(s))",
-        d.workflow, branch_suffix, d.overall_status, d.total_runs
+        d.workflow, filter_suffix, d.overall_status, d.total_runs
     );
     for run in &d.runs {
         let conc = run.conclusion.as_deref().unwrap_or(&run.status);
@@ -4818,6 +5130,11 @@ fn render_workflow_report_human(d: &CiWorkflowReport) {
             "  run {} [{}] branch={} sha={} event={}",
             run.run_id, conc, br, short_sha, ev
         );
+        if let Some(ref url) = run.html_url
+            && !url.is_empty()
+        {
+            println!("    url: {url}");
+        }
         if run.passed_count > 0 {
             println!(
                 "    [passed x{}] {}",
@@ -4831,6 +5148,11 @@ fn render_workflow_report_human(d: &CiWorkflowReport) {
                 println!("    [{}] {} (job {})", jconc, job.name, jid);
             } else {
                 println!("    [{}] {}", jconc, job.name);
+            }
+            if let Some(ref url) = job.html_url
+                && !url.is_empty()
+            {
+                println!("      url: {url}");
             }
             if let Some(ref step) = job.failing_step {
                 println!("      failing step: {step}");
@@ -4865,6 +5187,11 @@ fn render_ci_report_human(d: &CiReport) {
             d.ref_name, d.overall_status, d.total_count, d.failing_count, d.pending_count
         );
     }
+    if let Some(ref url) = d.html_url
+        && !url.is_empty()
+    {
+        println!("  url: {url}");
+    }
     if d.passed_count > 0 {
         println!(
             "  [passed x{}] {}",
@@ -4878,6 +5205,11 @@ fn render_ci_report_human(d: &CiReport) {
             println!("  [{}] {} (job {})", conc, check.name, jid);
         } else {
             println!("  [{}] {}", conc, check.name);
+        }
+        if let Some(ref url) = check.html_url
+            && !url.is_empty()
+        {
+            println!("    url: {url}");
         }
         if let Some(ref step) = check.failing_step {
             println!("    failing step: {step}");

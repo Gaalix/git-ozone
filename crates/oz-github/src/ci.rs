@@ -254,6 +254,9 @@ pub struct CiReport {
     pub commit_sha: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+    /// Primary clickable GitHub Actions run or check URL (preserved even after compaction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
     /// Aggregate state: `"passing"`, `"failing"`, `"pending"`, `"no_checks"`, or `"superseded"`.
     pub overall_status: String,
     pub all_passed: bool,
@@ -352,8 +355,14 @@ pub struct CiRunsReport {
 pub struct CiWorkflowOptions {
     /// Workflow filename (e.g. `sentry-release.yaml`), path, numeric ID, or display name.
     pub workflow: String,
-    /// Optional branch filter (`--branch` / `--ref`); when `None`, returns recent runs across all branches.
+    /// Optional branch filter (`--branch` / local branch `--ref`); when `None`, returns recent runs across all branches.
     pub branch: Option<String>,
+    /// Optional commit SHA filter (`head_sha=<sha>`); pins workflow lookup/watch to a specific commit.
+    pub head_sha: Option<String>,
+    /// Optional RFC-3339 minimum `created_at` timestamp (runs created earlier are ignored).
+    pub min_created_at: Option<String>,
+    /// Optional pre-existing workflow run IDs to ignore (e.g. runs existing before a push).
+    pub ignore_run_ids: HashSet<u64>,
     /// Maximum number of recent workflow runs to return (defaults to `5`).
     pub limit: usize,
     /// Maximum lines per failing job's `log_excerpt` (defaults to `40`).
@@ -375,6 +384,9 @@ impl Default for CiWorkflowOptions {
         Self {
             workflow: String::new(),
             branch: None,
+            head_sha: None,
+            min_created_at: None,
+            ignore_run_ids: HashSet::new(),
             limit: DEFAULT_WORKFLOW_RUN_LIMIT,
             max_excerpt_lines: DEFAULT_MAX_EXCERPT_LINES,
             include_checks: Vec::new(),
@@ -440,6 +452,8 @@ pub struct CiWorkflowReport {
     pub workflow_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha_filter: Option<String>,
     /// Status of the latest run: `"passing"`, `"failing"`, `"pending"`, or `"no_runs"`.
     pub overall_status: String,
     pub all_passed: bool,
@@ -576,8 +590,10 @@ fn query_ci_status_with_client(
     opts: &CiQueryOptions,
     max_lines: usize,
 ) -> Result<CiReport> {
-    let (ref_name, commit_sha, resolved_pr_num, _initial_pr_head_sha) =
-        resolve_ci_target(repo, client, owner, gh_repo, opts)?;
+    let target = resolve_ci_target(repo, client, owner, gh_repo, opts)?;
+    let ref_name = target.ref_name;
+    let commit_sha = target.commit_sha;
+    let resolved_pr_num = target.pr_number;
 
     let query_ref = if commit_sha.is_empty() {
         ref_name.as_str()
@@ -591,14 +607,20 @@ fn query_ci_status_with_client(
 
     let mut jobs_by_id: HashMap<u64, GitHubActionsJob> = HashMap::new();
     let mut jobs_by_name: HashMap<String, GitHubActionsJob> = HashMap::new();
+    let mut primary_run_url: Option<String> = None;
 
-    let branch_filter =
-        (!ref_name.is_empty() && ref_name != commit_sha).then_some(ref_name.as_str());
+    let branch_filter = workflow_branch_filter_for_target(&ref_name, &commit_sha, target.is_branch);
     let sha_filter = (!commit_sha.is_empty()).then_some(commit_sha.as_str());
     if let Ok(runs) = client.list_workflow_runs(owner, gh_repo, branch_filter, sha_filter) {
         for run in runs.into_iter().take(10) {
             if !commit_sha.is_empty() && run.head_sha != commit_sha {
                 continue;
+            }
+            if primary_run_url.is_none()
+                && let Some(ref url) = run.html_url
+                && !url.is_empty()
+            {
+                primary_run_url = Some(url.clone());
             }
             if let Ok(jobs) = client.list_jobs_for_workflow_run(owner, gh_repo, run.id) {
                 for job in jobs {
@@ -617,6 +639,7 @@ fn query_ci_status_with_client(
         ref_name,
         commit_sha,
         resolved_pr_num,
+        primary_run_url,
         &check_runs,
         &jobs_by_id,
         &jobs_by_name,
@@ -749,6 +772,17 @@ pub fn query_workflow_ci_status(
         .as_deref()
         .map(normalize_short_branch)
         .filter(|s| !s.is_empty());
+    let head_sha_filter = opts
+        .head_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let min_created_at = opts
+        .min_created_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let (client, parsed_remote) = GitHubClient::for_repo(
         repo,
@@ -759,14 +793,29 @@ pub fn query_workflow_ci_status(
     let _ = client.require_authenticated()?;
     let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
 
-    let (resolved_wf_id, runs) = fetch_workflow_runs_resolved(
+    let fetch_limit = if !opts.ignore_run_ids.is_empty() || min_created_at.is_some() {
+        limit.clamp(10, 50)
+    } else {
+        limit
+    };
+    let (resolved_wf_id, raw_runs) = fetch_workflow_runs_resolved(
         &client,
         owner,
         gh_repo,
         workflow_query,
         branch_filter.as_deref(),
-        limit,
+        head_sha_filter.as_deref(),
+        fetch_limit,
     )?;
+    let runs: Vec<GitHubWorkflowRun> = filter_workflow_runs(
+        raw_runs,
+        head_sha_filter.as_deref(),
+        min_created_at,
+        &opts.ignore_run_ids,
+    )
+    .into_iter()
+    .take(limit)
+    .collect();
 
     let mut failure_cache = HashMap::new();
     let summaries = build_workflow_run_summaries(
@@ -785,13 +834,18 @@ pub fn query_workflow_ci_status(
         workflow_query.to_string(),
         Some(resolved_wf_id),
         branch_filter,
+        head_sha_filter,
         summaries,
         None,
     ))
 }
 
-/// Watches the latest run of a GitHub Actions workflow (`oz ci --workflow <name> --watch`)
+/// Watches the latest matching run of a GitHub Actions workflow (`oz ci --workflow <name> --watch`)
 /// until it passes, fails, or times out.
+///
+/// When `head_sha`, `min_created_at`, or `ignore_run_ids` filters are set and GitHub has not
+/// yet registered a matching run (post-push lag), polls up to `watch_opts.startup_timeout`
+/// emitting [`CiWatchEvent::WaitingForChecks`] instead of matching an older completed run.
 pub fn watch_workflow_ci_status<F>(
     repo: &OzoneRepo,
     wf_opts: &CiWorkflowOptions,
@@ -825,6 +879,25 @@ where
         .as_deref()
         .map(normalize_short_branch)
         .filter(|s| !s.is_empty());
+    let head_sha_filter = wf_opts
+        .head_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let min_created_at = wf_opts
+        .min_created_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let fetch_per_page = if head_sha_filter.is_some()
+        || min_created_at.is_some()
+        || !wf_opts.ignore_run_ids.is_empty()
+    {
+        10
+    } else {
+        1
+    };
 
     let (client, parsed_remote) = GitHubClient::for_repo(
         repo,
@@ -835,19 +908,25 @@ where
     let _ = client.require_authenticated()?;
     let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
 
-    let (resolved_wf_id, initial_runs) = fetch_workflow_runs_resolved(
+    let (resolved_wf_id, initial_raw_runs) = fetch_workflow_runs_resolved(
         &client,
         owner,
         gh_repo,
         workflow_query,
         branch_filter.as_deref(),
-        1,
+        head_sha_filter.as_deref(),
+        fetch_per_page,
     )?;
 
     let start = Instant::now();
     let mut polls: u32 = 0;
     let mut runs_etag: Option<String> = None;
-    let mut cached_runs: Vec<GitHubWorkflowRun> = initial_runs;
+    let mut cached_runs: Vec<GitHubWorkflowRun> = filter_workflow_runs(
+        initial_raw_runs,
+        head_sha_filter.as_deref(),
+        min_created_at,
+        &wf_opts.ignore_run_ids,
+    );
     let mut jobs_cache: HashMap<u64, (Option<String>, Vec<GitHubActionsJob>)> = HashMap::new();
     let mut failure_cache: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
     let mut seen_states: HashMap<String, (String, Option<String>)> = HashMap::new();
@@ -863,11 +942,17 @@ where
                 gh_repo,
                 &resolved_wf_id,
                 branch_filter.as_deref(),
-                1,
+                head_sha_filter.as_deref(),
+                fetch_per_page,
                 runs_etag.as_deref(),
             ) {
                 Ok(ConditionalGet::Modified { value, etag, .. }) => {
-                    cached_runs = value;
+                    cached_runs = filter_workflow_runs(
+                        value,
+                        head_sha_filter.as_deref(),
+                        min_created_at,
+                        &wf_opts.ignore_run_ids,
+                    );
                     if etag.is_some() {
                         runs_etag = etag;
                     }
@@ -947,9 +1032,13 @@ where
             }
         } else if !emitted_waiting {
             emitted_waiting = true;
+            let waiting_ref = branch_filter.as_deref().map_or_else(
+                || workflow_query.to_string(),
+                |b| format!("{workflow_query}@{b}"),
+            );
             on_event(CiWatchEvent::WaitingForChecks {
-                ref_name: workflow_query.to_string(),
-                commit_sha: String::new(),
+                ref_name: waiting_ref,
+                commit_sha: head_sha_filter.clone().unwrap_or_default(),
                 elapsed_secs,
             });
         }
@@ -958,6 +1047,7 @@ where
             workflow_query.to_string(),
             Some(resolved_wf_id.clone()),
             branch_filter.clone(),
+            head_sha_filter.clone(),
             run_summaries,
             None,
         );
@@ -1086,6 +1176,46 @@ where
     }
 }
 
+fn filter_workflow_runs(
+    runs: Vec<GitHubWorkflowRun>,
+    head_sha: Option<&str>,
+    min_created_at: Option<&str>,
+    ignore_run_ids: &HashSet<u64>,
+) -> Vec<GitHubWorkflowRun> {
+    let min_dt = min_created_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+    runs.into_iter()
+        .filter(|run| {
+            if ignore_run_ids.contains(&run.id) {
+                return false;
+            }
+            if let Some(sha) = head_sha
+                && !sha.is_empty()
+                && !run.head_sha.eq_ignore_ascii_case(sha)
+            {
+                return false;
+            }
+            if let Some(min_raw) = min_created_at
+                && let Some(ref created) = run.created_at
+            {
+                let created_trimmed = created.trim();
+                if !created_trimmed.is_empty() {
+                    if let (Some(min_parsed), Ok(created_parsed)) = (
+                        min_dt,
+                        chrono::DateTime::parse_from_rfc3339(created_trimmed),
+                    ) {
+                        if created_parsed < min_parsed {
+                            return false;
+                        }
+                    } else if created_trimmed < min_raw {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 fn normalize_workflow_selector(raw: &str) -> String {
     let trimmed = raw.trim().replace('\\', "/");
     let stripped = trimmed
@@ -1102,6 +1232,7 @@ fn fetch_workflow_runs_resolved(
     gh_repo: &str,
     workflow_query: &str,
     branch_filter: Option<&str>,
+    head_sha_filter: Option<&str>,
     limit: usize,
 ) -> Result<(String, Vec<GitHubWorkflowRun>)> {
     let normalized = normalize_workflow_selector(workflow_query);
@@ -1116,6 +1247,7 @@ fn fetch_workflow_runs_resolved(
             gh_repo,
             &normalized,
             branch_filter,
+            head_sha_filter,
             limit,
         ) {
             Ok(runs) => return Ok((normalized, runs)),
@@ -1129,6 +1261,7 @@ fn fetch_workflow_runs_resolved(
                         gh_repo,
                         &resolved_id,
                         branch_filter,
+                        head_sha_filter,
                         limit,
                     )?;
                     return Ok((resolved_id, runs));
@@ -1144,6 +1277,7 @@ fn fetch_workflow_runs_resolved(
         gh_repo,
         &resolved_id,
         branch_filter,
+        head_sha_filter,
         limit,
     )?;
     Ok((resolved_id, runs))
@@ -1290,6 +1424,7 @@ fn assemble_workflow_report(
     workflow: String,
     workflow_id: Option<String>,
     branch_filter: Option<String>,
+    head_sha_filter: Option<String>,
     runs: Vec<CiWorkflowRunSummary>,
     watch: Option<CiWatchMetadata>,
 ) -> CiWorkflowReport {
@@ -1339,6 +1474,7 @@ fn assemble_workflow_report(
         workflow,
         workflow_id,
         branch_filter,
+        head_sha_filter,
         overall_status,
         all_passed,
         total_runs,
@@ -1349,15 +1485,157 @@ fn assemble_workflow_report(
     }
 }
 
+/// Pre-push snapshot of existing GitHub check-run and workflow-run IDs on a target commit,
+/// used by `oz push <tag> --watch` so already-completed branch checks do not short-circuit
+/// watching newly triggered tag/release workflows.
+#[derive(Debug, Clone, Default)]
+pub struct CiPrePushSnapshot {
+    pub check_run_ids: HashSet<u64>,
+    pub workflow_run_ids: HashSet<u64>,
+}
+
+/// Best-effort snapshot of pre-existing check runs and workflow runs for `commit_sha` before a push.
+#[must_use]
+pub fn snapshot_preexisting_ci_ids(
+    repo: &OzoneRepo,
+    remote: Option<&str>,
+    commit_sha: &str,
+    auth_token: Option<&str>,
+    api_url: Option<&str>,
+) -> CiPrePushSnapshot {
+    let sha = commit_sha.trim();
+    if sha.is_empty() {
+        return CiPrePushSnapshot::default();
+    }
+    let remote_name = remote
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("origin");
+    let Ok((client, parsed_remote)) =
+        GitHubClient::for_repo(repo, Some(remote_name), auth_token, api_url)
+    else {
+        return CiPrePushSnapshot::default();
+    };
+    if client.require_authenticated().is_err() {
+        return CiPrePushSnapshot::default();
+    }
+    let Ok((owner, gh_repo)) = parsed_remote.require_owner_repo() else {
+        return CiPrePushSnapshot::default();
+    };
+
+    let check_run_ids = client
+        .list_check_runs_for_ref(owner, gh_repo, sha)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    let workflow_run_ids = client
+        .list_workflow_runs(owner, gh_repo, None, Some(sha))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.head_sha.eq_ignore_ascii_case(sha))
+        .map(|r| r.id)
+        .collect();
+
+    CiPrePushSnapshot {
+        check_run_ids,
+        workflow_run_ids,
+    }
+}
+
+/// Best-effort snapshot of pre-existing workflow run IDs for a specific workflow + commit before a push.
+#[must_use]
+pub fn snapshot_preexisting_workflow_run_ids(
+    repo: &OzoneRepo,
+    wf_opts: &CiWorkflowOptions,
+) -> HashSet<u64> {
+    let workflow_query = wf_opts.workflow.trim();
+    if workflow_query.is_empty() {
+        return HashSet::new();
+    }
+    let remote_name = wf_opts
+        .remote
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("origin");
+    let Ok((client, parsed_remote)) = GitHubClient::for_repo(
+        repo,
+        Some(remote_name),
+        wf_opts.auth_token.as_deref(),
+        wf_opts.api_url.as_deref(),
+    ) else {
+        return HashSet::new();
+    };
+    if client.require_authenticated().is_err() {
+        return HashSet::new();
+    }
+    let Ok((owner, gh_repo)) = parsed_remote.require_owner_repo() else {
+        return HashSet::new();
+    };
+    let branch_filter = wf_opts
+        .branch
+        .as_deref()
+        .map(normalize_short_branch)
+        .filter(|s| !s.is_empty());
+    let head_sha_filter = wf_opts
+        .head_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Ok((_, runs)) = fetch_workflow_runs_resolved(
+        &client,
+        owner,
+        gh_repo,
+        workflow_query,
+        branch_filter.as_deref(),
+        head_sha_filter,
+        10,
+    ) else {
+        return HashSet::new();
+    };
+
+    runs.into_iter()
+        .filter(|r| head_sha_filter.is_none_or(|sha| r.head_sha.eq_ignore_ascii_case(sha)))
+        .map(|r| r.id)
+        .collect()
+}
+
 /// Polls GitHub Check Runs and Actions jobs until all watched checks pass, a check fails
 /// (`fail_fast` exits immediately with its cleaned log excerpt), a newer commit supersedes
 /// the watched branch/PR, or `timeout` / `startup_timeout` expires.
 ///
 /// Uses HTTP `ETag` / `If-None-Match` conditional caching (`304 Not Modified`), rate-limit
 /// backoff, and failure-log caching across ticks.
-pub fn watch_ci_status<F>(
+pub fn watch_ci_status<F>(repo: &OzoneRepo, opts: &CiWatchOptions, on_event: F) -> Result<CiReport>
+where
+    F: FnMut(CiWatchEvent),
+{
+    watch_ci_status_inner(repo, opts, None, None, on_event)
+}
+
+/// Variant of [`watch_ci_status`] for post-push watching (especially tag pushes) that waits
+/// up to `new_checks_grace` for newly triggered check runs or workflow runs when every
+/// initially observed check was already present in `baseline` before the push.
+pub fn watch_ci_status_after_push<F>(
     repo: &OzoneRepo,
     opts: &CiWatchOptions,
+    baseline: &CiPrePushSnapshot,
+    new_checks_grace: Option<Duration>,
+    on_event: F,
+) -> Result<CiReport>
+where
+    F: FnMut(CiWatchEvent),
+{
+    watch_ci_status_inner(repo, opts, Some(baseline), new_checks_grace, on_event)
+}
+
+fn watch_ci_status_inner<F>(
+    repo: &OzoneRepo,
+    opts: &CiWatchOptions,
+    baseline: Option<&CiPrePushSnapshot>,
+    new_checks_grace: Option<Duration>,
     mut on_event: F,
 ) -> Result<CiReport>
 where
@@ -1385,8 +1663,11 @@ where
     let _ = client.require_authenticated()?;
     let (owner, gh_repo) = parsed_remote.require_owner_repo()?;
 
-    let (ref_name, commit_sha, resolved_pr_num, initial_pr_head_sha) =
-        resolve_ci_target(repo, &client, owner, gh_repo, query)?;
+    let target = resolve_ci_target(repo, &client, owner, gh_repo, query)?;
+    let ref_name = target.ref_name;
+    let commit_sha = target.commit_sha;
+    let resolved_pr_num = target.pr_number;
+    let initial_pr_head_sha = target.initial_pr_head_sha;
     let gix_repo = open_gix_unrestricted(&repo.repo_root).ok();
     let mut initial_stale_pr_sha: Option<String> =
         initial_pr_head_sha.filter(|s| !s.is_empty() && s != &commit_sha);
@@ -1398,10 +1679,9 @@ where
     } else {
         commit_sha.clone()
     };
-    let branch_filter = (!ref_name.is_empty() && ref_name != commit_sha && ref_name != "HEAD")
-        .then_some(ref_name.as_str());
+    let branch_filter = workflow_branch_filter_for_target(&ref_name, &commit_sha, target.is_branch);
     let sha_filter = (!commit_sha.is_empty()).then_some(commit_sha.as_str());
-    // When watching a branch/PR (not a pinned SHA), query workflow runs by branch so we can
+    // When watching a branch/PR (not a pinned SHA or tag), query workflow runs by branch so we can
     // also detect if a newer commit superseded the watched commit.
     let wf_sha_filter = if branch_filter.is_some() {
         None
@@ -1424,6 +1704,11 @@ where
     // Track last seen `(status, conclusion)` per check name so `on_event` only fires on deltas.
     let mut seen_states: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut emitted_waiting_for_checks = false;
+    let has_preexisting_baseline = baseline.is_some_and(|b| {
+        (!b.check_run_ids.is_empty() || !b.workflow_run_ids.is_empty())
+            && new_checks_grace.is_some_and(|g| !g.is_zero())
+    });
+    let mut seen_new_post_push_activity = !has_preexisting_baseline;
 
     loop {
         polls = polls.saturating_add(1);
@@ -1580,10 +1865,17 @@ where
 
         let mut jobs_by_id: HashMap<u64, GitHubActionsJob> = HashMap::new();
         let mut jobs_by_name: HashMap<String, GitHubActionsJob> = HashMap::new();
+        let mut primary_run_url: Option<String> = None;
 
         for run in cached_workflow_runs.iter().take(10) {
             if !commit_sha.is_empty() && run.head_sha != commit_sha {
                 continue;
+            }
+            if primary_run_url.is_none()
+                && let Some(ref url) = run.html_url
+                && !url.is_empty()
+            {
+                primary_run_url = Some(url.clone());
             }
             let prev_etag = jobs_cache.get(&run.id).and_then(|(e, _)| e.clone());
             match client.list_jobs_for_workflow_run_conditional(
@@ -1634,6 +1926,7 @@ where
                 ref_name,
                 commit_sha,
                 resolved_pr_num,
+                primary_run_url,
                 &cached_check_runs,
                 &jobs_by_id,
                 &jobs_by_name,
@@ -1670,6 +1963,7 @@ where
             ref_name.clone(),
             commit_sha.clone(),
             resolved_pr_num,
+            primary_run_url,
             &cached_check_runs,
             &jobs_by_id,
             &jobs_by_name,
@@ -1682,8 +1976,33 @@ where
         let elapsed = start.elapsed();
         let elapsed_secs = elapsed.as_secs();
 
+        // Check if any post-push check run or workflow run has appeared beyond pre-push baseline.
+        let mut has_new_pending_workflow_run = false;
+        if let Some(snap) = baseline {
+            let new_check_seen = cached_check_runs
+                .iter()
+                .any(|c| !snap.check_run_ids.contains(&c.id));
+            let new_wf_seen = cached_workflow_runs.iter().any(|r| {
+                (commit_sha.is_empty() || r.head_sha == commit_sha)
+                    && !snap.workflow_run_ids.contains(&r.id)
+            });
+            has_new_pending_workflow_run = cached_workflow_runs.iter().any(|r| {
+                (commit_sha.is_empty() || r.head_sha == commit_sha)
+                    && !snap.workflow_run_ids.contains(&r.id)
+                    && r.status != "completed"
+            });
+            if new_check_seen || new_wf_seen {
+                seen_new_post_push_activity = true;
+            }
+        }
+
+        let waiting_for_post_push_tag_checks = !seen_new_post_push_activity
+            && report.pending_count == 0
+            && report.failing_count == 0
+            && new_checks_grace.is_some_and(|grace| elapsed < grace);
+
         // Emit incremental state-change events for checks.
-        if report.total_count == 0 {
+        if report.total_count == 0 || waiting_for_post_push_tag_checks {
             if !emitted_waiting_for_checks {
                 emitted_waiting_for_checks = true;
                 on_event(CiWatchEvent::WaitingForChecks {
@@ -1708,10 +2027,11 @@ where
             }
         }
 
-        // Check terminal conditions.
-        if report.total_count > 0 {
+        // Check terminal conditions (skipped while waiting during post-push tag grace window or
+        // while a newly triggered workflow run for this commit is still queued/in-progress).
+        if !waiting_for_post_push_tag_checks && report.total_count > 0 {
             if report.failing_count > 0 && opts.fail_fast {
-                let stopped_early = report.pending_count > 0;
+                let stopped_early = report.pending_count > 0 || has_new_pending_workflow_run;
                 let outcome = if stopped_early {
                     CiWatchOutcome::FailedFast
                 } else {
@@ -1735,7 +2055,7 @@ where
                 return Ok(report);
             }
 
-            if report.pending_count == 0 {
+            if report.pending_count == 0 && !has_new_pending_workflow_run {
                 let outcome = if report.failing_count > 0 {
                     CiWatchOutcome::Failed
                 } else {
@@ -1758,7 +2078,10 @@ where
                 });
                 return Ok(report);
             }
-        } else if elapsed >= opts.startup_timeout {
+        } else if report.total_count == 0
+            && !has_new_pending_workflow_run
+            && elapsed >= opts.startup_timeout
+        {
             let outcome = CiWatchOutcome::NoChecksTimedOut;
             report.watch = Some(CiWatchMetadata {
                 outcome,
@@ -1814,7 +2137,11 @@ where
             base_sleep
         };
 
-        let effective_deadline = if report.total_count == 0 {
+        let effective_deadline = if waiting_for_post_push_tag_checks {
+            new_checks_grace
+                .unwrap_or(opts.startup_timeout)
+                .min(opts.timeout)
+        } else if report.total_count == 0 && !has_new_pending_workflow_run {
             opts.startup_timeout.min(opts.timeout)
         } else {
             opts.timeout
@@ -1909,6 +2236,7 @@ fn assemble_ci_report(
     ref_name: String,
     commit_sha: String,
     pr_number: Option<u64>,
+    primary_run_url: Option<String>,
     check_runs: &[GitHubCheckRun],
     jobs_by_id: &HashMap<u64, GitHubActionsJob>,
     jobs_by_name: &HashMap<String, GitHubActionsJob>,
@@ -1924,6 +2252,7 @@ fn assemble_ci_report(
         ref_name,
         commit_sha,
         pr_number,
+        primary_run_url,
         check_runs,
         jobs_by_id,
         jobs_by_name,
@@ -1943,6 +2272,7 @@ fn assemble_ci_report_inner(
     ref_name: String,
     commit_sha: String,
     pr_number: Option<u64>,
+    primary_run_url: Option<String>,
     check_runs: &[GitHubCheckRun],
     jobs_by_id: &HashMap<u64, GitHubActionsJob>,
     jobs_by_name: &HashMap<String, GitHubActionsJob>,
@@ -2012,6 +2342,10 @@ fn assemble_ci_report_inner(
         ));
     }
 
+    let html_url = primary_run_url
+        .filter(|u| !u.is_empty())
+        .or_else(|| derive_primary_ci_url_from_checks(&summaries));
+
     let total_count = summaries.len();
     let failing_count = summaries
         .iter()
@@ -2034,6 +2368,7 @@ fn assemble_ci_report_inner(
         ref_name,
         commit_sha,
         pr_number,
+        html_url,
         overall_status,
         all_passed,
         total_count,
@@ -2044,6 +2379,19 @@ fn assemble_ci_report_inner(
         checks: summaries,
         watch: None,
     }
+}
+
+fn derive_primary_ci_url_from_checks(checks: &[CiCheckSummary]) -> Option<String> {
+    let first_url = checks
+        .iter()
+        .find_map(|c| c.html_url.as_deref().filter(|u| !u.is_empty()))?;
+    // Normalize `.../actions/runs/<run_id>/job/<job_id>` to the run-level URL `.../actions/runs/<run_id>`.
+    if let Some((prefix, _)) = first_url.split_once("/job/")
+        && prefix.contains("/actions/runs/")
+    {
+        return Some(prefix.to_string());
+    }
+    Some(first_url.to_string())
 }
 
 fn adaptive_poll_interval(poll_index: u32, fixed: Option<Duration>) -> Duration {
@@ -2146,36 +2494,171 @@ fn is_sha_ancestor_of_watched(
     is_ancestor_commit(repo, cand_oid, watched_oid)
 }
 
+struct ResolvedCiTarget {
+    ref_name: String,
+    commit_sha: String,
+    pr_number: Option<u64>,
+    initial_pr_head_sha: Option<String>,
+    is_branch: bool,
+}
+
+fn is_full_hex_sha(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn workflow_branch_filter_for_target<'a>(
+    ref_name: &'a str,
+    commit_sha: &str,
+    is_branch: bool,
+) -> Option<&'a str> {
+    let is_resolved_branch =
+        is_branch && !ref_name.is_empty() && ref_name != commit_sha && ref_name != "HEAD";
+    let is_unresolved_branch_name = commit_sha.is_empty()
+        && !ref_name.is_empty()
+        && ref_name != "HEAD"
+        && !ref_name.starts_with("refs/tags/")
+        && !is_full_hex_sha(ref_name);
+    (is_resolved_branch || is_unresolved_branch_name).then_some(ref_name)
+}
+
+/// Peels a Git revision, ref name, annotated tag, or raw tag OID to its target commit SHA hex.
+///
+/// Falls back to the resolved detached OID if the object is not a commit or tag.
+#[must_use]
+pub fn peel_rev_to_commit_sha(repo: &OzoneRepo, spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let gix_repo = open_gix_unrestricted(&repo.repo_root).ok()?;
+    peel_rev_to_commit_sha_in_gix(&gix_repo, trimmed)
+}
+
+fn peel_rev_to_commit_sha_in_gix(gix_repo: &gix::Repository, spec: &str) -> Option<String> {
+    let id = gix_repo.rev_parse_single(spec).ok()?;
+    let peeled = id
+        .object()
+        .ok()
+        .and_then(|o| o.peel_to_commit().ok())
+        .map_or_else(|| id.detach(), |c| c.id);
+    Some(peeled.to_hex().to_string())
+}
+
+/// Returns `true` when `spec` names a tag ref (`refs/tags/*` or an existing local tag).
+#[must_use]
+pub fn is_local_tag_ref(repo: &OzoneRepo, spec: &str) -> bool {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("refs/tags/") {
+        return true;
+    }
+    let Ok(gix_repo) = open_gix_unrestricted(&repo.repo_root) else {
+        return false;
+    };
+    read_ref_oid(&gix_repo, &format!("refs/tags/{trimmed}"))
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Resolves `--branch` / `--ref` (`--rev`) CLI inputs for `oz ci --workflow` into
+/// `(branch_filter, head_sha_filter)` without sending tags, SHAs, or `HEAD` as `?branch=`.
+#[must_use]
+pub fn resolve_workflow_target_filters(
+    repo: &OzoneRepo,
+    explicit_branch: Option<&str>,
+    explicit_ref: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(br) = explicit_branch.map(str::trim).filter(|s| !s.is_empty()) {
+        let short = normalize_short_branch(br);
+        return ((!short.is_empty()).then_some(short), None);
+    }
+
+    let Some(raw_ref) = explicit_ref.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+
+    if let Ok(gix_repo) = open_gix_unrestricted(&repo.repo_root) {
+        if !raw_ref.starts_with("refs/tags/") {
+            let short = normalize_short_branch(raw_ref);
+            if !short.is_empty()
+                && let Ok(Some(oid)) = read_ref_oid(&gix_repo, &format!("refs/heads/{short}"))
+            {
+                let sha = peel_rev_to_commit_sha_in_gix(&gix_repo, &oid.to_hex().to_string())
+                    .unwrap_or_else(|| oid.to_hex().to_string());
+                return (Some(short), Some(sha));
+            }
+        }
+        if let Some(sha) = peel_rev_to_commit_sha_in_gix(&gix_repo, raw_ref) {
+            return (None, Some(sha));
+        }
+    }
+
+    if is_full_hex_sha(raw_ref) {
+        return (None, Some(raw_ref.to_string()));
+    }
+    if raw_ref.starts_with("refs/tags/") {
+        return (None, None);
+    }
+    let short = normalize_short_branch(raw_ref);
+    ((!short.is_empty()).then_some(short), None)
+}
+
 fn resolve_ci_target(
     repo: &OzoneRepo,
     client: &GitHubClient,
     owner: &str,
     gh_repo: &str,
     opts: &CiQueryOptions,
-) -> Result<(String, String, Option<u64>, Option<String>)> {
+) -> Result<ResolvedCiTarget> {
     if let Some(pr_num) = opts.pr_number {
         let pr = client.get_pull_request(owner, gh_repo, pr_num)?;
         let sha = pr.head.sha.clone();
-        return Ok((pr.head.ref_name, sha.clone(), Some(pr_num), Some(sha)));
+        return Ok(ResolvedCiTarget {
+            ref_name: pr.head.ref_name,
+            commit_sha: sha.clone(),
+            pr_number: Some(pr_num),
+            initial_pr_head_sha: Some(sha),
+            is_branch: true,
+        });
     }
 
     let gix_repo = open_gix_unrestricted(&repo.repo_root)?;
     if let Some(ref explicit) = opts.target_ref {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() {
-            let short = normalize_short_branch(trimmed);
-            if let Some(oid) = read_ref_oid(&gix_repo, &format!("refs/heads/{short}"))? {
-                return Ok((short, oid.to_hex().to_string(), None, None));
+            if !trimmed.starts_with("refs/tags/") {
+                let short = normalize_short_branch(trimmed);
+                if let Some(oid) = read_ref_oid(&gix_repo, &format!("refs/heads/{short}"))? {
+                    let sha = peel_rev_to_commit_sha_in_gix(&gix_repo, &oid.to_hex().to_string())
+                        .unwrap_or_else(|| oid.to_hex().to_string());
+                    return Ok(ResolvedCiTarget {
+                        ref_name: short,
+                        commit_sha: sha,
+                        pr_number: None,
+                        initial_pr_head_sha: None,
+                        is_branch: true,
+                    });
+                }
             }
-            if let Ok(oid) = gix_repo.rev_parse_single(trimmed) {
-                return Ok((
-                    trimmed.to_string(),
-                    oid.detach().to_hex().to_string(),
-                    None,
-                    None,
-                ));
+            if let Some(peeled_sha) = peel_rev_to_commit_sha_in_gix(&gix_repo, trimmed) {
+                return Ok(ResolvedCiTarget {
+                    ref_name: trimmed.to_string(),
+                    commit_sha: peeled_sha,
+                    pr_number: None,
+                    initial_pr_head_sha: None,
+                    is_branch: false,
+                });
             }
-            return Ok((trimmed.to_string(), String::new(), None, None));
+            return Ok(ResolvedCiTarget {
+                ref_name: trimmed.to_string(),
+                commit_sha: String::new(),
+                pr_number: None,
+                initial_pr_head_sha: None,
+                is_branch: false,
+            });
         }
     }
 
@@ -2214,7 +2697,13 @@ fn resolve_ci_target(
         None => (None, None),
     };
 
-    Ok((branch, sha, pr_num, pr_head_sha))
+    Ok(ResolvedCiTarget {
+        is_branch: branch != "HEAD",
+        ref_name: branch,
+        commit_sha: sha,
+        pr_number: pr_num,
+        initial_pr_head_sha: pr_head_sha,
+    })
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -2982,5 +3471,159 @@ mod tests {
 2026-11-18T13:20:07Z summary line\n";
         let tail = extract_cleaned_log_tail(raw_log, Some("Run tests"), 2).expect("tail");
         assert_eq!(tail, "fail test_b\nsummary line");
+    }
+
+    #[test]
+    fn peels_annotated_tags_and_resolves_workflow_filters() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let run_git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "Tester"]);
+        run_git(&["config", "user.email", "tester@example.com"]);
+        std::fs::write(tmp.path().join("README.md"), "hello\n").expect("write");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "initial"]);
+        let commit_sha = run_git(&["rev-parse", "HEAD"]);
+        run_git(&["tag", "-a", "v0.7.0", "-m", "Release v0.7.0"]);
+        let tag_obj_oid = run_git(&["rev-parse", "refs/tags/v0.7.0"]);
+        assert_ne!(
+            tag_obj_oid, commit_sha,
+            "annotated tag object OID must differ from commit OID"
+        );
+
+        let repo = OzoneRepo::discover(Some(tmp.path())).expect("discover repo");
+
+        assert_eq!(
+            peel_rev_to_commit_sha(&repo, "v0.7.0").as_deref(),
+            Some(commit_sha.as_str())
+        );
+        assert_eq!(
+            peel_rev_to_commit_sha(&repo, "refs/tags/v0.7.0").as_deref(),
+            Some(commit_sha.as_str())
+        );
+        assert_eq!(
+            peel_rev_to_commit_sha(&repo, &tag_obj_oid).as_deref(),
+            Some(commit_sha.as_str())
+        );
+        assert!(is_local_tag_ref(&repo, "v0.7.0"));
+        assert!(is_local_tag_ref(&repo, "refs/tags/v0.7.0"));
+        assert!(!is_local_tag_ref(&repo, "main"));
+
+        // Workflow filter resolution: tags / HEAD / SHAs must set head_sha and NOT branch.
+        assert_eq!(
+            resolve_workflow_target_filters(&repo, None, Some("v0.7.0")),
+            (None, Some(commit_sha.clone()))
+        );
+        assert_eq!(
+            resolve_workflow_target_filters(&repo, None, Some("refs/tags/v0.7.0")),
+            (None, Some(commit_sha.clone()))
+        );
+        assert_eq!(
+            resolve_workflow_target_filters(&repo, None, Some("HEAD")),
+            (None, Some(commit_sha.clone()))
+        );
+        let short_sha = &commit_sha[..8];
+        assert_eq!(
+            resolve_workflow_target_filters(&repo, None, Some(short_sha)),
+            (None, Some(commit_sha.clone()))
+        );
+        // Local branch sets both branch and peeled head_sha.
+        assert_eq!(
+            resolve_workflow_target_filters(&repo, None, Some("main")),
+            (Some("main".to_string()), Some(commit_sha.clone()))
+        );
+        // Explicit --branch sets branch only.
+        assert_eq!(
+            resolve_workflow_target_filters(&repo, Some("main"), None),
+            (Some("main".to_string()), None)
+        );
+        // Unknown 40-char SHA sets head_sha only.
+        let remote_sha = "a".repeat(40);
+        assert_eq!(
+            resolve_workflow_target_filters(&repo, None, Some(&remote_sha)),
+            (None, Some(remote_sha))
+        );
+    }
+
+    #[test]
+    fn filters_workflow_runs_by_sha_timestamp_and_ignore_ids() {
+        let mk_run = |id: u64, sha: &str, created: &str| GitHubWorkflowRun {
+            id,
+            name: Some("Release".to_string()),
+            path: Some(".github/workflows/release.yml".to_string()),
+            event: Some("push".to_string()),
+            head_branch: Some("v0.7.0".to_string()),
+            head_sha: sha.to_string(),
+            status: "completed".to_string(),
+            conclusion: Some("success".to_string()),
+            html_url: Some(format!("https://github.com/acme/rocket/actions/runs/{id}")),
+            created_at: Some(created.to_string()),
+            updated_at: None,
+        };
+
+        let runs = vec![
+            mk_run(10, "oldsha", "2026-11-28T10:00:00Z"),
+            mk_run(11, "targetsha", "2026-11-28T10:01:00Z"),
+            mk_run(12, "targetsha", "2026-11-28T10:05:00Z"),
+            mk_run(13, "targetsha", "2026-11-28T10:06:00Z"),
+        ];
+
+        let mut ignore = HashSet::new();
+        ignore.insert(12);
+        let filtered = filter_workflow_runs(
+            runs,
+            Some("targetsha"),
+            Some("2026-11-28T10:02:00Z"),
+            &ignore,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, 13);
+    }
+
+    #[test]
+    fn derives_primary_ci_url_from_actions_job_or_external_check() {
+        let checks = vec![CiCheckSummary {
+            name: "cargo test".to_string(),
+            status: "completed".to_string(),
+            conclusion: Some("success".to_string()),
+            failing_step: None,
+            log_excerpt: None,
+            job_id: Some(701),
+            run_id: Some(900),
+            html_url: Some("https://github.com/acme/rocket/actions/runs/900/job/701".to_string()),
+        }];
+        assert_eq!(
+            derive_primary_ci_url_from_checks(&checks).as_deref(),
+            Some("https://github.com/acme/rocket/actions/runs/900")
+        );
+
+        let ext = vec![CiCheckSummary {
+            name: "buildkite".to_string(),
+            status: "completed".to_string(),
+            conclusion: Some("success".to_string()),
+            failing_step: None,
+            log_excerpt: None,
+            job_id: None,
+            run_id: None,
+            html_url: Some("https://buildkite.com/acme/rocket/builds/42".to_string()),
+        }];
+        assert_eq!(
+            derive_primary_ci_url_from_checks(&ext).as_deref(),
+            Some("https://buildkite.com/acme/rocket/builds/42")
+        );
     }
 }

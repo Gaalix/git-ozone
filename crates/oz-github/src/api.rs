@@ -1267,6 +1267,7 @@ impl GitHubClient {
         repo: &str,
         workflow_id: &str,
         branch: Option<&str>,
+        head_sha: Option<&str>,
         per_page: usize,
     ) -> Result<Vec<GitHubWorkflowRun>> {
         let encoded = encode_path_segment(workflow_id);
@@ -1275,17 +1276,22 @@ impl GitHubClient {
         if let Some(br) = branch {
             params.push(("branch".to_string(), br.to_string()));
         }
+        if let Some(sha) = head_sha {
+            params.push(("head_sha".to_string(), sha.to_string()));
+        }
         let env: WorkflowRunsEnvelope = self.get_json_with_query(&path, &params)?;
         Ok(env.workflow_runs)
     }
 
     /// Conditionally lists runs for a specific GitHub Actions workflow with `ETag` support.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn list_workflow_runs_for_workflow_conditional(
         &self,
         owner: &str,
         repo: &str,
         workflow_id: &str,
         branch: Option<&str>,
+        head_sha: Option<&str>,
         per_page: usize,
         if_none_match: Option<&str>,
     ) -> Result<ConditionalGet<Vec<GitHubWorkflowRun>>> {
@@ -1294,6 +1300,9 @@ impl GitHubClient {
         let mut params = vec![("per_page".to_string(), per_page.clamp(1, 100).to_string())];
         if let Some(br) = branch {
             params.push(("branch".to_string(), br.to_string()));
+        }
+        if let Some(sha) = head_sha {
+            params.push(("head_sha".to_string(), sha.to_string()));
         }
         Ok(map_conditional(
             self.get_json_conditional::<WorkflowRunsEnvelope>(&path, &params, if_none_match)?,
