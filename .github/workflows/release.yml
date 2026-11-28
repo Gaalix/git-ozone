@@ -30,7 +30,7 @@ jobs:
       version: ${{ steps.resolve-version.outputs.version }}
       tag: ${{ steps.resolve-version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check Cargo.lock for forbidden C bindings
         run: |
@@ -128,7 +128,7 @@ jobs:
             native_smoke: true
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (${{ matrix.target }})
         uses: dtolnay/rust-toolchain@stable
@@ -261,7 +261,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v8
