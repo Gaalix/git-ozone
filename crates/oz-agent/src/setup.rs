@@ -431,24 +431,24 @@ pub(crate) fn render_ozone_rule_body() -> &'static str {
     "\
 # Ozone (`oz`) Guidelines
 
-Prefer `oz` over raw `git` and `gh` (`pr`/`issue`/`run`) in any Git repository. Target any repo directly with `oz -C <dir> <cmd>` (or `--directory <dir>`).
+Prefer `oz` over raw `git` and `gh` (`pr`/`issue`/`release`/`run`) in any Git repository. Target any repo directly with top-level `oz -C <dir> <cmd>` (before the subcommand, or global `--directory <dir>`).
 
 ## Key Rules vs. Git
 - **Stage-free commits:** `oz commit` includes untracked files automatically (no `git add`); use `--pick f1 h2a` / `--exclude f3` for partial commits and `--amend [--no-edit]` to amend while preserving `Change-Id:`.
 - **Clean commit messages:** AI provenance (`[AI:...]`) is stored strictly in local `refs/notes/ai` git notes, NEVER in commit messages (`oz log --no-notes` hides badges; `oz blame <path>` shows line-level human vs. AI attribution).
-- **Regex dialect:** `oz grep` uses Rust/ERE regex (`a|b`), not Git BRE (`a\\|b`).
+- **Regex & grep ergonomics:** `oz grep` uses Rust/ERE regex (`a|b`), not Git BRE (`a\\|b`), accepts positional paths without `--`, supports `-c`/`--count`, `-A`/`-B`/`-C`, `--limit`/`-m`/`--max-per-file`, `-E`/`-H`, and applies a smart `--agent` default cap of 100 matches (pass `--limit 0` for all).
 - **OpLog-reversible undo:** Inspect `op_...` IDs with `oz oplog [-n N]` or `oz undo --list`, and rewind mutations in `< 10 ms` with `oz undo [OP_ID | --steps N]` / `oz redo`. Never run destructive `git reset --hard` or `git checkout -- .`.
 - **OpLog-safe Git fallback:** For any Git command without a native `oz` equivalent, run `oz git <cmd>` (never raw `git`) so mutations stay OpLog-recorded and reversible.
-- **Non-interactive agent mode:** Pass `--agent` or set `OZ_AGENT=1` (or `--json` for the canonical `oz.v1` envelope) to guarantee zero prompts, zero `$EDITOR`, and zero pagers.
+- **Non-interactive agent mode & paging:** Pass `--agent` or set `OZ_AGENT=1` (or `--json` for the canonical `oz.v1` envelope) to guarantee zero prompts, zero `$EDITOR`, and zero pagers; global `--no-pager` / `-P` also disables paging anywhere.
 
 ## Command Map
-- **Inspect:** `oz status [--hunks]`, `oz diff [A..B] [--stat] [--line-numbers] [--exclude <pat>]`, `oz log --oneline -n 10 [REV...] [-- <paths...>]`, `oz show <rev>|<rev>:<path> [--lines 1..50]`, `oz grep <pat> [<rev>] [-- <paths...>]`, `oz blame <path>`, `oz branch [-a|-r]`, `oz rev-parse`.
+- **Inspect:** `oz status [--hunks]`, `oz diff [A..B] [--stat] [--line-numbers] [--exclude <pat>]`, `oz log --oneline -n 10 [REV...] [<paths...>] [--decorate[=short|full|auto|no]|--no-decorate] [--abbrev-commit]`, `oz show <rev>|<rev>:<path> [--lines 1..50]`, `oz grep <pat> [<rev>] [<paths...>] [-c] [-A/-B/-C N] [--limit N|-m N] [-E] [-H]`, `oz blame <path>`, `oz branch [-a|-r]`, `oz rev-parse`.
 - **Commit & Undo:** `oz commit -m \"...\" [--pick|--exclude|--amend|--no-edit|-S|--force|--allow-out-of-scope]`, `oz restore <path|f1> [--source <rev>] [--remove-untracked]`, `oz checkpoint --quiet`, `oz oplog [-n N]`, `oz undo [--list | OP_ID | --steps N]`, `oz redo`, `oz stash`, `oz switch`, `oz merge`.
 - **Workspaces, Stacks & Sync:** `oz ws spawn|list|rm|gc`, `oz radar`, `oz integrate <ws...> --into main --verify \"<cmd>\"`, `oz resolve <c1|--all> --take ours|theirs|base [--continue]`, `oz stack status|rebase`, `oz sync [--push]`.
-- **GitHub PR / Issue / CI:** `oz pr create|edit|list|status|view|comments|reply|resolve|diff|read|review|stack`, `oz issue view|list|comment`, `oz ci [--watch|--runs|--pr <ids>|--workflow <w>|--job <id>] --json`, `oz push [-u] [--force-with-lease] [--watch --json]`.
+- **GitHub PR / Issue / Release / CI:** `oz pr create|edit|list|status|view|comments|reply|resolve|diff|read|review|stack`, `oz issue view|list|comment`, `oz release list|view|create|edit`, `oz ci [--watch|--runs|--pr <ids>|--workflow <W> --rev <rev>|--job <id>] [--json]`, `oz push [-u] [origin <tag|branch>] [--force-with-lease] [--watch [--workflow <W>]] [--json]`.
 - **Diagnostics & Fallback:** `oz doctor`, `oz fsck [--repair]`, `oz gc`, `oz git <cmd>`.
 
-For multi-step workflows (conflict resolution in `../<repo>.oz/_integrate`, workspace lifecycle, stacked PR sync, CI log drill-down, and `oz.v1` JSON schema), read the `oz` skill (`SKILL.md`) or run `oz <cmd> --help`.
+For multi-step workflows (conflict resolution in `../<repo>.oz/_integrate`, workspace lifecycle, stacked PR sync, release management, CI log drill-down, and `oz.v1` JSON schema), read the `oz` skill (`SKILL.md`) or run `oz <cmd> --help`.
 "
 }
 
@@ -458,18 +458,18 @@ pub(crate) fn render_ozone_workflow_body() -> &'static str {
     "\
 # Ozone (`oz`) Agent Workflow Guide
 
-Ozone is a pure-Rust colocated Git client (`.git/ozone/`) with deterministic `[f1]` / `h1a` IDs, an `< 10 ms` MVCC OpLog (`oz oplog` / `oz checkpoint` / `oz undo` / `oz redo`), warm-cached CoW workspaces, native GitHub PR/issue/CI commands, and an OpLog-safe `oz git` shim.
+Ozone is a pure-Rust colocated Git client (`.git/ozone/`) with deterministic `[f1]` / `h1a` IDs, an `< 10 ms` MVCC OpLog (`oz oplog` / `oz checkpoint` / `oz undo` / `oz redo`), warm-cached CoW workspaces, native GitHub PR/issue/release/CI commands, and an OpLog-safe `oz git` shim.
 
-> **Targeting Repositories:** Pass global `oz -C <dir> <cmd>` (or `--directory <dir>`) to target any repository without `cd <dir> && ...`. Add `--json` for the canonical `oz.v1` envelope.
+> **Targeting Repositories & Paging:** Pass top-level `oz -C <dir> <cmd>` (before the subcommand, or global `--directory <dir>`) to target any repository without `cd <dir> && ...`. Pass global `--no-pager` / `-P` to disable paging anywhere, and add `--json` for the canonical `oz.v1` envelope.
 
 ## 1. Fast Inspection (`status`, `diff`, `log`, `show`, `grep`, `blame`, `rev-parse`)
 
 - **Compact status:** `oz status` (`--hunks` to expand >5 collapsed hunks; `oz status --json` for structured output). Combines status, `(+/-)` diffstat, and deterministic `[f1]` / `h1a` IDs.
 - **Line-numbered diffs & excludes:** `oz diff [A..B | --base <rev> --rev <rev>] [--stat] [--line-numbers] [--exclude <pat|glob|f1|h1a>] [targets...]` (also supports `:!<path>` exclusions; `oz diff --json` always includes exact 1-based `old_line`/`new_line`).
-- **History & branch comparison:** `oz log --oneline -n 10 [REV...] [-- <paths...>]` — supports multiple revs (`HEAD origin/main`), symmetric diff (`A...B --left-right`), `-i`/`--regexp-ignore-case`, `--no-notes`, `--format fuller`, `--author`, `--grep`, `-S`/`--pickaxe`, `-G`/`--grep-diff`, and `--since`.
+- **History & branch comparison:** `oz log --oneline -n 10 [REV...] [<paths...>]` — positional paths auto-detect without `--`; supports `--decorate[=short|full|auto|no]`, `--no-decorate`, `--abbrev-commit`, multiple revs (`HEAD origin/main`), symmetric diff (`A...B --left-right`), `-i`/`--regexp-ignore-case`, `--no-notes`, `--format fuller`, `--author`, `--grep`, `-S`/`--pickaxe`, `-G`/`--grep-diff`, and `--since`.
 - **Commits, blobs & rev-scoped grep (no checkout needed):**
   - `oz show <rev> [--stat] [--json]` and `oz show <rev>:<path> [--lines 1..50] [--line-numbers]`.
-  - `oz grep <pattern> [<rev>] [-i] [-F] [-l] [--exclude <glob>] [--max-line-len N] [-- <paths...>]` — **uses Rust/ERE regex (`a|b`), NOT Git BRE (`a\\|b`)**; line numbers are always on and lines >400 chars truncate by default (`--max-line-len 0` disables).
+  - `oz grep <pattern> [<rev>] [<paths...>] [-i] [-F] [-l] [-c|--count] [-A/-B/-C N] [--limit N] [-m|--max-per-file N] [-E] [-H] [--exclude <glob>] [--max-line-len N]` — **uses Rust/ERE regex (`a|b`), NOT Git BRE (`a\\|b`)**; positional paths work without `--` (use `--` only when disambiguating an ambiguous rev vs. path); line numbers are always on; lines >400 chars truncate by default (`--max-line-len 0` disables); under `--agent` / `OZ_AGENT=1`, output defaults to a smart 100-match cap (skipped for `-l`/`-c`, pass `--limit 0` for all matches).
 - **Line-level human vs. AI attribution (`oz blame`):** `oz blame <path> [--rev <rev>] [--json]` reports per-line human vs. AI authorship backed by local `refs/notes/ai` git notes (never stored in commit messages; interoperable with `git notes --ref=ai show <oid>`).
 - **Branches & revisions:** `oz branch [-a|-r] [--json]` and `oz rev-parse [--short[=<len>]] [--verify] [--abbrev-ref] [--show-toplevel] [--is-inside-work-tree] [revs...]`.
 
@@ -506,7 +506,7 @@ Ozone is a pure-Rust colocated Git client (`.git/ozone/`) with deterministic `[f
   2. Resolve via CLI (`oz resolve c1 --take ours|theirs|base` or `oz resolve --all --take ours --continue`) or edit files directly in `../<repo>.oz/_integrate`.
   3. Resume with `oz integrate --continue [--verify \"cargo test\"]` (or `oz merge --continue` / `oz stack rebase --continue`), or cancel cleanly with `oz integrate --abort` (removes `_integrate`).
 
-## 5. Stacked PRs, `oz sync`, GitHub PR/Issue Lifecycle & CI Watching
+## 5. Stacked PRs, `oz sync`, GitHub PR/Issue/Release Lifecycle & CI Watching
 
 - **Stacked branches & `oz sync` recipe:**
   - Inspect & rebase local stacks preserving `Change-Id:`: `oz stack status [--onto main]` and `oz stack rebase [--onto main] [--continue|--abort]`.
@@ -528,18 +528,24 @@ Ozone is a pure-Rust colocated Git client (`.git/ozone/`) with deterministic `[f
   - `oz issue view <n|url> [--comments] [--json]`
   - `oz issue list [--state open|closed|all] [--search \"...\"] [--author ...] [--assignee ...] [--label ...] [--limit N] [--json]`
   - `oz issue comment <n|url> (--body \"...\" | --body-file <path|->)`
-- **Push & CI watching** (passing checks collapsed into `passed_checks` by default; pass `--verbose` for full check URLs/IDs):
+- **Releases (REST-backed):**
+  - `oz release list [-L|--limit N] [--json]`
+  - `oz release view [<tag> | --latest] [--no-body] [--no-assets] [--json]`
+  - `oz release create <tag> [-t|--title \"...\"] [-n|--notes \"...\" | -F|--notes-file <path|->] [--generate-notes] [--target <ref>] [-d|--draft] [-p|--prerelease] [--json]` (`--body` / `--body-file` aliases supported)
+  - `oz release edit <tag> [-t|--title ...] [-n|--notes ... | -F|--notes-file <path|->] [--publish|--draft] [--prerelease|--no-prerelease] [--json]`
+- **Push & CI watching** (passing checks collapsed into `passed_checks` by default; human output prints clickable `url:` links; pass `--verbose` for full check URLs/IDs):
   - `oz push [-u] [origin] [b1 b2 ...] [--atomic] [--force-with-lease] [--watch --json]`
-  - `oz ci --watch --json`, `oz ci --json`, `oz ci --pr 1,2,3 --json`, `oz ci --runs [--branch main] [--limit N] --json`, `oz ci --workflow <file|name> [--branch main] [--limit N] [--watch] --json`, `oz ci --job <id> --max-excerpt-lines 150 [--step <name>] [--raw] --json`.
+  - Tag & workflow push watch (peels annotated tags to their commit SHA and waits race-free past pre-existing branch checks): `oz push origin <tag> --watch --workflow <W> [--json]`
+  - `oz ci --watch --json`, `oz ci --json`, `oz ci --pr 1,2,3 --json`, `oz ci --runs [--branch main] [--limit N] --json`, `oz ci --workflow <file|name> [--rev <tag|sha|branch>] [--branch main] [--limit N] [--watch] --json`, `oz ci --job <id> --max-excerpt-lines 150 [--step <name>] [--raw] --json`.
 
-## 6. Diagnostics, Recovery & Automation (`--agent`, `--json` `oz.v1`)
+## 6. Diagnostics, Recovery & Automation (`--agent`, `--no-pager`/`-P`, `--json` `oz.v1`)
 
 - **Diagnostics & maintenance:**
   - `oz doctor [--json]`: checks OS/filesystem (`statfs`), FUSE3/reflink/ProjFS readiness, `oz-vfsd` health, SSH signing, GitHub auth, and active workspace mounts.
   - `oz fsck [--repair] [--json]`: verifies `.git/`, OpLog chain, snapshot reachability, and orphaned mounts/baselines (`--repair` safely recovers interrupted transactions and broken metadata without touching user working-tree files).
   - `oz gc [--oplog-days 30] [--max-entries N] [--dry-run] [--json]`: compacts `.git/ozone/oplog/` and prunes expired OpLog snapshots safely.
-- **Non-interactive agent mode (`--agent` / `OZ_AGENT=1`):**
-  - Pass `--agent` or set `OZ_AGENT=1` (also auto-enabled by `--json`, `CI=1`, or non-TTY stdio) to suppress interactive prompts, `$EDITOR`, and pagers (delegated commands automatically receive `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`, `PAGER=cat`, `GCM_INTERACTIVE=never`, `OZ_AGENT=1`).
+- **Non-interactive agent mode (`--agent` / `OZ_AGENT=1`) & paging:**
+  - Pass `--agent` or set `OZ_AGENT=1` (also auto-enabled by `--json`, `CI=1`, or non-TTY stdio) to suppress interactive prompts, `$EDITOR`, and pagers (delegated commands automatically receive `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`, `PAGER=cat`, `GCM_INTERACTIVE=never`, `OZ_AGENT=1`). Global `--no-pager` / `-P` also disables paging on any command. Under `--agent`, `oz grep` defaults to 100 matches (`--limit 0` for all).
 - **Canonical `--json` `oz.v1` envelope:**
   - Every `--json` command emits `{ \"schema\": \"oz.v1\", \"ok\": bool, \"op_id\": string|null, \"workspace\": string|null, \"branch\": string|null, \"head_oid\": string|null, \"data\": ..., \"warnings\": [...], \"conflicts\": [...], \"recovery_commands\": [...], \"error\"?: { \"code\", \"exit_code\", \"message\" } }` (`error` appears only when `ok == false`).
   - Exit codes: `0` success, `1` conflict or verification/CI failure, `2` usage, config, or guardrail error.
@@ -548,21 +554,21 @@ Ozone is a pure-Rust colocated Git client (`.git/ozone/`) with deterministic `[f
 
 fn render_skill_markdown(skill_name: &str) -> String {
     format!(
-        "---\nname: {skill_name}\ndescription: Stage-free Git client (`oz`) with addressable file/hunk commits (`--pick`, `--amend`, `-S`), OpLog inspection & `< 10 ms` undo (`oplog`, `undo --list`), `oz git` fallback, CoW workspaces, conflict resolution (`_integrate`, `resolve`), stacked PRs (`stack`, `sync`), GitHub PR/issue/CI workflows, `blame`, and `doctor`/`fsck`/`gc`.\n---\n\n{}",
+        "---\nname: {skill_name}\ndescription: Stage-free Git client (`oz`) with addressable file/hunk commits (`--pick`, `--amend`, `-S`), OpLog inspection & `< 10 ms` undo (`oplog`, `undo --list`), `oz git` fallback, CoW workspaces, conflict resolution (`_integrate`, `resolve`), stacked PRs (`stack`, `sync`), GitHub PR/issue/release/CI workflows, `blame`, and `doctor`/`fsck`/`gc`.\n---\n\n{}",
         render_ozone_workflow_body()
     )
 }
 
 fn render_cursor_mdc() -> String {
     format!(
-        "---\ndescription: Ozone (`oz`) compact always-on rules — stage-free commits, OpLog undo, `oz git` fallback, workspaces, PR/issue/CI, and non-interactive agent mode\nglobs:\nalwaysApply: true\n---\n\n{}",
+        "---\ndescription: Ozone (`oz`) compact always-on rules — stage-free commits, OpLog undo, `oz git` fallback, workspaces, PR/issue/release/CI, and non-interactive agent mode\nglobs:\nalwaysApply: true\n---\n\n{}",
         render_ozone_rule_body()
     )
 }
 
 fn render_windsurf_rule() -> String {
     format!(
-        "---\ntrigger: always_on\ndescription: Ozone (`oz`) compact always-on rules — stage-free commits, OpLog undo, `oz git` fallback, workspaces, PR/issue/CI, and non-interactive agent mode\n---\n\n{}",
+        "---\ntrigger: always_on\ndescription: Ozone (`oz`) compact always-on rules — stage-free commits, OpLog undo, `oz git` fallback, workspaces, PR/issue/release/CI, and non-interactive agent mode\n---\n\n{}",
         render_ozone_rule_body()
     )
 }
@@ -940,12 +946,22 @@ mod tests {
         assert!(claude_skill.contains("oz integrate"));
         assert!(claude_skill.contains("oz undo"));
         assert!(claude_skill.contains("oz ci --json"));
+        assert!(claude_skill.contains("oz release list"));
+        assert!(claude_skill.contains("oz release create"));
+        assert!(claude_skill.contains("oz push origin <tag> --watch --workflow <W>"));
+        assert!(claude_skill.contains("--no-pager"));
+        assert!(claude_skill.contains("--limit 0"));
+        assert!(claude_skill.contains("--max-per-file"));
+        assert!(claude_skill.contains("--decorate"));
 
         // Verify Cursor .mdc frontmatter and Antigravity YAML frontmatter.
         let cursor_mdc =
             fs::read_to_string(dir.path().join(".cursor/rules/oz.mdc")).expect("read mdc");
         assert!(cursor_mdc.starts_with("---\ndescription:"));
         assert!(cursor_mdc.contains("alwaysApply: true"));
+        assert!(cursor_mdc.contains("oz release list|view|create|edit"));
+        assert!(cursor_mdc.contains("--no-pager"));
+        assert!(cursor_mdc.contains("--workflow <W>"));
 
         let agy_skill =
             fs::read_to_string(dir.path().join(".agent/skills/oz/SKILL.md")).expect("read agy");

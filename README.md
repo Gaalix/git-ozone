@@ -152,7 +152,7 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 
 | Invocation | Purpose |
 | :--- | :--- |
-| `oz <cmd>` | Primary CLI — supports global `--json`, `--agent`, `-C`/`--directory <DIR>`, `-V/--version`. |
+| `oz <cmd>` | Primary CLI — supports top-level `-C <DIR>`, global `--directory <DIR>`, `--no-pager`/`-P`, `--json`, `--agent`, and `-V/--version`. |
 | `git ozone <cmd>` | Native Git subcommand alias provided by the `git-ozone` binary. |
 | `oz git <cmd>` | Optional compatibility shim (`alias git="oz git"`). Intercepts `worktree`, `status`, `diff`, `add`, `reset`, `commit`, `switch`, `checkout`, `merge`, `rebase`, `clone`, `fetch`, `push` natively on Ozone and wraps delegated mutating `git` commands in OpLog transactions so even `git reset --hard` is reversible via `oz undo`. |
 
@@ -163,9 +163,9 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz ws <spawn\|list\|rm\|gc>` | Manage isolated CoW/VFS workspaces (`--from`, `--branch`, `--backend`, warm cache LRU GC). |
 | `oz status [--hunks]` | Indexless `O(dirty_files)` status emitting deterministic `[f1]` file and collapsed/full `h1a` hunk IDs. |
 | `oz diff [--base/--rev \| A..B] [--exclude PAT] [--line-numbers] [TARGETS...]` | Histogram unified diffs (working tree or revision ranges) with explicit `old_line`/`new_line`, `--exclude` / `:!<path>`, file/hunk IDs, or `--stat`. |
-| `oz grep <PATTERN> [REV] [-- <PATHS...>]` | Search working-tree files or any Git revision's tree with full Rust regex (`regex-automata`), `-F`, `-i`, `-l`, `--exclude` / `:!<path>`, and line-length caps. |
+| `oz grep <PATTERN> [REV] [PATHS...]` | Search working-tree files or any Git revision's tree with Rust/ERE regex (`regex-automata`), positional paths without `--`, `-c`/`--count`, `-A`/`-B`/`-C` context, `--limit`/`-m`/`--max-per-file`, smart `--agent` default cap (`--limit 0` for all), `-F`, `-i`, `-l`, `-E`, `-H`, `--exclude` / `:!<path>`, and line-length caps. |
 | `oz commit -m "..."` | Stage-free commit (`--pick`, `--exclude`, `--amend`, `--no-edit`, `-S/--sign`, `--no-verify`, hooks, guardrails, `Change-Id:`). |
-| `oz log` / `oz show` / `oz rev-parse` | Commit graph (`--oneline`, `--left-right`, `--no-notes`, `--format fuller`, `--author`, `--grep`, `-S`/`--pickaxe`, `-G`/`--grep-diff`, `--since`, `-- <paths...>`), commit & `<rev>:<path> --lines` blob inspection, and native `rev-parse`. |
+| `oz log` / `oz show` / `oz rev-parse` | Commit graph (`--oneline`, `--left-right`, `--decorate[=...]`/`--no-decorate`, `--abbrev-commit`, `--no-notes`, `--format fuller`, `--author`, `--grep`, `-S`/`--pickaxe`, `-G`/`--grep-diff`, `--since`, positional paths without `--`), commit & `<rev>:<path> --lines` blob inspection, and native `rev-parse`. |
 | `oz stash` | `push` / `pop` / `list` / `drop` backed by MVCC OpLog snapshots so `oz undo` reverses stash operations too. |
 | `oz merge <SOURCES...>` | In-memory 3-way merge (e.g. `origin/main`) into the current branch (`--ff-only`, `--no-ff`, `--verify "<cmd>"`, `--continue`/`--abort`, `OpLog`-reversible via `oz undo`). |
 | `oz cherry-pick` / `oz revert` | In-memory cherry-pick & revert with `--no-commit`, `--json`, and OpLog undo support. |
@@ -177,11 +177,12 @@ Ozone follows the **`uv` Playbook**: a clean primary CLI (`oz`) plus drop-in Git
 | `oz integrate <SOURCES...>` | In-memory 3-way merge into `--into <branch>` with `--verify "<cmd>"` and `_integrate/` sandbox. |
 | `oz resolve <ID \| --all> --take <ours\|theirs\|base>` | Resolve structured conflict IDs (`c1`, `c2`) with optional `--continue`. |
 | `oz stack <status\|rebase>` | Inspect and in-memory rebase stacked branches while preserving `Change-Id:` trailers. |
-| `oz clone` / `oz fetch` / `oz pull` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--ff-only`, `--rebase`, `--atomic`, `--force-with-lease`, `--watch`, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
+| `oz clone` / `oz fetch` / `oz pull` / `oz push` | Pure-Rust Git Wire Protocol v2 (`--filter=blob:none`, `--ff-only`, `--rebase`, `--atomic`, `--force-with-lease`, `--watch [--workflow <W>]` with annotated tag peeling & race-free wait, `--no-verify` `pre-push` hooks, `~/.ssh/config`). |
 | `oz pr <create\|edit\|list\|status\|view\|comments\|reply\|resolve\|diff\|read\|review\|stack>` | Create/edit/list PRs, check one-line multi-PR verdicts, inspect/reply/resolve `[t1]` inline review threads, view line-numbered PR diffs, read files at PR head, submit pre-validated reviews, and push stacked PRs. |
 | `oz issue <view\|list\|comment>` | Inspect, search, and comment on GitHub Issues via REST (`--state`, `--search`, `--label`, `--assignee`, `--limit`). |
+| `oz release <list\|view\|create\|edit>` | Manage and inspect GitHub Releases via REST (`-L/--limit`, `--latest`, `-t/--title`, `-n/--notes`, `-F/--notes-file`, `--generate-notes`, `--target`, `-d/--draft`, `-p/--prerelease`, `--publish`). |
 | `oz sync` | Fetch, fast-forward base, retarget stacked PRs, rebase downstream, GC merged workspaces, refresh warm baseline. |
-| `oz ci` | Inspect GitHub Check Runs & workflow runs (`--runs`, `--pr`, `--workflow`), watch CI (`--watch --json`), and drill into failing Actions job logs (`--job <id>`). |
+| `oz ci` | Inspect GitHub Check Runs & workflow runs (`--runs`, `--pr`, `--workflow <W> --rev <rev>`), watch CI (`--watch --json`) with clickable URLs, and drill into failing Actions job logs (`--job <id>`). |
 | `oz agent setup` | Install idempotent skills/rules and `oz checkpoint --quiet` hooks for 5 agent harnesses. |
 | `oz mcp` | Launch built-in JSON-RPC 2.0 stdio Model Context Protocol server (11 tools). |
 | `oz blame <PATH>` | Line-level human vs. AI (`refs/notes/ai`) authorship attribution. |
