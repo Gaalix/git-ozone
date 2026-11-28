@@ -1,15 +1,15 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 # Template manifest: PackageVersion, URL, and InstallerSha256 are populated automatically from SHA256SUMS.txt by .github/workflows/release.yml (packaging/populate-manifests.py) and published as release assets.
 PackageIdentifier: OzoneVCS.Ozone
-PackageVersion: 1.4.0
+PackageVersion: 1.4.5
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
-  - RelativeFilePath: oz-v1.4.0-x86_64-pc-windows-msvc\oz.exe
+  - RelativeFilePath: oz-v1.4.5-x86_64-pc-windows-msvc\oz.exe
     PortableCommandAlias: oz
-  - RelativeFilePath: oz-v1.4.0-x86_64-pc-windows-msvc\git-ozone.exe
+  - RelativeFilePath: oz-v1.4.5-x86_64-pc-windows-msvc\git-ozone.exe
     PortableCommandAlias: git-ozone
-  - RelativeFilePath: oz-v1.4.0-x86_64-pc-windows-msvc\oz-vfsd.exe
+  - RelativeFilePath: oz-v1.4.5-x86_64-pc-windows-msvc\oz-vfsd.exe
     PortableCommandAlias: oz-vfsd
 UpgradeBehavior: install
 Commands:
@@ -18,7 +18,7 @@ Commands:
   - oz-vfsd
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/Gaalix/git-ozone/releases/download/v1.4.0/oz-v1.4.0-x86_64-pc-windows-msvc.zip
+    InstallerUrl: https://github.com/Gaalix/git-ozone/releases/download/v1.4.5/oz-v1.4.5-x86_64-pc-windows-msvc.zip
     InstallerSha256: "0000000000000000000000000000000000000000000000000000000000000000"
 ManifestType: installer
 ManifestVersion: 1.6.0

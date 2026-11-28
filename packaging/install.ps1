@@ -5,11 +5,11 @@
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/Gaalix/git-ozone/main/packaging/install.ps1 | iex
-#   .\packaging\install.ps1 -Version 1.4.0 -Prefix "$env:LOCALAPPDATA\Ozone" -DryRun
+#   .\packaging\install.ps1 -Version 1.4.5 -Prefix "$env:LOCALAPPDATA\Ozone" -DryRun
 
 [CmdletBinding()]
 param(
-    [string]$Version = $(if ($env:OZ_VERSION) { $env:OZ_VERSION } else { "1.4.0" }),
+    [string]$Version = $(if ($env:OZ_VERSION) { $env:OZ_VERSION } else { "1.4.5" }),
     [string]$Prefix = $(if ($env:OZ_INSTALL_PREFIX) { $env:OZ_INSTALL_PREFIX } else { Join-Path $env:LOCALAPPDATA "Ozone" }),
     [string]$Repo = $(if ($env:OZ_REPO) { $env:OZ_REPO } else { "Gaalix/git-ozone" }),
     [switch]$DryRun,
@@ -65,7 +65,7 @@ $Target = Get-OzoneTarget
 
 if ($Version -eq "latest") {
     if ($DryRun) {
-        $Version = "1.4.0"
+        $Version = "1.4.5"
         Write-Info "dry-run: using default version $Version instead of querying GitHub API for 'latest'"
     } else {
         $Version = Resolve-LatestVersion -RepoSlug $Repo

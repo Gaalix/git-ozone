@@ -9,7 +9,7 @@ Ozone ships architecture-specific `.deb` packages (`amd64` and `arm64`) on every
 Download the matching `.deb` and `SHA256SUMS.txt` from the [GitHub Releases](https://github.com/Gaalix/git-ozone/releases) page:
 
 ```bash
-VERSION=1.4.0
+VERSION=1.4.5
 ARCH="$(dpkg --print-architecture)" # amd64 or arm64
 
 curl -fsSLO "https://github.com/Gaalix/git-ozone/releases/download/v${VERSION}/ozone_${VERSION}_${ARCH}.deb"
@@ -29,7 +29,7 @@ Use [`build-deb.sh`](./build-deb.sh) after compiling release binaries:
 ```bash
 cargo build --release --locked -p oz-cli -p oz-vfsd --bin oz --bin git-ozone --bin oz-vfsd
 ./packaging/deb/build-deb.sh \
-  --version 1.4.0 \
+  --version 1.4.5 \
   --arch amd64 \
   --bin-dir target/release \
   --out-dir dist

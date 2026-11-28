@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to package (e.g. v1.4.0); defaults to Cargo.toml workspace version"
+        description: "Release tag to package (e.g. v1.4.5); defaults to Cargo.toml workspace version"
         required: false
         type: string
       publish:
